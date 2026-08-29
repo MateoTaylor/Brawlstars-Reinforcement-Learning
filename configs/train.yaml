@@ -1,0 +1,243 @@
+# PPO training configuration -- the single file you edit to tune a run.
+#
+# Loaded by brawl_sim/training/config.py (`load_train_config`), consumed by scripts/train.py.
+# Deliberately separate from configs/default.yaml: that file describes the SIMULATOR (map size,
+# episode length, bot toggles -- what the world is), this one describes the RUN (PPO
+# hyperparameters, reward shaping, the difficulty curriculum -- how the agent learns in it).
+# Nothing here reaches EnvConfig/SimParams except via `run.env_overrides` and `curriculum`.
+#
+# Override any single key from the CLI without editing this file:
+#   python scripts/train.py --set ppo.n_steps=256 --set learning_rate.initial=1e-4
+
+# ---------------------------------------------------------------------------------------------
+# UNITS. Since configs/default.yaml sets `sim.action_repeat: 5`, one SB3 timestep is one AGENT
+# DECISION = 5 sim ticks = 0.25s of game time. Every "timesteps"/"steps" number in THIS file is
+# therefore in decisions, and every one of them was divided by 5 when action_repeat went 1 -> 5
+# so the run covers the same amount of simulated game time as before. `sim.max_episode_steps`
+# (3000) stays in SIM TICKS and is the one number that is NOT in this unit -- an episode is 600
+# decisions long. See configs/default.yaml's `sim.action_repeat` comment.
+# ---------------------------------------------------------------------------------------------
+
+run:
+  name: mortis_ppo              # run directory name; a timestamp suffix is added unless --no-stamp
+  seed: 0
+  device: cuda                  # cuda | cpu
+  out_dir: runs                 # runs/<name>/{best,checkpoints,tb,train.yaml,curriculum.json}
+  total_timesteps: 300_000_000   # decisions; = 300M sim ticks, the pre-action_repeat budget
+  n_envs: 4096                   # SB3 boundary cost grows with this; 128-1024 is the sane band
+  algo: maskable_ppo            # maskable_ppo (uses action_masks) | ppo
+
+  env_config: configs/default.yaml
+  agent_obs: configs/agent_obs.yaml
+  randomization: null           # e.g. configs/randomization.yaml -- per-env stat jitter, applied
+                                # on top of (and independently of) the curriculum below
+  # Nested dict deep-merged onto env_config, e.g.
+  #   entities: {n_enemies: 6}
+  #   sim: {max_episode_steps: 3000}
+  env_overrides:
+    observation:
+      # The agent PROVABLY cannot see the full-map grid: configs/agent_obs.yaml's only grid group
+      # is `view_channels` (egocentric), and brawl_sim/core/obs_select.py indexes `full_obs["view"]`
+      # and never `full_obs["world"]`. But build_obs rasterizes the 60x60x12 world grid TWICE per
+      # step anyway -- once in _observe, once in _autoreset -- and then throws both away.
+      #
+      # Measured at n_envs=1024 on an idle GPU (min of 5, identical reset per measurement):
+      # 188.35 -> 178.85 ms/step, i.e. 9.5 ms/step (5.0%), plus 73 MB less peak VRAM. The VRAM
+      # saving scales with n_envs, so at this file's n_envs: 4096 it is roughly 290 MB.
+      #
+      # Left ON in configs/default.yaml, so every tool that genuinely wants the whole map
+      # (render/viewer.py, scripts/watch.py, scripts/record_rollout.py) is unaffected -- this
+      # override is scoped to TRAINING, where nothing reads it. Turn it back on here if you add an
+      # agent_obs group that consumes `world`.
+      include_world_grid: false
+
+  info_mode: episode            # minimal | episode | full. "episode" is the MINIMUM the
+                                # curriculum needs -- it is what carries info["outcome"].
+  checkpoint_every_steps: 5_000_000   # decisions; 0 disables periodic checkpoints. 1/20th the
+                                       # save frequency of the old 200k -- best_model.zip (eval
+                                       # callback) and the LR/clip schedules (function of
+                                       # total_timesteps) are unaffected by this value.
+  tensorboard: true
+  log_interval: 1               # rollouts between SB3 logger dumps
+  verbose: 1
+
+ppo:
+  n_steps: 128                   # per env, in DECISIONS;
+  batch_size: 8192               # must divide n_steps * n_envs
+  n_epochs: 6
+  gamma: 0.998                 # PER DECISION. Horizon 1/(1-0.998) ~= 400 decisions
+  gae_lambda: 0.98
+  ent_coef: 0.005
+  vf_coef: 0.5
+  max_grad_norm: 0.5
+  target_kl: 0.02               # e.g. 0.02 to early-stop an epoch that moves the policy too far
+  normalize_advantage: true
+
+# Both schedules are functions of SB3's `progress_remaining` (1.0 at the first step -> 0.0 at
+# total_timesteps). schedule: constant | linear | cosine | exponential.
+learning_rate:
+  schedule: linear
+  initial: 2.0e-4
+  final: 1.0e-5
+
+clip_range:
+  schedule: linear
+  initial: 0.2
+  final: 0.05
+
+policy:
+  cnn_output_dim: 160           # BrawlFeaturesExtractor: conv stack over the uint8 grid group
+  mlp_hidden_dims: [256, 256]   # BrawlFeaturesExtractor: stacked MLP over every float32 group
+  net_arch:                     # policy/value heads on top of the extractor
+    pi: [384, 384]
+    vf: [384, 384]
+
+# VecNormalize. Observation normalization is OFF by default because configs/agent_obs.yaml
+# already sets `normalize: true` (obs_select scales fields into sane ranges on-device, before
+# the host transfer). Reward normalization is ON: shaped-reward magnitudes shift every time the
+# curriculum advances, and a running return-scale keeps PPO's value loss well conditioned.
+normalize:
+  obs: false
+  reward: true
+  clip_obs: 10.0
+  clip_reward: 10.0
+
+# ShapedReward (brawl_sim/training/reward.py). Per-tick terms are in RAW sim units -- damage is
+# on a ~1000-per-hit scale, hence the 1e-3 weights. Set any weight to 0.0 to disable that term.
+reward:
+  # --- terminal (fires once, on the tick the episode ends) ---
+  win_bonus: 10.0               # hero was the last one alive
+  death_penalty: -3.0           # hero died (combat or zone)
+  rank_bonus: 0.5                # x places above last: 0 for 7th, 6.0 for 1st at n_enemies=6
+  # --- per tick ---
+  damage_dealt: 3.0e-4          # 1 rwd per 2000 hero damage
+  damage_taken: -1.0e-4         # x hero damage taken this tick (combat only; zone is below)
+  hp_healed: 1.0e-4             # x hero HP restored this tick (regen + super lifesteal); the
+                                # mirror of damage_taken, so healing a wound off refunds what
+                                # taking it cost. Capped by max HP, so it cannot be farmed.
+  kill: 3.0                     # x enemies the hero killed this tick
+  cube_pickup: 0.5             # x power cubes the hero collected this tick
+  survive_per_step: 0.0       # flat, every tick the hero is alive
+  in_zone_per_step: -0.05       # flat, every tick the hero is outside the safe rect
+  scale: 1.0                    # multiplies the whole sum; a global volume knob
+
+# Stationary evaluation. Periodically plays a small, FIXED set of matches against each difficulty
+# tier below, with the curriculum's sampling switched off and the same seed every time -- so the
+# scenarios, maps, and bots are identical at 2M steps and at 20M steps.
+#
+# This is the only signal in the run comparable across time. `rollout/ep_rew_mean` is measured
+# against the training distribution, which the curriculum deliberately makes harder, so it cannot
+# tell "policy improved" apart from "curriculum got easier". These can.
+#
+# Logged as `eval/win_rate_<tier>` (also columns in logs/progress.csv) AND as one overlaid
+# TensorBoard chart, `eval/win_rate`, with a line per tier (written to logs/eval_<tier>/).
+# `best_model.zip` is saved whenever the mean win rate across tiers improves.
+#
+# Cost: one rollout of `len(tiers) * episodes_per_tier` envs, ALL RUN IN PARALLEL, bounded by
+# sim.max_episode_steps ticks (3000) -- that tick cap does NOT scale with episodes_per_tier, since
+# raising it only widens the batch, not the number of sequential rounds. This env is built ONCE
+# and held in VRAM for the whole run (TierEvaluator is eager, not rebuilt per eval) -- a permanent
+# memory cost, not just a slower periodic eval. Measured on an RTX 5070 Ti (17.1GB): 4096 training
+# envs alone = 1.47GB; adding 4000 eval envs (episodes_per_tier=1000 x 4 tiers) brings the combined
+# peak to ~2.95GB -- comfortable headroom. At n=1000/tier the win-rate standard error is ~1.6pp
+# (vs ~8.8pp at the old n=32).
+#
+# Worth knowing: `every_timesteps` counts SB3 timesteps, which advance by n_envs (4096) per
+# DECISION -- so 3_000_000 training timesteps is only ~732 decisions (~3660 sim ticks) of training
+# progress. Each eval call can take up to cfg.max_agent_steps (600) decisions of its OWN
+# (separate, wider) batch to finish. Those are different batches ticking independently, but in
+# wall-clock terms a single eval can take longer than the training that happens between two evals,
+# especially early on before episodes end quickly.
+eval:
+  enabled: true
+  every_timesteps: 5_000_000      # decisions; = the pre-action_repeat 15M sim ticks. Each eval
+                                  # takes ~6-10 min wall-clock at episodes_per_tier=1000
+                                  # (measured), so this keeps cumulative eval overhead to roughly
+                                  # an hour. The eval rollout itself is now bounded by
+                                  # cfg.max_agent_steps (600) rather than 3000 step() calls.
+  episodes_per_tier: 300
+  tiers: []                     # empty = every tier under curriculum.tiers below
+  deterministic: true           # argmax actions; lower variance, the usual choice for eval
+  seed: 999983                  # unrelated to run.seed, so eval scenarios aren't ones seen in training
+  at_start: true                # one eval before training starts, as the baseline
+
+# ---------------------------------------------------------------------------------------------
+# Difficulty curriculum.
+#
+# A "tier" is a set of MULTIPLIERS applied to configs/brawlers.yaml's own per-archetype numbers,
+# so tier `hard` (all 1.0) is exactly the bots as authored there. Tiers are sampled per
+# (env, archetype) on every reset, from the current stage's `tier_weights` -- so within one
+# batch you face the advertised mixture, and within one episode different archetypes can sit at
+# different tiers. Archetype SELECTION stays uniformly random throughout (entities.
+# randomize_enemy_types in configs/default.yaml); the curriculum changes how well those bots
+# play, not which ones show up.
+#
+# Advancement is adaptive: the win rate over the last `window_episodes` finished episodes must
+# reach a stage's `advance_win_rate` (with at least `min_episodes_at_stage` episodes played at
+# that stage) before it advances. The final stage has advance_win_rate: null and is terminal.
+curriculum:
+  enabled: true
+  window_episodes: 500          # rolling window the win rate is measured over
+  min_episodes_at_stage: 500    # floor before a stage may advance, so a lucky window can't skip
+  demote_win_rate: null         # e.g. 0.05 -- drop back a stage if the win rate collapses
+  max_timesteps_at_stage: null  # e.g. 5_000_000 -- force-advance a stalled stage
+
+  # Multipliers on the brawlers.yaml base value, applied to bot kinds only (never the hero).
+  #   aim_noise       x aim_noise_std_rad and aim_noise_tiles  (HIGHER = worse aim)
+  #   reaction_delay  x reaction_delay                         (HIGHER = slower to react)
+  #   lead_target     x lead_target_fraction, clamped to [0,1] (LOWER  = worse at leading shots)
+  #   decision_period x decision_period_ticks, floored at 1    (HIGHER = re-decides less often)
+  #   move_speed      x move_speed
+  #   hp              x base_hp
+  #   damage          x base_damage
+  tiers:
+    easy:
+      aim_noise: 3.0
+      reaction_delay: 2.2
+      lead_target: 0.25
+      decision_period: 2.0
+      move_speed: 0.90
+      hp: 0.75
+      damage: 0.70
+    medium:
+      aim_noise: 1.8
+      reaction_delay: 1.6
+      lead_target: 0.60
+      decision_period: 1.5
+      move_speed: 0.95
+      hp: 1.0
+      damage: 0.85
+    hard:                       # brawlers.yaml exactly as authored -- the reference bot
+      aim_noise: 1.0
+      reaction_delay: 1.0
+      lead_target: 1.0
+      decision_period: 1.0
+      move_speed: 1.0
+      hp: 1.0
+      damage: 1.0
+    elite:                      # aim/reaction sharpened past reference, THEN combat stats up
+      aim_noise: 0.6
+      reaction_delay: 0.6
+      lead_target: 1.0
+      decision_period: 1.0
+      move_speed: 1.0
+      hp: 1.25
+      damage: 1.20
+
+  # Walked in order. `tier_weights` need not sum to 1 -- they are normalized.
+  stages:
+    - name: easy_ramp           # "weighted more towards weaker enemies"
+      tier_weights: {easy: 0.50, medium: 0.40, hard: 0.10}
+      advance_win_rate: 0.2
+    - name: mixed
+      tier_weights: {easy: 0.35, medium: 0.45, hard: 0.20}
+      advance_win_rate: 0.3
+    - name: hard_lean
+      tier_weights: {easy: 0.20, medium: 0.45, hard: 0.35}
+      advance_win_rate: 0.3
+    - name: hard_mostly          # "until it's only playing hard bots"
+      tier_weights: {medium: 0.3, hard: 0.7}
+      advance_win_rate: 0.3
+    - name: elite               # terminal stage
+      tier_weights: {medium: 0.1, hard: 0.4, elite: 0.5}
+      advance_win_rate: null

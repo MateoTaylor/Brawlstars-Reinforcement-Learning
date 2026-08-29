@@ -1,0 +1,104 @@
+{
+  "_comment": [
+    "GROUND-plane homography: H maps tile (x,y) -> pixels of the NORMALIZED viewport",
+    "(brawl_vision.capture.normalize_viewport output), NOT a raw capture frame.",
+    "H_top is the wall-top plane the corners were actually clicked on; H is that fit",
+    "transferred down to the ground by a planar homology. See solve_camera_model."
+  ],
+  "H": [
+    [
+      78.30154421495271,
+      -11.372189728309335,
+      524.5876403643551
+    ],
+    [
+      0.6584121973078114,
+      55.72367096973234,
+      429.5344080943695
+    ],
+    [
+      0.001747557894603844,
+      -0.011849877816040239,
+      1.0
+    ]
+  ],
+  "H_inv": [
+    [
+      0.012923740699607134,
+      0.0010956987876689622,
+      -7.250274968498793
+    ],
+    [
+      1.959890001412053e-05,
+      0.016445351527592036,
+      -7.074125675020225
+    ],
+    [
+      -2.2352740516915337e-05,
+      0.00019296060917729758,
+      0.9288427503549459
+    ]
+  ],
+  "H_top": [
+    [
+      78.6470275236523,
+      -11.422366283240489,
+      519.2529313370824
+    ],
+    [
+      0.6613172539921294,
+      55.96953582990241,
+      373.86017950767916
+    ],
+    [
+      0.0017552684971165404,
+      -0.011902162033888265,
+      1.0
+    ]
+  ],
+  "pixels_per_tile": 48,
+  "viewport": [
+    2002,
+    1126
+  ],
+  "is_affine": false,
+  "parallax_tiles": -0.8787068538082657,
+  "source_frame": "calib_showdown_f060.png",
+  "notes": "Solo Showdown, 2026-08. Grid from wall-top corners; transferred to the ground plane by a planar homology. Height pair 3 excluded: both clicks were on different vertical edges, giving a slope geometrically impossible next to its neighbour.",
+  "report": {
+    "n_grid_points": 13,
+    "grid_residual_px": {
+      "mean": 2.008640610533588,
+      "median": 1.2443961183810537,
+      "max": 4.277955570517471
+    },
+    "height_pairs_used": [
+      "1",
+      "2",
+      "4",
+      "5",
+      "6"
+    ],
+    "height_pairs_excluded": [
+      "3"
+    ],
+    "base_residual_px": {
+      "mean": 4.116448358212817,
+      "max": 6.58031175037976
+    },
+    "vanishing_point": [
+      1733.664733973349,
+      13047.736102766994
+    ],
+    "mu": 1.015197355431238,
+    "H_perspective_row": [
+      0.001747557894603844,
+      -0.011849877816040239
+    ],
+    "parallax_tiles": {
+      "mean": -0.8787068538082657,
+      "min": -0.9651383526806958,
+      "max": -0.7905808423942933
+    }
+  }
+}

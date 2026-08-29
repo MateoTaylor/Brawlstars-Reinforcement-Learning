@@ -1,0 +1,45 @@
+# The agent's fair-information view (AgentObsSpec). See BRAWL_SIM_BUILD_PLAN.md Step 32 and
+# brawl_sim/core/obs_select.py. Loaded by obs_select.load_agent_spec(path, cfg) -- shapes are
+# NOT written here, they're computed from these fields against a real cfg at load time.
+fair: true
+normalize: true
+groups:
+  - name: self
+    per_entity: false
+    dtype: float32
+    # long_dash_frac AND long_dash_ready (Step D1): the fraction is what a policy can plan
+    # against ("0.8 charged -- hold off attacking for one more second"), the flag is the
+    # discontinuity that actually changes what a dash does. A flag alone gives no gradient to
+    # follow; a fraction alone hides the exact moment the ability becomes available.
+    fields: [hero.pos_norm, hero.vel, hero.facing_vec, hero.hp_frac, hero.ammo_frac,
+             hero.ammo_whole, hero.attack_cd, hero.can_attack, hero.dashing,
+             hero.dash_t, hero.dash_dir, hero.invuln, hero.in_bush, hero.in_zone,
+             hero.cubes, hero.long_dash_ready, hero.long_dash_frac,
+             hero.super_ready, hero.super_charge_frac,
+             meta.time_frac, meta.n_enemies_alive]
+  - name: enemies                       # slots 1..n_enemies, index-stable, gated by fair
+    per_entity: true
+    dtype: float32
+    fields: [entities.alive, entities.revealed_to_hero, entities.kind_onehot,
+             entities.rel_pos, entities.dist, entities.rel_vel, entities.hp_frac,
+             entities.cubes, entities.can_attack, entities.dashing, entities.in_bush]
+  - name: projectiles                   # nearest K by time_to_closest, K = 12 -- NOT index-stable
+    per_entity: true
+    max_slots: 12
+    dtype: float32
+    # class_onehot (D13) is what lets the policy tell a stationary 696-per-tick puddle from an
+    # incoming bullet. Without it the two are near-identical rows -- a hazard has zero velocity,
+    # but so does a bullet aimed straight at the hero at the moment of closest approach, and both
+    # carry a damage figure and an aoe. Getting that wrong means either fleeing harmless ground or
+    # standing in a sphere for 4 seconds.
+    fields: [projectiles.alive, projectiles.kind_onehot, projectiles.class_onehot,
+             projectiles.rel_pos, projectiles.vel, projectiles.damage, projectiles.aoe,
+             projectiles.time_to_closest, projectiles.threatens_hero]
+  - name: zone
+    per_entity: false
+    dtype: float32
+    fields: [zone.hero_margin, zone.active, zone.safe_area_frac, zone.next_shrink_in]
+  - name: grid                          # (10, view_h, view_w) uint8 egocentric, fair channels only
+    dtype: uint8
+    view_channels: [blocks_unit, blocks_projectile, is_bush, is_water, in_zone,
+                    enemy_revealed, hero, box, pickup, projectile]

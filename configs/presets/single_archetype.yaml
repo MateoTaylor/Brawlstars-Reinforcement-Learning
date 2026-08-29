@@ -1,0 +1,8 @@
+# Pins every enemy to a single archetype (sniper) instead of the default random mix --
+# useful for isolating one bot archetype's behavior in tests. Nine entries match
+# configs/default.yaml's entities.n_enemies. Overrides fragment -- deep-merge onto
+# configs/default.yaml via load_config's `overrides`.
+
+entities:
+  randomize_enemy_types: false
+  fixed_enemy_types: [sniper, sniper, sniper, sniper, sniper, sniper, sniper, sniper, sniper]

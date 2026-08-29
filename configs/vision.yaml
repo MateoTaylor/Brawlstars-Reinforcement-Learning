@@ -1,0 +1,116 @@
+# brawl_vision tunables. See Terrain_Perception_Build_Plan.md and brawl_vision/config.py.
+#
+# SETTINGS live here -- numbers you tune by hand, where a different value is a different
+# judgment call. MEASUREMENTS live in brawl_vision/data/*.json (the homography, the HUD
+# rectangles): those are outputs of a calibration script, regenerated rather than edited.
+#
+# READ THIS BEFORE TRUSTING ANY NUMBER BELOW. Most of these are PLACEHOLDERS -- nobody has
+# pointed this pipeline at real footage yet. Every value that has not been measured says so and
+# names the phase that replaces it. Treating an unmeasured default as a finding is exactly the
+# failure this file is commented to prevent.
+
+capture:
+  monitor: 1          # mss monitor index; 0 is the virtual "all screens" rectangle
+  # 20 Hz, matching the sim's tick rate (configs/default.yaml sim.dt: 0.05). Note this is NOT
+  # the decision rate: sim.action_repeat: 5 makes one agent decision cover 5 ticks, so the
+  # pipeline's real budget is 4 Hz / 250 ms. Capturing at the tick rate rather than the
+  # decision rate gives odometry (Phase F) more, smaller inter-frame shifts to correlate,
+  # which is the regime cv2.phaseCorrelate is most accurate in.
+  target_fps: 20.0
+  # Brightness above which a pixel counts as rendered content rather than a letterbox bar.
+  # 25, not 0 and not 12: compression does not preserve pure black, and the ramp at a hard
+  # bar/content boundary measured 11-16 on real footage -- so 12 admits ringing as "content" and
+  # made the detected left edge wander over 194..216 frame to frame. At 25 the same clip's right
+  # edge is rock steady at 2217 and the left clusters at 206.
+  black_level: 25
+  # MEASURED, not a placeholder and not a tuning knob. Solo Showdown constricts the visible WIDTH
+  # relative to other modes, at the same zoom, to keep matches fair -- 2002x1126 (exactly 16:9)
+  # against the training cave's full-screen 2436x1126, both at ~77 px/tile. Every frame is symmetrically
+  # trimmed to this aspect before anything else touches it, which is what lets ONE homography
+  # serve every mode. Expressed as an aspect rather than a pixel width so it survives a
+  # resolution change. See Terrain_Perception_Build_Plan.md Section 3.
+  normalized_aspect: 1.7777778    # 16 / 9
+
+odometry:                 # Phase F
+  # MEASURED. A PER-WINDOW floor: windows below it are dropped, and a frame left with fewer
+  # than min_windows is called a cut. Good frames sit at p01 = 0.20-0.95 across all seven
+  # fixtures; the one real cut (training_gadget f508) leaves a single window at 0.132.
+  # This floor alone is NOT sufficient -- a window locked onto a moving sprite scores
+  # 0.92-0.98 while reporting pure fiction. See min_agreement_ratio for what catches that.
+  min_response: 0.10
+  # MEASURED, and it assumes capture.target_fps: 20. The fastest thing in the game is not a
+  # walk -- Mortis's charged dash covers 5.34 tiles in 0.30 s (17.8 tiles/s), i.e. 0.89 tiles
+  # per frame at 20 Hz, against 0.137 for the fastest walk. 2.0 leaves 2.2x headroom over the
+  # dash and still catches the one real cut in the fixtures (a 3.3-tile jump). This bound is
+  # per FRAME, not per second: raise it if the capture rate drops.
+  max_shift_tiles: 2.0
+  # Correlation window geometry. ONE window over the whole patch does not work: measured on
+  # counted_walking.mp4, a single 823x581 window reports 2.8 tiles of camera travel across a
+  # stretch where the background is provably identical -- phase correlation locked onto the
+  # moving sprites. A grid of windows plus a median outvotes them. 192/192 gives 11 windows at
+  # 4.5 ms/frame; 128/128 gives 33 at 4.1 ms and 256/256 gives 4 at 3.2 ms, and all three agree
+  # on a real camera leg within 0.2 tiles -- so this is a cost choice, not an accuracy one.
+  window_px: 192
+  stride_px: 192
+  min_windows: 4
+  # How far a per-window estimate may sit from the median and still COUNT AS AGREEING. It is the
+  # tolerance min_agreement_ratio is measured against, not a threshold of its own. Steady tracking
+  # measures 0.002 tiles of median disagreement, three orders below this.
+  max_disagreement_tiles: 0.25
+  # Share of windows that must agree for a frame to be TRUSTED. Below it the frame is still
+  # integrated, just marked 'uncertain' so Phase I can decline to vote on it -- it is not a cut
+  # threshold. Measured: median 1.0 and p01 >= 0.90 on every clip, while a real camera cut goes
+  # to 0.0. Median deviation alone would not work here, because a coherent split (half the patch
+  # sliding one way, half the other) puts the median inside one group and drives it to zero.
+  min_agreement_ratio: 0.75
+
+zone:                     # Phase G
+  # MEASURED (Phase G) on three visually different maps: zone_grows_from_east,
+  # showdown_alternate_map and showdown_has_gadget, sampled before, during and after a shrink.
+  #
+  # The band is carried by S and V, not H. On showdown_alternate_map the BUSHES are yellow-green
+  # with a median hue of 60 -- the same hue as the gas -- and a hue-only band flags 11.5% of that
+  # frame against 4.0% for this one, swallowing the whole bush strip. Gas is a bright, washed-out
+  # overlay; foliage is dark, saturated and textured. That is the separation, and it is why this
+  # threshold was not shippable until a second map with green foliage existed.
+  #
+  # OpenCV 8-bit HSV: H is 0-179 (a HALF-degree hue wheel, not 0-359), S and V are 0-255.
+  # Writing a 0-359 hue is the easiest mistake here and yields an empty mask rather than an
+  # error, so brawl_vision.config.validate range-checks it.
+  #
+  # H may wrap (low > high) for a hue range spanning red; S and V may not. validate enforces
+  # exactly that asymmetry, and zone.detect_zone implements the wrap as a union of two bands.
+  hsv_low:  [42, 60, 185]
+  hsv_high: [75, 165, 255]
+  # Opening kernel in rectified pixels. Clouds are tens of pixels across; the false positives that
+  # survive the colour band (damage numbers, pickup glints, a nameplate) are not.
+  open_px: 9
+  # Share of a cell that must be real world before the cell is judged at all. Mostly-occluded
+  # cells are UNKNOWN, not clear.
+  min_cell_pixels: 0.5
+  # Fraction of a cell's pixels inside the threshold for the CELL to count as gassed. Above 0.5
+  # so a cell straddling the gas boundary resolves to whichever side owns most of it instead of
+  # flickering frame to frame.
+  min_cell_fraction: 0.6
+
+occupancy:                # Phase I
+  # The accumulated per-match grid. Sized generously rather than to a real map: this system has
+  # no pre-built reference to align to, so the origin is wherever tracking started and the
+  # camera can walk off in any direction from it. 128 is ~2x the sim's 60x60 map in every
+  # direction before the grid would need to grow.
+  grid_h: 128
+  grid_w: 128
+  # PLACEHOLDER -- set against the hand-verified ground-truth grid in Phase I.
+  # Minimum observations before a cell may lock, and the share of those votes the winning class
+  # must hold. Both trade map-fill speed against the risk of locking a misclassification, and
+  # LOCKING IS FOREVER (nothing reclassifies a locked cell for the rest of the match), so err
+  # high. lock_ratio must exceed 1/5: with five terrain classes an even split would otherwise
+  # clear the bar and lock whatever the first min_votes frames happened to see.
+  min_votes: 5
+  lock_ratio: 0.8
+
+classifier:               # Phase H
+  # Not a placeholder -- a real choice. At deploy time the GPU is busy running the policy, and
+  # the Phase H model (a shallow fully-convolutional head, not a U-Net) is small enough that
+  # CPU inference very likely fits inside the 250 ms decision budget. Measure before moving it.
+  device: cpu

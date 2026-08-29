@@ -1,0 +1,28 @@
+{
+  "clip": "showdown_alternate_map2",
+  "origin_tile": [
+    -20,
+    -25
+  ],
+  "size_tiles": [
+    24,
+    18
+  ],
+  "grid_window": [
+    39,
+    57,
+    44,
+    68
+  ],
+  "mosaic_coverage": 1.0,
+  "legend": {
+    ".": "FLOOR",
+    "#": "WALL",
+    "b": "BUSH",
+    "~": "WATER",
+    "f": "FENCE",
+    "S": "SPAWN",
+    "X": "BOX",
+    "?": "UNLABELLED"
+  }
+}

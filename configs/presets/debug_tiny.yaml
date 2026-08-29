@@ -1,0 +1,11 @@
+# Small, fast, deterministic config for tests -- n_envs=8 + this preset is the CONVENTIONS.md
+# testing default. This is an overrides fragment: deep-merge it onto configs/default.yaml via
+# load_config(path, overrides=yaml.safe_load(this_file)). Every key here nests under the same
+# section names as default.yaml.
+
+world: {map_h: 20, map_w: 20, maps: [blank], map_selection: fixed, fixed_map: blank}
+view: {height: 10, width: 14}
+entities: {n_enemies: 2}
+sim: {max_episode_steps: 300}
+zone: {enabled: false}
+observation: {include_world_grid: false}

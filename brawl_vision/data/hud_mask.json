@@ -1,0 +1,60 @@
+{
+  "_comment": [
+    "SCREEN-ANCHORED UI only, in normalized [0,1] coordinates of the NORMALIZED viewport",
+    "(brawl_vision.capture.normalize_viewport output), NOT of a raw capture frame.",
+    "EXCLUDED because they follow the world and belong to the entity chunk: the local player's",
+    "nameplate (measured to wander 330 px / 4.3 tiles horizontally), other players' nameplates,",
+    "loot boxes, and the auto-aim reticle. Also excluded: the transient 'Idle Warning' banner,",
+    "screen-anchored but rare, and covering it would cost a wide central band.",
+    "KNOWN GAP: no gadget button has been observed yet; none of the three clips has one.",
+    "GOES STALE if Supercell changes the UI layout. There is no auto-detection."
+  ],
+  "source": "tests/fixtures/vision/{zone_grows_from_east,counted_walking}.mp4",
+  "viewport": [
+    2002,
+    1126
+  ],
+  "notes": "Solo Showdown + training cave, captured 2026-08.",
+  "rects": [
+    {
+      "name": "brawlers_left",
+      "note": "match-state readout, top left. Solo Showdown only; the training cave shows 'Damage per second' here instead.",
+      "x": 0.014985,
+      "y": 0.022202,
+      "w": 0.201299,
+      "h": 0.069272
+    },
+    {
+      "name": "chat_bubble",
+      "note": "emote/chat bubble, right edge. The bubble is a 124x102 px element that appears at TWO heights depending on whether a spectator/kill list is above it: y [252,355] in showdown_alternate_map and _map2, y [372,475] in the other four clips. The original rect covered only the lower one, and Phase L's mosaic showed the uncovered bubble smearing across the world canvas. Union of both, padded.",
+      "x": 0.904096,
+      "y": 0.217584,
+      "w": 0.095904,
+      "h": 0.227353
+    },
+    {
+      "name": "attack_button",
+      "note": "primary attack. Measured independently in both Showdown and the cave at the same place, which is the evidence button layout is mode-independent.",
+      "x": 0.693307,
+      "y": 0.635879,
+      "w": 0.1004,
+      "h": 0.174956
+    },
+    {
+      "name": "super_button",
+      "note": "super. Measured in the TRAINING CAVE -- the Showdown clip never charged one, so its position transfers on the strength of attack_button agreeing across modes.",
+      "x": 0.621878,
+      "y": 0.79929,
+      "w": 0.075425,
+      "h": 0.151865
+    },
+    {
+      "name": "joystick",
+      "note": "FLOATING movement stick: it spawns wherever the thumb lands, so this is a motion ENVELOPE, not the stick. Measured spans in the Showdown clip were x=[0,447] y=[614,1084]; padded to the reachable bottom-left region. This one rect is ~11% of the frame -- two thirds of the whole mask -- and is the price of a floating control.",
+      "x": 0.0,
+      "y": 0.550622,
+      "w": 0.235265,
+      "h": 0.449378
+    }
+  ]
+}

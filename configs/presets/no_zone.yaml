@@ -1,0 +1,4 @@
+# Disables the shrinking zone; everything else stays at configs/default.yaml's values.
+# Overrides fragment -- deep-merge onto configs/default.yaml via load_config's `overrides`.
+
+zone: {enabled: false}

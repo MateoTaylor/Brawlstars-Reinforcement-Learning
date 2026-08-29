@@ -1,0 +1,31 @@
+[project]
+name = "brawl-sim"
+version = "0.1.0"
+description = "Vectorized PyTorch sim of Brawl Stars Solo Showdown, with a Stable-Baselines3 VecEnv adapter."
+requires-python = ">=3.11"
+dependencies = [
+    "torch",
+    "numpy",
+    "pyyaml",
+]
+
+[project.optional-dependencies]
+dev = ["pytest", "pytest-xdist"]
+sb3 = ["stable-baselines3", "sb3-contrib", "gymnasium", "tensorboard"]
+render = ["matplotlib"]
+video = ["imageio-ffmpeg"]  # bundled ffmpeg binary for ReplayViewer.save(*.mp4); .gif needs neither
+vision = ["opencv-python", "mss"]
+
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools.packages.find]
+include = ["brawl_sim*", "brawl_vision*"]
+
+[tool.pytest.ini_options]
+markers = [
+    "gpu: test requires a CUDA device",
+    "slow: test runs a real (if tiny) training loop; deselect with -m 'not slow'",
+    "vision: test needs a recorded clip or captured frame under tests/fixtures/vision/; those are gitignored game footage, so this skips on a fresh clone. Deselect with -m 'not vision'",
+]

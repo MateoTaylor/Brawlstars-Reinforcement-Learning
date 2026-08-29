@@ -1,0 +1,36 @@
+__pycache__/
+*.pyc
+*.pyo
+.pytest_cache/
+.venv/
+venv/
+*.egg-info/
+build/
+dist/
+.ipynb_checkpoints/
+docs/OBSERVATION.md
+docs/AGENT_OBS.md
+*.log
+.DS_Store
+runs/
+eval_videos/
+
+# Sprite PNGs are extracted game assets (Supercell IP) -- keep the folder structure and README
+# tracked, not the images themselves. See brawl_sim/render/assets/README.md.
+brawl_sim/render/assets/**/*.png
+# Screen captures and recorded clips of a live match are extracted game assets (Supercell IP),
+# the same rule as the sprite PNGs above. Ignored BY EXTENSION rather than by directory, so the
+# folder structure, the READMEs, and -- critically -- the hand-authored ground truth that lives
+# alongside the footage (label CSVs, *.truth.json, *.grid.csv) all stay tracked. Those are your
+# annotations, not Supercell's pixels, and they are what the regression fixtures actually assert
+# against. See Terrain_Perception_Build_Plan.md Phase 0.
+brawl_vision/data/frames/**/*.png
+brawl_vision/data/frames/**/*.jpg
+brawl_vision/data/frames/**/*.jpeg
+tests/fixtures/vision/**/*.png
+tests/fixtures/vision/**/*.jpg
+tests/fixtures/vision/**/*.jpeg
+tests/fixtures/vision/**/*.mp4
+tests/fixtures/vision/**/*.mkv
+
+*.md

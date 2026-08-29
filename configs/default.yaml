@@ -1,0 +1,230 @@
+seed: 0
+device: cuda
+
+world:
+  map_h: 60
+  map_w: 60
+  # skull_creek, feast_or_famine, scorched_stone and island_invasion are modeled on the Solo
+  # Showdown maps of the same names; see brawl_sim/maps/README.md. Between them the rotation
+  # covers water as a meaningful hazard, loot concentrated somewhere dangerous, fences as real
+  # cover, and bush density from `open`'s almost-none to `island_invasion`'s 36%.
+  #
+  # `walled` is deliberately NOT here: it is the only 60x60 map with no bush at all, so nothing
+  # on it exercises concealment. It stays in the repo as a fixture (tests/test_map_csvs.py
+  # checks its water and fences) and can still be pinned by hand with
+  # scripts/watch.py --map walled, but nothing trains on it.
+  maps: [open, bushy, skull_creek, feast_or_famine, scorched_stone, island_invasion]
+  map_selection: uniform
+  fixed_map: open
+# MEASURED from the real Solo Showdown camera, not chosen. See Terrain_Perception_Build_Plan.md
+# Phase K. The old 20x40 predated any measurement and was ~1.7x too wide.
+#
+# Push the four corners of the normalized viewport (2002x1126) through the Phase C homography's
+# H_inv and you get the ground quad the camera actually sees -- a trapezoid, 28.9 tiles across
+# its far edge and 23.3 across its near one, 18.4 tall. The view has to be the largest axis
+# aligned rectangle INSIDE that quad, not its bounding box: a bounding box hands the policy the
+# trapezoid's missing corners, which is information it will not have at deploy time and fails
+# silently. The rectangle also has to be centred on the HERO, because `_view_origin` is
+# `hero_ix - view_w // 2` and cannot express anything else. That gives 22.90 x 14.03.
+#
+# The hero sits at the viewport centre horizontally (+0.09 tiles) and +0.80 tiles BELOW
+# it vertically, which is what costs the height. Anchor: the one-tile green ground marker under
+# the local player, measured over frames where the camera is actively TRACKING the player -- it
+# does not always centre the hero, see README "Known divergences".
+#
+# Integers, finally: the window is pinned to the hero's CELL, so with view_w = 2k+1 the hero sits
+# somewhere inside that cell and the window slides by up to a whole tile. EVERY placement has to
+# fit, not the average one -- checking only the centred placement accepts 23x13, which then falls
+# 0.54 tiles outside whenever the hero drifts to one side of its cell.
+#
+# 21x13 clears the footprint by 0.024 tiles, which looks like a coin flip and is not: 23x13 misses
+# by 0.54 and 21x15 by 0.98, twenty to forty times that margin. Odd dimensions also centre the
+# hero exactly, where the old even 40 put it one column off.
+#
+# `tests/test_vision_camera.py` re-derives all of this from the shipped homography, so a
+# recalibration that changes the field of view fails there instead of silently leaving this
+# number stale.
+view:  {height: 13, width: 21}
+
+sim:
+  dt: 0.05                         # SIM tick = 20 Hz, the rate the world updates at
+  max_episode_steps: 3000          # SIM TICKS, i.e. 150s of game time -- NOT agent steps
+  # How many sim ticks one AGENT DECISION covers (env.py `_run_decision`). 5 gives 20 Hz / 5 =
+  # 4 Hz decisions, which is roughly how often a human actually changes their mind in this game.
+  #
+  # MOVEMENT is held across the window (the hero keeps walking/dashing on the same heading);
+  # the FIRE bit is applied on the first sub-tick only, so one decision is at most one attack --
+  # "fire" means the same thing here as at action_repeat: 1, and matches what MaskablePPO's
+  # action mask (evaluated once per decision) promises. Every attack_cooldown in
+  # configs/brawlers.yaml is 0.30-0.50s and so already exceeds this window; the guard is kept as
+  # insurance against a future brawler that fires faster than the decision rate.
+  #
+  # This is the decision-rate knob, and it changes three things you should expect to see:
+  #   - episodes are 3000/5 = 600 agent steps instead of 3000 (cfg.max_agent_steps), so
+  #     rollout/ep_len_mean drops ~5x and one PPO rollout spans ~5x more game time
+  #   - one SB3 timestep is now 5 sim ticks, so total_timesteps/eval.every_timesteps/
+  #     checkpoint_every_steps in configs/train.yaml all buy 5x more simulated game time
+  #   - gamma discounts per DECISION, so a per-tick discount must be raised to gamma**5 to keep
+  #     the same real-time horizon (configs/train.yaml already does this)
+  # Reward is NOT affected: per-tick terms integrate over the window, so total episode return is
+  # invariant to this value (brawl_sim/training/reward.py). Bot decision_period_ticks, the zone
+  # schedule, regen, and cooldowns are all on the sim clock and are likewise unaffected.
+  # Set to 1 to restore per-tick decisions; behavior is then bit-identical to before this knob
+  # was wired up.
+  action_repeat: 5
+  action_latency_seconds: 0.001    # rounds to 0 ticks at 20 Hz; buffer is a pass-through
+
+action: {n_move_bins: 16, dash_on_idle: facing}
+
+observation:
+  include_world_grid: true
+  include_privileged: true
+  grid_dtype: uint8
+
+entities:
+  n_enemies: 9                  # 10 players total: 1 hero + 9 enemies
+  randomize_enemy_types: true
+  enemy_type_weights: {sniper: 0.22, artillery: 0.15, melee: 0.09, rifle: 0.16,
+                       edgar: 0.12, spike: 0.13, bull: 0.13}
+  # Only consulted when randomize_enemy_types is false; length must equal n_enemies
+  # (core/spawn.sample_enemy_kinds raises otherwise). Kept valid, not just the active default.
+  fixed_enemy_types: [sniper, artillery, melee, rifle, edgar, spike, bull, sniper, rifle]
+  enemy_hp_mult: 1.0
+  enemy_damage_mult: 1.0
+  unit_radius: 0.4
+
+# max_projectiles is sized by config.peak_projectile_demand -- the worst-case CONCURRENT slot
+# count for this roster, which is `n_enemies` copies of the most demanding bot kind bursting a
+# full clip within one projectile lifetime. Shelly's 5-pellet volley (Step B2) makes that
+# 9 x (3 volleys x 5 pellets) = 135, up from 45 at Bo's 3 pellets, so 128 no longer covers it and
+# volleys would have been silently thinned (alloc_slots drops the shot; it does not raise).
+#
+# Spike (6 shards x 3 shells in the air) raises that bound to 162 and takes the title of most
+# demanding kind off Shelly, but stays under the 192 already reserved here -- so adding him needed
+# no change to this line. Bull is a second 5-pellet shotgun and so ties Shelly at 15 per entity,
+# well under Spike, leaving the bound at 162. config.validate recomputes it from the roster on
+# every load and raises if it ever passes; do not treat the headroom as permanent.
+#
+# 192 rather than 256: it is the smallest round value above the (then) 135 bound, and the
+# projectile phase costs roughly 0.12 ms/step per slot at n_envs=1024, so the difference is
+# ~7.7 ms/step rather than ~15. Measured peaks in real play are far below the bound (35 under the
+# shipped archetype weights, 82 in an all-Shelly lobby), because bots need a target in range, are
+# staggered by decision_period_ticks, and die -- but the buffer must cover what CAN happen.
+limits: {max_projectiles: 192, max_boxes: 16, max_pickups: 32}
+
+# cubes/boxes: both cube numbers are now the real game's (Step E2). A power cube gives
+# +10% damage and a FLAT +400 max HP.
+#
+# `hp_per_cube` replaces `hp_bonus_per_cube: 0.15`, which was a FRACTION of base_hp -- a different
+# mechanic, not just a different magnitude. The old shape scaled with the brawler, so cubes made
+# the tankiest tankier: a 16-cube Buzz hit 34000 HP and a 16-cube Brock 20400, widening the gap
+# they start with. Flat, every brawler gains the same 6400, which is why the real game can hand
+# the same cube to everyone. It also roughly HALVES late-episode HP, and therefore late-episode
+# time-to-kill.
+#
+# boxes.hp is the one item left on this list where real data disagrees with the schema: real box
+# HP scales 4500-8500 with the lobby's average power level rather than being a constant.
+#
+# "gas deals 20% of max HP/s, not a flat DPS" came off this list at Step B3 -- see the zone block.
+cubes:
+  hp_per_cube: 400                  # real: flat +400 max HP per cube (was hp_bonus_per_cube: 0.15)
+  damage_bonus_per_cube: 0.10       # real: +10% damage per cube (was 0.15)
+  max_cubes: 16
+  cubes_per_box: 1
+  cubes_on_kill_base: 1
+  drop_victim_cubes: true
+  pickup_radius: 0.6
+
+boxes: {n_boxes: 8, hp: 3000}
+
+# The zone deals a FRACTION of each entity's own max HP per second, not a flat HP/s. The
+# requirement is that nobody survives more than ~5 seconds inside it -- so 0.20, and it holds for
+# every brawler regardless of HP. A flat rate could not express that: at the old `dps: 1000.0` a
+# 6000 HP Brock lasted 6s, a 10000 HP Buzz lasted 10s, and a fully cube-stacked 34000 HP Buzz
+# lasted 34s, which meant power cubes bought zone tankiness and the player who most needed pushing
+# out could ignore it longest. This is also the real game's mechanic.
+#
+# fraction_growth_per_step keeps the old escalation SHAPE (+20% of the base rate per shrink, as
+# 1000 -> +200 did), so by shrink 5 the rate is 0.40 and the zone kills in 2.5s.
+zone:
+  enabled: true
+  mode: rect
+  start_fraction: 0.08
+  step_seconds: 1.5
+  tiles_per_step: 1
+  max_hp_fraction_per_second: 0.20   # 1/0.20 = 5s to die from full
+  fraction_growth_per_step: 0.04
+  iframes_block_zone: false
+
+# Out-of-combat regeneration. The stopwatch (ent_out_of_combat_t) is reset by taking damage AND by
+# attacking, so you cannot hold a target down while out-healing the chip damage you take back.
+# max_hp_fraction_per_second is a FRACTION of the entity's own max HP -- so regen time to full is
+# the same for every brawler, and collecting power cubes (which raise max HP) doesn't slow it down.
+#
+# 0.13 / 3.0 s are the OFFICIAL Brawl Stars values (bot_overhaul.md D12), not tuning knobs -- a
+# full heal takes ~7.7 s once the delay elapses. This was 0.2 (a ~5 s heal) and is now slower,
+# which matters because Step B1 roughly halves everyone's damage: at the new numbers a hero regens
+# ~1040 HP/s against Mortis's ~770 sustained DPS, so a bot that fully disengages for 3 s cannot be
+# out-damaged from range. The 3 s window resetting on ANY damage is what keeps fights resolvable,
+# so the failure mode to watch for is DISENGAGEMENT, not attrition -- and the ZONE is the designed
+# answer to it (see the zone block: 5 seconds inside and you are dead, whoever you are).
+regen: {enabled: true, delay_seconds: 3.0, max_hp_fraction_per_second: 0.13}
+
+bots:
+  break_boxes: true
+  collect_cubes: true
+  avoid_zone: true
+  fight_each_other: true
+
+  # --- personalities: what a bot does with its MOVEMENT, drawn per entity per reset and
+  # orthogonal to its archetype (see brawl_sim/bots/personality.py). Set false to make every bot
+  # a rush, which is the closest thing to the pre-personality behavior.
+  personalities: true
+  # rush: closes on anything visible.
+  # camper: sits in a bush, fires only once it can be seen.
+  # hunter: sweeps bushes hunting for hidden players. 
+  #trapper: holds a bush but shoots freely.
+  # kite: works the open map holding its archetype's ideal range.
+  # Weighted toward hunter+rush on purpose: those two are what punishes a bush-camping hero, the
+  # degenerate policy this whole mechanic exists to break.
+  personality_weights: {rush: 0.28, camper: 0.12, hunter: 0.24, trapper: 0.16, kite: 0.20}
+  # Force at least this many bots per env to draw rush or hunter, so an unlucky roll can never
+  # produce a lobby the agent beats by standing still. 0 disables the guarantee.
+  min_aggressive: 1
+  # Bots shoot loot boxes when they have no enemy target, so the hero no longer has uncontested
+  # access to every cube on the map.
+  attack_boxes: true
+
+  # How far a BOT may acquire and hold a target. Applies to bot targeting only -- the hero's
+  # observation is unaffected (see brawl_sim/bots/perception.bot_visibility). Without this, bots
+  # saw the entire 60x60 map: 84% of bot-ticks had a target locked at a mean 22.7 tiles, roughly 3x
+  # the longest weapon's reach, so no bot ever had a reason to go looking for anyone and every
+  # "nothing is visible" personality branch was effectively dead. 14 is comfortably beyond every
+  # attack_range in brawlers.yaml (max 8.67), so bots still spot you before they can shoot you.
+  # 0 disables the limit and restores the old see-everything behavior.
+  sight_tiles: 14.0
+
+  # LOCAL cover search: "where do I duck into", used by camper/trapper. A small radius is correct
+  # here -- cover you have to cross the map for is not cover.
+  bush_search_tiles: 4          # radius of the shared bush scan; sizes a fixed 49-probe set
+
+  # MAP-SCALE sweep: "where do I go looking", used by hunter and by trapper's idle relocation.
+  # One bush waypoint per hunt_cell_tiles-square cell (see brawl_sim/maps/loader.bush_waypoints).
+  # This deliberately does NOT reuse bush_search_tiles: with a 4-tile radius on a 24%-bush map,
+  # hunters always found another unsearched tile one step away and shuffled around their spawn --
+  # measured at 75 tiles walked for 15.7 net displacement. Cells make each leg a real journey.
+  hunt_cell_tiles: 10           # 6x6 = 36 waypoints on the default 60x60 map (max 63)
+  hunt_arrive_tiles: 2.0        # within this of a waypoint marks it searched
+  hunt_timeout_seconds: 12.0    # give up on an unreachable waypoint after this long
+
+  zone_avoid_tiles: 4.0         # start steering inward once this close to the safe rect's edge
+  camper_zone_flee_tiles: 2.0   # a camper abandons its bush once clearance drops to this
+  wander_seconds: 2.5           # explore-heading re-roll period when nothing is visible
+
+perception:                     # drives BOT behavior and the revealed_* flags.
+  bush_reveal_radius: 2.0       # It never removes data from the observation package.
+  reveal_after_attack: 1.0
+  los_step_tiles: 0.5
+  max_ray_tiles: 24.0
+
+engine: {debug_checks: false, compile: false}

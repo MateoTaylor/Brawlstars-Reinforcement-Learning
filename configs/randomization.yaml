@@ -1,0 +1,12 @@
+# Domain randomization overlay (N08). Ships fully commented out -- uncomment any subset of
+# lines to layer per-env variation onto configs/brawlers.yaml / configs/default.yaml with no
+# other change. Keys are "section.field" dotted paths matching those two files' section and
+# leaf key names exactly. mode defaults to "additive" (the sampled range replaces the base
+# value outright); mode: multiplicative scales the base value instead.
+#
+# entities.enemy_hp_mult:       {low: 0.8, high: 1.25}
+# entities.enemy_damage_mult:   {low: 0.8, high: 1.25}
+# bot_sniper.aim_noise_std_rad: {low: 0.03, high: 0.20}
+# bot_sniper.reaction_delay:    {low: 0.05, high: 0.40}
+# bot_melee.move_speed:         {low: 0.9, high: 1.15, mode: multiplicative}
+# hero_mortis.reload_seconds:   {low: 1.5, high: 1.9}
