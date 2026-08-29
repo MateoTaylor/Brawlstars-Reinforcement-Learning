@@ -74,6 +74,10 @@ Two rules that are not obvious, both learned by building maps that violated them
 | `S`  | SPAWN   | pass | pass |
 | `X`  | BOX     | pass | pass |
 
+Grids are row-major with `origin="upper"`, so **y increases downward**, matching CSV row order.
+`loader.validate_map` enforces four things on load: the outer border is entirely wall, 8-32
+spawn markers, 8-64 box markers, and the unit-passable region is a single connected component.
+
 See `BRAWL_SIM_BUILD_PLAN.md` Step 2 / Notice 4 for the source-of-truth pass/block table and
 why there's no separate vision column (the camera is bird's-eye; only bush-hiding restricts
 sight, computed in `bots/perception.py`, not here).

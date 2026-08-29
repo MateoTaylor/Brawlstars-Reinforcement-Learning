@@ -33,4 +33,8 @@ tests/fixtures/vision/**/*.jpeg
 tests/fixtures/vision/**/*.mp4
 tests/fixtures/vision/**/*.mkv
 
-*.md
+Terrain_Perception_Build_Plan.md
+TRAINING.md
+BRAWL_SIM_BUILD_PLAN.md
+CONVENTIONS.md
+bot_overhaul.md
