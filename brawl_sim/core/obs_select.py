@@ -32,18 +32,43 @@ mask) -- this happens unconditionally, independent of `fair`, since it's slot-pa
 fairness. **This is the one group shape that is NOT index-stable tick to tick** -- unlike every
 other group, a given output row is not "the same real entity" across steps.
 
-**`normalize: true` is a real but intentionally narrow transform**, not full z-scoring: fields
-whose `obs_schema` units are `"tiles"` are divided by `max(cfg.map_w, cfg.map_h)` (the same
-scale `*_norm` fields already use, applied here to the few raw-tile fields that don't have a
-`_norm` counterpart, e.g. `entities.rel_pos`/`zone.hero_margin`), and fields in `"tiles/s"` are
-divided by a fixed reference speed grounded in `configs/brawlers.yaml`'s actual stat ranges (see
-`_NORM_SPEED_SCALE`). Every other unit (seconds/hp/count/fraction/bool/onehot/unitless) passes
-through unnormalized -- most of those already have a bounded `_frac`/`_whole`/`onehot`
-alternative available for a spec author to pick instead. This is a genuinely underspecified
-corner of Step 32's plan text (no acceptance criterion exercises it); extend
-`_NORM_DIVISOR_TILES`/`_NORM_SPEED_SCALE` if a concrete training run needs more units covered.
-Grid (`uint8`) groups are never normalized -- Hard Constraint 3 fixes their space at `[0, 255]`
-regardless.
+**`normalize: true` is a real but intentionally narrow transform**, not full z-scoring. Four
+units are covered, each by one constant chosen the same way -- so that the largest value the sim
+can actually produce lands just inside 1.0, with headroom:
+
+    tiles    / max(cfg.map_w, cfg.map_h)   the scale `*_norm` fields already use, applied to the
+                                           raw-tile fields with no `_norm` counterpart
+    tiles/s  / _NORM_SPEED_SCALE   (20.0)
+    hp       / _NORM_HP_SCALE   (20000.0)
+    count    / _NORM_COUNT_SCALE   (20.0)
+
+`seconds`/`fraction`/`bool`/`onehot`/`unitless`/`radians`/`enum`/`index` still pass through
+unnormalized. Fractions and bools are already bounded; the rest have a bounded `_frac`/`_whole`/
+`onehot` alternative a spec author can pick instead. Grid (`uint8`) groups are never normalized
+-- Hard Constraint 3 fixes their space at `[0, 255]` regardless.
+
+**`hp` and `count` were added when the deployed spec dropped `hp_frac`** (see
+`configs/agent_obs_deploy.yaml`). Power cubes make max HP unobservable to CV, so the deployed
+agent reads the HP *numeral* and there is no denominator to divide by -- which turns two fields
+that had been bounded fractions into raw magnitudes of 20500 and 9. Both now have a divisor
+rather than a special case. Note this also rescales `projectiles.damage` in `agent_obs.yaml`,
+the only other `hp`-unit field in any shipped spec, and the `cubes` fields in `agent_obs.yaml`/
+`agent_obs_lowinfo.yaml`: those specs' observations change value (not width), so a checkpoint
+trained under them before this change cannot be resumed after it.
+
+One limitation worth stating rather than discovering: `count` also covers CUMULATIVE counters
+(`hero.shots_fired`, `hero.kills`), which no constant bounds. Dividing them by 20 makes them
+smaller, not bounded. They are not in any shipped spec -- they exist for `info`/eval logging --
+and if one starts using them it needs a bounded alternative, not a bigger divisor.
+
+**Normalizing a counter cannot disturb the reward, and that is worth knowing before someone
+adds `hero.kills` to a spec and goes looking for the reward term to compensate.** Nothing here
+touches `full_obs`: `build_agent_obs` gathers into its own `out_buffers` and `_normalize`
+returns a new tensor, so the dict `env.py` builds `info` from keeps raw units. And the kill
+reward does not read a counter at all -- `training/reward.py` takes `info["kills_tick"]`, which
+`core/events.py` recomputes each tick from `newly_dead & (ent_last_hit_by >= 0)` precisely
+because the cumulative `ent_kills` has no "before this tick" snapshot to diff against. The two
+paths never meet.
 """
 from dataclasses import dataclass
 from pathlib import Path
@@ -78,6 +103,21 @@ _NORM_DIVISOR_TILES = lambda cfg: float(max(cfg.map_w, cfg.map_h))
 # headroom for randomization, while raw entity move_speed (~2.3-2.6 tiles/s) lands at a small,
 # well-behaved ~0.12.
 _NORM_SPEED_SCALE = 20.0
+
+# Reference HP scale for `normalize: true`'s "hp" fields. The largest HP the sim can produce is
+# an enemy at the roster's highest base (10000, bot_melee/bot_bull) carrying `cubes.max_cubes: 16`
+# at `cubes.hp_per_cube: 400` flat, scaled by the top of `enemy_hp_mult`'s randomization range:
+# (10000 + 6400) * 1.25 = 20500. The hero cannot exceed 8000 + 6400 = 14400 (enemy_hp_mult never
+# touches the hero -- see core/stats.effective_max_hp). 20000 puts that ceiling at 1.03 and a
+# fresh Mortis at 0.40, the same "small but well-behaved" placement _NORM_SPEED_SCALE gives a
+# walking entity. Re-derive it, don't nudge it, if base_hp or the cube numbers change.
+_NORM_HP_SCALE = 20000.0
+
+# Reference scale for `normalize: true`'s "count" fields. The largest BOUNDED count in
+# obs_schema is `cubes` at `cubes.max_cubes: 16`; `meta.n_enemies_alive` reaches cfg.n_enemies
+# (9) and `hero.ammo_whole` reaches max_ammo (3). 20.0 covers all three with headroom -- the
+# same number as _NORM_SPEED_SCALE by coincidence, not by sharing a meaning.
+_NORM_COUNT_SCALE = 20.0
 
 _tensor_cache: dict = {}
 
@@ -229,6 +269,10 @@ def _norm_divisor(units: str, cfg) -> float:
         return _NORM_DIVISOR_TILES(cfg)
     if units == "tiles/s":
         return _NORM_SPEED_SCALE
+    if units == "hp":
+        return _NORM_HP_SCALE
+    if units == "count":
+        return _NORM_COUNT_SCALE
     return 1.0
 
 
@@ -329,7 +373,14 @@ def _build_grid_group(full_obs: dict, g: GroupSpec) -> torch.Tensor:
 
 
 def _normalize(raw: torch.Tensor, g: GroupSpec) -> torch.Tensor:
-    scale = _cached_tensor(("norm_scale", g.name), g.norm_scale, torch.float32, raw.device)
+    # The scale tuple is part of the cache key, not just the group NAME. Keying on the name alone
+    # was wrong the moment a second spec existed: `configs/agent_obs{,_lowinfo,_deploy}.yaml` all
+    # have a group called "self", at 25/25/24 columns, so loading two of them in one process
+    # handed the second the first's scale vector -- a broadcast error at best, and silently wrong
+    # divisors whenever the widths happened to match. Tuples of floats are hashable, so this
+    # costs one extra cache entry per distinct scale vector and nothing else.
+    scale = _cached_tensor(("norm_scale", g.name, g.norm_scale), g.norm_scale,
+                           torch.float32, raw.device)
     return raw / scale
 
 

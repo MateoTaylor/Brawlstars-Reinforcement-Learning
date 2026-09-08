@@ -155,6 +155,13 @@ zone:
   max_hp_fraction_per_second: 0.20   # 1/0.20 = 5s to die from full
   fraction_growth_per_step: 0.04
   iframes_block_zone: false
+  # OBSERVATION ONLY -- no effect on dynamics. zone.hero_margin_local is zone.hero_margin clamped
+  # to +/- this many tiles, which is the shape the deployed loop can actually supply: it has no
+  # rect, only a sticky map of gas it has SEEN, so past a horizon its answer saturates. Whatever
+  # number sits here, brawl_deployment's gas estimator clamps at the same one -- it READS this
+  # value out of the run's env_config rather than carrying a copy, so there is only ever one.
+  # 10 tiles is where an inference-time ablation put the knee (-1.9 pp at 10, -5.2 pp at 6).
+  margin_horizon_tiles: 10.0
 
 # Out-of-combat regeneration. The stopwatch (ent_out_of_combat_t) is reset by taking damage AND by
 # attacking, so you cannot hold a target down while out-healing the chip damage you take back.

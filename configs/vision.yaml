@@ -114,3 +114,247 @@ classifier:               # Phase H
   # the Phase H model (a shallow fully-convolutional head, not a U-Net) is small enough that
   # CPU inference very likely fits inside the 250 ms decision budget. Measure before moving it.
   device: cpu
+
+detector:                 # brawl_vision/object_detection -- third-party YOLO over the RAW frame
+  # Which fetched model to run. Names are keys of object_detection/weights.MODELS, not paths:
+  # the file is downloaded rather than committed, so a path here would point at nothing on a
+  # fresh clone. See object_detection/weights/NOTICE.md for what these are and where from.
+  model: entity_v2
+  # MEASURED across three Solo Showdown fixtures (showdown_alternate_map, _map2, _has_gadget;
+  # 101 frames, every 40th, floor 0.20). The two classes behave completely differently:
+  #
+  #   player   n=103  median 0.91, p05 0.81 -- flat from 0.35 to 0.70, 98% survive either way
+  #   enemy    n=112  median 0.86, p25 0.67, p05 0.28 -- a long low tail
+  #
+  # So this threshold is entirely a statement about ENEMIES; the player box is insensitive to it.
+  # The tail is not noise, it is occlusion -- an enemy half behind a bush or leaving the frame,
+  # which is exactly when you want it. 0.5 keeps 95 of the 112; PylaAI's 0.6 drops 6 more of
+  # those, and 0.35 adds 6 back. 0.5 sits at the knee. This is three clips of one game mode, not
+  # a law: re-measure before trusting it on a map that looks different.
+  conf: 0.5
+  # Class-wise NMS overlap. PylaAI's value, unmeasured here and left alone: brawlers do not
+  # stack, so the duplicate-suppression regime this controls is barely exercised.
+  iou: 0.6
+  # Classes dropped after NMS. 'teammate' is meaningless in Solo Showdown, which is the mode this
+  # project targets -- and at conf 0.5 it is nearly a no-op anyway: 1 teammate box in those same
+  # 101 frames, against 7 if the floor drops to 0.20 (median 0.24, i.e. noise). Its real value is
+  # as a canary, because the ONE thing that makes it fire in bulk is a corrupted input -- fed BGR
+  # instead of RGB the same footage yields 44 teammate boxes where correct input yields none (see
+  # detector.py). Empty this list when debugging the detector rather than using it.
+  ignore: [teammate]
+  # auto | cpu | cuda. 'auto' takes CUDA when the onnxruntime-gpu build is installed and CPU
+  # otherwise; 'cuda' fails loudly instead. Measured at 12.9 ms/frame on CPU for a 2002x1126
+  # frame, against the 250 ms decision budget -- so CPU is not the constraint here, and this
+  # exists for the deploy-time case where the GPU is free and the terrain classifier is not.
+  device: auto
+  # Where in a detection box the brawler's FEET are, as a fraction of box height up from the
+  # BOTTOM edge. The bottom edge itself (0.0) is wrong and it is worth knowing why: these boxes
+  # enclose the nameplate, health bar, ammo pips, sprite AND any active aura, so the bottom is
+  # the bottom of the aura -- measured ~68 px, about one tile, below Mortis's feet on
+  # standstill f300. Because auras come and go, the box also breathes: player box height swings
+  # 264-380 px within one clip.
+  #
+  # MEASURED by the one accuracy test available without hand labels -- a brawler cannot stand in
+  # a WALL or in WATER, and the occupancy map knows where those are. Share of frames placing the
+  # player in an impossible cell, scored against each clip's fully-accumulated map:
+  #
+  #   anchor               0%     20%     30%     40%     50%    100%   | base rate
+  #   showdown_..._map    23.7%  11.3%  11.9%  14.9%  23.8%  56.5%  |  26.5%
+  #   showdown_..._map2   15.6%   6.7%   5.4%   1.1%   0.8%   4.9%  |  19.1%
+  #
+  # The raw bottom edge is barely better than chance (23.7% vs a 26.5% base rate). The optimum
+  # is a BAND, not a point: the wall-heavy clip prefers 0.20 and degrades past 0.40, the
+  # water-heavy one keeps improving to 0.50 -- they disagree because the terrain classifier's
+  # own weak spot is walls, so some "impossible" cells are the map being wrong, not the anchor.
+  # 0.30 is the middle and near-best on both. Still not a calibration: settling it needs frames
+  # labelled with a brawler's true tile.
+  anchor_frac: 0.30
+
+projectile:               # object_detection/projectile_detection -- OUR model, over the RAW frame
+  # A PATH, not a registry key, and that is the difference from detector.model above. That model
+  # is fetched from a URL by name and has one correct version; this one is produced by
+  # projectile_detection/train.py on whatever machine ran it, so there is no registry to name.
+  #
+  # Empty means the promoted default, projectile_detection/weights/projectiles.onnx. Promotion is
+  # a deliberate copy rather than "newest run wins", because runs/ increments (projectiles,
+  # projectiles2, ...) and a path into it would pin whichever run happened to be first. When the
+  # file is missing, weights.require() lists the runs that could satisfy it, newest first, with
+  # the copy command -- so leaving this blank is the normal state, not an unfinished one.
+  model: ""
+  # NOT MEASURED. A placeholder in the sense configs/vision.yaml uses the word, but not an
+  # arbitrary one -- there are two reasons to expect it to sit below detector.conf's 0.5:
+  #
+  #   1. YOLO26 is NMS-FREE. It emits a fixed 300 rows per frame with no objectness score ahead
+  #      of them, padded out at ~0.003 confidence, so this threshold is the ONLY thing thinning
+  #      the field. For the anchor-grid entity model, objectness has already done most of that.
+  #   2. The cost asymmetry runs the other way. A brawler is large and persistent, so a frame
+  #      that misses one is recovered by the next; a projectile is on screen for a handful of
+  #      frames, so a miss loses the whole event. Meanwhile a duplicate projectile box costs
+  #      almost nothing, where a duplicate "player" box means the pipeline is broken.
+  #
+  # Sweep it with --projectile-conf on real footage and replace this comment with the numbers,
+  # the way detector.conf's was replaced. Until then it is a guess with a rationale.
+  conf: 0.30
+  # auto | cpu | cuda, resolved exactly as detector.device is -- 'auto' takes CUDA when the
+  # onnxruntime-gpu build is present, 'cuda' fails loudly if it is not.
+  #
+  # There is no `iou` key here and that is deliberate rather than an omission: YOLO26 runs no NMS
+  # at all, so an overlap threshold would be a setting nothing reads. It matters for projectiles
+  # specifically -- a volley of three shots along one line overlaps heavily, and NMS is exactly
+  # what would have merged them into one box.
+  device: auto
+
+hp:                       # object_detection/hp_detection -- the HP number inside a detection box
+  # ALL MEASURED on day10_gameplay.mp4 unless a line says otherwise. The digit templates are a
+  # separate artifact and are NOT tuned here: they live in
+  # object_detection/hp_detection/data/digits.npz and are regenerated by
+  # scripts/vision_hp_calibrate.py, the same way the homography is.
+  #
+  # READ THIS BEFORE LOOSENING ANYTHING. The failure mode this whole stage is built against is
+  # not a noisy number, it is a CONFIDENT WRONG one. Brawl Stars floats damage and healing
+  # popups -- white, the same font, several times larger -- straight across the health readout,
+  # and a covered "8400" reads as a clean, well-formed "8" scoring 0.928 with a 0.181 margin.
+  # Almost every value below is part of catching that.
+
+  # The slice of each box searched. The readout sits at the top; the digit row's top edge never
+  # exceeded 0.35 of box height in the sampled crops, and 0.55 is that with room for the box
+  # "breathing" 264-380 px within one clip as auras come and go.
+  crop_height_frac: 0.55
+  # Horizontal padding, as a fraction of box width: the bar is drawn to a width set by MAX HP and
+  # overhangs the box (up to 160 px of bar against a 135 px box). The cost is pulling a
+  # neighbour's readout in during a fight, which the centring test rejects.
+  crop_pad_frac: 0.12
+
+  # The HP number is WHITE. The nameplate a few pixels above it is TEAM-COLOURED (green for you,
+  # salmon for an enemy) in the same font at the same size, and the saturation CEILING is the
+  # only thing separating them -- this is not a generic "bright" threshold.
+  white_max_sat: 70
+  white_min_val: 175
+
+  # Digit height band, in SCREEN pixels. Measured over 195 glyphs: 15:47 16:103 17:16, with a
+  # thin tail at 12 and 20-24 that is popups caught mid-animation, not HP digits. The upper bound
+  # is load-bearing -- it is what tells a digit from a floating damage number -- and
+  # brawl_vision.config.validate refuses a value that reaches into locate.POPUP_MIN_H.
+  # These are screen pixels and the HUD does not scale with the camera: re-measure at a new
+  # capture resolution.
+  glyph_min_height: 13
+  glyph_max_height: 19
+
+  # Confidence-ramp floors: where a glyph's NCC score / runner-up margin stops counting for
+  # anything. Intact reads sit at a median NCC of 0.949 with margins of 0.15-0.20; the two bad
+  # reads that survived every structural gate scored 0.418/0.054 and 0.693/0.367.
+  min_glyph_score: 0.70
+  min_glyph_margin: 0.03
+
+  # Filled-bar hue per class, OpenCV 8-bit (H is 0-179, a HALF-degree wheel). Player green
+  # medians 56 and enemy red medians 173 across 161 measured bars; the enemy band WRAPS past 179,
+  # which is legitimate and handled -- validate deliberately does not require low <= high, the
+  # same asymmetry zone.hsv_low documents. Searched only in a window under an already-found digit
+  # row: a hue search over the whole box finds the map instead, because the day10 skin's bush is
+  # hue 93 and its water is ~66, a hair from player green.
+  bar_hue_player: [46, 66]
+  # [166, 5], NOT [166, 180]: OpenCV hue tops out at 179, so 180 is not a colour -- and spelled
+  # that way the band also fails to WRAP, quietly matching nothing at the red end it exists for.
+  bar_hue_enemy:  [166, 5]
+
+  # --- temporal. All in FRAMES at whatever rate the caller drives the tracker; at the 4 Hz
+  # decision rate confirm_frames 2 is 500 ms of latency on a genuine HP change.
+  # How many times a CHANGED value must be seen before it replaces the committed one, unless it
+  # arrives above instant_confidence. Deliberately debouncing rather than a window vote: HP is
+  # not constant, so voting collapses its own agreement exactly when the reading is most correct.
+  confirm_frames: 2
+  # Frames a track coasts on its last committed HP through unusable reads. Not 0 -- a readout
+  # covered by its own damage popup belongs to a brawler whose HP is still about what it was, and
+  # reporting nothing there punches a hole in the observation while the agent is being shot at.
+  max_misses: 3
+  # A read this confident commits with no confirmation, EXCEPT when it is a digit-truncation of
+  # the value it would replace ("8400" -> "400"), which is the signature of a covered readout and
+  # is never trusted on confidence alone.
+  instant_confidence: 0.90
+  # Per-frame confidence decay while coasting or being contradicted.
+  decay: 0.75
+  # Frame-to-frame association gate, as a fraction of box WIDTH. This is NOT a tracker: a Mortis
+  # dash covers ~340 px between decisions at 4 Hz against a ~180 px box, and breaking there is
+  # intended behaviour.
+  match_distance_frac: 1.5
+  # A POLICY choice, not a measurement -- it trades wrong numbers against absent ones, and which
+  # is worse belongs to whoever consumes the observation.
+  min_confidence: 0.50
+
+  # --- ammo. object_detection/hp_detection/hero_bars.py, the track below the HERO's own HP bar.
+  # MEASURED on bluestacks-example-new.mp4, NOT on day10_gameplay.mp4 like the rest of this
+  # section -- and at that clip's own **1920x1080**, not at the 2002x1126 this file says
+  # elsewhere. ClipReader trims to 16:9 and never resizes, and that clip is natively 16:9. The
+  # stack scales with viewport height (measured: super track 116 px at 1080, 120 at 1126), so
+  # these are 1080 numbers that happen to be right at the 1126 deployment viewport. See
+  # hero_bars.py:PIP_WIDTH_PX.
+  #
+  # The ammo and super tracks sit BELOW the HP bar, so this stage needs a taller slice than
+  # crop_height_frac gives it: the super track's last row was at 0.68 of box height in the
+  # sampled crops. Separate from crop_height_frac rather than raising it, because a taller crop
+  # for the DIGIT search means more chances to pull in a neighbour's readout.
+  ammo_crop_height_frac: 0.75
+  # A filled pip's orange. Narrow on purpose -- the map's crate borders are also orange, and this
+  # band is not what rejects them; the pitch lattice in slot_fills is. See that docstring.
+  ammo_hue: [2, 18]
+  ammo_sat_min: 110
+  ammo_val_min: 130
+  # One pip's painted width, in viewport pixels -- the DENOMINATOR, since the three pips are
+  # identical and there is no recoverable track extent to divide by three. Mode of 353 runs (34,
+  # with 33 and 35 as its shoulders); mean 34.33, sd 0.66 over 144 frames showing all three.
+  # A full pip therefore reads 0.94-1.03 and that residual is reported, not snapped away.
+  # Re-measure at a new capture resolution: this is screen pixels, like the glyph heights above.
+  ammo_pip_px: 34
+
+  # --- super charge (hp_detection/hero_bars.read_super). One track below the ammo pips, and
+  # unlike ammo it is SELF-NORMALIZING: the empty remainder is painted in its own colour, so the
+  # denominator is the track's own extent rather than a calibrated constant.
+  #
+  # MEASURED on bluestacks-example-new.mp4 over 181 located frames, each colour sampled from a run
+  # identified by structure rather than by these thresholds: 3890 filled px, 6494 ready px, 1720
+  # empty px. Filled hue 26-29 / sat 114-197 / val 219-255.
+  super_hue: [20, 35]
+  super_sat_min: 100
+  super_val_min: 180
+  # Ready: hue 162-166 at saturation EXACTLY 255 in every percentile p5..p95, val 189-234. A THIRD
+  # STATE, not "all yellow" -- at full charge the whole widget turns magenta, so a reader that
+  # counts yellow and divides reports 0.0 charge at the moment the super becomes available.
+  super_ready_hue: [155, 172]
+  super_ready_sat_min: 230
+  super_ready_val_min: 160
+  # Empty: hue 124-133, sat 102-143, val 74-99. Narrow deliberately. A first pass used sat >= 80
+  # with val 60-140 and that mask ate the map behind the widget, returning tracks of 110-225 px
+  # for a 116 px widget and deflating every charge reading in proportion. This map is made of dark
+  # blue-purple; only the tight value band separates the widget from it.
+  super_empty_hue: [117, 137]
+  super_empty_sat: [90, 165]
+  super_empty_val: [62, 118]
+  # The track's full width at the calibrated viewport and the tolerance around it. A SANITY GATE,
+  # never a denominator -- the reading divides by the extent the frame itself found. Measured as
+  # the median of 171 successful reads: p10 114, p50 116, p90 118, min 104, max 128, sd 2.6.
+  super_track_px: 116
+  super_track_tol_px: 22
+
+hud:                      # hud.py -- screen-anchored readouts. "Brawlers left: N", so far.
+  # This section has three keys because everything else about the widget is GEOMETRY, and
+  # geometry lives in hud.py as reference pixels at a 1126 px viewport, measured across six clips
+  # at two resolutions. The same rule configs/vision.yaml applies elsewhere: a setting is a thing
+  # a user might reasonably want different, and "where Supercell draws the colon" is not that.
+  #
+  # NOT here, and deliberately: the white threshold. hud.py reads hp.white_max_sat and
+  # hp.white_min_val, because the count is the same font in the same white as an HP digit --
+  # measured at saturation 2-5, value 203-255, comfortably inside (S<70, V>175). A near-duplicate
+  # pair here would be two knobs that must agree.
+  #
+  # How many brawlers the mode fields, and so the largest count that can be real. Solo Showdown
+  # is 10. A read outside 1..10 is a mis-segmentation, not a surprising match.
+  max_brawlers: 10
+  # Glyph floors for the count. A BACKSTOP -- what actually rejects the white map pixels a
+  # screen-space band admits is structural: a colon at the measured x, a bounded gap from it to
+  # the first digit, and a shared row. An ungated pass had a score p05 of 0.308, which was map
+  # blobs classifying as digits. MEASURED after the gates, over 4538 accepted reads across ten
+  # clips: score p05 0.893-0.930 per clip, global min 0.758; margin p05 0.160-0.229, min 0.152.
+  # A solid 19x41 white rectangle still reads as a `1` at 0.753/0.076 -- raising these to cover
+  # that would put them above real reads, which is why the structural gates are the defence.
+  min_glyph_score: 0.70
+  min_glyph_margin: 0.05

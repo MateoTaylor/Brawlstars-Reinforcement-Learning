@@ -200,6 +200,7 @@ _ROWS: tuple[tuple, ...] = (
     ("zone.dps", ("N",), "float32", "hp/s", (0.0, None), "Damage-per-second the HERO takes outside the rect (the zone's rate is a fraction of max HP, so it differs per entity).", False, None),
     ("zone.next_shrink_in", ("N",), "float32", "seconds", (0.0, None), "Seconds until the next shrink (0 if disabled/overdue).", False, None),
     ("zone.hero_margin", ("N", 4), "float32", "tiles", None, "(x-lo.x, hi.x-x, y-lo.y, hi.y-y); negative = outside on that side.", False, None),
+    ("zone.hero_margin_local", ("N", 4), "float32", "tiles", None, "hero_margin clamped to +/- cfg.zone_margin_horizon_tiles -- the same four distances as a bounded sensor sees them, which is what brawl_deployment can supply from observed gas. Deploy specs take this; full-information specs take hero_margin.", False, None),
     ("zone.safe_area_frac", ("N",), "float32", "fraction", (0.0, 1.0), "Safe rect area / map area.", False, None),
 
     # ---- visibility ----------------------------------------------------------------------

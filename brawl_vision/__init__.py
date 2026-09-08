@@ -2,9 +2,13 @@
 real game. See Terrain_Perception_Build_Plan.md.
 
 Structured as CHUNKS. This package's root holds what every chunk needs (frame sources, camera
-geometry, config); each subpackage is one chunk. `terrain/` is the first and, for now, the only
-one -- entity detection and HUD value reading land beside it later and reuse the root modules
-unchanged.
+geometry, config); each subpackage is one chunk. `terrain/` is the first: calibrated homography,
+odometry, per-cell classification, accumulated occupancy. `object_detection/` is the second, and
+it is deliberately NOT built on the first -- it runs a third-party YOLO over the RAW frame and
+returns boxes in screen pixels, where terrain rectifies and accumulates in tile space. The two
+share `sources.Frame` and nothing else; the scripts that show both compose them. `hud.py` is the
+third and sits in this root rather than in a subpackage, because a screen-anchored readout needs
+neither a homography nor a detection -- only a frame and the fact that it is 16:9.
 
 **CONVENTIONS.md governs `brawl_sim`, not this package, and the boundary is deliberate.** The
 leading-(N,) batch rule and the no-host-sync rule scope to `BrawlVecEnv.step()`; there is

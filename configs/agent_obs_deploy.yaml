@@ -1,0 +1,137 @@
+# DEPLOYABLE agent view -- configs/agent_obs_lowinfo.yaml minus the four fields nothing will
+# actually supply at runtime. Selected per run with
+#   python scripts/train.py --set run.agent_obs=configs/agent_obs_deploy.yaml
+# and never by default.
+#
+# WHY A THIRD FILE RATHER THAN AN EDIT
+# ------------------------------------
+# `runs/mortis_lowinfo-20260902-005036/train.yaml` names configs/agent_obs_lowinfo.yaml BY PATH.
+# Narrowing that file in place would leave that run's own config pointing at a spec it was not
+# trained under -- the checkpoint would still load its weights and then be fed a differently
+# shaped observation, or fail at the first linear layer. Adding a file costs nothing and keeps
+# every finished run reproducible.
+#
+# WHAT THIS DROPS, RELATIVE TO agent_obs_lowinfo.yaml
+# ---------------------------------------------------
+# lowinfo's rule is sim-to-real parity: the agent may see only what brawl_vision can recover from
+# a screen capture. That rule was applied to enemy ARCHETYPE and projectile TYPE. It was never
+# applied field by field, and four survivors fail it:
+#
+#   entities.cubes        Another player's power-cube count is not drawn anywhere on screen. The
+#                         cubes themselves are visible as pickups; who has collected how many is
+#                         not.
+#   entities.can_attack   Another player's ammo state. Same problem -- the ammo bar is drawn for
+#                         YOUR brawler only (brawl_vision/object_detection/hp_detection/locate.py
+#                         documents the readout stack and says so explicitly).
+#   entities.dashing      Recoverable in principle from a speed threshold, but only for brawlers
+#                         whose dash we can name -- and entities.kind_onehot is exactly what
+#                         lowinfo removed. Keeping this would smuggle back a weak type signal.
+#   hero.cubes            The ONE here that CV could supply: the pip row sits in the same box
+#                         stack as the hero's own HP bar. Dropped by operator decision -- no
+#                         reader will be built for it. A field nobody intends to supply is in the
+#                         same position as one nobody can.
+#
+# The alternative to dropping them was feeding a constant into four columns a policy had been
+# trained to trust. That is the specific failure this whole line of configs exists to prevent:
+# it is silent, and it presents as "the policy is bad at real Brawl Stars".
+#
+# WHAT THIS REPLACES: hp_frac -> hp, on BOTH sides
+# ------------------------------------------------
+# `hero.hp_frac` and `entities.hp_frac` are `hp / max_hp`, and max_hp is NOT OBSERVABLE. A power
+# cube adds a flat +400 to it (configs/default.yaml `cubes.hp_per_cube`), for the hero and for
+# every enemy, and nothing on screen says how many cubes anyone is holding -- that is the same
+# fact that removed entities.cubes two sections up. Dividing by the kit constant in
+# configs/brawlers.yaml gives a number that is correct only until the first cube is picked up.
+#
+# The fix is not a better denominator, it is no denominator. brawl_vision's HP reader
+# (object_detection/hp_detection/read.py) produces the HP NUMERAL and deliberately ships no fill
+# ratio -- its docstring explains that the depleted remainder of the bar is a pale wash, so "a
+# ratio computed against the filled run alone would be the constant 1.0 dressed up as a
+# measurement". So absolute HP is the quantity the pipeline already supplies, for enemies as well
+# as the hero, and hp_frac is the one it can supply for NEITHER.
+#
+# This is also a small information GAIN, not a concession. Base HP spans 6000-10000 across the
+# roster, so "50%" could mean 2 Mortis hits or 5; the absolute number distinguishes them. And
+# because cubes raise HP above every base value, a large HP reading is itself evidence of a
+# cube-fed enemy -- who also hits ~10% harder per cube. hp_frac destroys that signal.
+#
+# Scale: obs_select normalizes `hp` units by _NORM_HP_SCALE (20000), sized so the sim's maximum
+# possible HP -- (10000 + 16*400) * 1.25 = 20500 -- lands at 1.03. A fresh Mortis reads 0.40.
+# `meta.n_enemies_alive` picked up a divisor in the same change (_NORM_COUNT_SCALE), having been
+# the largest raw magnitude in this vector at up to 9.
+#
+# WHAT DELIBERATELY SURVIVES
+# --------------------------
+#   entities.rel_vel      KEPT, and this is the line to delete if that changes. It is recoverable:
+#                         brawl_deployment/perception/tracker.py produces it, and the odometry
+#                         error that inflates absolute speeds cancels in `ent_vel - hero_vel`
+#                         (measured: 8% of samples past the physical bound, against 38% for the
+#                         absolute speeds it is built from). An inference-time ablation could not
+#                         detect the trained policy using this column at all -- zeroing it cost
+#                         1.3 pp of win rate against a 2.6 pp standard error -- so removing it
+#                         would probably also be harmless. It stays because it is free, and
+#                         because it is the only enemy field carrying motion.
+#
+#   entities.revealed_to_hero    Not a stat lookup: it is whether the tracker saw this enemy on
+#                         THIS tick (Track.seen_now) rather than coasted on a prediction.
+#   entities.in_bush      An occupancy-map lookup at the enemy's tile, not a property of the enemy.
+#   hero.can_attack, hero.dashing, hero.cubes' self-group neighbours
+#                         The `self` group is proprioception, not perception -- the deployed loop
+#                         ISSUES the actions, so its own timers are dead-reckoned exactly from the
+#                         action stream plus configs/brawlers.yaml. See BRAWL_DEPLOYMENT_DESIGN.md
+#                         6.3. That is why hero.can_attack stays while entities.can_attack goes;
+#                         they are the same quantity from opposite sides of the camera.
+#
+# NOT A DROP-IN CHECKPOINT SWAP. Narrowing changes the observation width and with it
+# BrawlFeaturesExtractor's first linear layer, so no checkpoint trained under agent_obs.yaml or
+# agent_obs_lowinfo.yaml can be loaded here. Train from scratch, in its own run directory.
+fair: true
+normalize: true
+groups:
+  - name: self                          # lowinfo's self group minus hero.cubes -- see header
+    per_entity: false
+    dtype: float32
+    fields: [hero.pos_norm, hero.vel, hero.facing_vec, hero.hp, hero.ammo_frac,
+             hero.ammo_whole, hero.attack_cd, hero.can_attack, hero.dashing,
+             hero.dash_t, hero.dash_dir, hero.invuln, hero.in_bush, hero.in_zone,
+             hero.long_dash_ready, hero.long_dash_frac,
+             hero.super_ready, hero.super_charge_frac,
+             meta.time_frac, meta.n_enemies_alive]
+  - name: enemies                       # slots 1..n_enemies, index-stable, gated by fair
+    per_entity: true
+    dtype: float32
+    # entities.kind_onehot removed by lowinfo; cubes/can_attack/dashing removed here, and
+    # hp_frac swapped for raw hp -- see WHAT THIS REPLACES. What is left is exactly what a
+    # detector plus a tracker reports: something is there, where, how far, how fast relative to
+    # us, how much HP the numeral over it says, and whether it is in a bush.
+    fields: [entities.alive, entities.revealed_to_hero,
+             entities.rel_pos, entities.dist, entities.rel_vel, entities.hp,
+             entities.in_bush]
+  - name: projectiles                   # nearest K by time_to_closest, K = 12 -- NOT index-stable
+    per_entity: true
+    max_slots: 12
+    dtype: float32
+    # Unchanged from lowinfo. A moving dot and nothing more.
+    fields: [projectiles.alive, projectiles.rel_pos, projectiles.vel,
+             projectiles.time_to_closest]
+  - name: zone                          # unchanged -- the zone is drawn on screen
+    per_entity: false
+    dtype: float32
+    fields: [zone.hero_margin, zone.active, zone.safe_area_frac, zone.next_shrink_in]
+  - name: grid                          # bare occupancy counts, no kind, no class -- and now
+                                        # two channels shorter than lowinfo's. See below.
+    dtype: uint8
+    # `box` and `pickup` DROPPED, taking this group from (10, 13, 21) to (8, 13, 21). Audited
+    # against what is on disk rather than assumed: the entity detector's classes are exactly
+    # {0: enemy, 1: teammate, 2: player} and the terrain classifier's are (FLOOR, WALL, BUSH,
+    # WATER, FENCE). Nothing detects a crate or a power-cube pickup, so these two are in the same
+    # position as the four fields dropped above -- unsuppliable, and a channel of zeros in a
+    # channel the policy was trained to read is the silent failure this file exists to prevent.
+    #
+    # OPERATOR DECISION, and explicitly TEMPORARY: box/pickup detection is excluded for this
+    # training run and the deployment that follows it, to be added later. When it returns, restore
+    # these two channels AND `reward.cube_pickup` in configs/train.yaml, which was zeroed in the
+    # same decision -- the agent cannot be paid for collecting something it cannot see.
+    # tests/test_configs_files.py pins that pairing so the two cannot drift apart.
+    view_channels: [blocks_unit, blocks_projectile, is_bush, is_water, in_zone,
+                    enemy_revealed, hero, projectile]

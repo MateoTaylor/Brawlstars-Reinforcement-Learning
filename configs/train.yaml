@@ -28,6 +28,11 @@ run:
   algo: maskable_ppo            # maskable_ppo (uses action_masks) | ppo
 
   env_config: configs/default.yaml
+  # Full information by default. The deployable views are selected per run and never by default:
+  #   --set run.agent_obs=configs/agent_obs_deploy2.yaml   <- the one the live loop targets
+  #   --set run.agent_obs=configs/agent_obs_deploy.yaml    <- its predecessor, kept so the
+  #                                                           2026-09-07 Mortis run reproduces
+  # Each is a different observation width, so none of them is a checkpoint swap.
   agent_obs: configs/agent_obs.yaml
   randomization: null           # e.g. configs/randomization.yaml -- per-env stat jitter, applied
                                 # on top of (and independently of) the curriculum below
@@ -116,7 +121,19 @@ reward:
                                 # mirror of damage_taken, so healing a wound off refunds what
                                 # taking it cost. Capped by max HP, so it cannot be farmed.
   kill: 3.0                     # x enemies the hero killed this tick
-  cube_pickup: 0.5             # x power cubes the hero collected this tick
+  # ZEROED, and paired with a config change elsewhere -- restore both together or neither.
+  # The deploy specs drop the grid's `box` and `pickup` channels because nothing
+  # detects a crate or a cube on screen (the entity detector's classes are {enemy, teammate,
+  # player}), so a deployed agent cannot see the thing this term pays for. Paying for it anyway
+  # trains an approach behaviour that cannot transfer, and does it silently -- the run looks fine
+  # and the deployment underperforms for a reason nothing reports.
+  #
+  # NOTE this is a SHARED file: zeroing it here also disables the term for agent_obs.yaml and
+  # agent_obs_lowinfo.yaml runs, which CAN see cubes. That is the operator's call for now, on the
+  # grounds that deployment is the live target; a full-info run that wants the term back can pass
+  # `--set reward.cube_pickup=0.5` without touching this file.
+  # tests/test_configs_files.py pins the pairing to every deploy spec's channels.
+  cube_pickup: 0.0              # x power cubes the hero collected this tick -- see above
   survive_per_step: 0.0       # flat, every tick the hero is alive
   in_zone_per_step: -0.05       # flat, every tick the hero is outside the safe rect
   scale: 1.0                    # multiplies the whole sum; a global volume knob

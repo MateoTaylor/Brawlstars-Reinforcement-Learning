@@ -1,0 +1,132 @@
+# DEPLOYABLE agent view, second pass -- configs/agent_obs_deploy.yaml with the ZONE GROUP rebuilt
+# around what the live loop was MEASURED to be able to reconstruct. Every other group is
+# byte-identical to its parent; tests/test_configs_files.py pins that.
+#
+#   python scripts/train.py --set run.agent_obs=configs/agent_obs_deploy2.yaml
+#
+# WHY A FOURTH FILE RATHER THAN AN EDIT
+# -------------------------------------
+# Same reason there was a third. `runs/*/train.yaml` names its spec BY PATH, so narrowing
+# agent_obs_deploy.yaml in place would leave the 2026-09-07 Mortis run pointing at a spec it was
+# not trained under. That checkpoint is the one being deployed right now; it must stay
+# reproducible. Adding a file costs nothing.
+#
+# WHAT CHANGED, AND WHY IT ONLY SURFACED AFTER agent_obs_deploy.yaml
+# ------------------------------------------------------------------
+# agent_obs_deploy.yaml kept the whole zone group with the comment "unchanged -- the zone is drawn
+# on screen". The zone IS drawn on screen. That turned out to be the wrong question: the four
+# fields are not the zone, they are functions of the SAFE RECT and its SCHEDULE, and a camera that
+# follows the hero recovers neither. Measured on tests/fixtures/vision/bluestacks-example-zone.mp4
+# (BRAWL_DEPLOYMENT_DESIGN.md 9.14):
+#
+#   zone.next_shrink_in   STRUCTURALLY UNOBSERVABLE, dropped. The gas front advancing and the gas
+#                         front merely being REVEALED as the camera pans are the same pixels. The
+#                         visible front moved 7 tiles in 3 s at t~21-24 s purely from reveal. No
+#                         amount of footage fixes this -- it is a property of an egocentric camera,
+#                         confirmed on iOS and BlueStacks captures alike. Zeroing it in an
+#                         inference-time ablation cost 1.5 pp; feeding it a plausible-looking wrong
+#                         number cost 4.4 pp, i.e. WORSE than not having it. Dropping is the
+#                         better of the two available moves.
+#
+#   zone.safe_area_frac   NO SUPPLIER, dropped. It needs the map's total extent, which the deployed
+#                         loop never learns -- it has an odometry-anchored 128x128 canvas, not a
+#                         map. Priced at -2.8 pp for a +/-0.05 error. This is the one field a
+#                         better perception stack could genuinely rescue, and it is also the most
+#                         redundant: the grid group's `in_zone` channel already carries the safe
+#                         area's LOCAL shape, which is what a fleeing decision actually uses.
+#
+#   zone.hero_margin      REPLACED by zone.hero_margin_local, not dropped -- it is the field that
+#                         matters and it is 3/4 recoverable. Zeroing the whole zone group cost
+#                         10.4 pp (7 standard errors, the only large reproducible effect in two
+#                         ablation passes), and hero_margin is where that value lives.
+#
+# THE REPLACEMENT: hero_margin -> hero_margin_local
+# -------------------------------------------------
+# Both are (x-lo.x, hi.x-x, y-lo.y, hi.y-y), four signed distances in tiles, negative = outside on
+# that side. The difference is a clamp to +/- `zone.margin_horizon_tiles` (configs/default.yaml,
+# 10 tiles), and the clamp is not a safety rail -- it is the shape of the deployed estimator.
+#
+# brawl_deployment has no rect to subtract from. It has GasMap: a sticky, odometry-anchored record
+# of cells it has SEEN gassed, and it answers "how far to gas along -x, +x, -y, +y". Beyond the
+# horizon that scan returns nothing and the answer saturates. Training on an unclamped margin and
+# deploying on a saturating one is exactly the silent lie this whole family of files exists to
+# prevent, so the sim now saturates too. There is exactly ONE number: the estimator reads
+# `zone.margin_horizon_tiles` out of the run's env_config instead of carrying its own copy, so the
+# two halves cannot drift. Do not hardcode it on either side.
+#
+# The clamp is symmetric because the blindness is: standing deep in gas, the nearest clear ground
+# is as far outside the sensor as distant gas is when standing safe.
+#
+# One consequence worth knowing rather than fixing: `tiles` normalizes by 60 (the map's extent), so
+# a horizon of 10 makes this the narrowest column in the vector, spanning +/-0.167 where its
+# unclamped predecessor reached ~0.5. That is a smaller input scale, not an unnormalized one, and
+# the run is from scratch so the first layer learns it. Do not "fix" it with a per-field divisor:
+# obs_select._norm_divisor is keyed by UNITS on purpose, and a field-specific exception is how that
+# table stops being checkable (tests/test_configs_files.py asserts the property, not a list).
+#
+# WHAT THIS DOES NOT MODEL, HONESTLY
+# ----------------------------------
+# GasMap only marks a cell gassed when that cell was on screen. Cells the hero never looked at stay
+# `clear` forever, so the estimator's error is ONE-SIDED OPTIMISTIC: it under-reports danger in
+# exactly the places the hero walked away from, which is where the gas goes. The clamp bounds that
+# error at the horizon; it does not remove it. Modelling it properly would need a per-env
+# visibility memory in the sim, which is a much larger change for an effect the measured ablations
+# put in the low single digits. Two things that were measured and deliberately NOT modelled:
+#
+#   staleness      A margin up to 6 s old cost 2.2 pp. Adding a delay line to training would inject
+#                  noise into every episode to buy back a fraction of that. Not done.
+#   axis asymmetry The screen is wider than it is tall, so +/-x is sensed further than +/-y. A
+#                  three-condition ablation came back non-monotone (0.697 / 0.724 / 0.704), i.e.
+#                  noise, so the horizon is ONE scalar, not two.
+#
+# WIDTH CHANGES: the zone group goes 7 -> 5 columns. Not a checkpoint swap; train from scratch.
+fair: true
+normalize: true
+groups:
+  - name: self                          # unchanged from agent_obs_deploy.yaml
+    per_entity: false
+    dtype: float32
+    fields: [hero.pos_norm, hero.vel, hero.facing_vec, hero.hp, hero.ammo_frac,
+             hero.ammo_whole, hero.attack_cd, hero.can_attack, hero.dashing,
+             hero.dash_t, hero.dash_dir, hero.invuln, hero.in_bush, hero.in_zone,
+             hero.long_dash_ready, hero.long_dash_frac,
+             hero.super_ready, hero.super_charge_frac,
+             meta.time_frac, meta.n_enemies_alive]
+  - name: enemies                       # slots 1..n_enemies, index-stable, gated by fair
+    per_entity: true
+    dtype: float32
+    # Unchanged from agent_obs_deploy.yaml, whose header explains every removal: kind_onehot by
+    # lowinfo, cubes/can_attack/dashing as unsuppliable, hp_frac -> hp because cubes move max_hp.
+    fields: [entities.alive, entities.revealed_to_hero,
+             entities.rel_pos, entities.dist, entities.rel_vel, entities.hp,
+             entities.in_bush]
+  - name: projectiles                   # nearest K by time_to_closest, K = 12 -- NOT index-stable
+    per_entity: true
+    max_slots: 12
+    dtype: float32
+    # Unchanged. A moving dot and nothing more.
+    fields: [projectiles.alive, projectiles.rel_pos, projectiles.vel,
+             projectiles.time_to_closest]
+  - name: zone                          # the ONLY group that differs from agent_obs_deploy.yaml
+    per_entity: false
+    dtype: float32
+    # 7 columns -> 5. hero_margin -> hero_margin_local (clamped at the sensing horizon),
+    # safe_area_frac and next_shrink_in dropped outright. See the header for each.
+    fields: [zone.hero_margin_local, zone.active]
+  - name: grid                          # bare occupancy counts, no kind, no class -- and two
+                                        # channels shorter than lowinfo's. See below.
+    dtype: uint8
+    # `box` and `pickup` DROPPED, taking this group from (10, 13, 21) to (8, 13, 21). Audited
+    # against what is on disk rather than assumed: the entity detector's classes are exactly
+    # {0: enemy, 1: teammate, 2: player} and the terrain classifier's are (FLOOR, WALL, BUSH,
+    # WATER, FENCE). Nothing detects a crate or a power-cube pickup, so these two are in the same
+    # position as the fields agent_obs_deploy.yaml dropped -- unsuppliable, and a channel of
+    # zeros the policy was trained to read is the silent failure this family of files prevents.
+    #
+    # OPERATOR DECISION, and explicitly TEMPORARY: box/pickup detection is excluded for this
+    # training run and the deployment that follows it, to be added later. When it returns, restore
+    # these two channels AND `reward.cube_pickup` in configs/train.yaml, which was zeroed in the
+    # same decision -- the agent cannot be paid for collecting something it cannot see.
+    # tests/test_configs_files.py pins that pairing so the two cannot drift apart.
+    view_channels: [blocks_unit, blocks_projectile, is_bush, is_water, in_zone,
+                    enemy_revealed, hero, projectile]

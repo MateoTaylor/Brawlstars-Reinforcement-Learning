@@ -29,6 +29,7 @@ are the outstanding classifier failure. Nothing yet connects a trained policy to
 | `brawl_sim/render/` | ASCII renderer and a scrubbable matplotlib replay viewer |
 | `brawl_sim/maps/` | eight CSV maps (seven 60x60, one tiny for tests), six in the training rotation |
 | `brawl_vision/` | frame sources, camera calibration, odometry, terrain, occupancy |
+| `brawl_vision/object_detection/` | third-party YOLO entity detector over the raw frame |
 | `configs/` | every number in the project; nothing is hardcoded |
 | `scripts/` | the runnable entry points below |
 | `tests/` | ~60 test modules, CPU by default |
@@ -136,6 +137,70 @@ python scripts/vision_truth.py clip.mp4 --check         # score against a hand-v
 `vision_watch.py` is the tool the rest of the pipeline was built with — camera calibration,
 rectification, odometry, zone detection and classification are all far faster to check by
 looking than by reading numbers.
+
+### Entity detection (third-party)
+
+A separate, parallel chunk: `brawl_vision/object_detection/` runs **PylaEntityDetectorV2** — a
+YOLOv11n trained by the PylaAI community, classes `enemy / teammate / player` — over the **raw**
+frame and returns boxes in screen pixels. It is not built on the terrain pipeline and does not
+feed it. Terrain rectifies and accumulates a world in tile space; this reads one frame and
+remembers nothing. Putting them in the same output frame is so you can *look at both* before
+deciding whether they should ever talk to each other.
+
+The weights are fetched rather than committed (10.6 MB, AGPL, someone else's repo — see
+`brawl_vision/object_detection/weights/NOTICE.md`):
+
+```bash
+pip install -e ".[detect]"                     # onnxruntime; use onnxruntime-gpu for CUDA
+python scripts/vision_fetch_detector.py        # ~10 MB, digest-checked
+
+python scripts/vision_detect.py clip.mp4 -o boxes.mp4    # detector alone. Start here
+python scripts/vision_evaluate.py clip.mp4 -o both.mp4 --detect   # boxes AND the map
+```
+
+`--detect` implies `--layout side-by-side`: annotated frame left, reconstructed map right.
+Measured at 12.9 ms/frame on CPU against the 250 ms decision budget, and the combined render
+still runs faster than real time.
+
+`--detect-on-map` additionally projects each box's bottom edge through the same homography the
+terrain pipeline uses, and marks the resulting tile on the map. Paired with `--layout view` you
+get the agent's own window twice — rectified frame left, predicted map right, same tiles at the
+same scale, markers on both — which is where you can check whether a detected brawler lands on
+the cell the map claims:
+
+```bash
+python scripts/vision_evaluate.py clip.mp4 -o view.mp4 --detect-on-map --layout view
+```
+
+**Where in the box you project from is the whole game.** A YOLO box here encloses the nameplate,
+health bar, ammo pips, sprite *and* any active aura — so its bottom edge is the bottom of the
+aura, measured ~68 px (about a tile) below the brawler's feet, and it breathes as effects come
+and go (player box height swings 264→380 px within one clip).
+
+`detector.anchor_frac` therefore projects from **30% of the box height up from the bottom**, not
+from the bottom edge. It was measured against the one accuracy test available without hand
+labels: a brawler cannot stand in a wall or in water, and the occupancy map knows where those
+are. Share of frames placing the player in an impossible cell:
+
+| anchor | 0% | 20% | 30% | 40% | 50% | base rate |
+|---|---|---|---|---|---|---|
+| `showdown_alternate_map` | 23.7% | **11.3%** | 11.9% | 14.9% | 23.8% | 26.5% |
+| `showdown_alternate_map2` | 15.6% | 6.7% | 5.4% | **1.1%** | 0.8% | 19.1% |
+
+The raw bottom edge is barely better than chance. The optimum is a *band* — the wall-heavy clip
+prefers 0.20 and degrades past 0.40, the water-heavy one keeps improving — and they disagree
+partly because the terrain classifier's own weak spot is walls, so some "impossible" cells are the
+map being wrong rather than the anchor. 0.30 is the middle and near-best on both.
+
+Still not a calibration: read a marker as "a brawler is about here", not as a tile index.
+`--detect-anchor` overrides it. See `brawl_vision/object_detection/project.py`.
+
+Two things worth knowing before trusting it. The model wants **RGB** — feeding it OpenCV's BGR
+does not error, it produces *more* boxes: on one Solo Showdown clip, 44 "teammate" detections
+where correct input yields none, plus duplicate players and lower confidence throughout. And
+`teammate` is impossible in Solo Showdown, so `configs/vision.yaml` drops it by default; it fires
+once in 101 frames at the shipped threshold, and a burst of them means something upstream is
+wrong.
 
 ## Using the sim in code
 

@@ -254,6 +254,61 @@ def test_zone_fields():
     assert abs(margin[3].item() - (13.0 - 8.0)) < 1e-4
 
 
+def test_zone_hero_margin_local_saturates_at_the_sensing_horizon():
+    """`hero_margin_local` is the field configs/agent_obs_deploy2.yaml trains on, and the reason it
+    exists is that the deployed loop has no safe rect to subtract from -- it scans a sticky map of
+    gas it has SEEN (brawl_deployment/perception/grid.py) and stops at a horizon. So the sim
+    saturates at the same number, and this test pins the three cases that matter: a margin inside
+    the horizon passes through, one beyond it saturates, and a NEGATIVE margin (hero standing in
+    the gas) saturates the same way on the other side -- the blindness is symmetric, because
+    nearby clear ground is as unsensed from deep inside the gas as distant gas is from safety.
+
+    If this drifts from brawl_deployment's own clamp, training and deployment disagree about what
+    a large margin means, silently. See BRAWL_DEPLOYMENT_DESIGN.md 9.14."""
+    n_envs = 1
+    cfg, params, bank, gen, spec = _cfg_params_bank(
+        n_envs=n_envs,
+        overrides={"zone": {"enabled": True, "margin_horizon_tiles": 4.0}},
+    )
+    state = _reset(cfg, params, bank, gen, spec, n_envs)
+    assert cfg.zone_margin_horizon_tiles == 4.0
+
+    state.zone_lo[0] = torch.tensor([3.0, 3.0])
+    state.zone_hi[0] = torch.tensor([13.0, 13.0])
+    state.ent_pos[0, 0] = torch.tensor([15.0, 8.0])  # 2 tiles outside the rect on the +x side
+
+    vis, los = _vis_los(state, bank, params, cfg)
+    z = obs_mod.build_obs(state, bank, vis, los, params, cfg)["zone"]
+
+    raw, local = z["hero_margin"][0], z["hero_margin_local"][0]
+    assert local.shape == raw.shape
+    assert abs(local[0].item() - 4.0) < 1e-4    # raw 12.0, beyond the horizon -> saturated
+    assert abs(local[1].item() - (-2.0)) < 1e-4  # raw -2.0, inside it -> untouched, sign kept
+    assert abs(local[2].item() - 4.0) < 1e-4    # raw 5.0 -> saturated
+    assert abs(local[3].item() - 4.0) < 1e-4    # raw 5.0 -> saturated
+
+    # And the other side of the symmetry: deep in the gas, far from any clear ground.
+    state.ent_pos[0, 0] = torch.tensor([19.0, 8.0])
+    vis, los = _vis_los(state, bank, params, cfg)
+    local = obs_mod.build_obs(state, bank, vis, los, params, cfg)["zone"]["hero_margin_local"][0]
+    assert abs(local[1].item() - (-4.0)) < 1e-4  # raw -6.0 -> saturated negative
+
+
+def test_zone_hero_margin_local_is_the_raw_margin_when_the_horizon_is_wide():
+    """The clamp must be a clamp and nothing else -- no rescaling, no offset, no dropped sign.
+    Widen the horizon past anything a 20x20 map can produce and the two fields must coincide
+    exactly, for every env, not just the hero's own."""
+    n_envs = 8
+    cfg, params, bank, gen, spec = _cfg_params_bank(
+        n_envs=n_envs,
+        overrides={"zone": {"enabled": True, "margin_horizon_tiles": 1000.0}},
+    )
+    state = _reset(cfg, params, bank, gen, spec, n_envs)
+    vis, los = _vis_los(state, bank, params, cfg)
+    z = obs_mod.build_obs(state, bank, vis, los, params, cfg)["zone"]
+    assert torch.equal(z["hero_margin_local"], z["hero_margin"])
+
+
 # ---- projectile threat features ----------------------------------------------------------
 
 def test_projectile_threatens_hero():

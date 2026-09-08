@@ -10,6 +10,42 @@ If the two ever need to match again, the fix is to point this module's table at 
 one import, one place -- rather than to re-scatter the colours through three viewers.
 
 `brawl_sim` is untouched. `scripts/watch.py` and the simulator's own renderer keep their palette.
+
+#### There is no such thing as "the game's colours", and this table has to pick a map
+
+Brawl Stars reskins its environments, and the fixtures are not subtle about it:
+`showdown_alternate_map` is magenta ground with red foliage, `showdown_alternate_map2` is
+blue-grey with blue crates, `day10_gameplay` is dark purple with teal bushes and purple stone
+walls. A palette sampled from one is wrong for the others -- not broken, just no longer echoing
+what is on screen beside it.
+
+**This table is sampled from `9_5_brawlstars_eval`, retargeted from `day10_gameplay`.** The two
+skins share a purple ground and diverge on everything else, so the move was not a no-op: day10's
+teal bushes and its washed lilac walls do not exist here.
+
+#### How these numbers were produced, so the next retarget is not a pipette-and-taste job
+
+`scripts/vision_sample_palette.py`. It rectifies every 40th frame, runs the *terrain classifier*
+over it, keeps cells the classifier is >=85% sure of and that are fully inside `plan.valid`, and
+reports luminance percentiles of the pixels underneath. Sampling by classifier label rather than
+by eye matters for one class in particular: a WALL cell contains a lit top face AND a shadowed
+side, and their average is a colour that appears nowhere in the footage.
+
+Measured over 62 s of `9_5_brawlstars_eval` (cells / p50 / p90):
+
+    FLOOR   19568   #4e2b62   #6a3371
+    WALL     4124   #793aa9   #965ec6      <- p50 is slab-average, p90 is the lit top
+    BUSH     2385   #1d9737   #1ec13d
+    WATER      107   #85da6e   #90f07c
+    FENCE        4   -                     <- four cells in the whole clip; noise, not a sample
+
+Two constraints bound what can be done with those numbers, and both are enforced by tests rather
+than by care:
+
+  * every class at least 60 apart in RGB from every other AND from UNKNOWN
+    (`test_every_class_is_visually_separable_from_every_other`), and
+  * every class more than 0.3 from UNKNOWN in its brightest channel
+    (`test_unknown_is_far_from_every_real_class`), which is what sets how dark FLOOR may be.
 """
 from brawl_sim.constants import Tile
 
@@ -18,31 +54,53 @@ from brawl_sim.constants import Tile
 UNKNOWN_COLOR = "#000000"
 
 TILE_COLORS = {
-    # Floor and wall are both blue-greys taken from the footage rather than invented: sampling the
-    # cells the classifier is >90% sure of across showdown_alternate_map2 gives a floor of #25293a
-    # and a wall of #233e64. Floor is dark and walls light, the inverse of the simulator's scheme,
-    # because floor is ~73% of a typical map and is the one that should recede.
+    # SAMPLED p50, used as-is. The dark maroon-purple plank floor this skin actually has, and the
+    # one class that needs no adjustment: its brightest channel is 98/255 = 0.384, clear of the
+    # 0.3 the UNKNOWN test demands. day10's floor needed a 1.35x lift to clear the same bar; this
+    # one is simply lighter to begin with, so nothing is invented.
     #
-    # FLOOR IS NOT THE SAMPLED VALUE, and the constraint is UNKNOWN. #25293a's brightest channel is
-    # 58/255 = 0.227, under the 0.3 that `tests/test_vision_overlay.py` requires between UNKNOWN and
-    # every class -- a near-black floor beside a black "never observed" makes the two
-    # indistinguishable exactly when the distinction matters most, on a half-explored map where the
-    # whole question is which dark region is floor and which is nothing. So the sampled hue is kept
-    # and the value lifted 1.5x until it clears (0.341). Blue carries it: at the same lightness a
-    # NEUTRAL grey would fail, because its brightest channel is lower.
-    Tile.FLOOR: "#383e57",
-    # Lighter than the sampled #233e64, which is a whole-cell average including the crates' shadowed
-    # sides. This echoes their lit tops, and buys the contrast against the floor that the average
-    # does not (141 in RGB against 39).
-    Tile.WALL:  "#9aa8cc",
-    Tile.BUSH:  "#d23b2e",
-    Tile.WATER: "#e08b2a",
-    # Not specified when the rest were chosen. Picked to sit clear of both the bush red and the
-    # water orange, which are its nearest neighbours on the wheel and the two it would otherwise be
-    # confused with -- FENCE is the rarest class and the one that can least afford to be ambiguous.
+    # Floor is ~73% of a typical map and is the one that should recede. Left at the sample.
+    Tile.FLOOR: "#4e2b62",
+    # SAMPLED p90 -- the LIT TOP FACE, not the p50 slab average of #793aa9.
+    #
+    # This is the one deliberate departure from "median of the class", and it is the same
+    # departure the day10 palette made for the same reason: a wall is a raised block, roughly half
+    # of what the classifier calls WALL is its shadowed side, and what a viewer reads as "wall" is
+    # the top. Taking p50 also costs the contrast that makes the map legible -- #793aa9 is only 82
+    # from FLOOR in RGB, barely over the 60 the test floors at, and floor-vs-wall is the pair a
+    # map is mostly made of. The p90 top face is 133 away.
+    Tile.WALL:  "#965ec6",
+    # SAMPLED p50, used as-is. Forest green, and a real change from day10's teal #1b8b9a -- this
+    # skin's foliage is straightforwardly green.
+    #
+    # That green is what makes WATER the interesting problem below, and it is also what un-fixed a
+    # fix: the day10 note recorded that teal had cleared an old clash between bush red and the
+    # enemy marker's red. Green keeps that clearance (enemy red is 200 away), so the clash stays
+    # gone for a different reason than before.
+    Tile.BUSH:  "#1d9737",
+    # SAMPLED p75/p90 (they agree). Flat, bright, almost fluorescent green.
+    #
+    # **BUSH and WATER are both green in this skin, and that is the palette's one hard problem.**
+    # The footage tells them apart by texture and edge -- water is a flat rectangle with a crisp
+    # rim, foliage is spiky and mottled -- and a flat-shaded tile map has neither of those to work
+    # with. So the whole distinction has to ride on VALUE, which fortunately is where the two are
+    # furthest apart in the source: green channel 151 against 240. That is 161 in RGB, well clear
+    # of the 60 floor, and it is why neither is nudged toward the other for the sake of "matching"
+    # more closely.
+    #
+    # Only 107 cells backed this, against 2385 for BUSH -- there is little water in the clip. p75
+    # and p90 landing on the same value is the reason to trust it anyway: a noisy sample would not
+    # be flat across percentiles.
+    Tile.WATER: "#90f07c",
+    # NOT SAMPLED -- four cells in 62 seconds, which is the classifier hedging on bush edges
+    # rather than fence anywhere on this map. Retained from the previous palette, which is the
+    # honest thing to do with a class the footage cannot speak to.
+    #
+    # Still the only warm hue here (floor/wall purple, bush/water green), so it cannot be confused
+    # with any of them, and it clears every pair by 105 or better.
     Tile.FENCE: "#e8d44a",
     # Never rendered by the vision stack (the classifier has five classes), but present so the
     # table can stand in for the simulator's anywhere that iterates `Tile`.
-    Tile.SPAWN: "#383e57",
-    Tile.BOX:   "#383e57",
+    Tile.SPAWN: "#4e2b62",
+    Tile.BOX:   "#4e2b62",
 }

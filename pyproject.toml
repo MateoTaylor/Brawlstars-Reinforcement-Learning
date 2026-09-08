@@ -15,13 +15,41 @@ sb3 = ["stable-baselines3", "sb3-contrib", "gymnasium", "tensorboard"]
 render = ["matplotlib"]
 video = ["imageio-ffmpeg"]  # bundled ffmpeg binary for ReplayViewer.save(*.mp4); .gif needs neither
 vision = ["opencv-python", "mss"]
+# Third-party YOLO entity/wall detectors (brawl_vision/object_detection). onnxruntime, not
+# ultralytics: the .pt files are pickled ultralytics classes and cannot be loaded without that
+# whole package, while the .onnx exports need one ~15 MB dependency and no version coupling to
+# the library that produced them.
+detect = ["onnxruntime"]
+# GPU inference. Deployment needs this -- on CPU the projectile detector costs 47 ms of a 50 ms
+# tick (BRAWL_DEPLOYMENT_DESIGN.md 9.12). Install it INSTEAD of `detect`, not alongside: the two
+# wheels write the same files under site-packages/onnxruntime and whichever pip touches last
+# wins, so `pip uninstall -y onnxruntime` first or the CPU build silently comes back.
+#
+# The [cuda,cudnn] extras are the part that is easy to miss and the reason a first attempt at
+# this failed. Bare `onnxruntime-gpu` installs a CUDA-capable RUNTIME with no CUDA LIBRARIES,
+# and there is no error at install time -- `get_available_providers()` cheerfully lists
+# CUDAExecutionProvider, session creation then fails to load cublasLt64_13.dll and falls back to
+# CPU with a warning, and every latency number looks exactly like it did before. The extras pull
+# NVIDIA's own wheels (~3 GB), which is what makes this work with no system CUDA toolkit
+# installed -- there is none on the dev machine and torch does not help, because torch bundles
+# CUDA 12 in torch/lib while onnxruntime-gpu 1.29 is built against CUDA 13.
+#
+# ALWAYS verify by reading `ObjectDetector.provider` from a constructed detector, never by
+# reading `get_available_providers()` -- only the first one reports what actually ran.
+detect-gpu = ["onnxruntime-gpu[cuda,cudnn]"]
 
 [build-system]
 requires = ["setuptools>=68"]
 build-backend = "setuptools.build_meta"
 
 [tool.setuptools.packages.find]
-include = ["brawl_sim*", "brawl_vision*"]
+include = ["brawl_sim*", "brawl_vision*", "brawl_deployment*"]
+
+[tool.setuptools.package-data]
+# Calibration MEASUREMENTS ship with the package -- brawl_deployment.match_state resolves
+# control_calibration.json relative to __file__, so an install that drops it fails at import
+# rather than at first use.
+brawl_deployment = ["data/*.json"]
 
 [tool.pytest.ini_options]
 markers = [

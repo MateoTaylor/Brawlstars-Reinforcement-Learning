@@ -91,6 +91,10 @@ class EnvConfig:
     bots_hunt_timeout_seconds: float = 12.0
     zone_enabled: bool = True
     zone_mode: str = "rect"
+    # Sensing horizon for zone.hero_margin_local ONLY -- it changes no dynamics, just how far that
+    # one observation field can see. Must equal the clamp the deployed gas estimator uses; see
+    # BRAWL_DEPLOYMENT_DESIGN.md 9.14.
+    zone_margin_horizon_tiles: float = 10.0
     iframes_block_zone: bool = False
     regen_enabled: bool = True
     drop_victim_cubes: bool = True
@@ -236,6 +240,7 @@ _ENV_CONFIG_FIELDS = (
     ("bots.hunt_timeout_seconds", "bots_hunt_timeout_seconds", float),
     ("zone.enabled", "zone_enabled", bool),
     ("zone.mode", "zone_mode", str),
+    ("zone.margin_horizon_tiles", "zone_margin_horizon_tiles", float),
     ("zone.iframes_block_zone", "iframes_block_zone", bool),
     ("regen.enabled", "regen_enabled", bool),
     ("cubes.drop_victim_cubes", "drop_victim_cubes", bool),
@@ -1013,6 +1018,15 @@ def validate(cfg: EnvConfig, params: SimParams) -> None:
             )
         if bool((params.zone_fraction_growth < 0).any()):
             raise ValueError("zone.fraction_growth_per_step must be >= 0")
+
+    # Checked whether or not the zone is enabled: it is an observation setting, and a zero or
+    # negative horizon would collapse zone.hero_margin_local to a constant column -- exactly the
+    # "trained on a constant" failure configs/agent_obs_deploy*.yaml exist to prevent.
+    if cfg.zone_margin_horizon_tiles <= 0:
+        raise ValueError(
+            f"zone.margin_horizon_tiles must be > 0 (it is the sensing horizon "
+            f"zone.hero_margin_local is clamped to), got {cfg.zone_margin_horizon_tiles}"
+        )
 
     if cfg.regen_enabled:
         if bool((params.regen_delay < 0).any()):

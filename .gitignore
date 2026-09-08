@@ -33,6 +33,28 @@ tests/fixtures/vision/**/*.jpeg
 tests/fixtures/vision/**/*.mp4
 tests/fixtures/vision/**/*.mkv
 
+# Third-party detector weights (brawl_vision/object_detection). Fetched, not committed: 10.6 MB
+# of somebody else's AGPL-licensed model from a repo with no releases and no licence file. The
+# NOTICE.md beside them -- provenance, SHA-256, class lists, the licence question -- IS tracked,
+# and `python scripts/vision_fetch_detector.py` puts the blobs back. Same split as data/ above:
+# structure and documentation tracked, opaque payload not.
+brawl_vision/object_detection/weights/*.onnx
+brawl_vision/object_detection/weights/*.pt
+brawl_vision/object_detection/weights/*.part
+brawl_vision/data/training_videos/**
+
+# Projectile training set (brawl_vision/object_detection/projectile_detection). The CVAT export is
+# 906 MB and `dataset/` is 869 MB of the same bytes, unpacked by train.py on first run; the COCO
+# yolo26n.pt is 5.3 MB of Ultralytics' AGPL-licensed weights. `runs/` is covered by the rule at the
+# top of this file. Code and docstrings tracked, payload not -- same split as the two blocks above.
+brawl_vision/object_detection/projectile_detection/*.zip
+brawl_vision/object_detection/projectile_detection/dataset/
+brawl_vision/object_detection/projectile_detection/*.pt
+
+# Ultralytics' AMP check downloads a throwaway yolo26n.pt to ./weights on the first train run.
+# Not ours, not used for training, recreated on demand.
+/weights/
+
 Terrain_Perception_Build_Plan.md
 TRAINING.md
 BRAWL_SIM_BUILD_PLAN.md

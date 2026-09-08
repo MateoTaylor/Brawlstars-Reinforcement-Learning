@@ -1,0 +1,96 @@
+# LOW-INFORMATION agent view -- a sibling of configs/agent_obs.yaml, selected per run with
+#   python scripts/train.py --set run.agent_obs=configs/agent_obs_lowinfo.yaml
+# and never by default. configs/agent_obs.yaml is untouched and remains the full-information
+# environment; nothing outside this file changes between the two regimes, so switching back is
+# dropping the --set.
+#
+# WHAT THIS HIDES, AND WHY THIS PARTICULAR LINE
+# ---------------------------------------------
+# The rule is sim-to-real parity with the vision pipeline: the agent may see only what
+# brawl_vision can actually recover from a screen capture. A detector reports "an enemy is at
+# these coordinates with this much of its HP bar left" and "a projectile is at these coordinates,
+# moving this way" -- it does not report which brawler that silhouette is, nor which weapon fired
+# that sprite. Training on fields the deployed system cannot supply builds a policy that leans on
+# a signal that vanishes the moment it leaves the simulator.
+#
+# Relative to configs/agent_obs.yaml, exactly two groups differ:
+#
+#   enemies      -- entities.kind_onehot dropped (8 columns). The agent sees that an enemy is
+#                   there, where it is, how fast it is closing and how much HP it has left, but
+#                   not whether it is a sniper or a Bull.
+#
+#   projectiles  -- everything but the kinematics dropped: kind_onehot (7), class_onehot (3),
+#                   damage, aoe, threatens_hero. A projectile is reduced to a moving dot.
+#
+# The non-obvious drops in that second list, spelled out because re-adding one by reflex would
+# quietly undo this whole config:
+#
+#   damage/aoe      Continuous, but per-weapon CONSTANTS -- the roster's damage figures are
+#                   distinct enough (880 Bull pellet vs 600 Shelly arrow, see
+#                   brawl_sim/constants.py's Proj.BULL_SLUG note) that a policy recovers the
+#                   weapon by regression and the one-hot's absence buys nothing. Dropping the
+#                   label while keeping the fingerprint is not masking.
+#   threatens_hero  Derived from state.prj_radius (core/observation.py) -- a per-weapon stat, so
+#                   this bool is a type leak wearing a threat-flag's clothes. It also folds in
+#                   prj_owner, which the vision pipeline does not resolve.
+#
+# What deliberately SURVIVES in projectiles, and why it is not a leak:
+#
+#   vel               "The traveling of the projectile" -- the thing this regime is meant to keep.
+#                     A tracker recovers it from consecutive detections; no stat table involved.
+#   time_to_closest   geo.closest_approach(prj_pos, prj_vel, hero_pos) and nothing else -- pure
+#                     kinematics over two fields already in this group, carrying zero information
+#                     they don't. Kept as an inductive bias, not as an observation; it stays
+#                     computable downstream from the same detections. Delete the line if you want
+#                     the policy to derive closing geometry itself.
+#                     (It is ALSO the top-K sort key for max_slots, which reads it straight from
+#                     the full observation -- so removing it from `fields` below is safe and does
+#                     not break slot selection.)
+#
+# The grid group is unchanged and needs no edit: its `projectile` and `enemy_revealed` channels
+# are bare occupancy counts that never carried kind or class in the first place.
+#
+# NOT A DROP-IN CHECKPOINT SWAP. Narrowing these two groups changes the observation width, and
+# with it BrawlFeaturesExtractor's first linear layer -- a checkpoint trained under one spec
+# cannot be loaded under the other (the same shape break wrappers/sb3_features.py documents for
+# the view resize). Train low-info runs from scratch and keep them in their own run directory
+# (--set run.name=...).
+fair: true
+normalize: true
+groups:
+  - name: self                          # identical to configs/agent_obs.yaml -- the hero's own
+    per_entity: false                   # kit is not hidden from it, only other players' are
+    dtype: float32
+    fields: [hero.pos_norm, hero.vel, hero.facing_vec, hero.hp_frac, hero.ammo_frac,
+             hero.ammo_whole, hero.attack_cd, hero.can_attack, hero.dashing,
+             hero.dash_t, hero.dash_dir, hero.invuln, hero.in_bush, hero.in_zone,
+             hero.cubes, hero.long_dash_ready, hero.long_dash_frac,
+             hero.super_ready, hero.super_charge_frac,
+             meta.time_frac, meta.n_enemies_alive]
+  - name: enemies                       # slots 1..n_enemies, index-stable, gated by fair
+    per_entity: true
+    dtype: float32
+    # entities.kind_onehot REMOVED (see header). Slot order does not reintroduce it: entity slots
+    # are index-stable within an episode, but configs/default.yaml sets randomize_enemy_types:
+    # true, so which archetype lands in slot 3 is redrawn every reset and the index carries no
+    # information across episodes. Setting randomize_enemy_types: false with fixed_enemy_types
+    # (as configs/presets/single_archetype.yaml does) WOULD make the slot index a perfect
+    # stand-in for the kind and silently defeat this file.
+    fields: [entities.alive, entities.revealed_to_hero,
+             entities.rel_pos, entities.dist, entities.rel_vel, entities.hp_frac,
+             entities.cubes, entities.can_attack, entities.dashing, entities.in_bush]
+  - name: projectiles                   # nearest K by time_to_closest, K = 12 -- NOT index-stable
+    per_entity: true
+    max_slots: 12
+    dtype: float32
+    # A moving dot and nothing more. See the header for what left and why each departure matters.
+    fields: [projectiles.alive, projectiles.rel_pos, projectiles.vel,
+             projectiles.time_to_closest]
+  - name: zone                          # identical to configs/agent_obs.yaml
+    per_entity: false
+    dtype: float32
+    fields: [zone.hero_margin, zone.active, zone.safe_area_frac, zone.next_shrink_in]
+  - name: grid                          # identical to configs/agent_obs.yaml -- see header
+    dtype: uint8
+    view_channels: [blocks_unit, blocks_projectile, is_bush, is_water, in_zone,
+                    enemy_revealed, hero, box, pickup, projectile]

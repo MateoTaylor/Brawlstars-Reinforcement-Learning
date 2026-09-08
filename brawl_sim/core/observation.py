@@ -396,6 +396,12 @@ def build_obs(state, bank, vis: torch.Tensor, raw_los: torch.Tensor, params, cfg
     # ---- zone ----
     map_area = float(cfg.map_w * cfg.map_h)
     zone_size = state.zone_hi - state.zone_lo
+    hero_margin = torch.stack([
+        hero_pos[:, 0] - state.zone_lo[:, 0],
+        state.zone_hi[:, 0] - hero_pos[:, 0],
+        hero_pos[:, 1] - state.zone_lo[:, 1],
+        state.zone_hi[:, 1] - hero_pos[:, 1],
+    ], dim=-1)
     obs["zone"] = {
         "lo": state.zone_lo,
         "hi": state.zone_hi,
@@ -405,12 +411,20 @@ def build_obs(state, bank, vis: torch.Tensor, raw_los: torch.Tensor, params, cfg
         "step": state.zone_step,
         "dps": zone_mod.current_dps(state, params),
         "next_shrink_in": torch.clamp(state.zone_next_t - state.time, min=0.0),
-        "hero_margin": torch.stack([
-            hero_pos[:, 0] - state.zone_lo[:, 0],
-            state.zone_hi[:, 0] - hero_pos[:, 0],
-            hero_pos[:, 1] - state.zone_lo[:, 1],
-            state.zone_hi[:, 1] - hero_pos[:, 1],
-        ], dim=-1),
+        "hero_margin": hero_margin,
+        # Same four signed distances, seen through a BOUNDED SENSING HORIZON. The sim knows the
+        # safe rect; a camera does not -- brawl_deployment reconstructs these margins by scanning
+        # a sticky map of gas it has actually SEEN, so past `zone_margin_horizon_tiles` its answer
+        # saturates instead of growing. Training on the unclamped field and deploying on the
+        # clamped one is the usual silent lie; this field is the honest shape, and the deployed
+        # estimator clamps at the same number by reading cfg.zone_margin_horizon_tiles out of the
+        # run's own env_config. See BRAWL_DEPLOYMENT_DESIGN.md 9.14/9.15.
+        #
+        # The clamp is symmetric because the failure is symmetric: standing deep in gas, the
+        # nearest clear ground is as unobservable as distant gas is when standing safe.
+        "hero_margin_local": torch.clamp(
+            hero_margin, -cfg.zone_margin_horizon_tiles, cfg.zone_margin_horizon_tiles
+        ),
         "safe_area_frac": (zone_size[:, 0] * zone_size[:, 1]) / map_area,
     }
 

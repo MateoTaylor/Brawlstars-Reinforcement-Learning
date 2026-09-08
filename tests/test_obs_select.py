@@ -231,3 +231,112 @@ def test_dump_obs_schema_regenerates_agent_obs_docs_deterministically():
     second = dump_mod.render_agent_obs()
     assert first == second
     assert "## `self`" in first and "## `grid`" in first
+
+
+# ---- normalize: true, per unit ------------------------------------------------------------
+#
+# Until the deployed spec dropped `hp_frac`, nothing here exercised `normalize: true` at all --
+# obs_select's own docstring called it "a genuinely underspecified corner of Step 32's plan text
+# (no acceptance criterion exercises it)". That is how `hp` and `count` fields came to sit in a
+# normalized spec undivided. These tests are that acceptance criterion.
+
+def test_every_normalized_unit_divides_by_its_documented_scale():
+    cfg = _cfg()
+    assert obs_select._norm_divisor("tiles", cfg) == float(max(cfg.map_w, cfg.map_h))
+    assert obs_select._norm_divisor("tiles/s", cfg) == obs_select._NORM_SPEED_SCALE
+    assert obs_select._norm_divisor("hp", cfg) == obs_select._NORM_HP_SCALE
+    assert obs_select._norm_divisor("count", cfg) == obs_select._NORM_COUNT_SCALE
+    # Bounded by construction; a divisor here would shrink a field that is already in range.
+    for units in ("fraction", "bool", "onehot", "unitless", "radians"):
+        assert obs_select._norm_divisor(units, cfg) == 1.0
+
+
+def test_the_hp_scale_covers_the_largest_hp_the_sim_can_produce():
+    """Derived from the shipped config rather than restated, so a change to the roster or the
+    cube numbers fails here instead of quietly pushing a normalized field past 1.
+
+    The ceiling is an enemy at the roster's highest base HP, holding `max_cubes` at
+    `hp_per_cube` flat, scaled by the top of `enemy_hp_mult` -- see core/stats.effective_max_hp,
+    which applies that multiplier to the cube total and never to the hero.
+    """
+    import yaml as _yaml
+
+    # cubes.* resolve onto SimParams, not EnvConfig, so they are read from the file itself.
+    cubes = _yaml.safe_load(open("configs/default.yaml").read())["cubes"]
+    brawlers = _yaml.safe_load(open("configs/brawlers.yaml").read())
+    base = [v["base_hp"] for v in brawlers.values() if isinstance(v, dict) and "base_hp" in v]
+    ceiling = (max(base) + cubes["max_cubes"] * cubes["hp_per_cube"]) * 1.25
+
+    normalized = ceiling / obs_select._NORM_HP_SCALE
+    assert normalized <= 1.05, (
+        f"max possible HP {ceiling:.0f} normalizes to {normalized:.2f}; raise _NORM_HP_SCALE"
+    )
+    # Not so large that a real HP reading vanishes into the noise floor either -- a fresh Mortis
+    # should land near the ~0.1-0.5 band _NORM_SPEED_SCALE puts a walking entity in.
+    assert 0.2 <= brawlers["hero_mortis"]["base_hp"] / obs_select._NORM_HP_SCALE <= 0.6
+
+
+def test_the_count_scale_covers_every_bounded_count_in_the_schema():
+    import yaml as _yaml
+
+    cfg = _cfg()
+    max_cubes = _yaml.safe_load(open("configs/default.yaml").read())["cubes"]["max_cubes"]
+    for largest in (max_cubes, cfg.n_enemies, 3):  # cubes, brawlers left, ammo
+        assert largest / obs_select._NORM_COUNT_SCALE <= 1.0
+
+
+def test_normalized_hp_and_count_fields_come_out_in_range_on_a_real_env():
+    """End to end: the divisor is applied where it is supposed to be, not merely defined."""
+    env, cfg, full_obs = _env_and_obs(n_envs=4, seed=3)
+    spec_dict = {
+        "fair": True, "normalize": True,
+        "groups": [{"name": "self", "per_entity": False, "dtype": "float32",
+                    "fields": ["hero.hp", "meta.n_enemies_alive", "hero.ammo_whole"]}],
+    }
+    path = _write_spec(spec_dict)
+    try:
+        spec = obs_select.load_agent_spec(path, cfg)
+        buffers = obs_select.make_agent_obs_buffers(spec, cfg, 4, torch.device("cpu"))
+        out = obs_select.build_agent_obs(full_obs, spec, cfg, buffers)["self"]
+        assert out.min() >= 0.0
+        assert out.max() <= 1.0, f"a normalized field left [0, 1]: {out.max().item()}"
+        # And it is a real division, not a coincidence of small raw values: hero HP is thousands.
+        raw_hp = full_obs["hero"]["hp"]
+        assert torch.allclose(out[:, 0], raw_hp / obs_select._NORM_HP_SCALE)
+        assert raw_hp.max() > 100.0
+    finally:
+        os.remove(path)
+
+
+def test_two_specs_with_a_same_named_group_do_not_share_a_normalization_vector():
+    """A latent bug found by the test above, worth its own name.
+
+    `_normalize` memoizes its scale vector, and the key used to be the group NAME alone -- but
+    the vector depends on the group's FIELDS. All three shipped specs have a group called
+    "self", at 25/25/24 columns, so loading two of them in one process gave the second the
+    first's divisors: a broadcast error when the widths differ, and silently wrong scaling when
+    they match. Anything that evaluates a checkpoint against more than one spec hits this.
+    """
+    env, cfg, full_obs = _env_and_obs(n_envs=4, seed=5)
+    wide = {"fair": True, "normalize": True,
+            "groups": [{"name": "self", "per_entity": False, "dtype": "float32",
+                        "fields": ["hero.hp", "hero.vel", "meta.n_enemies_alive"]}]}
+    narrow = {"fair": True, "normalize": True,
+              "groups": [{"name": "self", "per_entity": False, "dtype": "float32",
+                          "fields": ["meta.n_enemies_alive"]}]}
+    paths = [_write_spec(wide), _write_spec(narrow)]
+    try:
+        outs = []
+        for path in paths:
+            spec = obs_select.load_agent_spec(path, cfg)
+            buffers = obs_select.make_agent_obs_buffers(spec, cfg, 4, torch.device("cpu"))
+            outs.append(obs_select.build_agent_obs(full_obs, spec, cfg, buffers)["self"].clone())
+        assert outs[0].shape[1] == 4 and outs[1].shape[1] == 1
+        # The shared field must normalize identically in both, by the count scale.
+        raw_n = full_obs["meta"]["n_enemies_alive"].to(torch.float32)
+        expected = raw_n / obs_select._NORM_COUNT_SCALE
+        assert torch.allclose(outs[0][:, 3], expected)
+        assert torch.allclose(outs[1][:, 0], expected)
+    finally:
+        for p in paths:
+            os.remove(p)
