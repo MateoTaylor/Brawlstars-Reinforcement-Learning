@@ -31,8 +31,9 @@ from brawl_vision.config import VisionConfig, validate
 from brawl_vision.object_detection import Detection
 from brawl_vision.object_detection.hp_detection import AmmoReading, read_ammo
 from brawl_vision.object_detection.hp_detection.hero_bars import (
-    AMMO_BAND, MAX_AMMO_SLOTS, PIP_PITCH_PX, PIP_WIDTH_PX, SUPER_BAND, _band_mask,
-    _bridged_runs, _runs, pip_mask, read_super, slot_fills,
+    AMMO_BAND, MAX_AMMO_SLOTS, PIP_PITCH_PX, PIP_WIDTH_PX, REF_VIEWPORT_H, SLOT_TOL_PX,
+    SUPER_BAND, _band_mask, _bridged_runs, _runs, is_plausible, pip_mask, read_super, slot_fills,
+    split_merged,
 )
 
 CLIP = "tests/fixtures/vision/bluestacks-example-new.mp4"
@@ -46,8 +47,16 @@ WHITE_BGR = (250, 250, 250)
 
 
 def synth_stack(fills=(1.0, 1.0, 1.0), *, pitch=PIP_PITCH_PX, pip_px=PIP_WIDTH_PX,
-                intruders=(), bar_len=112, size=(320, 420), no_digits=False, no_bar=False):
+                intruders=(), bar_len=112, size=(REF_VIEWPORT_H, 420), no_digits=False,
+                no_bar=False):
     """A frame carrying one hero readout stack, plus the `Detection` that encloses it.
+
+    **The frame must be `REF_VIEWPORT_H` tall, and the height is not decoration.** `read_ammo`
+    scales the pip width and pitch by `frame.shape[0] / REF_VIEWPORT_H`, because the widget scales
+    with the viewport, so a fixture that draws 1126-scale pips into a 320 px frame is describing a
+    screen that cannot exist -- and the reader, correctly, refuses to read it. This default was
+    320 while the reader ignored height; the two must now agree, and a test that wants a different
+    height must draw its pips at that height's scale too.
 
     Layout mirrors what was measured on real footage: white digits, then the HP bar 20 rows
     below their top, then the ammo track 18 rows below the bar. `intruders` are extra orange
@@ -266,6 +275,110 @@ def test_the_reported_row_is_in_frame_coordinates_not_crop_coordinates():
     r = read_ammo(frame, det)
     assert r.row > int(det.xyxy[1])
     assert r.row < frame.shape[0]
+
+
+# ---------------------------------------------------------------------------
+# the three defects a deployed run found. See the module docstring's table -- these are the
+# regressions for it, and each one is a real frame from tests/fixtures/vision.
+# ---------------------------------------------------------------------------
+
+def test_the_lattice_pitch_scales_with_the_viewport_or_the_third_pip_is_lost():
+    """Frame 29 of bluestacks-example-new.mp4, verbatim: three clean 31 px runs at 56/90/124 on a
+    1080-tall frame.
+
+    The lattice error ACCUMULATES with slot index, so this is not a rounding wobble -- at slot 2
+    the reference pitch lands 9 px away against a tolerance of 8, and the third pip is discarded
+    in silence. A full magazine reads 2.00, and which frames it happened to depended on which run
+    was longest that frame, so the same clip flickered between 2 and 3.
+    """
+    frame_29 = [(56, 31), (90, 31), (124, 31)]
+    at_reference_pitch = slot_fills(frame_29, PIP_WIDTH_PX)
+    assert at_reference_pitch[2] == 0.0
+    assert sum(at_reference_pitch) == pytest.approx(1.8, abs=0.1)
+
+    scale = 1080 / REF_VIEWPORT_H
+    scaled = slot_fills(frame_29, round(PIP_WIDTH_PX * scale), pitch=PIP_PITCH_PX * scale)
+    assert scaled[2] > 0.9
+    # 31 px against a scaled 33 is 0.94 a pip -- the +/-0.06 denominator floor the module
+    # docstring prices and declines to snap away, not a residue of the lattice error.
+    assert sum(scaled) == pytest.approx(2.82, abs=0.05)
+
+
+def test_a_full_magazine_at_a_lower_viewport_height_still_reads_three():
+    """The end-to-end form of the above: 1080-normalized footage, which is what every fixture clip
+    is and what `ClipReader` produces, against constants quoted at 1126."""
+    scale = 1080 / REF_VIEWPORT_H
+    frame, det = synth_stack((1.0, 1.0, 1.0), pitch=PIP_PITCH_PX * scale,
+                             pip_px=round(PIP_WIDTH_PX * scale), size=(1080, 420))
+    r = read_ammo(frame, det)
+    assert r is not None
+    assert r.ammo == pytest.approx(3.0, abs=0.1)
+
+
+def test_a_pip_pair_whose_seam_got_painted_reads_as_two_pips_not_one():
+    """Anti-aliasing across the few unpainted pixels between two pips merges them into one run.
+    Handing that to a single slot and then capping at 1.0 costs a whole pip for a frame -- which
+    is an ammo count that drops and comes back, i.e. an impossible reversal. 116 of 4108 painted
+    fixture frames carry a run wider than one pip."""
+    assert split_merged([(0, 72)], PIP_WIDTH_PX, PIP_PITCH_PX) == [(0, 34), (38, 34)]
+    assert slot_fills([(0, 72)], PIP_WIDTH_PX) == pytest.approx((1.0, 1.0, 0.0), abs=0.02)
+
+
+def test_a_whole_track_painted_as_one_run_reads_three():
+    assert slot_fills([(0, 111)], PIP_WIDTH_PX) == pytest.approx((1.0, 1.0, 1.0), abs=0.05)
+
+
+def test_split_merged_leaves_a_run_inside_one_pips_slack_alone():
+    """A pip renders 33-35 px against a calibrated 34, so the split must not fire on the ordinary
+    spread -- cutting a single 35 px pip in two would invent ammo out of anti-aliasing."""
+    for length in (33, 34, 35, 40):
+        assert split_merged([(7, length)], PIP_WIDTH_PX, PIP_PITCH_PX) == [(7, length)]
+
+
+def test_is_plausible_admits_a_reloading_partial_and_rejects_a_hole():
+    """The bar fills from the LEFT. Full pips, then at most one partial, then empties -- every
+    other shape is a misread, with no temporal assumption needed to say so."""
+    assert is_plausible((1.0, 1.0, 1.0))
+    assert is_plausible((1.0, 0.4, 0.0))
+    assert is_plausible((0.0, 0.0, 0.0))
+    assert is_plausible((0.94, 1.0, 1.0))          # anti-aliasing, not a hole
+    assert not is_plausible((0.3, 1.0, 1.0))
+    assert not is_plausible((1.0, 0.0, 1.0))
+
+
+def test_a_scrap_one_pitch_LEFT_of_the_track_makes_the_frame_unreadable():
+    """The worst intruder is not one that adds a pip, it is one that lands ON the lattice to the
+    left of slot 0: every real pip shifts one slot right and the third falls off the end. The
+    reading stays inside 0..3 and looks entirely reasonable -- it was 2.29 here -- which is why
+    the slot PATTERN and not the total is what catches it."""
+    frame, det = synth_stack((1.0, 1.0, 1.0), intruders=((-int(PIP_PITCH_PX), 10),))
+    assert read_ammo(frame, det) is None
+
+
+def test_a_row_of_orange_scraps_is_unreadable_not_an_almost_empty_magazine():
+    """A 6 px fleck of map is not 18% of a pip. MEASURED: frames like this were 21% of the
+    impossible reversals, every one of them a confident low reading between two neighbours that
+    agreed with each other."""
+    frame, det = synth_stack((), intruders=((0, 6), (20, 5)))
+    assert read_ammo(frame, det) is None
+
+
+def test_a_band_wider_than_the_whole_track_is_unreadable_not_a_full_magazine():
+    """Insurance for the hole `split_merged` opens: an orange band across the row used to read
+    1.0 (one slot, capped), and cut on the lattice it would read a plausible 3.0 instead. No
+    fixture frame trips this -- it is here because the failure it prevents is invisible."""
+    frame, det = synth_stack((), intruders=((0, 130),))
+    assert read_ammo(frame, det) is None
+
+
+def test_an_unreadable_frame_returns_None_rather_than_the_number_it_almost_had():
+    """The contract `read_ammo` has always claimed, now enforced on its own output as well as on
+    its inputs: `None` means could not read, never a guess. The shadow state skips a `None` and
+    RESYNCS ONTO a number, so a wrong reading is strictly worse than a missing one."""
+    for kwargs in ({"intruders": ((0, 6),)}, {"intruders": ((0, 130),)},
+                   {"fills": (1.0, 1.0, 1.0), "intruders": ((-int(PIP_PITCH_PX), 10),)}):
+        fills = kwargs.pop("fills", ())
+        assert read_ammo(*synth_stack(fills, **kwargs)) is None
 
 
 # ---------------------------------------------------------------------------

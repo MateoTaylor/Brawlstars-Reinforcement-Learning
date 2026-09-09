@@ -22,7 +22,8 @@ from brawl_sim.config import load_config
 from brawl_sim.env import BrawlVecEnv
 from brawl_deployment.control.buttons import ATTACK_FIRE, ATTACK_NONE, ATTACK_SUPER
 from brawl_deployment.perception.shadow import (
-    DESYNC, GRACE, NO_READ, OK, SUSPECT, ShadowHero, ShadowParams,
+    AMMO_TOLERANCE, AMMO_TOLERANCE_UNPAINTED, DESYNC, DESYNC_GRACE_SECONDS, GRACE, NO_READ,
+    OK, SUSPECT, ShadowHero, ShadowParams,
 )
 from brawl_vision.object_detection.hp_detection.hero_bars import AmmoReading, SuperReading
 
@@ -513,7 +514,9 @@ def test_a_dropped_dash_trips_only_after_three_consecutive_strikes():
     shadow = _shadow()
     shadow.advance(1.0)
     shadow.act(1, ATTACK_FIRE)
-    shadow.advance(1.0)                       # past the grace window
+    shadow.advance(0.4)
+    shadow.act(1, ATTACK_FIRE)                          # TWO -- see the one-shot test below
+    shadow.advance(DESYNC_GRACE_SECONDS + 0.1)          # past the grace window
     assert shadow.observe()["ammo"] < 2.5
 
     statuses = [shadow.check_ammo(_ammo(3.0)).status for _ in range(3)]
@@ -546,6 +549,35 @@ def test_a_missing_read_neither_strikes_nor_clears():
     assert shadow.strikes == 1
 
 
+def test_a_shadow_ABOVE_the_read_is_forgiven_up_to_a_whole_pip():
+    """`read_ammo` sums painted fill, and the second live deployment showed it detects a
+    RECHARGING pip only intermittently -- 2.00 -> 2.56 -> 2.00 inside half a second while the true
+    value climbed monotonically. Unpainted pixels can only lose ammo, never invent it, so a shadow
+    sitting up to one pip above the read is exactly what a missed partial looks like.
+
+    A symmetric 0.5 sits below that sensor's own noise floor (p90 of |error| was 0.64) and
+    manufactured all three of that run's resyncs."""
+    assert AMMO_TOLERANCE_UNPAINTED > AMMO_TOLERANCE
+
+    shadow = _shadow()
+    shadow.advance(10.0)                       # full clip, no attack, well outside grace
+    shadow.ammo = 2.6
+    for _ in range(5):
+        assert shadow.check_ammo(_ammo(2.0)).status == OK      # the read missed the partial
+    assert shadow.strikes == 0
+
+
+def test_a_shadow_BELOW_the_read_keeps_the_TIGHT_bound_because_that_is_the_real_failure():
+    """The asymmetry must not cost sensitivity in the direction the canary exists for. A read
+    ABOVE the shadow means the game is holding ammo we already spent -- our taps are not landing --
+    and no amount of missing paint can produce that, because missing paint reads LOW."""
+    shadow = _shadow()
+    shadow.advance(10.0)
+    shadow.ammo = 2.0
+    statuses = [shadow.check_ammo(_ammo(2.6)).status for _ in range(3)]
+    assert statuses == [SUSPECT, SUSPECT, DESYNC]
+
+
 def test_the_grace_window_covers_the_frame_that_was_captured_before_the_tap():
     shadow = _shadow()
     shadow.advance(1.0)
@@ -556,12 +588,59 @@ def test_the_grace_window_covers_the_frame_that_was_captured_before_the_tap():
     assert shadow.strikes == 0
 
 
+def test_the_grace_window_outlasts_the_measured_tap_to_pip_delay():
+    """The first live deployment measured 0.50-1.25 s from a modelled tap to the bar showing the
+    spend, and the window was 0.30 -- so every burst manufactured a desync, and all four of that
+    run's resyncs were false. A window shorter than the delay does not merely waste the
+    fail-closed budget: the resync ADOPTS the CV reading, so a trip inside the delay writes a
+    stale ammo value into the shadow and causes the next trip. Resync 2 of run1 was resync 1's
+    doing.
+
+    1.25 s is the worst clean observation from that run. Pinning it here means shortening the
+    window has to argue with the measurement rather than with a comment."""
+    assert DESYNC_GRACE_SECONDS > 1.25
+
+    shadow = _shadow()
+    shadow.advance(1.0)
+    shadow.act(1, ATTACK_FIRE)                 # shadow spends immediately; the game has not yet
+    shadow.advance(1.25)
+    assert shadow.check_ammo(_ammo(3.0)).status == GRACE
+    assert shadow.strikes == 0
+
+
 def test_the_canary_is_live_again_through_the_reload():
+    """Blind during the delay, awake for the rest. Mortis's reload is 2.25 s per pip, so the
+    window has to expire well inside it or the canary never sees the reload it exists to check."""
+    assert DESYNC_GRACE_SECONDS < 2.25, "a window longer than one reload would mute it forever"
     shadow = _shadow()
     shadow.advance(1.0)
     shadow.act(1, ATTACK_FIRE)
-    shadow.advance(0.40)
+    shadow.advance(0.4)
+    shadow.act(1, ATTACK_FIRE)
+    shadow.advance(DESYNC_GRACE_SECONDS + 0.05)
     assert shadow.check_ammo(_ammo(3.0)).status == SUSPECT
+
+
+def test_a_SINGLE_unlanded_shot_is_below_the_canary_and_that_is_the_price_of_the_window():
+    """**A limitation, asserted so it is a known one.** Widening the grace to the measured 1.5 s
+    tap-to-pip delay costs single-shot sensitivity: the reload refills 0.44 pips/s, so by the time
+    the window expires a lone missing spend has regrown to within `AMMO_TOLERANCE` and reads as
+    agreement.
+
+    That is the right trade rather than a regression. At 0.30 s the canary was not detecting
+    dropped shots either -- it was firing on TRUE readings the game had not drawn yet, four times
+    in the 41 s of run1, and each false trip wrote a stale value into the shadow. And the failure
+    the canary actually exists for -- input stopping altogether -- is never one shot; two are
+    already loud, which the test above pins.
+
+    If single-shot detection is ever wanted, the fix is not a shorter window: it is comparing CV
+    against the shadow as it was one delay ago, which needs a history this class does not keep."""
+    shadow = _shadow()
+    shadow.advance(1.0)
+    shadow.act(1, ATTACK_FIRE)
+    shadow.advance(DESYNC_GRACE_SECONDS + 0.05)
+    assert shadow.check_ammo(_ammo(3.0)).status == OK
+    assert shadow.observe()["ammo"] > 2.5
 
 
 # ---------------------------------------------------------------------------

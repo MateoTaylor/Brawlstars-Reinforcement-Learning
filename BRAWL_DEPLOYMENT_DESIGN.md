@@ -7,8 +7,9 @@ tested** — `brawl_deployment/{capture,match_state}.py`, `control/`, `perceptio
 `tests/test_deployment_{control,tracker,projectiles,shadow,grid}.py` +
 `tests/test_vision_{hero_bars,hud}.py` (222 passed).
 Injection is confirmed live in the training ground (§4.1); the vision stack is confirmed to
-transfer to BlueStacks unmodified (§9.4); both detectors run on the GPU and a 20 Hz tick measures
-36.2 ms against its 50 ms budget (§7.1). **Every field in the observation spec now has a supplier** — every CV one has a reader and
+transfer to BlueStacks unmodified (§9.4); both detectors run on the GPU, and the assembled loop measures
+27.1 ms of stage work per perception tick and 34.7 ms per decision tick, plus a ~24 ms grab -- which
+is what set the perception rate at **12 Hz**, decisions staying at the trained 4 Hz (§6.13). **Every field in the observation spec now has a supplier** — every CV one has a reader and
 every proprioceptive one has the shadow, which is checked field-for-field against a live
 `BrawlVecEnv`. The policy that will consume them exists too: `runs/mortis_deploy-20260907-041522`
 trained 300M steps against `configs/agent_obs_deploy.yaml`. **`assemble.py` is BUILT and
@@ -16,8 +17,13 @@ proven against the sim** (§6.6) — `tests/test_deployment_assemble.py` runs a 
 `BrawlVecEnv`, feeds the assembler the same frame through the deployed suppliers' interfaces,
 and asserts the result equals `obs_select.build_agent_obs`'s column-for-column, on both deploy
 specs. **`policy.py` is BUILT too** (§6.7): the checkpoint loads behind four guards against
-being paired with the wrong observation, and runs on the CPU at 0.96 ms/decision. **Still
-design: `loop.py`, `window.py` and `config.py` — the loop has no driver.**
+being paired with the wrong observation, and runs on the CPU at 0.96 ms/decision. **`loop.py` is BUILT (§6.13) and the
+pipeline is end-to-end**: `scripts/deploy_run.py --dry-run` builds window, capture, both
+detectors, the checkpoint and the calibration, and decides for real against a `NullBackend`.
+**Nothing in the package is unbuilt.** `control/calibration.py` and
+`scripts/deploy_calibrate.py` are built too (§6.14), and both exist to *measure* — so what is
+left is not a design question at all. **The friendly battle in §10.11 is the only blocking
+item, and it is an operator task.**
 **The `zone` group's supplier is decided (§9.14, §9.15, §9.16).** Two ablation passes price the
 whole group at 10.4 pp and every realistic degradation of it — a countdown pinned to zero, margins
 stale by six seconds, margins clamped to what the camera reaches — at 0–4 pp against a 1.5 pp
@@ -70,7 +76,8 @@ no privileged information and must recover identity and velocity from anonymous 
 detections. §6.1.
 
 Recommended order: ~~§4 spike~~ **done** → ~~§5~~ **done** → ~~§6.1~~ **done** → ~~§6.3 shadow
-state~~ **done** → §6.2 grid → `loop.py`.
+state~~ **done** → ~~§6.2 grid~~ **done** → ~~`loop.py`~~ **done** → ~~`deploy_calibrate.py`~~ **done** →
+**§10.11, a friendly battle. That is the whole remaining list.**
 
 ---
 
@@ -82,7 +89,7 @@ state~~ **done** → §6.2 grid → `loop.py`.
                        BlueStacks (fullscreen, one monitor)
                                     │
                     ┌───────────────┴───────────────┐
-                    │  20 Hz                        │  4 Hz
+                    │  12 Hz                        │  4 Hz
                     ▼                               ▼
         ┌───────────────────────┐       ┌───────────────────────┐
         │ PERCEPTION TICK       │       │ DECISION              │
@@ -112,34 +119,50 @@ state~~ **done** → §6.2 grid → `loop.py`.
 
 ### 1.2 Two rates, and why it is not one
 
-**Capture and odometry run at 20 Hz. Decisions happen at 4 Hz, on every 5th frame.**
+**Perception runs at 12 Hz. Decisions happen at 4 Hz, on every 3rd frame.**
 
-This is not a performance hedge, it is forced by an existing measured constant.
-`configs/vision.yaml` sets `odometry.max_shift_tiles: 2.0` and its own comment states the bound
-is **per frame, not per second**, sized against Mortis's charged dash at 0.89 tiles/frame *at 20
-Hz*. Capture at 4 Hz and the same dash moves 4.45 tiles between frames, blowing through the gate;
-every frame of a dash reads as a cut and camera tracking drops. The comment says so directly:
-"raise it if the capture rate drops."
+They are not the same kind of number, and the first version of this section had that wrong by
+deriving both from `cfg.dt`:
 
-So the loop captures at the sim's *tick* rate and decides at the sim's *decision* rate, which is
-the same 20 Hz / 4 Hz split `brawl_sim` already runs internally (`dt=0.05`, `action_repeat=5`,
-`agent_dt=0.25`). The deployed loop mirrors the trained one rather than inventing a new cadence.
+- **The decision period is DERIVED and not settable**: `cfg.dt * cfg.action_repeat` = 250 ms,
+  read out of the run's own env config. The policy chose actions on that rhythm, so a different
+  one is an agent stepping at a cadence it never trained on, with nothing on screen to show for it.
+- **The perception period is a SETTING** (`loop.tick_hz`), because the checkpoint has no opinion
+  about it: it never sees the refreshes between its own decisions. `config.resolve_rates` admits
+  only rates that divide the decision period into a whole number of ticks -- 20 / 16 / 12 / 8 for
+  this checkpoint -- and raises rather than rounding.
 
-The cheap stages run at 20 Hz (odometry ~7.5 ms/frame measured, ring score is a few hundred
-microseconds at 1–3 anchors). The expensive stages — YOLO, HP reading, projection, assembly,
-policy — run at 4 Hz. Held actions between decisions are exactly the sim's `_held` semantics:
-movement persists, the fire bit does not repeat.
+Perception is not free to be slow, though, and that is what pins the floor. `configs/vision.yaml`
+sets `odometry.max_shift_tiles: 2.0` and its own comment states the bound is **per frame, not per
+second**, sized against Mortis's charged dash at 0.89 tiles/frame *at 20 Hz*. Decide-rate capture
+(4 Hz) would move the same dash 4.45 tiles between frames; every frame of a dash would read as a
+cut, and a cut is not a dropped frame -- `Odometry._cut` resets the occupancy map and drops every
+track. `validate` refuses any tick rate that crosses the bound, which is why 8 Hz is not on the
+list of admissible rates even though it divides the period cleanly.
 
-`shadow.advance` sits on the 20 Hz side because it is the thing that *keeps* those two rates
-honest: it takes the real elapsed seconds and spends them as whole `dt` sub-ticks, so a decision
-that ran long is a decision that consumed more of them rather than one that quietly desynced the
-hero's cooldowns from the game's. §6.3.
+**12 rather than the sim's own 20 is a MEASURED choice** (6.13): at 20 Hz the stage work plus a
+live grab does not fit inside 50 ms, and the pacer deliberately does not sleep on an overrun, so
+20 Hz produced a *jittering* period rather than a slow one -- and a decision window near 263 ms
+instead of the trained 250. At 12 Hz (83.3 ms) every measured tick fits with at least 18 ms to
+spare and the decision window is exactly 250 ms. The price is a dash at 1.48 tiles/frame instead
+of 0.89, 74% of the bound.
 
-`grid` is split across both rates for a reason worth naming. `grid.observe_zone` is a 20 Hz
+The cheap stages run every tick (odometry ~7.5 ms/frame measured, ring score is a few hundred
+microseconds at 1-3 anchors). The expensive stages -- YOLO, HP reading, projection, assembly,
+policy -- run every decision. Held actions between decisions are exactly the sim's `_held`
+semantics: movement persists, the fire bit does not repeat.
+
+`shadow.advance` sits on the every-tick side because it is the thing that *keeps* those two rates
+honest: it takes the real elapsed seconds and spends them as whole `cfg.dt` sub-ticks, so a
+decision that ran long is a decision that consumed more of them rather than one that quietly
+desynced the hero's cooldowns from the game's. Being denominated in real seconds rather than in
+ticks is also what made the perception rate movable at all. 6.3.
+
+`grid` is split across both rates for a reason worth naming. `grid.observe_zone` is an every-tick
 deposit because the gas map accumulates and a skipped frame is evidence thrown away, while
-`grid.build` is a 4 Hz read because the grid is only ever consumed by a decision. That is the same
-split `occupancy` already uses, and it is why `GasMap` holds state and `GridBuilder.build` is a
-pure function of it. §6.2.
+`grid.build` is a per-decision read because the grid is only ever consumed by a decision. That is
+the same split `occupancy` already uses, and it is why `GasMap` holds state and `GridBuilder.build`
+is a pure function of it. 6.2.
 
 ### 1.3 What `CONVENTIONS.md` does and does not govern
 
@@ -160,29 +183,37 @@ backwards.
 ```
 brawl_deployment/
   __init__.py           # the boundary docstring, as brawl_vision has
-  config.py             # DeploymentConfig <- configs/deployment.yaml
-  window.py             # locate BlueStacks, verify geometry, resolve monitor index
-  loop.py               # the 20 Hz / 4 Hz driver; owns the safety gate
-  match_state.py        # in-match detection + hysteresis (wraps gameplay.py)
+  config.py             # DeploymentConfig <- configs/deployment.yaml                  BUILT
+  window.py             # locate BlueStacks, verify geometry, resolve monitor index   BUILT
+  capture.py            # window crop -> normalized viewport frames, every tick       BUILT
+  loop.py               # the 12 Hz / 4 Hz driver; owns the safety gate               BUILT
+  match_state.py        # in-match detection + hysteresis (wraps gameplay.py)         BUILT
   policy.py             # checkpoint load, action masking, predict                   BUILT
   perception/
     __init__.py
     tracker.py          # detections -> index-stable slots + velocity            BUILT
-    projectiles.py      # projectile boxes -> velocity + time-to-closest, 20 Hz   BUILT
+    projectiles.py      # projectile boxes -> velocity + time-to-closest, tick   BUILT
     shadow.py           # dead-reckoned own-state, checked against the CV readers      BUILT
     grid.py             # occupancy + tracks -> the (8, 13, 21) view grid              BUILT
+    zone.py             # GasMap -> the spec's four zone fields (NOT terrain/zone.py)  BUILT
     assemble.py         # -> obs dict matching the deployed spec, via obs_select      BUILT
   control/
     __init__.py
-    backend.py          # InputBackend protocol + a NullBackend for dry runs
-    adb.py              # persistent-contact sendevent backend
-    keymap.py           # Win32 SendInput keystroke backend
-    joystick.py         # move_bin -> anchor-relative contact point
-    buttons.py          # attack / super tap geometry
-    calibration.py      # anchor, saturation radius, button coords -> data/*.json
+    backend.py          # InputBackend protocol + a NullBackend for dry runs         BUILT
+    adb.py              # persistent-contact sendevent backend                       BUILT
+    joystick.py         # move_bin -> anchor-relative contact point                  BUILT
+    buttons.py          # attack / super tap geometry                                BUILT
+    calibration.py      # button re-fit + the live tap/move verifications       BUILT
   data/
     control_calibration.json    # MEASURED, regenerated not edited
+scripts/
+  deploy_run.py         # the entry point; --dry-run drives a NullBackend            BUILT
+  deploy_calibrate.py   # regenerates data/control_calibration.json                BUILT
 ```
+
+`keymap.py` is gone from this list rather than pending: §4.1 settled on the ADB backend, and a
+second input path that no code selects is a maintenance cost with no reader. **Every file
+above is built**; what remains is running the two live scripts against a real match (§10.11).
 
 Same settings-vs-measurements split `configs/vision.yaml` documents: tunables you argue about go
 in `configs/deployment.yaml`, outputs of a calibration script go in `brawl_deployment/data/*.json`.
@@ -385,17 +416,23 @@ Action masking must be applied at inference the same way `MaskablePPO` saw it in
 super is not charged, bin 2 is masked out. `hero.action_mask` is the sim-side reference; the
 deployed equivalent reads super readiness off the HUD (§6.3).
 
-### 4.5 Calibration
+### 4.5 Calibration — BUILT 2026-09-08, see §6.14
 
 `control/calibration.py`, run once per resolution/UI-scale, output to
 `brawl_deployment/data/control_calibration.json`, regenerated rather than hand-edited:
 
-- `anchor` — chosen joystick touch-down point.
-- `radius_px` — saturation radius (§4.3).
+- `anchor` — chosen joystick touch-down point. **MEASURED** (§4.3), by hand; no script reproduces
+  it, which is why `update_calibration` replaces blocks rather than the file.
+- `radius_px` — saturation radius (§4.3). **MEASURED** the same way.
 - `attack`, `super` — button centres and radii. **Reuse `gameplay.calibrate_buttons`**, which
   already finds these from a temporal median via `HoughCircles` + `ring_score_at` refinement, and
-  already handles the fact that this game ships two different HUD layouts.
+  already handles the fact that this game ships two different HUD layouts. **BUILT** — it took two
+  new parameters rather than a copy, because `RADIUS_PX` had to widen for this HUD only (§5).
 - `rest_anchor` — bottom-left resting stick position, for the contact-loss detector (§4.2).
+  **NOT BUILT, and named rather than quietly skipped.** It needs a knob finder validated against a
+  frame showing a *released* stick, and no fixture is known to contain one. Every other desync
+  signal §6.3 names (the ammo canary, position divergence) is wired, so this buys a third one and
+  costs an unvalidated radius — and radii are exactly what §4.5 below says not to trust.
 
 **Radii do not transfer across frame sources; centres do.** This was found the hard way, live.
 The same gadget button fits `r = 33.2` on the OBS recording's temporal median and `r = 39.9` on a
@@ -474,15 +511,18 @@ gap-filled run; live has no future frames. The adaptation:
 
 - **Calibrate once at startup** from `median_frame` over N frames captured while the user is in a
   match, then cache. Per-frame cost afterwards is `ring_score_at` at 1–3 anchors — microseconds,
-  affordable at 20 Hz.
+  affordable at every perception tick.
 - **Replace "longest run" with hysteresis.** `longest_span`'s job was rejecting flicker in both
   directions; live, the two directions have very different costs. Entering gameplay wrongly means
   spraying inputs at a menu; exiting wrongly means standing still for a beat. So: **enter** needs
   a sustained run above threshold, **exit** is fast but not instant.
 - The reason exit cannot be instant is documented in `gameplay.py` itself: *"a Super detonating
   over the button drops the score for a few frames in the middle of a match, and those frames are
-  gameplay."* Require K consecutive sub-threshold samples. Suggested starting point: enter on 10
-  consecutive (0.5 s at 20 Hz), exit on 6 (0.3 s), both tuned against a real clip before trusting.
+  gameplay."* Require K consecutive sub-threshold samples. **These are DURATIONS -- 0.5 s to
+  enter, 0.33 s to exit -- expressed in perception ticks**, so the counts move with `loop.tick_hz`:
+  they were 10 and 6 at 20 Hz and are **6 and 4** at the shipped 12 (§6.13). Leaving them at 10/6
+  would have stretched the exit to half a second of input into a results screen, which is the one
+  direction the gate exists to be fast in. `data/control_calibration.json` records both.
 
 **The safety gate.** On exit: release every contact, stop emitting input, keep capturing. This is
 what stops the agent hammering the end-of-round menu. It should be a hard interlock in `loop.py`
@@ -920,6 +960,74 @@ firing silently inside a check would hide the very failure the check exists to r
 fire, every unobservable timer is reseeded to the state that offers the policy *less*: a full
 cooldown, no dash, no i-frames, an uncharged long dash, no super.
 
+**And the resync must ADOPT the reading that tripped it.** `resync()` takes the reading as an
+optional argument and `loop.py` was calling it bare: the timers were reseeded and the strike
+count cleared, but `ammo` kept the value that had just failed the comparison. The canary then
+re-tripped three reads later, every time, spending `shadow.max_resyncs` and stopping the match
+on a gap it was holding the correction for. This matters more than a plain oversight would,
+because the operator has stated that `configs/brawlers.yaml`'s `move_speed`, `attack_cooldown`
+and `reload_seconds` are **approximations** fitted for training rather than measurements of
+this build: a `reload_seconds` that is merely a little wrong is exactly what produces a steady
+one-sided ammo gap, and converging on CV is what keeps that a logged note instead of a stopped
+match. Found by writing the telemetry test below, not by a live run.
+
+**The window was sized for one decision period and the delay is four.** The first real deployment
+(run1.csv, 2026-09-09, 41 s, 155 decisions, 7 attacks) measured the gap between a modelled tap
+and the pip bar reading one lower at **0.50-1.25 s, median 1.00** -- and `verify_tap` needs a
+0.9 s `TROUGH_WINDOW_S` to catch the same drop, which is the same number from the other side.
+`DESYNC_GRACE_SECONDS` was 0.30. Every one of that run's four resyncs followed an attack
+cluster by 1-2 s, and not one was a real desync:
+
+| t | shadow | CV | what actually happened |
+|---|---|---|---|
+| 7.94 s | 1.22 | 2.00 | two taps modelled at 6.69 and 7.19; the bar had drawn only the first |
+| 8.69 s | 2.18 | 1.00 | the second spend landed -- against a shadow the FIRST resync had just set from a stale read |
+| ~29 s | -- | -- | tap at 27.19, bar moved at 28.44 |
+| ~38 s | -- | -- | taps at 36.94 and 37.44, bar moved at 38.19 and 38.44 |
+
+Two things follow. A window shorter than the observable delay does not merely waste the
+fail-closed budget -- because a resync ADOPTS the CV value, a trip inside the delay writes a
+**stale** ammo into the shadow and manufactures the next trip; row two is row one's doing.
+And it does not matter which half of the delay is actuation (ADB to emulator to game) and
+which is the swing animation plus the bar drain: the canary compares against what is on
+screen, so the window must cover the whole observable path either way.
+
+The window is now **1.5 s** -- the worst clean observation plus one decision period. The price
+is single-shot sensitivity: at 0.44 pips/s a lone missing spend regrows inside `AMMO_TOLERANCE`
+before the window expires. That is the right trade, because at 0.30 s the canary was not
+catching dropped shots either -- it was firing on true readings -- and the failure it exists
+for, input stopping altogether, is never one shot. Two are already loud.
+
+Run1 also showed `read_ammo` returning a spurious **0.00 or 1.00 off a full clip** about once
+in 60 reads, for one or two samples and never three, which `DESYNC_STRIKES = 3` absorbs unaided.
+
+**And the comparison is asymmetric, because the sensor's error is.** The second live deployment
+(2026-09-09, 38 s, 141 decisions, 9 attacks) tripped three more times, all NEGATIVE -- the
+shadow above the read, the opposite of run 1. `read_ammo` sums PAINTED pip fill, and it detects
+a *recharging* pip only intermittently: CV read 2.00 -> 2.56 -> 2.00 inside half a second at
+t=16.5, and 2.00 -> 2.65 -> 2.00 at t=17.7, while the true value climbed monotonically and the
+shadow sat between them. Outside the grace window that run's |error| was median 0.12, **p90
+0.64**, max 1.56 -- so a symmetric 0.5 tolerance sits BELOW the sensor's own noise floor.
+
+Unpainted pixels can only lose ammo, never invent it, so the two directions are not the same
+evidence:
+
+| direction | meaning | bound |
+|---|---|---|
+| read **above** shadow | the game holds ammo we already spent — **our taps are not landing**, the failure the canary exists for. Missing paint reads LOW, so nothing about the sensor can produce this. | `AMMO_TOLERANCE` 0.5, unchanged |
+| read **below** shadow | a recharging pip the detector missed | `AMMO_TOLERANCE_UNPAINTED` 1.0 |
+
+Replaying that run's 100 reads through the strike machine: symmetric 0.5 trips 3 times, at
+exactly the t=17.7 / 23.5 / 28.2 seen live; asymmetric trips **0**, while still flagging 6 of
+7 samples of an injected "no input lands" failure -- the same as the tight rule. Flooring both
+sides to whole pips was tried first and is **worse** (6 trips): it turns a 2.99-against-3.00
+boundary into a full pip of disagreement.
+
+Two runs, two opposite false-positive mechanisms, one lesson: **this canary compares a
+continuous dead-reckoned value against a lagged, intermittent sensor, and every bound on it
+has to come from that sensor's measured behaviour rather than from what half a pip sounds
+like.**
+
 **Position is a ceiling, not a threshold.** This section named position as the second desync
 signal. A symmetric "CV position diverged from the prediction" check is not implementable and would
 be useless if it were — the shadow has no terrain, so every wall the hero walks into reads as
@@ -1220,6 +1328,59 @@ reporting not-ready rather than holding a stale one. **Brawlers left** it cannot
 Sustained disagreement on ammo is the desync signal, and §8's fail-closed path is where that ends
 up.
 
+#### The ammo reader was quietly wrong, and the shadow state is what noticed — CORRECTED 2026-09-09
+
+§6.3's canary compares a dead-reckoned ammo count against `read_ammo` once per decision. Two live
+runs kept tripping it, and the fixes in §6.3 (a wider grace window, an asymmetric tolerance) were
+both about the *comparison*. They were necessary and they were not sufficient, because the third
+possibility had not been priced: **the instrument itself was wrong**, often, and confidently.
+
+Scored over **4685 frames of six fixture clips** with no ground truth at all, on two things that
+cannot physically happen — a pip fuller than the one to its left, and a whole-pip change reversed
+inside 0.3 s, which is faster than any reload or any two shots:
+
+| reader | non-monotonic frames | impossible reversals | unreadable |
+|---|---|---|---|
+| as shipped through both live runs | 83 (1.77%) | **99 of 182 (54.4%)** | 0 |
+| + constants scaled to the viewport | 87 (1.86%) | 92 of 179 (51.4%) | 0 |
+| + merged runs split | 83 (1.77%) | 93 of 185 (50.3%) | 0 |
+| **+ both plausibility gates (ships now)** | **0 (0.00%)** | **48 of 129 (37.2%)** | 213 (4.55%) |
+
+**More than half of the ammo changes this reader reported were impossible.** Three causes, and
+only two of them are causes:
+
+1. **The pip constants did not scale with the viewport.** The opening paragraph of this section
+   already recorded that the widget scales with height and that 34 px was "right at deployment by
+   luck" — what it missed is that the *lattice* error accumulates with slot index. `slot_fills`
+   tests each run against `k · pitch`, so at slot 2 a 2.5 px pitch error lands 5 px off and a
+   34 px pitch lands 9 px off, past the 8 px tolerance. **The third pip is silently discarded and
+   a full magazine reads 2.00** — frame 29 of `bluestacks-example-new.mp4`, three clean 31 px runs
+   at 56/90/124, reading `(0.91, 0.91, 0.00)`. Whether it happened depended on which run was
+   longest that frame, so the same full magazine flickered between 2 and 3. That flicker is what
+   the canary kept firing on.
+2. **Anti-aliasing merges two pips into one run**, and one run went to one slot and was then capped
+   at 1.0 — so a merge cost a whole pip for a frame. 116 of 4108 painted frames carry such a run.
+3. **A misread returned a number.** `read_ammo`'s docstring has always promised that `None` means
+   "could not read, never a guess", and it enforced that on its *inputs* (no digit row, no HP bar)
+   and never on its output. Two gates now do: a row whose longest run is not pip-sized, and a slot
+   pattern the widget cannot draw. This removed no cause at all and is the largest single
+   improvement in the table.
+
+**4.55% unreadable is the price, and for this consumer it is the right one.** The shadow skips a
+`NO_READ` and *resyncs onto* a number, so a wrong reading is strictly worse than a missing one —
+two live runs were stopped by false resyncs and none was ever harmed by a skipped comparison.
+Buying more was refused: treating a frame with no orange at all as unreadable rather than as the
+empty magazine it usually is reaches 37.2% → 33.8% reversals at **16.9% unreadable**, and blinds
+the reader exactly when Mortis is out of ammo — which is the state §6.15 measures reloads from.
+
+**The general lesson, and it is not about pips.** Every test in `tests/test_vision_hero_bars.py`
+draws its own synthetic frame at the calibrated scale with nothing behind it, and every one of
+them passed throughout. A fixture that is generated from the same constant the code under test
+uses cannot detect that the constant is wrong. What found this was a *consumer* with an
+independent model of the same quantity — which is exactly what §6.3's shadow state is, and is a
+second reason to keep it beyond the obs columns it fills.
+
+
 #### What I would revisit
 
 - ~~**`hero.hp_frac` has the same denominator problem.**~~ **Resolved by §9.10, and not the way
@@ -1230,9 +1391,12 @@ up.
   flat +400 to it for the hero and every enemy alike. The fix was to stop needing a denominator —
   the spec now takes absolute `hero.hp` / `entities.hp`, which is what the reader always produced.
   Worth keeping as a worked example of a measurement question that was really a modelling one.
-- **Pip pitch as a scale check.** Three equal segments at a known pitch is a free ruler. If the
-  measured pitch ever drifts from a third of the track, something upstream rescaled and the
-  calibrated-viewport assumption (§9.4) has broken.
+- ~~**Pip pitch as a scale check.**~~ **It was the thing that was broken, and it had already
+  broken — see the block above.** The note was right that the pitch is a free ruler and wrong
+  about which way the error would come: it expected deployment to rescale under a constant fitted
+  on the fixtures, and what actually happened is the reverse. The constant was quoted at 1126, the
+  fixtures are 1080, and `AmmoReading.pip_px` had been reporting the drift into a field nobody
+  read. A free ruler nobody looks at is not a check.
 
 ### 6.5 `entities.hp` — the enemy numeral, measured 2026-09-08
 
@@ -1396,6 +1560,781 @@ was *selected* under. **One hazard for `loop.py`:** a deterministic policy whose
 changing repeats one action forever. In the sim the state moves on and it self-corrects; against a
 frozen capture it does not, so a stuck-input detector belongs in the loop, not here.
 
+### 6.8 The whole stack against a live emulator — MEASURED 2026-09-08
+
+First time any of this ran against BlueStacks rather than a recorded clip. Mortis in Nulls Brawl's
+**Training Grounds**, four stationary dummies at 4000 HP, monitor at 1440p. Frames kept at
+`tests/fixtures/vision/live-training-20260908/` (gitignored) with a tracked manifest beside them.
+
+**Everything read-only passed, and most of it perfectly.**
+
+| stage | result |
+|---|---|
+| `find_adb_serial` | `127.0.0.1:5555` from `bluestacks.conf`, instance `Pie64` |
+| `find_touch_device` | derived `/dev/input/event4`, `abs_max` 32767, **from the live device** |
+| capture | 2558×1439 → 2002×1126 at **0.794× (a downscale)**, 26.7 ms median / 35.4 p95 against 50 ms |
+| match gate | `refine()` peak **0.891** vs a 0.45 threshold; **40/40** frames above it (0.849–0.891) |
+| detector | 4 enemy + 1 player, every box conf > 0.917, **9.4 ms** median |
+| `HealthTracker` | **160/160** enemy boxes read, all `== 4000`; **40/40** hero, all `== 8000` |
+| `read_ammo` / `read_super` | **40/40** each — 3.0/3 ammo (`pip_px` 35), super charged and `ready` |
+| detect + HP together | **11.1 ms** against the 250 ms decision budget |
+
+Two operational notes fall out. The detector's **first call costs 997 ms** (ONNX warm-up), so
+`loop.py` must warm it before the gate is allowed to open, or the first decision blows its budget
+by 4×. And `refine()` found its peak at the *stored* radius — the OBS-fitted calibration happened
+to transfer to the live `mss` source here. That is not a general licence to skip refining (see
+`control_calibration.json`'s own note on radii); it is what happened on this setup.
+
+**The action → screen chain is closed, and there is no y flip.** Four cardinal bins, ~0.9 s each,
+measured on the hero's own detected ground point:
+
+| bin | commanded | hero moved | cos |
+|---|---|---|---|
+| 1 | right, +x | (+86.4, +2.1) px | +1.000 |
+| 9 | left, −x | (−110.2, −0.8) px | +1.000 |
+| 5 | **down, +y** | (−11.2, **+62.5**) px | +0.984 |
+| 13 | up, −y | (−20.1, −107.5) px | +0.983 |
+
+**Mean cos = +0.992.** This is the assembled `Joystick` driving a live game, not the §4.3 spike —
+and `is_down` stayed **True** through `apply(0)`, so idle-is-a-position holds in practice.
+
+#### Three findings that change what gets built
+
+**1. An occluding window can change the VIEWPORT GEOMETRY — but only from a screen edge, and only
+one direction of it is caught. CORRECTED 2026-09-08, see below.**
+
+*What was originally written here:* "with an unrelated window over the emulator the same grab
+normalized to 2521×1418 instead of 2558×1439, so any overlap changes the geometry." **That claim
+was overstated and its evidence was confounded** — two samples, and the first was the lobby screen
+while the second was gameplay, which is a content difference of its own. It is recorded rather
+than deleted because the corrected version is narrower in a way that matters for what gets built.
+
+Controlled replacement: paste sub-`black_level` rectangles into one real 1440p grab and re-run
+`detect_content_box` + `normalize_viewport`. Baseline box (0, 2559, 0, 1438) → **2560×1439**.
+
+| occlusion | content box | `normalize_viewport` |
+|---|---|---|
+| centred window 1000×700 | unchanged | fine |
+| full-height band 400×1440 through the middle | unchanged | fine |
+| left-edge window 600×800 | 1960×1439 | **raises** |
+| right-edge window 600×800 | 1878×1439 | **raises** |
+| top strip 2560×120 | 2560×1319 | **succeeds — silently wrong** |
+| bottom strip 2560×120 | 2560×1320 | **succeeds — silently wrong** |
+| dark over 60% of every column | 2560×575 | **succeeds — silently wrong** |
+
+Three things follow, and each of them is smaller and more actionable than "refuse to run".
+
+- **Interior occlusion cannot move the box at all.** It is a *bounding* box, and pass 2 of
+  `detect_content_box` only ever reads `cols[0]`/`cols[-1]` and `rows[0]`/`rows[-1]`. A window in
+  the middle of the emulator — which is what mine was — corrupts *pixels*, not geometry. That is
+  an ordinary perception problem: bad detections, a bad gate score, nothing scaled.
+- **Horizontal loss is already guarded, loudly.** `normalize_viewport` compares width against
+  `height × aspect` and refuses to upscale.
+- **Vertical loss was unguarded and silent**, precisely *because* that width test is relative:
+  120 lost rows drop the target width to 2345 to match, the aspect test passes, and out comes a
+  well-formed 16:9 frame of less world. `DeployCapture` then resizes it to 2002×1126 and no stage
+  downstream can tell, while every projected tile coordinate is off by the height ratio.
+
+**Fixed:** `DeployCapture.MIN_HEIGHT_COVERAGE = 0.99` — the content box must span ≥99% of the
+grab's height, checked once on the first frame. A fullscreen 1440p grab spans 1439/1440 = 0.9993;
+a 15 px strip is already a 1% scale error, so the threshold sits far from both. Width gets no
+equivalent check: the aspect test covers it, and a legitimately pillarboxed source has a narrow
+box by design. `tests/test_deployment_capture.py` carries the table above as fixtures.
+
+**And the exposure is startup-only.** `ScreenCapture` computes the box once from `box_sample=5`
+frames and caches it (`capture.py:248`, `if self._box is None`); it is never recomputed. A window
+appearing mid-match cannot change the crop. So this was never the standing hazard §10.3 feared —
+it is a first-second-of-the-session condition, which is exactly the shape a startup guard closes.
+The operator instruction is correspondingly milder than "nothing may ever overlap": **have the
+screen clear when the loop starts**, and the guard enforces it.
+
+**2. Odometry reads ~0 in Training Grounds, correctly.** The arena fits on one screen, so the
+camera never scrolls, and odometry measures *camera* motion. Status was `"ok"` on 83/83 frames
+throughout. This is why the direction table above is measured on the hero's screen position
+instead: **odometry is the wrong instrument in a non-scrolling venue**, and a zero there is not a
+fault. Anything that tests odometry needs a real match.
+
+**3. ⚠ THE ATTACK TAP LANDED ON A VENUE-SPECIFIC BUTTON — and the fix is to stop aiming at the
+button at all.** The `super` and `gadget` anchors land correctly, but `attack` at viewport
+(1748, 1042) lands on a **green chevron button that exists only in this venue**, drawn on top of
+the real attack area. Taps there were unreliable: 2 of 3 consumed no ammo, and **the super
+discharged without ever being commanded**. Nothing raised — the tap "succeeded" every time.
+
+**Operator, correcting my diagnosis: attack is an AREA, not a button.** Any tap on the right side
+of the screen fires, so long as it does not overlap the Super or gadget buttons, and the attack
+stick *floats to the touch point* the way the movement stick does. So the anchor was not
+mis-aimed; it was aimed at a real button that swallowed the touch.
+
+That inverts the design decision. The attack tap point should be chosen by **clearance**, the same
+way §4.3 chose the joystick anchor, rather than by fitting the button sprite:
+
+- The measured `attack` centre stays in `control_calibration.json` as what it is — where the
+  button *is*, useful to the gate and to nothing else. It stops being the tap target.
+- The tap target becomes a **setting** in `configs/deployment.yaml`, in screen fractions, like the
+  joystick's `(0.18·W, 0.62·H)`. Proposed **`(0.88·W, 0.55·H)`** = device (1690, 594): right side,
+  ~330 px from gadget and ~450 px from super, well above the button cluster and well inside the
+  right edge. That is a number to argue about, not a measurement, so it belongs in the yaml.
+- **Verified by ammo, not by pixels.** Calibration taps once and asserts `read_ammo` decrements.
+  That check is venue-independent and would have caught the chevron immediately.
+
+This also *weakens* the rule the original finding set. Calibration still has to happen in a real
+match for the joystick and the gate, but a clearance-chosen attack point is immune to the
+two-HUD-layout hazard in a way a sprite-fitted one never was. Training Grounds remains fine for
+everything read-only, and the manifest says so per-stage. Recorded in `control/buttons.py`'s
+module docstring, which is where someone would otherwise "fix" the anchor back onto the sprite.
+
+### 6.9 `window.py` — BUILT
+
+Three jobs, all in service of one thing: making `mss` and the calibration agree about what is
+being captured. `DeployCapture` grabs a *monitor* and crops to whatever `detect_content_box`
+finds — it has no idea which window it is looking at.
+
+**Identity is the process image, not the title or the class.** The title is the instance name and
+is user-renameable (and BlueStacks rewrites it with FPS counters); the class name is Qt's and
+moves with the build. `HD-Player.exe` is stable, and matching it ties the window to the same
+installation `find_adb_serial` read the port from. Two instances open → **raise**, never pick one:
+the adb serial addresses exactly one of them, and choosing wrong gives an agent that watches one
+game and plays another.
+
+**DPI awareness is set before the first geometry call**, and this is the same failure shape as
+§6.8's silent rescale. A DPI-unaware process is *lied to* about window coordinates — Windows
+scales them — while `mss` makes itself aware and reports physical pixels. The two then disagree by
+the scale factor with everything looking self-consistent.
+
+**`monitor_index_for` never returns 0.** `mss.monitors[0]` is the union of every display, and on a
+multi-monitor desktop it matches any window; capturing it would hand `detect_content_box` a frame
+containing a second monitor, and the box would come back describing something that is not the
+game. Index is chosen by the window centre, cross-checked against Win32's own `MonitorFromWindow`.
+
+**Focus is deliberately NOT checked.** Touch goes in over ADB, so the agent keeps playing with the
+window unfocused — that is the whole reason §4.1 chose the ADB backend over `SendInput`. What
+`WindowGuard.check()` actually watches is narrower: the window still exists, is not minimized, and
+its client area has not moved or resized. It returns a *reason string* rather than raising,
+because the loop has to release its contacts before stopping and an exception in the middle of
+that is how a joystick contact gets left down.
+
+`require_fullscreen` defaults on: a windowed emulator is a different projection, not a smaller
+picture of the same one.
+
+#### The occlusion check, and the operating constraint it exposes
+
+`find_occluders` probes five points in the client area with `WindowFromPoint` and reports any
+window drawn on top. This is the **mid-session** half of §6.8's hazard: the content box is cached
+at startup, so a later window cannot move the crop, but it absolutely puts its own pixels where
+the game should be — which reads downstream as bad detections and a bad gate score, with nothing
+raising.
+
+It is kept separate from the geometry check because the two deserve different responses. **A moved
+window ends the run** (every calibrated coordinate is now wrong). **A window on top should pause
+it** — release contacts, keep capturing, resume when the view clears — because it is transient by
+nature and the world model survives it.
+
+Verified against the live desktop: with a fullscreen stand-in window, the probe correctly named
+the two windows sitting over it. Which surfaces the constraint plainly, and it is not a code
+problem: **on a single monitor, the emulator must be the frontmost window while the agent plays.**
+There is no arrangement where the operator watches over the agent's shoulder in another window on
+the same screen — `mss` grabs the desktop, so whatever is in front is what the pipeline sees.
+Pausing on occlusion is what makes that survivable rather than fatal: alt-tab away and the agent
+stands still; come back and it resumes.
+
+### 6.10 `config.py` + `configs/deployment.yaml` — BUILT
+
+Ordinary in shape — the same frozen dataclass, dotted-path table and absent-key-keeps-the-default
+loader as `brawl_sim/config.py` and `brawl_vision/config.py`. **What is interesting is the list of
+things that are deliberately not settings.**
+
+| not a knob | derived from | what a knob would cost |
+|---|---|---|
+| decision cadence | `cfg.dt * cfg.action_repeat` | a policy stepping at a rhythm it never trained at |
+| *the perception rate is the exception* | it IS a knob, `loop.tick_hz` | nothing -- the checkpoint never sees between-decision frames. It is still guarded: `resolve_rates` refuses a rate that does not divide the decision period, and `validate` refuses one that violates `odometry.max_shift_tiles`, a bound stated *per frame* (6.13) |
+| `time_frac` denominator | `cfg.max_episode_steps * cfg.dt` | a silently rescaled column, invisible because it clamps |
+| capture viewport | `load_camera_model().viewport` | a second source of truth for 2002×1126 |
+| monitor index | `window.monitor_index_for()` | capturing the wrong screen |
+| the env config and obs spec | the run's own `train.yaml` | an observation of the right *width* with the wrong columns |
+| gate refinement | always runs | 0.98 becomes 0.08 across frame sources |
+
+Every one of those, configured, produces a *running* agent that is wrong rather than an error.
+That is the criterion: a number goes in the yaml when a different value is a different judgment
+call, and gets derived when a different value is simply incorrect.
+
+`validate(cfg, sim_cfg, vision_cfg)` does the cross-checks the split makes possible. The one worth
+naming: at `dt = 0.20` a Mortis charged dash covers 3.56 tiles per frame against
+`max_shift_tiles = 2.0`, so **every dash would read as a camera cut** — caught at load, where
+otherwise it would show up as an agent that mysteriously loses its world model whenever it moves
+fast. It also refuses an `attack_tap` on the left half of the screen by name, since that is the
+movement joystick's half and a tap there *moves* rather than fires, silently.
+
+The attack tap point lands here as `control.attack_tap: [0.88, 0.55]` — §6.8's correction, as a
+setting, chosen for clearance. `test_deployment_config.py` pins it against the measured button
+centres in `control_calibration.json`, so any later move has to keep clearing Super and gadget by
+4× their radius.
+
+### 6.11 The crop box comes from the window, not from the pixels — MEASURED 2026-09-08
+
+**This closes §6.8 finding 1 properly, and the real cause was never occlusion.**
+
+The startup guard added in §6.8 fired on the first live run against a clean screen:
+
+```
+the detected content box is 1418 px tall out of a 1440 px grab (98.5%)
+```
+
+**1418 is the same number I had blamed on an overlapping window.** It is reproducible, and the
+diagnosis is: rows 0–13 of the grab are *exactly* black (mean 0.0 across the full width), rows
+14–20 ramp up, content starts at row 21. That band is the **Nulls Brawl lobby's own artwork**.
+Confirmed from the guest side: `wm size` reports 1920×1080 and the client rect is 2560×1440 —
+identical aspect, so BlueStacks adds no letterbox. Nothing is covering the screen. The app is
+simply not drawing there.
+
+So the content box is a function of **what the app happens to be rendering at startup**:
+
+| screen | inferred box | scale to 2002×1126 |
+|---|---|---|
+| gameplay | 2558×1439 | 0.783 |
+| **lobby** | 2560×**1418** | 0.794 |
+
+And `ScreenCapture` computes the box **once** and caches it. A loop started at the lobby — which
+is where every loop starts, since the agent has to be at a menu before a match — would crop 21
+real rows off every gameplay frame for the whole match: a **1.55% vertical rescale plus a 16.4 px
+offset** at the viewport, on every projected tile coordinate, with nothing raising.
+
+**The fix is to stop inferring.** `detect_content_box` answers "which pixels are lit", which is
+only the same question as "where does the game render" when the app draws to its edges. The window
+manager answers the actual question and does not care what is drawn: `DeployCapture.from_window`
+takes the crop rectangle from the client rect, resolving the monitor index and the box from one
+source so the two cannot disagree. Detection remains the default only for recorded clips, where
+there is no window to ask and the letterbox is baked in.
+
+Verified live: `from_window` gives 2560×1440 → 2002×1126 at 0.7820 × 0.7819 (the two axes agree),
+24.1 ms median against the 50 ms budget, and the first grab no longer pays for a five-frame box
+sample.
+
+**What this costs, stated honestly.** The window box keeps the two columns and one row that
+gameplay inference trimmed, so the same raw pixel lands ~1.6 px further left and ~1.0 px further
+up at the frame's far edge. That is 3% of a 48 px tile and well inside `MatchState.refine`'s ±12 px
+rescan — but it is a change to a geometry that was verified by the wall-blocks-on-the-tile-grid
+check, so **re-verify it against a real gameplay frame**; it is on the friendly-battle list.
+
+Two smaller corrections fall out. The `MIN_HEIGHT_COVERAGE` guard from §6.8 is **kept but
+demoted**: it now guards only the inference path, and is skipped when the box is supplied. And
+`live-training-20260908.manifest.json`'s `scale: 0.794` was wrong — it was `1126/1418`, computed
+on a lobby grab while the same row's `normalized_source` came from gameplay. Corrected to 0.783.
+
+**The guard earned its keep on its first run.** It was built to catch occlusion; it caught a
+different and more likely failure that had already been in the record for a day, mislabelled.
+
+---
+
+### 6.12 `perception/zone.py` — the last unsupplied group — BUILT 2026-09-08
+
+The four groups `assemble` needs had suppliers; `zone` did not. §9.14–§9.16 did the measuring and
+the operator took the call (§9.15: deploy on the current checkpoint). This is that call written
+down as code. `tests/test_deployment_zone.py`, 23 tests, in the siloed fast set.
+
+**`ZoneEstimator(cfg)` → `estimate(gas, hero_pos) -> {field: value}`.** Stateless between calls:
+everything it reports is a function of the `GasMap` handed in, so a `GasMap.reset` on a segment
+change needs no matching reset here. `hero_pos` is **world** tiles — `camera_relative +
+odometry.position_tiles`, the frame `GasMap` deposits in.
+
+| field | supplier | honesty |
+|---|---|---|
+| `hero_margin` | four ray scans over `gassed`, ±x/±y, capped at `cfg.zone_margin_horizon_tiles` | recoverable out to a horizon |
+| `active` | `gassed.any()` | truthful, and latches for free because `GasMap` is sticky |
+| `safe_area_frac` | `1 − gassed cells / (map_w · map_h)` over the map block | the group's weak column, knowingly |
+| `next_shrink_in` | pinned at `0.0` | a lie, priced at ≤1 SE, recorded, reversible |
+
+**Three things about it are easy to misread later, so they are pinned by tests.**
+
+1. **The column is `hero_margin`; the values are `hero_margin_local`.** The sim emits `hero_margin`
+   unclamped — a training episode could show 25 tiles — and this saturates at 10. That substitution
+   is §9.15's "clamped at 10 tiles" row: **−1.9 pp** against a 1.5 pp standard error.
+   `agent_obs_deploy2.yaml` fixes it by naming the clamped field; until a run exists behind that
+   spec, this is the accepted mismatch, and it is the first thing to look at if the agent misjudges
+   gas at long range.
+
+2. **The sign flips on where the hero stands, and the clamp is symmetric.** On clear ground the
+   distance along −x to the first gassed cell *is* `x − lo.x`. Standing in gas, the hero is outside
+   the rect on all four sides, so all four go negative and their magnitude is the distance to clear
+   ground. Deep inside a gas field the nearest clear ground is as far past the sensor as distant gas
+   is when standing safe — a one-sided clamp would model a sensor this is not.
+
+3. **Every unknown reads optimistic, in one direction, by design.** `GasMap` never guesses, so an
+   unseen cell is clear forever; a ray that runs off the canvas returns the horizon rather than the
+   distance travelled; a hero off the canvas gets four full margins rather than four zeros, because
+   zeros would claim they are standing exactly on all four edges at once. §9.15's second pass
+   measured staleness at −0.6/−1.6/−2.2 pp for 1/2/4 tiles, which is what makes accepting the bias
+   defensible rather than merely convenient. The fix, if telemetry ever asks for one, is a better
+   accumulation rule in `GasMap` — not a different observation.
+
+**The horizon is read from `cfg`, never carried here.** Two copies of 10.0 in two packages is how
+the sim and the estimator drift apart, and the drift is silent: the spec keeps naming the right
+column while the estimator saturates somewhere the training data never did. A test constructs a
+second estimator at a 4-tile horizon and asserts it saturates there.
+
+**`safe_area_frac` reuses §9.17's assumption rather than inventing a second one.** The map is
+`cfg.map_w × cfg.map_h` tiles centred on the odometry origin — the same thing `hero.pos_norm`'s
+`MapFrame` already assumes. That buys the scale exactly and quarantines the uncertainty in the
+origin. Gas deposited outside that block is real gas, but it is not map area, and counting it would
+drive the fraction negative.
+
+**Name collision worth stating once:** this is not `brawl_vision/terrain/zone.py`, which answers
+"is this cell gassed" for a single frame. That one is the sensor; this one reads what the sensor has
+accumulated.
+
+---
+
+### 6.13 `loop.py` — the driver, and the interlock — BUILT 2026-09-08
+
+Every other file in the package is a stage. This is the one that decides *when* each runs, and
+therefore the one that owns the rule everything else fails closed on: **the control layer may only
+emit while the match gate is true.** `tests/test_deployment_loop.py`, 30 tests, siloed set.
+
+**One rate is derived and one is chosen, and the first version of this section had that wrong.**
+`config.resolve_rates` settles them together:
+
+- **The DECISION period is derived and fixed** at `cfg.dt × cfg.action_repeat` = 250 ms, read out
+  of the run's own env config. The policy chose actions on that rhythm; a different one is an agent
+  stepping at a cadence it never trained on, with nothing on screen to show for it.
+- **The PERCEPTION period is `loop.tick_hz`**, a setting — admitted only at values that divide the
+  decision period into a whole number of ticks (20 / 16 / 12 / 8 for this checkpoint; 13 raises
+  rather than rounding to 3.25). **The checkpoint has no opinion about it**: it never sees the
+  refreshes between its own decisions. Odometry does, and `validate` refuses any rate that would
+  put a Mortis dash past `odometry.max_shift_tiles`.
+
+Deriving both from `dt` conflated two different questions and cost the loop its timing margin for
+no gain. **Shipped: 12 Hz perception, 3 ticks per decision, 250 ms decisions.**
+
+**Phases, and why occlusion is the only failure that is not terminal:**
+
+| phase | capturing | emitting | leaves by |
+|---|---|---|---|
+| `WAITING` | yes | **no** | the gate opening, and only after `refine` succeeds |
+| `PLAYING` | yes | yes | the gate closing, the watchdog, or any `_stop` |
+| `PAUSED` | yes | **no** | the occluding window going away |
+| `STOPPED` | no | **no** | nothing — it is terminal in-process |
+
+A window drawn over the emulator is transient by nature and the world model survives it: odometry
+and the occupancy map are *frozen* while nothing deposits, not corrupted. A moved or closed window
+is not transient, and invalidates every geometry constant in the package — the crop box came from
+that window at startup (§6.11). So one pauses and the other stops.
+
+**A gate that opens and then fails to refine does not start a match.** `MatchState.refine` raises
+when the best achievable score is still sub-threshold, which means the frame is not gameplay. The
+loop treats that as a false gate open — `force_exit`, stay in `WAITING`, log — rather than
+propagating it, so a stray ring-shaped thing on a menu costs one log line instead of the run.
+
+**Skipped decisions are the §9.8 rule at loop level.** A supplier with nothing to say (no hero box,
+no hero HP, no `brawlers-left` read yet, odometry not `ok`) skips the decision instead of filling a
+column. The held movement bin persists and the fire bit does not repeat, so a skip is exactly one
+more action-repeat window of the previous action — a state the sim produces constantly. Every skip
+is named in the telemetry row, because "the agent stood still" and "no observation could be built"
+look identical from outside and mean opposite things.
+
+**Two things are held rather than skipped, and both are the same kind of holding `HealthTracker`
+already does:** `meta.n_enemies_alive` through a failed HUD read (it changes only on a kill), and a
+promoted enemy slot's HP for the life of its track. Neither is seeded before its first real read,
+and a slot's HP is dropped the moment its track id changes — carrying a dead enemy's number onto the
+slot's next occupant would be a fabricated value wearing a real one's clothes.
+
+#### The tick budget, measured
+
+40 frames of `bluestacks-example-new` at the deployment viewport, every stage warmed, on this
+machine. **These are the per-stage costs; the grab is measured separately in §6.11 at 24.1 ms
+median / 27.5 ms max live.**
+
+| stage | rate | median | p95 | max |
+|---|---|---|---|---|
+| rectify | every tick | 0.7 | 0.9 | 0.9 |
+| odometry | every tick | 3.2 | 3.4 | 3.5 |
+| `detect_zone` | every tick | 6.0 | 6.5 | 8.7 |
+| terrain classify | every tick | 6.1 | 6.5 | 6.8 |
+| occupancy deposit | every tick | 0.0 | 1.8 | 1.8 |
+| projectile detect | every tick | 10.9 | 11.3 | 11.7 |
+| **plain tick, no grab** | | **27.1** | | **30.0** |
+| entity detect | 4 Hz | 7.6 | 8.2 | 8.3 |
+| **decision tick, no grab** | | **34.7** | | **37.7** |
+
+#### Why this is 12 Hz and not 20
+
+Composed with the live grab, a plain tick is **~51 ms** and a decision tick **~59 ms**, worst
+measured frame plus worst measured grab **57.5 / 65.2 ms**. Against a 50 ms period that does not
+fit — and `_pace` does not sleep on an overrun, deliberately, because firing four ticks back to
+back to catch up violates the same shift bound in the other direction. So **20 Hz does not give a
+slow loop, it gives a jittering one**: ~51 ms plain, ~59 ms decision, and a decision window of
+4×51 + 59 ≈ **263 ms against the trained 250**. The nominal rate was never reached and the agent's
+step was stretched 5% as a side effect, with jitter on top.
+
+Neither of those violates the odometry bound — 0.96 tiles per 54 ms frame against 2.0 — so the
+first version of this section stopped there and left the rate alone. **That was the wrong call**,
+and the operator's is the right one: an unreached nominal rate is a loop with no margin at all, on
+a machine that is also being used for other things.
+
+At **12 Hz (83.3 ms)** every measured combination fits with room to spare:
+
+| | + grab median 24.1 | + grab max 27.5 | slack, worst |
+|---|---|---|---|
+| plain tick, max 30.0 | 54.1 | 57.5 | **+25.8 ms** |
+| decision tick, max 37.7 | 61.8 | 65.2 | **+18.1 ms** |
+
+and the decision window lands on **250 ms exactly**, which 20 Hz did not. 22% slack on the worst
+tick is what makes the period *consistent* rather than merely *achievable*, and it is what absorbs
+this machine doing other work at the same time.
+
+**The price, stated rather than buried.** A Mortis charged dash covers **1.48 tiles per frame**
+instead of 0.89 — 74% of `max_shift_tiles: 2.0`, so 1.35× headroom instead of 2.2×. That matters
+more than it sounds: crossing the bound is not a dropped frame, it is `Odometry._cut`, which bumps
+the segment and therefore **resets the occupancy map and drops every track**. The exposure is
+narrow — only the *charged* dash comes close (an uncharged one is 0.74 tiles/frame and a walk is
+0.23), and `long_dash_seconds: 4.5` means charged dashes are occasional. The bound is kept at 2.0
+rather than raised, because the cut it exists to catch is a camera teleport whose size does not
+depend on the frame rate (the one in the fixtures is a 3.3-tile jump), so raising it would spend
+margin where it matters to buy margin where it does not.
+
+**Projectiles are the second price, and it is bigger than "3 samples per decision instead of 5"
+makes it sound.** Re-running §9.5's measurement (same clip, same method; it reproduces that table's
+20 Hz row exactly) gives the fraction of projectiles that get the **two looks a velocity needs**:
+
+| rate | mean samples/projectile | **>=2 samples** | >=3 |
+|---|---|---|---|
+| 20 Hz | 1.83 | **44%** | 19% |
+| 16 Hz | 1.47 | **33%** | 14% |
+| **12 Hz** | 1.10 | **21%** | 10% |
+
+44% → 21% would be a bad trade if it were spread evenly. **It is not** — stratifying the same 90
+projectiles by how long they are on screen shows where it all lands:
+
+| time on screen | n | 20 Hz | 16 Hz | 12 Hz |
+|---|---|---|---|---|
+| < 100 ms | 60 | 17% | 7% | **0%** |
+| 100-200 ms | 20 | 99% | 78% | **42%** |
+| >= 200 ms | 10 | 100% | 100% | **100%** |
+
+**Every projectile with 200 ms or more of flight is still fully observed at 12 Hz**, and those are
+the only ones there is time to react to — 200 ms is under one decision period. The aggregate drop
+is dominated by the 60 of 90 shots that live under 100 ms, which at 20 Hz were 17% observed, i.e.
+already the "partly unobservable at any rate this loop will run at" §9.5 recorded as a limitation
+rather than a bug. The real loss is the middle band: 20 shots, 99% → 42%.
+
+That is the strongest argument for 16 Hz, and it is an argument about **20 projectiles in 25
+seconds of combat**, against a timing budget that jitters. It is recorded here so the trade can be
+revisited with a number instead of an impression.
+
+**16 Hz is the other admissible rate** and the one to move to if a live run shows the budget is
+kinder than this estimate — it restores 1.8× dash headroom, but its worst decision tick (65.2 ms)
+overruns a 62.5 ms period, so it would still jitter on a bad frame. 8 Hz is not admissible at all:
+2.22 tiles per dash frame, past the bound, and `validate` refuses it by name.
+
+#### The first live run, 2026-09-09 — what 397 ticks bought
+
+A `--dry-run` against a real friendly battle. **The rate choice is confirmed and four defects were
+found, three of which no test could have caught because the tests stubbed the very thing that was
+wrong.**
+
+Confirmed: **tick median 55.8 ms, p95 68.0, against the 83 ms budget** — 12 Hz fits live, with the
+grab included, on a machine doing other work. The gate refined to 0.780 against a 0.45 threshold,
+and **match-over detection fired correctly** ("match gate closed"), which was one of the three
+things §10.11 needed a real venue for.
+
+| defect | what it was | why the suite missed it |
+|---|---|---|
+| **Occlusion ended the run instead of pausing it** | `loop.py` branched on `"occlud" in reason`; `window.py`'s message says **"drawn over"**. The pause path was unreachable, so alt-tabbing away stopped the run for good. | The test's guard stub returned hand-written prose (`"occluded by 2 window(s)"`) that *did* contain the substring. A stub that produces different content than the real producer tests the stub. |
+| **`grab_ms` reported the running total** | `capture.grab_seconds` is cumulative — its own docstring says so — and the row stored it raw, printing a *3516 ms median grab* nested inside a 55.8 ms tick. The real per-grab cost is 7341.7 / 397 = **18.5 ms**. | The capture stub held `grab_seconds` at a constant 0.02, so a cumulative read and a per-frame read were indistinguishable. |
+| **A dry run burned its own fail-closed budget** | The shadow spends ammo for attacks a `NullBackend` never injected, so the canary trips — correctly — every time. It hit **4 of 5 resyncs in 22 s** and would have stopped any longer dry run. | There were no tests for the resync path at all, and `read_ammo` was stubbed to `None`, so the branch was never reached. |
+| **The warm-up tick was reported as an overrun** | `VisionStack.warm`'s ~1 s of PTX JIT lands inside the gate-opening tick, printing `max 758.7` against `budget 83` and burying the real p95. | Cosmetic, but it is the number the rate decision is read off. |
+
+The fixes are structural rather than local, because three of the four are the same mistake:
+**a consumer re-deriving a producer's meaning instead of being told it.**
+
+- `WindowGuard.check()` now returns a **`WindowFault`** — a `str` subclass (so every logging call
+  site is unchanged) carrying a `kind` in `{gone, minimized, moved, occluded}` and a `recoverable`
+  property. `loop.py` and `deploy_calibrate.py` branch on the tag. The regression test asserts both
+  that the fault is tagged *and* that `"occlud"` is genuinely absent from the message.
+- `TickRow.grab_ms` stores the **delta**, and the capture stub now accumulates like the real one.
+- `InputBackend` gained an **`injects`** property, false only for `NullBackend`. A desync under a
+  non-injecting backend is logged once, with the reason, and not counted. It is a property of the
+  backend rather than a dry-run flag on the loop, for the same reason `deploy_run.py` swaps the
+  backend instead of setting a boolean: there is then no path in which the two disagree.
+- `TickRow.warmup` flags the tick that paid the JIT, and the summary excludes it by name.
+
+**The lesson worth keeping is about the stubs, not the bugs.** Every one of these three lived
+exactly where a test double was *simpler* than the thing it replaced — constant where the real one
+accumulated, invented prose where the real one had a format, absent where the real one had a
+property. The siloed-test rule (no emulator, no GPU) is right and is not the problem; the fix is
+that a double must match the real object's *contract*, and the cheapest way to guarantee that is to
+assert against the producer's own output, as the occlusion test now does.
+
+#### The second and third live runs, 2026-09-09 — the move check was measuring the wrong thing
+
+The occlusion, grab-timing, dry-run-desync and warm-up fixes above all confirmed working. Then
+`deploy_calibrate.py` ran, and **two of its four jobs settled long-open questions while the third
+found a defect in the check itself**:
+
+| job | result |
+|---|---|
+| buttons | attack **0.960**, super **0.987**, gadget **0.756**, all centres within 2.7 px of stored. Radii refit by −5.1 / −12.6 / −0.5 px — the "centres transfer, radii do not" rule (§5) holding exactly as documented, on a third frame source. |
+| **tap** | **PASS, 3 of 3**, ammo 3.0 → 2.0 each time. This is §6.8's open question closed: the attack tap lands in a real match. Training Grounds swallowed 2 of 3 at the same coordinates. |
+| super | not charged, skipped rather than failed — correct. |
+| **move** | 2 of 4 bins FAILED, and **the check was wrong, not the movement**. |
+
+The move result, verbatim: bin 5 (down) `+1.99` tiles cos `+1.000`, bin 13 (up) `−2.21` cos
+`+1.000`, and bins 1 and 9 (right, left) at **`+0.00` and `−0.00` tiles of x**.
+
+**Vertical perfect, horizontal exactly zero, is not what a broken joystick looks like** — it is
+what a camera that is not panning in x looks like. `verify_move` measured
+`odometry.position_tiles` alone, and **odometry tracks the CAMERA**. The camera pans only when the
+map is larger than the screen on that axis, and whether it can pan in x is a property of the map
+and where the hero is standing.
+
+This is §6.8's Training-Grounds lesson in a venue that looked valid: *a correct ~0 is
+indistinguishable from a failure when you are measuring the wrong quantity.* Odometry over the
+fixtures confirms the camera is not universally x-clamped (`bluestacks-example-new` pans **20.6
+tiles** in x, `showdown_alternate_map` 6.1) — but `counted_walking` pans **0.12 tiles** in x
+against 3.64 in y, so a clamped axis is a real and unremarkable state for a clip to be in.
+
+**The fix is the project's own world-frame rule, applied where it had been skipped.** World is
+`camera_relative + odometry.position_tiles`; `verify_move` now samples both terms and checks the
+HERO's displacement, which is correct whether the camera pans or not. Both terms are kept on
+`MoveTrial` (`camera`, `relative`) and `diagnosis()` names the failure mode, so the three states
+that all used to print as "FAIL" are now distinguishable in one run:
+
+| camera | on-screen | means |
+|---|---|---|
+| moves | ~0 | normal — the camera follows the hero |
+| ~0 | moves | the camera is clamped on that axis; the hero walked fine |
+| ~0 | ~0 | the hero really did not move: walled in, or the input did not land |
+| — | hero never detected | the trial measured nothing, and says so instead of reading as "did not move" |
+
+**Still genuinely unresolved: whether the hero moved horizontally at all.** The old check cannot
+tell, and the data is gone. It needs one more run, ideally from open ground.
+
+#### What else had to move with it
+
+A rate change is only safe if every constant *denominated* in ticks but *justified* in seconds
+moves too. Three did, and finding them is the actual work of this change:
+
+| constant | was | now | why it is a duration |
+|---|---|---|---|
+| `loop.ODOMETRY_LOST_TICKS` → `ODOMETRY_LOST_SECONDS` | 40 ticks | **2.0 s** (24 ticks) | its own comment says "two seconds"; left at 40 it would silently have become 3.3 s. Now a duration divided by the resolved period. |
+| `match_gate.enter_samples` / `exit_samples` | 10 / 6 | **6 / 4** | 0.5 s / 0.33 s, and §5 introduced them in exactly those terms. Left alone, exit would have taken 0.5 s of input into a results screen — the one direction the gate exists to be fast in. |
+| `projectiles.MAX_COAST_S` | 0.1 s | **0.15 s** | the property is "one missed tick coasts, two do not", so it must sit between one and two tick periods. 0.1 s at 12 Hz still tolerated one miss, but by 17 ms. |
+
+`window.check_every_n_ticks` moved 20 → 12 for the same reason (about once a second), and
+`config.validate`'s occlusion bound is stated in *decisions* rather than ticks so it tracks the
+rate automatically. `TELEMETRY_ROWS` did not need to move: 4000 rows is longer than a match at
+every admissible rate, and the resource rule is about growth, not size.
+
+**The one constant deliberately NOT moved is `odometry.max_shift_tiles`** — see
+`configs/vision.yaml`, which now records why.
+
+**Two fixes got it from 60 ms to 54, and both were measurements rather than tuning.** The terrain
+classifier moved to CUDA — `configs/vision.yaml` had asked for exactly that measurement, and the
+answer was 9.26 ms → 5.86 ms with **bit-identical labels on every cell of every frame**. And the
+warm-up was extended to cover it: its first CUDA call costs 49 ms, which without warming would land
+inside the first perception tick of the match.
+
+**The lever not pulled, named so it stays available.** `detect_zone` plus the terrain classify and
+deposit are 12.1 ms of every 20 Hz tick, and terrain — unlike gas — is *static*. Moving the
+classifier and the deposit to the decision tick would return ~6 ms per plain tick. It is not done
+because the occupancy map would then fill in roughly five times slower in wall-clock, and match
+start is exactly when the hero is moving most and the grid group's terrain planes are still
+`UNKNOWN`. That trade has not been measured, and the budget does not currently require making it.
+
+#### What it deliberately does not do
+
+- **It does not queue matches.** Out of the MVP. `--matches 0` waits for the next gate instead of
+  reloading two detectors and a checkpoint, and emits nothing in the menus either way.
+- **It does not detect a dropped movement contact by ring score.** §4.2 suggests scoring the
+  joystick's rest anchor, but nothing has measured a rest-anchor radius and a radius does not
+  transfer across sources (§5). The desync signals that *do* exist — the ammo canary and hero
+  position divergence — are wired instead, and this gap is named rather than silently skipped.
+  `deploy_calibrate.py` is where that measurement would come from.
+
+`scripts/deploy_run.py` is the entry point. `--dry-run` builds the whole stack and drives every
+decision through a `NullBackend`, which is a swapped object rather than a flag the loop has to
+remember to check — so there is no code path in which a dry run reaches the device.
+
+---
+
+### 6.14 `control/calibration.py` + `deploy_calibrate.py` — proving the touches land — BUILT 2026-09-08
+
+Everything else in the package can be checked against a fixture. This cannot: it is the half of
+the system where **we act and the game responds**, and a recording has no response in it.
+
+**Screen coordinates are not evidence, and §6.8 is the proof.** That run tapped the calibrated
+attack centre and 2 of 3 taps consumed no ammo — not because the aim was wrong but because a
+Training-Grounds-only green button sat on the point and swallowed the touch. A check comparing
+"where we tapped" to "where the button is" would have passed that run with full marks. So every
+verification here is defined on a **game-state consequence** instead:
+
+| job | question | evidence | why nowhere else |
+|---|---|---|---|
+| `tap` | does `control_attack_tap` fire? | the ammo bar drops | venue-independent; the §6.8 failure |
+| `super` | does the Super button fire? | `read_super` stops reading `ready` | best-effort — an uncharged Super is skipped, never passed |
+| `move` | does the camera go where we steer? | odometry displacement vs the commanded bin | Training Grounds does not scroll, so odometry correctly reads ~0 |
+| `buttons` | where are the buttons on THIS source? | Hough + `ring_score_at` on a live median | radii do not transfer between frame sources (§4.5) |
+
+**Three details in the tap check are the whole check.**
+
+*It hunts a TROUGH, not a level.* The bar starts reloading the instant the swing spends the ammo,
+so a single delayed sample can land after it has partly refilled and read a working setup as a
+failed tap. The window samples at 20 Hz for 0.9 s and keeps the minimum. A consequence worth
+knowing: **one shot does not present as a 1.0 drop.** At Mortis's 1.7 s per pip the observable
+trough is ~0.88 below the start, which is what `MIN_DROP = 0.75`'s slack is actually for — and a
+reload only ever moves the bar *up*, so the same slack admits no false pass.
+
+*It waits for a near-full bar before pressing.* A tap at 0 ammo is a legitimate no-op that looks
+exactly like a swallowed touch, and starting from 3.0 makes the trough unambiguous where starting
+from 1.2 would not.
+
+*It fails a mixed result rather than taking the majority.* 2 of 3 is precisely what §6.8 produced.
+A tap has no mechanism for landing two times in three, so a majority rule would have called that
+setup good; the rule is every readable trial, and at least two of them. An unreadable bar is
+neither a pass nor a fail — it is not evidence, and is reported as `unread`.
+
+**The move check reads its commanded direction out of the `Joystick` rather than recomputing it.**
+That is the difference between a check that catches a y-flip and a check that shares one. It also
+records the largest single-frame odometry shift, against `odometry.max_shift_tiles: 2.0` — and
+paces itself at `cfg.dt` to do it, because a per-frame bound is only meaningful at the rate the
+loop runs. Sampling flat out would understate it; sampling slower would overstate it.
+
+**`gameplay.calibrate_buttons` gained two parameters instead of gaining a copy.** §5 records that
+`RADIUS_PX = (40, 115)` never proposes this HUD's ~33 px gadget to HoughCircles, so the function
+returns zero anchors on the deployment footage — a search-range failure, not a scoring one. The
+fix is `DEPLOY_RADIUS_PX = (25, 115)` passed in, with both bands living in `gameplay.py` where the
+sensitivity is documented. Widening the default would have changed what every existing recording
+calibrates to.
+
+**The fit is a re-fit, not a discovery.** Hough returns unnamed circles, and naming them by
+geometry ("the leftmost is the Super") is how a HUD change becomes an agent that taps the gadget.
+Candidates are matched to the *stored* centres within `MAX_CENTRE_SHIFT_PX`, and anything
+unmatched is **dropped rather than assigned to its nearest** — so a missing button is a missing
+key and never a wrong one.
+
+**`update_calibration` replaces blocks, not the file.** Only some blocks have a script behind
+them. The joystick's saturation radius was measured by hand in §4.3 by injecting contacts and
+reading the knob back off the framebuffer, and nothing here reproduces that; regenerating the file
+wholesale would quietly replace measured provenance with a default. Each replaced block's
+`_comment` is regenerated with it, because a stale comment beside fresh numbers is worse than no
+comment.
+
+**What it deliberately does not measure.** `rest_anchor` — the stick's home position, which §4.2
+wants for a dropped-contact detector. It needs a knob finder validated against a frame showing a
+*released* stick, and no fixture is known to contain one. Naming the gap is the honest state;
+supplying a half-verified radius for a detector that then fires spuriously is not.
+
+**`tests/test_deployment_calibration.py`, 27 tests, siloed set, 0.2 s.** The clock is injected, so
+the arm timeout and the trough window are asserted rather than commented, and the tap check is
+driven by a **reloading fake Mortis** rather than a list of readings — a script cannot get the
+refill-versus-trough race wrong in the way a real bar can. One test hands `verify_tap` exactly the
+§6.8 result and asserts FAIL.
+
+**The tile-grid job has no code, on purpose.** "Does the grid still line up under the
+window-derived crop box" is answered by `scripts/vision_watch.py deploy`, which is
+`TerrainOverlay` — already built, already carrying both projected tile grids — pointed at
+`DeployCapture` instead of a raw monitor grab. That branch lives in the script rather than in
+`brawl_vision.sources`, because the dependency runs the other way.
+
+### 6.15 `measure_reload.py` — refitting the kit constants off the game — MEASURED 2026-09-09
+
+The operator's standing instruction: *"the sim move speed / attack speed / reload speed were all
+approximations. Your measurements from the Nulls brawl will be more accurate than those from
+sim."* This is the first of those refits, and it is the only kit timer that can be refit at all
+— the ammo pip bar is the one the game draws. `attack_cd`, `invuln_t` and the dash timers are
+invisible and stay dead-reckoned in §6.3.
+
+It was blocked until §6.4's correction landed, and the block was not incidental: a reader whose
+whole-pip readings reverse impossibly 54% of the time cannot measure an interval between two
+whole-pip readings.
+
+#### Intervals, never events — which is why the one-second lag does not matter
+
+§6.3 measured the pip bar lagging the tap by 0.50–1.25 s, median 1.00. That destroys any
+measurement of *when* something happened and leaves every measurement of *how long between* two
+things intact, because **a constant lag subtracts out of a difference**. So nothing here is timed
+against an emitted action; everything is timed between two pip transitions, and the lag enters
+only as jitter. The same lag that forced §6.3's grace window from 0.30 s to 1.5 s costs this
+measurement nothing.
+
+#### Two families, and the second one is a test of the sim's model
+
+`brawl_sim/core/hero.tick_timers` models firing as **pausing** the reload for `attack_cooldown`
+(Step C1), which makes sustained fire `attack_cooldown + reload_seconds` per shot. That model
+gives the two observable intervals different meanings:
+
+| family | what it is | under the sim's model |
+|---|---|---|
+| **A** | gain → gain, no shot between | `reload_seconds` |
+| **B** | shot from a **full** magazine → next gain | `attack_cooldown + reload_seconds` |
+
+B is only well defined from full, because below full the reload clock is already running when the
+shot lands. So `B - A` is `attack_cooldown` measured on its own — the constant
+`configs/brawlers.yaml` defers as *"Step C1, paired with the reload pause that gives it meaning"*
+— and **A == B falsifies the pause outright.**
+
+#### What 14 clips say
+
+Sampled at 30 Hz, 0.25 s debounce, intervals spanning an unreadable stretch >0.4 s dropped rather
+than kept:
+
+| clip | A `n` | A median | B `n` | B median | shot→shot floor |
+|---|---|---|---|---|---|
+| `bluestacks-example-new` **(Mortis, provenance recorded above)** | 2 | **2.50** | 1 | **2.43** | 0.70 |
+| `showdown_alternate_map` | 9 | 2.50 | — | — | 0.37 |
+| `day10_gameplay` | 8 | 2.51 | — | — | 0.48 |
+| `day12_recording2` | 5 | 2.45 | — | — | 0.37 |
+| `showdown_alternate_map2` | 5 | 2.50 | — | — | — |
+| `day12_recording1` / `day12_recording3` | 2 / 2 | 2.50 / 2.50 | — | — | 0.63 |
+| `9_5_brawlstars_eval` | 1 | 1.67 | 5 | 2.44 | 2.40 |
+| **`showdown_has_gadget`** | 3 | **0.77** | — | — | 0.30 |
+| `zone_grows_from_east` | — | — | 1 | 0.80 | — |
+| `bluestacks-example-zone`, `standstill`, `counted_walking`, `training_gadget` | — | — | — | — | — |
+
+**Seven of the nine clips that yield an A sample cluster at 2.45–2.51.** The eighth,
+`9_5_brawlstars_eval`, has a single A sample at 1.67 that its own five B samples at 2.44 contradict
+— n=1 is not a measurement and is printed rather than dropped so that it can be seen to be n=1. The
+ninth reads 0.77 and is plainly a different brawler, and that row is the argument for the script's
+hardest rule — **sources are never pooled**. `reload_seconds`
+is per-brawler, `tests/fixtures/vision/README.md` does not record which brawler each clip shows,
+and a pooled median over those two clips is a reload nobody has.
+
+Two results follow, at different confidence:
+
+1. **`reload_seconds` is 2.50, not 2.25 — 11% slow in the sim.** Held for the only clip with
+   recorded provenance and for every other clip in the 2.5 cluster, across independent recordings
+   and two HUD layouts. Sample counts are small per clip and the agreement between them is what
+   carries it.
+2. **The reload is NOT paused by the attack cooldown.** B − A is **−0.07 s** on the Mortis clip
+   and B alone reads 2.43–2.44 against an A of 2.50 — zero within one sample period, and nowhere
+   near the +0.35 the sim's model predicts. **Caveat, stated because it is the one thing that
+   could still explain it:** A times two events of the same kind and B times a spend against a
+   gain, so any asymmetry in how fast the widget paints the two enters B and cancels in A. It
+   would have to be a 0.35 s asymmetry, which is 10 frames.
+
+`attack_cooldown` itself is *not* refuted: the shot→shot floor bottoms out at 0.37 s on the 2.5
+cluster against a configured 0.35, which is the closest thing to a confirmation this instrument
+can give. What is refuted is only the *reload pause* that C1 attached to it.
+
+#### What is deliberately not done here
+
+**Nothing is written to `configs/brawlers.yaml`.** Changing `reload_seconds` invalidates the
+deployed checkpoint's training distribution, and the operator's priority is explicit: get the
+already-trained agent onto BlueStacks first, update the sim for *later* training runs. So the
+measurement lands in `brawl_deployment/data/kit_timing.json` — the §4.5 split, settings in a config
+and measurements in `data/` — and the yaml edit is a decision, taken deliberately, before the next
+training run rather than as a side effect of a measurement script.
+
+#### What would sharpen it
+
+- **Which clips are Mortis.** One line from the operator, who recorded them, converts a cluster
+  into a measurement. Cheap for a human, impossible for this repo — nothing in it records the
+  brawler per clip.
+- **Deployment telemetry accumulates for free.** `ammo_cv` is in every `--telemetry` CSV, so every
+  run adds samples that are Mortis by construction. It is the *thinner* instrument — 4 Hz, so
+  0.25 s of quantization against a 2.5 s interval, and `run1.csv` yielded 29 readable values in
+  41 s — but it needs nobody to record anything. Point the script at the CSVs as they pile up.
+- **A clip recorded for this.** Mortis, in a friendly battle, emptying and refilling the magazine
+  repeatedly for two minutes, is worth more than all 14 fixtures put together for this one number.
+
 ---
 
 ## 7. Resource budget
@@ -1425,7 +2364,7 @@ Comfortable. The risk is not steady-state, it is **unbounded growth**, so three 
 
 Profiled live at 1440p with the real pipeline, steady state, on this machine:
 
-| 20 Hz perception stage | mean | notes |
+| per-tick perception stage | mean | notes |
 |---|---|---|
 | `mss` grab, 2560×1440 | 15.7 ms | the floor without DXGI |
 | normalize + copy | 1.2 ms | was **10.9 ms** — see below |
@@ -1433,7 +2372,7 @@ Profiled live at 1440p with the real pipeline, steady state, on this machine:
 | match gate | 0.4 ms | was **5.5 ms** — see below |
 | rectify | 0.8 ms | |
 | odometry | 4.5 ms | 11 correlation windows |
-| **total** | **25.4 ms** | against a **50 ms** budget at 20 Hz |
+| **total** | **25.4 ms** | against **50 ms** at the 20 Hz this was profiled at; **83.3 ms** at the shipped 12 (§6.13) |
 
 Plus, on the 4 Hz decision tick: HP read (~1.7 ms measured in `hp_detection`), tracking
 (microseconds), the grid (microseconds), assembly and policy, on top of the detectors below.
@@ -1446,10 +2385,12 @@ Plus, on the 4 Hz decision tick: HP read (~1.7 ms measured in `hp_detection`), t
 > | entity | 640×640 | 26.1 ms | **7.2 ms** (p90 7.4, max 8.2) |
 > | projectile | 960×960 | 47.2 ms | **10.8 ms** (p90 11.0, max 11.1) |
 >
-> 3.6× and 4.4×, which settles §9.5's unpaid bill. A **plain 20 Hz tick** is now 25.4 + 10.8 =
-> **36.2 ms** against 50 — the projectile pass fits on every tick, which is what §9.5 asked for.
-> A **decision tick** is 25.4 + 10.8 + 7.2 + 1.7 ≈ **45.1 ms** before assembly and policy, so
-> that tick is still the one at the edge, with roughly 5 ms for the two stages not yet built.
+> 3.6× and 4.4×, which settles §9.5's unpaid bill. A **plain tick** is now 25.4 + 10.8 =
+> **36.2 ms** — the projectile pass fits on every tick, which is what §9.5 asked for. A **decision
+> tick** is 25.4 + 10.8 + 7.2 + 1.7 ≈ **45.1 ms** before assembly and policy. Against the 50 ms of
+> a 20 Hz period that left ~5 ms for the two stages not yet built, and §6.13's end-to-end
+> measurement of the assembled loop showed that was not enough — which is why the perception rate
+> is now 12 Hz and these same numbers sit against 83.3 ms instead.
 >
 > **If that tips over, the overrun is affordable, and it is worth saying why rather than
 > treating 50 ms as a hard wall.** The budget exists to keep `odometry.max_shift_tiles: 2.0` satisfied, and that bound is
@@ -1485,7 +2426,8 @@ than a slow one.
 | Failure | Detection | Response |
 |---|---|---|
 | Match ended | §5 ring score | Release contacts, stop input. **Primary interlock.** |
-| Window lost focus / moved | `window.py` geometry check | Release, stop, warn. |
+| Window moved / resized / minimized / closed | `WindowGuard.check()` (§6.9) | Release, stop, warn. **Focus loss is not on this list** — ADB injection does not need it. |
+| A window drawn over the emulator | `find_occluders` (§6.9) | Release, **pause**, keep capturing; resume when clear. Transient by nature, and the world model survives it. |
 | Capture stall | `read_seconds` / frame timestamp gap | Release, stop. |
 | Movement contact dropped | Rest-anchor ring score (§4.2) | Re-acquire at anchor. |
 | Odometry lost (cut) | Existing `min_agreement_ratio` gate | Hold last action, re-seed; stop if sustained. |
@@ -1560,11 +2502,20 @@ stopped agent is recoverable by hand; an agent mashing inputs into a menu is not
    projectile, and `time_to_closest` also decides which 12 projectiles reach the policy at all.
    The cause is short lifetimes: median 50 ms on screen, p75 151 ms, p90 299 ms.
 
-   20 Hz rather than 30 or 60 because 20 Hz is the capture rate §1.2 already fixed for odometry
+   20 Hz rather than 30 or 60 because 20 Hz was the capture rate §1.2 fixed for odometry
    reasons; going above it means raising the whole loop, which is a much larger change than this
    field is worth. 44% is not good, and the honest reading is that **fast projectiles are partly
    unobservable at any rate this loop will run at** — a limitation to record rather than engineer
    away.
+
+   **The perception rate later moved to 12 Hz for timing reasons (§6.13), so this item's chosen
+   rate no longer exists.** The conclusion — *every* tick, not every decision — survives; the
+   number does not. Re-measured with the same method (which reproduces the 20 Hz row above
+   exactly), 12 Hz gets ≥2 samples on **21%** of projectiles and 16 Hz on 33%. The loss is not
+   spread evenly: shots on screen ≥200 ms are **100% covered at all three rates**, shots under
+   100 ms are near-hopeless at all three (17% even at 20 Hz), and the whole difference sits in the
+   100–200 ms band, 99% → 42%. §6.13 has both tables. This item's own sentence about partial
+   unobservability is what that band is.
 
    Note the original rationale — "20 Hz is 5× the YOLO cost" — was already wrong when it was
    written (item 12), and the bill it left behind is now **paid**: the projectile detector runs
@@ -2094,9 +3045,10 @@ stopped agent is recoverable by hand; an agent mashing inputs into a menu is not
       the residual, and it is a deployment-side problem** — the fix is a better accumulation rule
       in `GasMap`, not a different observation.
 
-    **Still to build:** the estimator itself (a `GasMap` scan along ±x/±y, clamped at the config's
-    horizon), which lands with `assemble.py`. Nothing here has been trained yet; `deploy2` has no
-    run behind it.
+    **The estimator is BUILT — `perception/zone.py`, §6.12.** It supplies the group the current
+    checkpoint's spec names, so the clamped values go into the unclamped `hero_margin` column at the
+    −1.9 pp measured above. Nothing here has been trained yet; `deploy2` has no run behind it, and
+    the retrain stays the lever §9.15 describes.
 
 17. ~~**`hero.pos_norm` has no honest supplier either — and it is in the `self` group.**~~
     **MEASURED AND CLOSED 2026-09-08 — a wrong origin is free, so anchor at the map centre.**
@@ -2214,6 +3166,54 @@ Concrete asks, roughly in order of payoff.
    the hero stands still with the front on screen and lets it come, the front's steps are
    unambiguous and `next_shrink_in`'s period falls out of one clip. Only worth recording if the
    pinned-zero decision in §9.15 is one you would rather not take.
+
+11. **A FRIENDLY BATTLE against bots, ~2 minutes, with Mortis.** The one thing Training Grounds
+   could not give (§6.8). Three things need the real venue: the **tap calibration**, which is
+   measurably wrong in Training Grounds — a venue-only green button sits over the attack area and
+   swallowed 2 of 3 taps while the super fired uncommanded; **odometry**, which reads a correct ~0
+   in an arena that does not scroll; and **match-over detection**, which needs a match that ends.
+   You do not need to play — start it, then leave the window alone and I will drive.
+
+   **The script for this is now built and tested — `scripts/deploy_calibrate.py` (§6.14).**
+
+   **The exact sequence, one battle per run:**
+
+   1. BlueStacks fullscreen on the 1440p monitor, Nulls Brawl open, Mortis selected.
+   2. Start the friendly battle. Do not wait for it to load.
+   3. Alt-tab to the terminal, start the script, alt-tab **straight back to BlueStacks**.
+   4. Leave the emulator on top and hands off for ~25 s (calibrate) or the match (dry run).
+   5. Alt-tab back and read the report.
+
+   ```
+   python scripts/deploy_run.py --dry-run --matches 0 --max-seconds 180
+   python scripts/deploy_calibrate.py
+   ```
+
+   **Step 3 is why alt-tabbing back matters, and it is now safe in either order.** A window drawn
+   over the fullscreen emulator is captured *instead of* the game. `deploy_run.py` PAUSES on that
+   — contacts released, still capturing — and resumes by itself. `deploy_calibrate.py` used to
+   raise on it, which failed the run before the operator could tab back; it now treats occlusion
+   as "not ready yet" and only raises on a moved, minimized or closed window. Neither needs a
+   grace period: the match gate cannot open through a covering window, so `--wait` bounds it.
+
+   **Minimizing or moving BlueStacks stops a run for good**, unlike covering it — the content box
+   is computed once at startup and would then crop the wrong pixels. Worth turning on focus assist
+   so a notification toast does not eat a few seconds mid-match.
+
+   The first drives the real policy end to end against a `NullBackend` and prints its own tick
+   budget and match-over transitions; it emits nothing, so it can run during a battle you are
+   playing yourself. The second is the one that touches the device: it taps, checks the ammo bar
+   went down, walks four cardinals and checks odometry followed, and re-fits the button table on
+   the live source. It plays badly on purpose — losing is expected and fine. Add `--write` only
+   after reading the button numbers it prints. A third, optional, answers the tile-grid question
+   by eye: `python scripts/vision_watch.py deploy`.
+
+   **Have the screen clear when I start capturing; after that it does not matter.** Revised
+   2026-09-08 from "nothing may overlap the window", which was overstated (§6.8 finding 1). The
+   content box is computed once from the first 5 frames and cached, and only something touching a
+   screen *edge* can move it — a window over the middle of the emulator corrupts pixels, not
+   geometry. `DeployCapture` now refuses to start if rows are missing, so this is enforced rather
+   than trusted.
 
 **Things you can do that I cannot**
 

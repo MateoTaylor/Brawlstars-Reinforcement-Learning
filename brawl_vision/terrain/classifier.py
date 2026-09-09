@@ -31,7 +31,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 from ..camera import RectifyPlan
-from ..config import VisionConfig
+from ..config import TERRAIN_WEIGHTS_PATH, VisionConfig
 from brawl_sim.constants import Tile
 
 from .labeling import CLASS_INDEX, CLASSES
@@ -175,6 +175,18 @@ class TerrainClassifier:
     def save(self, path) -> None:
         torch.save({"state_dict": self.net.state_dict(),
                     "classes": [t.name for t in CLASSES]}, str(path))
+
+    @classmethod
+    def from_config(cls, cfg: VisionConfig | None = None, path=None) -> "TerrainClassifier":
+        """The shipped weights on the configured device, so a caller needs neither.
+
+        Every other stage in this package has one of these (`ObjectDetector`, `HudReader`,
+        `HealthTracker`, `OccupancyMap`), and this was the only one that made its caller carry a
+        path -- which meant `brawl_deployment` would have had to hardcode `data/terrain.pt` and
+        pick a device the config already names.
+        """
+        cfg = cfg or VisionConfig()
+        return cls.load(path or TERRAIN_WEIGHTS_PATH, device=cfg.classifier_device)
 
     @classmethod
     def load(cls, path, device: str = "cpu") -> "TerrainClassifier":

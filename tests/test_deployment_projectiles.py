@@ -227,6 +227,19 @@ def test_a_reacquired_projectile_keeps_its_original_velocity_baseline():
     assert res.live[0].vel[0] == pytest.approx(8.0, abs=1e-6)
 
 
+def test_the_coast_window_tolerates_exactly_one_missed_tick_at_the_deployed_rate():
+    """The constant is in seconds but the property is in TICKS: one miss survives, two do not.
+    That held at 20 Hz by 17 ms and had to be rechecked when the rate moved to 12 (§6.13), which
+    is the whole reason this test exists alongside the absolute-time one below."""
+    from brawl_deployment.config import DeploymentConfig, resolve_rates
+
+    class _Sim:
+        dt, action_repeat = 0.05, 5
+
+    period = resolve_rates(_Sim(), DeploymentConfig()).tick_seconds
+    assert period < MAX_COAST_S < 2 * period
+
+
 def test_a_track_is_dropped_once_it_outlives_the_coast_window():
     trk = ProjectileTracker()
     run(trk, [[det_at(0.0, 0.0)], [det_at(0.4, 0.0)]])

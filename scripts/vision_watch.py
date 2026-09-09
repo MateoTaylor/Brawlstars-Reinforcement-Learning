@@ -5,10 +5,19 @@
     python scripts/vision_watch.py clip.mp4 --save out.mp4 --fps 15   # headless render
     python scripts/vision_watch.py --live                             # grab this screen instead
     python scripts/vision_watch.py screen:2 --stop 600                # a specific monitor
+    python scripts/vision_watch.py deploy                             # the emulator's own window
 
 The source is opened through `brawl_vision.sources.open_source`, so a recording and the live
 screen are the same object to everything downstream -- nothing below this script knows or cares
 which one it got.
+
+**`deploy` is the exception worth knowing about, and it is not a synonym for `--live`.** It opens
+`brawl_deployment.capture.DeployCapture` against the emulator's window: the crop box comes from
+the window manager rather than from the pixels, and the frames are resized to the calibrated
+viewport. That is the geometry `loop.py` actually runs on, and it is not the geometry `screen:N`
+produces -- BRAWL_DEPLOYMENT_DESIGN.md 6.11 measures the difference. So this is the mode to use
+when the question is "does the tile grid still line up under the box the loop will use", which is
+a question `--live` cannot answer.
 
 This is the debugging tool the rest of the plan is built with, not a demo: Phases C, D, F, G, H
 and I are all far faster to check by looking than by reading numbers. Space pauses.
@@ -104,11 +113,34 @@ def _window(source, start, stop, step=1):
         yield frame
 
 
+def _open(args, cfg):
+    """The source, with one extra mode `open_source` deliberately does not know about.
+
+    `brawl_vision` has no business importing `brawl_deployment` -- the dependency runs the other
+    way and `sources.py` is shared by the training tools. Resolving it here keeps that boundary
+    and costs one branch.
+    """
+    if args.source != "deploy":
+        return open_source(None if args.live else args.source, cfg)
+
+    import mss
+
+    from brawl_deployment.capture import DeployCapture
+    from brawl_deployment.window import find_emulator_window, set_dpi_aware
+
+    set_dpi_aware()
+    window = find_emulator_window()
+    with mss.mss() as sct:
+        monitors = [dict(m) for m in sct.monitors]
+    return DeployCapture.from_window(window, monitors)
+
+
 def main(argv=None) -> int:
     p = argparse.ArgumentParser(description=__doc__,
                                 formatter_class=argparse.RawDescriptionHelpFormatter)
     p.add_argument("source", nargs="?",
-                   help="a recorded .mp4, or 'screen'/'screen:<monitor>' for live capture")
+                   help="a recorded .mp4, 'screen'/'screen:<monitor>' for live capture, or "
+                        "'deploy' for the emulator window through DeployCapture")
     p.add_argument("--live", action="store_true", help="shorthand for source='screen'")
     p.add_argument("--start", type=int, default=0, help="first frame index")
     p.add_argument("--stop", type=int, default=None, help="last frame index, inclusive")
@@ -143,7 +175,7 @@ def main(argv=None) -> int:
 
     overlay = TerrainOverlay(plan, hud, model)
     occupancy = OccupancyMap.from_config(cfg)
-    with open_source(None if args.live else args.source, cfg) as source:
+    with _open(args, cfg) as source:
         stages = _stages(_window(source, args.start, args.stop, args.step), plan, Odometry(plan, cfg), cfg,
                          occupancy, classifier)
         if args.save:

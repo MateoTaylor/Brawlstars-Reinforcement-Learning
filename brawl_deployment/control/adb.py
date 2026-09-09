@@ -276,6 +276,11 @@ class AdbTouchBackend:
     def is_alive(self) -> bool:
         return self._proc is not None and self._proc.poll() is None
 
+    @property
+    def injects(self) -> bool:
+        """This one really does reach the device. See `InputBackend.injects`."""
+        return True
+
     def __enter__(self):
         return self
 

@@ -187,12 +187,26 @@ class ScreenCapture:
     """
 
     def __init__(self, cfg: VisionConfig | None = None, monitor: int | None = None,
-                 normalize: bool = True, box_sample: int = 5):
+                 normalize: bool = True, box_sample: int = 5,
+                 box: tuple[int, int, int, int] | None = None):
+        """`box` skips content detection and crops to the given rectangle instead.
+
+        **Supply it whenever the caller knows the geometry from an authoritative source**, which
+        for a live emulator means the window manager. `detect_content_box` infers the render
+        rectangle from pixels, and that inference is only necessary when nothing else can answer
+        -- a recorded clip, where the letterbox is baked in. Against a live window it is strictly
+        worse than asking, because the answer depends on what the app happens to be drawing:
+        MEASURED, the Nulls Brawl lobby has a genuinely black 21 px band at the top of its own
+        artwork, so detection there returns a box 21 rows shorter than the one the same emulator
+        produces during gameplay. See `brawl_deployment.capture.DeployCapture`.
+        """
         self.cfg = cfg or VisionConfig()
         self.monitor = self.cfg.capture_monitor if monitor is None else monitor
         self.normalize = normalize
         self._box_sample = box_sample
-        self._box: tuple[int, int, int, int] | None = None
+        self.box_supplied = box is not None
+        self._box: tuple[int, int, int, int] | None = box
+        self.raw_size: tuple[int, int] | None = None   # (w, h) of the grab BEFORE normalization
         self._sct = None
         self._index = 0
         self._t0: float | None = None
@@ -211,6 +225,18 @@ class ScreenCapture:
             self._sct.close()
             self._sct = None
         return False
+
+    @property
+    def content_box(self) -> tuple[int, int, int, int] | None:
+        """The crop rectangle in use: the one supplied to `__init__`, or the cached
+        `detect_content_box` result, or `None` before the first normalized grab.
+
+        Exposed because the box is *content-dependent* and computed once: a caller that knows what
+        the capture rectangle is supposed to contain can check the box against that expectation,
+        which this class cannot do for itself. `brawl_deployment.capture.DeployCapture` does
+        exactly that -- see its `_check_content_box`.
+        """
+        return self._box
 
     @property
     def n_frames(self) -> None:
@@ -242,6 +268,8 @@ class ScreenCapture:
     def grab(self) -> Frame:
         t_start = time.perf_counter()
         img = self._raw()
+        if self.raw_size is None:
+            self.raw_size = (img.shape[1], img.shape[0])
         if self._t0 is None:
             self._t0 = t_start
         if self.normalize:

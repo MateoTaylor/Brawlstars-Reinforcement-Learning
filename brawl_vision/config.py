@@ -32,6 +32,7 @@ DEFAULT_CONFIG_PATH = REPO_ROOT / "configs" / "vision.yaml"
 DATA_DIR = Path(__file__).resolve().parent / "data"
 HOMOGRAPHY_PATH = DATA_DIR / "homography.json"
 HUD_MASK_PATH = DATA_DIR / "hud_mask.json"
+TERRAIN_WEIGHTS_PATH = DATA_DIR / "terrain.pt"
 
 _MISSING = object()
 _ABSENT = object()

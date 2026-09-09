@@ -62,6 +62,45 @@ So the residual is reported rather than hidden. **Do not snap a near-1.0 slot to
 draws a reloading pip partially filled and `hero.ammo` is specified as *"fractional, reloads
 continuously"*, so a snap threshold would quantise away the very signal the field exists for. On
 `ammo_frac` the error is ±0.02, which is far below anything a policy trained on it can act on.
+
+#### The three ways this reader was silently wrong, and how a deployed run found them
+
+The deployed shadow state compares a dead-reckoned ammo count against this reader once per
+decision (BRAWL_DEPLOYMENT_DESIGN.md 6.3). Two live runs kept tripping that comparison, which put
+a measurement on the reader that no assertion in `tests/test_vision_hero_bars.py` could: over
+**4685 frames of six fixture clips**, scored with NO ground truth on two physical impossibilities
+-- a slot fuller than the one to its left, and a whole-pip change reversed inside 0.3 s, which is
+faster than any reload or any two shots.
+
+    reader                            non-monotonic frames    impossible reversals   unreadable
+    as shipped before this            83  (1.77%)             99 of 182  (54.4%)      0
+    + constants scaled to viewport    87  (1.86%)             92 of 179  (51.4%)      0
+    + merged runs split               83  (1.77%)             93 of 185  (50.3%)      0
+    + both gates (what ships now)      0  (0.00%)             48 of 129  (37.2%)    213  (4.55%)
+
+**More than half the ammo changes this reader reported were physically impossible**, and the test
+suite could not see it because every synthetic frame here is drawn at the calibrated scale with
+nothing behind it. The three causes, and note that only two of them are causes:
+
+  1. **The constants did not scale with the viewport.** See `REF_VIEWPORT_H`. The lattice error
+     accumulates with slot index, so the THIRD pip is the one that vanishes and a full magazine
+     reads 2.
+  2. **A merged pair lost a pip.** See `split_merged`. 116 of 4108 painted frames carry a run
+     wider than one pip.
+  3. **A misread returned a number.** See `is_plausible` and the two length gates in `read_ammo`.
+     This removed no cause at all -- it makes the reader ADMIT it could not read, which is the
+     contract the function's own docstring already claimed. It is also the single largest
+     improvement in the table, which is worth sitting with.
+
+**4.55% unreadable is the price, and for this consumer it is the right one.** The shadow state
+treats a missing read as `NO_READ` and skips the comparison; it treats a wrong read as evidence
+and resyncs onto it. Two live runs were stopped by false resyncs. None was ever harmed by a
+skipped one.
+
+Buying more was tried and refused: rejecting frames with no orange at all -- rather than reading
+them as the empty magazine they usually are -- reaches 33.8% reversals, but at **16.9%
+unreadable**, and it blinds the reader exactly when Mortis is out of ammo, which is the state he
+spends the most time in and the one the reload measurement is made of.
 """
 from dataclasses import dataclass
 
@@ -97,11 +136,28 @@ MIN_RUN_PX = 4
 # with viewport height exactly as `hud.py` measured the top-left HUD to: the super track runs 116
 # px at 1080 and a measured 120 at 1126, and the pip runs a median 33 at 1080 and 34 at 1126.
 #
-# So this constant is right for DEPLOYMENT, which resizes to 2002x1126 (BRAWL_DEPLOYMENT_DESIGN.md
-# 9.4 item 4) -- but by luck rather than by design, the 33-35 spread straddling both. Nothing here
-# scales, so pointing these readers at a third resolution needs the `REF_H` treatment `hud.py`
-# gives its own constants.
+# So this constant is quoted at 1126, which is what DEPLOYMENT resizes to
+# (BRAWL_DEPLOYMENT_DESIGN.md 9.4 item 4) -- and the fixture clips are 1080, which is why the
+# 33-35 spread straddles both and why nothing looked wrong for a long time. `read_ammo` now
+# applies the `REF_H` treatment `hud.py` gives its own constants; see `REF_VIEWPORT_H` for what
+# it cost not to. **`read_super` below still does not scale** -- its own measurement (116 px at
+# 1080 against 120 at 1126) says it has the same dependence, and it is a fraction of a measured
+# extent rather than a lattice, so the error is a few percent instead of a lost pip.
 PIP_WIDTH_PX = 34
+
+# The viewport height `PIP_PITCH_PX` and `PIP_WIDTH_PX` are quoted at. The widget scales with
+# viewport height, and until this constant existed the reader simply did not: MEASURED over 334
+# adjacent-run gaps, the pitch is **36 px on 1080-normalized footage and 38 px on 1126**, and the
+# width 32 against 34 -- both within a percent of the 1126/1080 ratio.
+#
+# **That is not cosmetic: the lattice error ACCUMULATES.** `slot_fills` tests each run against
+# `k * pitch` from an anchor, so at slot 2 a pitch that is 2.5 px small lands 5 px off, and at
+# pitch 34 it lands 9 px off -- past `SLOT_TOL_PX`, so the THIRD PIP IS SILENTLY DISCARDED. A full
+# clip then reads 2.00. Frame 29 of `bluestacks-example-new.mp4` shows it exactly: three clean
+# 31 px runs at 56/90/124 and a reading of (0.91, 0.91, 0.00). Whether it happened depended on
+# which run was longest that frame, so the same full clip flickered between 2 and 3 -- which is
+# what the deployed shadow's ammo canary kept tripping on.
+REF_VIEWPORT_H = 1126
 
 MAX_AMMO_SLOTS = 3
 
@@ -152,6 +208,30 @@ def pip_mask(crop_hsv_row: np.ndarray, hue_range: tuple[int, int], sat_min: int,
     return hue_ok & (s >= sat_min) & (v >= val_min)
 
 
+def split_merged(runs: list[tuple[int, int]], pip_px: int,
+                 pitch: float, tol: float = SLOT_TOL_PX) -> list[tuple[int, int]]:
+    """Cut runs that span more than one pip into per-pip pieces.
+
+    Adjacent pips are separated by a few pixels of unpainted track, and when anti-aliasing paints
+    that seam the two merge into a single run. MEASURED: runs of 68-70 px against a 34 px pip,
+    5% of the impossible reversals in the fixture set.
+
+    The old code handed such a run to one slot and then applied `min(1.0, ...)`, so the merge cost
+    a whole pip and the reading dropped by one for a single frame. Cutting on the pitch keeps both.
+    """
+    out: list[tuple[int, int]] = []
+    for start, length in runs:
+        if length <= pip_px + tol:
+            out.append((start, length))
+            continue
+        k, off = 0, 0
+        while off < length - 1:
+            out.append((start + off, min(pip_px, length - off)))
+            k += 1
+            off = round(k * pitch)
+    return out
+
+
 def slot_fills(runs: list[tuple[int, int]], pip_px: int,
                pitch: float = PIP_PITCH_PX, tol: float = SLOT_TOL_PX) -> tuple[float, ...]:
     """Per-pip fill in 0..1, from the painted runs in one row.
@@ -170,6 +250,7 @@ def slot_fills(runs: list[tuple[int, int]], pip_px: int,
     fills = [0.0] * MAX_AMMO_SLOTS
     if not runs:
         return tuple(fills)
+    runs = split_merged(runs, pip_px, pitch, tol)
 
     ref = max(runs, key=lambda r: r[1])[0]
     on_lattice = []
@@ -189,6 +270,24 @@ def slot_fills(runs: list[tuple[int, int]], pip_px: int,
             # calibrated pip width's last pixel of slack goes, in the slot it belongs to.
             fills[slot] = min(1.0, fills[slot] + length / pip_px)
     return tuple(fills)
+
+
+def is_plausible(fills: tuple[float, ...], slack: float = 0.15) -> bool:
+    """Does this reading look like an ammo bar at all?
+
+    The bar fills from the LEFT, so the only shapes the widget can draw are some prefix of full
+    pips, at most one partial, then empties. A slot fuller than the one to its left is therefore
+    not a low reading, it is *not a reading* -- the row that was measured was not the ammo track,
+    or an intruder anchored the lattice and shifted every real pip one slot right.
+
+    MEASURED over 4685 fixture frames: 1.77% of readings violate this, and rejecting them removes
+    a third of the physically impossible frame-to-frame changes on its own. `slack` admits the
+    anti-aliasing spread the module docstring already prices at +/-0.06 per slot, twice over.
+
+    This is the package's own rule applied where it had been skipped: `read_ammo` promises that
+    None means "could not read, never a guess", and an impossible slot pattern is a guess.
+    """
+    return all(b <= a + slack for a, b in zip(fills, fills[1:]))
 
 
 def read_ammo(frame: np.ndarray, det, cfg=None) -> AmmoReading | None:
@@ -237,11 +336,32 @@ def read_ammo(frame: np.ndarray, det, cfg=None) -> AmmoReading | None:
         # looks exactly like this, and Mortis empties his often.
         return AmmoReading(0.0, 0.0, 0, (0.0,) * MAX_AMMO_SLOTS, bar.xyxy[1] + AMMO_BAND[0] + y0, 0)
 
-    fills = slot_fills(best_runs, cfg.hp_ammo_pip_px)
+    # Scale the widget constants to THIS frame's viewport. See `REF_VIEWPORT_H`: the pips are
+    # 36 px apart at 1080 and 38 at 1126, and a fixed pitch drops the third pip on the smaller one.
+    scale = frame.shape[0] / REF_VIEWPORT_H
+    pip_px = max(1, round(cfg.hp_ammo_pip_px * scale))
+    pitch = PIP_PITCH_PX * scale
+
+    longest = max((length for _, length in best_runs), default=0)
+    if longest < pip_px - SLOT_TOL_PX:
+        # Nothing here is pip-sized. A 4 px scrap is not a nearly-empty magazine, it is a frame
+        # where the track was not found -- MEASURED as 21% of the impossible reversals, every one
+        # of them reading a confident 0.00 between two neighbours that agreed on 2.
+        return None
+    if longest > (MAX_AMMO_SLOTS - 1) * pitch + pip_px + SLOT_TOL_PX:
+        # Wider than the whole three-pip track, so it is not the track. This is INSURANCE, not a
+        # measured fix -- 0 of 4108 fixture frames trip it -- and it is here because
+        # `split_merged` opened the hole it closes: before the split, a 300 px orange band read
+        # `min(1.0, 300/34)` in one slot and came out as 1.0; after it, that band would be cut
+        # into eight lattice pieces and come out as a confident, plausible-looking 3.0.
+        return None
+
+    fills = slot_fills(best_runs, pip_px, pitch=pitch)
+    if not is_plausible(fills):
+        return None
     ammo = float(sum(fills))
     return AmmoReading(ammo=ammo, frac=ammo / MAX_AMMO_SLOTS, whole=int(ammo),
-                       slots=fills, row=best_row + y0,
-                       pip_px=max((length for _, length in best_runs), default=0))
+                       slots=fills, row=best_row + y0, pip_px=longest)
 
 
 # ---------------------------------------------------------------------------------------------

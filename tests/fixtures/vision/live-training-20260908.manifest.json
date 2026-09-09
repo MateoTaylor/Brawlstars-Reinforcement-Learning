@@ -1,0 +1,90 @@
+{
+  "_comment": [
+    "What is in tests/fixtures/vision/live-training-20260908/, and what it is good for.",
+    "",
+    "The FRAMES themselves are gitignored (same rule as every other clip here -- the repo tracks",
+    "annotations, not Supercell's pixels). This file is the tracked part: it says what was",
+    "captured, under what conditions, and which measurements came out of it, so a later session",
+    "can tell whether re-capturing is necessary.",
+    "",
+    "FIRST LIVE CAPTURE OF THE DEPLOYED PIPELINE. Everything before this was recorded clips at",
+    "1920x1080; this is mss grabbing a 2560x1440 desktop through DeployCapture, which is the",
+    "actual deployment path. See BRAWL_DEPLOYMENT_DESIGN.md 6.8."
+  ],
+
+  "captured": "2026-09-08",
+  "venue": "Nulls Brawl, Training Grounds (NOT a real match -- see caveats)",
+  "brawler": "Mortis",
+  "scene": "hero at 8000 HP, four stationary training dummies at 4000 HP each, no projectiles",
+
+  "capture": {
+    "monitor": "2560x1440, fullscreen BlueStacks, no overlays",
+    "normalized_source": [2558, 1439],
+    "viewport": [2002, 1126],
+    "scale": 0.783,
+    "note": [
+      "A DOWNSCALE, which is the good direction.",
+      "",
+      "CORRECTED 2026-09-08. This field previously read 0.794 and blamed an overlapping window for",
+      "a second reading of 2521x1418. Both were wrong. 0.794 is 1126/1418 -- it was computed on a",
+      "LOBBY grab while normalized_source came from a GAMEPLAY grab, so the record mixed two",
+      "sources. 0.783 is 2002/2558 and 1126/1439, which agree, and which is what this row's own",
+      "normalized_source implies.",
+      "",
+      "The 2521x1418 reading is real and reproducible and has nothing to do with occlusion: the",
+      "Nulls Brawl LOBBY has a genuinely black 21 px band at the top of its own artwork, so",
+      "detect_content_box returns 2560x1418 there against ~2560x1440 in gameplay. Since the box is",
+      "computed once and cached, a loop started at the lobby would crop 21 real rows off every",
+      "gameplay frame. Fixed by not inferring at all -- DeployCapture.from_window takes the crop",
+      "rectangle from the window manager. See BRAWL_DEPLOYMENT_DESIGN.md 6.11."
+    ]
+  },
+
+  "files": {
+    "f000..f039.png": "40 consecutive frames at a nominal 20 Hz, hero idle. The general-purpose set: gate, detector, HP, ammo, super.",
+    "before/acquired/hold00..hold19/idle.png": "One joystick drive, bin 1 (right). `acquired` is the contact down at the anchor, `hold*` is the knob deflected, `idle` is bin 0 -- the knob back at the anchor WITHOUT a release. Good for reading the knob's own position off the framebuffer."
+  },
+
+  "measured": {
+    "gate": {
+      "refine_peak": 0.891,
+      "threshold": 0.45,
+      "score_min": 0.849,
+      "score_median": 0.891,
+      "frames_above_threshold": "40/40",
+      "note": "refine() found its peak at the STORED radius -- unchanged. The radius transferred from the OBS recording to the live mss source on this setup, which is not something to rely on generally (see control_calibration.json's own note) but is what happened here."
+    },
+    "detector": {"median_ms": 9.4, "first_call_ms": 997, "detections": "4 enemy + 1 player, all conf > 0.917"},
+    "health": {"enemy": "160/160 read, all == 4000", "hero": "40/40 read, all == 8000", "detect_plus_hp_median_ms": 11.1},
+    "ammo": {"read": "40/40", "ammo": 3.0, "pip_px": 35},
+    "super": {"read": "40/40", "charge": 1.0, "state": "ready"},
+    "capture_ms": {"median": 26.7, "p95": 35.4, "max": 359.2, "budget": 50, "note": "machine was in use; the max is an outlier, not a steady-state figure"}
+  },
+
+  "caveats": [
+    "TRAINING GROUNDS IS NOT THE DEPLOYMENT VENUE, and two things differ in ways that matter.",
+    "",
+    "1. The ARENA DOES NOT SCROLL. It fits on one screen, so the camera never moves and odometry",
+    "   correctly reports ~0 tiles for every commanded direction. Odometry measures CAMERA motion.",
+    "   Do not use these frames to test odometry, and do not read a zero here as a fault.",
+    "",
+    "2. The BUTTON LAYOUT DIFFERS. The calibrated `super` and `gadget` anchors land correctly, but",
+    "   the `attack` anchor at viewport (1748, 1042) lands on a green chevron button that exists",
+    "   only in this venue, sitting on top of the real attack area. Taps there were unreliable: 2",
+    "   of 3 consumed no ammo, and the super discharged without being commanded.",
+    "",
+    "   Per the operator, this is a VENUE artifact and not an aiming error: attack is an AREA,",
+    "   not a button. Any tap on the right side of the screen fires so long as it misses the",
+    "   Super and gadget buttons, and the attack stick floats to the touch point the way the",
+    "   movement stick does. So the chevron swallowed a touch that was otherwise fine. The fix is",
+    "   to pick the tap point by CLEARANCE rather than by the button centre, and to confirm it in",
+    "   a friendly battle against the ammo counter.",
+    "",
+    "3. The super appears permanently charged and the HUD carries `Edit Controls` / `Exit` buttons",
+    "   and a `Damage per second:` readout, none of which appear in a match.",
+    "",
+    "What these frames ARE good for: capture geometry, the match gate, the detector, both HP",
+    "readers, ammo and super reading, and joystick direction (which was measured on the hero's own",
+    "screen position rather than on odometry, precisely because of caveat 1)."
+  ]
+}

@@ -1,0 +1,133 @@
+# brawl_deployment tunables. See BRAWL_DEPLOYMENT_DESIGN.md and brawl_deployment/config.py.
+#
+# SETTINGS live here -- numbers where a different value is a different judgment call.
+# MEASUREMENTS live in brawl_deployment/data/control_calibration.json: the joystick anchor, its
+# saturation radius and the button centres are outputs of scripts/deploy_calibrate.py, regenerated
+# rather than edited, and meaningless to hand-tune.
+#
+# WHAT IS NOT IN THIS FILE IS AS IMPORTANT AS WHAT IS. The DECISION cadence and
+# meta.time_frac's denominator are DERIVED from the training config the checkpoint was produced
+# under (dt, action_repeat, max_episode_steps). A knob for either would be a second source of
+# truth for the thing that must match training exactly, and the failure is a policy stepping at a
+# rhythm it never saw while every number on screen still looks plausible. Likewise the capture
+# viewport (read from the camera model) and the monitor index (resolved from the emulator window).
+#
+# The PERCEPTION rate is the one rate that IS a setting (loop.tick_hz below), because the
+# checkpoint has no opinion about it -- it never sees the refreshes between its own decisions.
+# It is still not free: resolve_rates() admits only values that divide the 250 ms decision period
+# into whole ticks, and validate() rejects any that would put a Mortis dash past
+# odometry.max_shift_tiles. config.py's module docstring lists the rest and why.
+
+run:
+  # The run directory carries its own train.yaml, which names the env config AND the agent_obs
+  # spec. Those are deliberately NOT repeated here: a spec path in this file could disagree with
+  # the one the checkpoint was trained against, and policy.py's guards exist because that
+  # disagreement is silent -- the observation is the right WIDTH with the wrong columns in it.
+  dir: runs/mortis_deploy-20260907-041522
+  checkpoint: best_model.zip
+
+policy:
+  # MEASURED (design 6.7): 0.96 ms on CPU against 7.56 ms on CUDA for one batch-1 decision, at
+  # 1.04M parameters. CPU wins 8x at this size -- the transfer dominates the arithmetic -- and it
+  # leaves all 16 GB of VRAM to the detectors, which is where VRAM is actually scarce.
+  device: cpu
+  # The stochastic policy is a training-time exploration device. A deployed agent sampling from
+  # its own action distribution adds noise to a decision it already made and makes every failure
+  # unreproducible.
+  deterministic: true
+
+window:                   # design 6.9
+  exe: HD-Player.exe      # matched on the process image; titles and Qt class names are not stable
+  # A windowed emulator is a different projection, not a smaller picture of the same one: the
+  # homography, the HUD mask and the tap anchors were all measured against a fullscreen client
+  # area. Turning this off means recalibrating, not merely accepting a smaller picture.
+  require_fullscreen: true
+  # mss grabs the DESKTOP, so any window in front of the emulator is what the pipeline sees. This
+  # detects that and the loop pauses -- releases contacts, keeps capturing, resumes when clear.
+  # Note the consequence, which is an operating constraint and not a bug: on a single monitor
+  # there is no arrangement where someone watches the agent in another window on the same screen.
+  check_occlusion: true
+  # Ticks between occlusion probes; 20 is once a second at the derived capture rate. Five
+  # WindowFromPoint calls cost microseconds, so this is not a cost tuning -- it is how long the
+  # agent may keep playing into a covered screen before it notices.
+  check_every_n_ticks: 12
+
+capture:
+  # null means "the monitor the emulator window is on", resolved by window.monitor_index_for.
+  # An explicit index is an override for when that resolution is wrong, not the normal path.
+  # Never 0: mss's index 0 is the union of every display, and capturing it would hand
+  # detect_content_box a frame containing a second monitor.
+  monitor: null
+
+control:
+  # "adb" drives the emulator. "null" runs the entire loop -- capture, perception, policy,
+  # telemetry -- and emits no input at all. That is the mode for the first run of any change to
+  # perception or the policy, and it is worth using more often than it feels like it should be.
+  backend: adb
+  # null asks find_adb_serial to read the single running instance out of bluestacks.conf.
+  adb_instance: null
+  # WHERE TO TAP TO FIRE, as a fraction of the DEVICE screen (1920x1080), so (0.88, 0.55) is
+  # (1690, 594).
+  #
+  # This is a SETTING, and that is the correction from design 6.8. Attack is an AREA, not a
+  # button: any tap on the right side of the screen fires so long as it misses the Super and
+  # gadget buttons, and the attack stick FLOATS to the touch point exactly like the movement
+  # stick. So this is chosen for CLEARANCE -- the same way 4.3 chose the joystick anchor -- and
+  # pointing it at the measured button centre would be a downgrade, not a fix. At 1920x1080 it
+  # sits ~330 px from gadget and ~450 px from super, above the button cluster and inside the
+  # right edge, which also keeps it clear of venue-specific buttons drawn over the attack area
+  # (a green chevron in Training Grounds swallowed 2 of 3 taps at the old anchor).
+  #
+  # UNVERIFIED IN A REAL MATCH. scripts/deploy_calibrate.py confirms it by tapping once and
+  # asserting read_ammo decrements, which is the venue-independent check and the one that would
+  # have caught the chevron immediately.
+  attack_tap: [0.88, 0.55]
+
+loop:                     # design 6.13
+  # Perception ticks per second. The DECISION rate is not here: it is dt * action_repeat = 250 ms
+  # from the training config, and only rates that divide that into whole ticks are accepted
+  # (20 / 16 / 12 / 8 for this checkpoint). Anything else raises rather than rounding, because
+  # rounding stretches the agent's step onto a rhythm it never trained on.
+  #
+  # 12 rather than the sim's own 20, and MEASURED (design 6.13): at 20 Hz the loop does not fit
+  # inside 50 ms -- 27.1 ms of stage work per plain tick and 34.7 per decision tick, plus a ~24 ms
+  # live grab. The pacer does not sleep on an overrun, so 20 Hz does not give a slow loop, it
+  # gives a JITTERING one, with the decision window landing near 263 ms instead of 250. At 12 Hz
+  # every tick fits with ~20 ms spare on the worst measured frame, the decision window is exactly
+  # 250 ms, and the spare absorbs this machine doing other work at the same time.
+  #
+  # The price, both halves measured: a Mortis charged dash covers 1.48 tiles per frame instead of
+  # 0.89 against odometry.max_shift_tiles = 2.0, and projectiles get the two looks a velocity needs
+  # on 21% of shots instead of 44%. The second is concentrated rather than spread -- shots on
+  # screen >=200 ms (the ones there is time to react to) are 100% covered at 12, 16 and 20 Hz
+  # alike, and the whole difference is the 100-200 ms band at 99% -> 42%.
+  #
+  # 16 is the next step up if a live run shows the budget is kinder than the estimate, or if
+  # dodging looks bad in that band. 8 is not an option -- 2.22 tiles per dash frame, past the
+  # bound, so every dash would reset the world model.
+  tick_hz: 12
+
+shadow:                   # design 6.3
+  # Consecutive ammo mismatches before resyncing the shadow hero from CV. Three, not one: a lone
+  # mismatch is as likely to be a pip bar misread mid-reload as a real desync, and resyncing on it
+  # reseeds the unobservable timers conservatively for no reason.
+  ammo_strikes: 3
+  # Resyncs inside one match before the run is called lost. Sustained desync means our actions are
+  # not landing, and an agent whose model of itself is wrong is worse than a stopped one.
+  max_resyncs: 5
+
+safety:
+  # The match gate is the primary interlock; this is the backstop for the gate itself being wrong.
+  # Generous on purpose -- a match runs ~150 s and this should never be what ends one.
+  max_match_seconds: 300.0
+  # A gap this long between frames means capture has stalled, and odometry's per-FRAME shift bound
+  # is already violated. Release and stop.
+  capture_stall_seconds: 1.0
+
+telemetry:
+  # Scalars only, append-only, one row per decision. Never frames: at 20 Hz a 1440p BGR history is
+  # ~124 MB/s, so a three-minute match would be ~22 GB (design 7).
+  dir: runs/deploy
+  # Frames to dump for debugging, hard-capped. 0 = off, and 0 is the only value that should
+  # survive into an unattended run.
+  frame_dump: 0

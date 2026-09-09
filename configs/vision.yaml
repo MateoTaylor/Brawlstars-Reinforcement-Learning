@@ -38,11 +38,18 @@ odometry:                 # Phase F
   # This floor alone is NOT sufficient -- a window locked onto a moving sprite scores
   # 0.92-0.98 while reporting pure fiction. See min_agreement_ratio for what catches that.
   min_response: 0.10
-  # MEASURED, and it assumes capture.target_fps: 20. The fastest thing in the game is not a
-  # walk -- Mortis's charged dash covers 5.34 tiles in 0.30 s (17.8 tiles/s), i.e. 0.89 tiles
-  # per frame at 20 Hz, against 0.137 for the fastest walk. 2.0 leaves 2.2x headroom over the
-  # dash and still catches the one real cut in the fixtures (a 3.3-tile jump). This bound is
-  # per FRAME, not per second: raise it if the capture rate drops.
+  # MEASURED. The fastest thing in the game is not a walk -- Mortis's charged dash covers 5.34
+  # tiles in 0.30 s (17.8 tiles/s), i.e. 0.89 tiles per frame at 20 Hz, against 0.137 for the
+  # fastest walk. 2.0 leaves 2.2x headroom over the dash and still catches the one real cut in
+  # the fixtures (a 3.3-tile jump). This bound is per FRAME, not per second.
+  #
+  # **The deployed loop now runs at 12 Hz, not 20** (BRAWL_DEPLOYMENT_DESIGN.md 6.13), which puts
+  # a charged dash at 1.48 tiles per frame -- 74% of this bound, 1.35x headroom instead of 2.2x.
+  # 2.0 is KEPT rather than raised: the cut it has to catch is a camera teleport, whose size does
+  # not depend on the frame rate, so raising this would spend the margin that matters to buy
+  # margin on the side that is still comfortable. `brawl_deployment/config.py` enforces the pairing
+  # -- `validate` refuses any tick rate that puts the dash past this number, which is why 8 Hz is
+  # not an option there. Re-measure before deploying a brawler faster than Mortis.
   max_shift_tiles: 2.0
   # Correlation window geometry. ONE window over the whole patch does not work: measured on
   # counted_walking.mp4, a single 823x581 window reports 2.8 tiles of camera travel across a
@@ -110,10 +117,20 @@ occupancy:                # Phase I
   lock_ratio: 0.8
 
 classifier:               # Phase H
-  # Not a placeholder -- a real choice. At deploy time the GPU is busy running the policy, and
-  # the Phase H model (a shallow fully-convolutional head, not a U-Net) is small enough that
-  # CPU inference very likely fits inside the 250 ms decision budget. Measure before moving it.
-  device: cpu
+  # MEASURED 2026-09-08 and moved, which is what the previous comment here asked for. It read:
+  # "at deploy time the GPU is busy running the policy... measure before moving it." Both halves
+  # turned out otherwise. The policy runs on the CPU in deployment (configs/deployment.yaml's
+  # policy_device, measured faster there than on CUDA for a network this small), so the GPU is
+  # running only the two detectors; and the budget that binds is the 50 ms PERCEPTION tick, not
+  # the 250 ms decision -- brawl_deployment/loop.py deposits terrain at 20 Hz because a skipped
+  # frame is evidence thrown away.
+  #
+  # 40 frames of bluestacks-example-new at the deployment viewport, after warm-up:
+  #   cpu    median 9.26 ms   p95  9.98   max 10.63
+  #   cuda   median 5.86 ms   p95  6.04   max  6.20
+  # and the two agree on EVERY cell of every frame (max disagreement 0.00000 over 10 frames), so
+  # this is 3.4 ms of a tight tick budget for an identical map. Driver: scratchpad/classifier_device.py.
+  device: cuda
 
 detector:                 # brawl_vision/object_detection -- third-party YOLO over the RAW frame
   # Which fetched model to run. Names are keys of object_detection/weights.MODELS, not paths:

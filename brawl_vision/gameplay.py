@@ -87,6 +87,14 @@ BUTTON_ROI = (0.55, 0.60, 1.00, 1.00)
 # matching map decoration.
 RADIUS_PX = (40, 115)
 
+# The BlueStacks/Nulls Brawl layout this project deploys against draws smaller buttons than either
+# iOS layout -- attack ~35, gadget ~33, super ~46 -- so `RADIUS_PX` never proposes the two best
+# ones to HoughCircles and `calibrate_buttons` returns nothing at all on that footage. That is a
+# search-range failure, not a scoring one: the same search at this floor finds them and they score
+# 0.587 and 0.818. Kept as a separate band rather than widening the default, because widening it
+# would change what every existing recording calibrates to.
+DEPLOY_RADIUS_PX = (25, 115)
+
 # A calibration whose best candidate scores below this is not a control cluster. The weakest
 # genuine recording here calibrates at 0.77.
 MIN_CALIBRATION_SCORE = 0.60
@@ -221,11 +229,18 @@ def median_frame(path, box, n: int = MEDIAN_SAMPLES) -> np.ndarray:
     return np.median(np.stack(frames), axis=0).astype(np.uint8)
 
 
-def calibrate_buttons(median: np.ndarray, max_anchors: int = MAX_ANCHORS) -> list[dict]:
+def calibrate_buttons(median: np.ndarray, max_anchors: int = MAX_ANCHORS,
+                      radius_px: tuple[int, int] = RADIUS_PX,
+                      min_score: float = MIN_CALIBRATION_SCORE) -> list[dict]:
     """Find the control-button rings in a recording's median frame, best first.
 
     Returns `[{score, cx, cy, r}, ...]`, empty if this recording shows no control cluster -- which
     is a real answer, not a failure: one of the recordings here is nine seconds of menus.
+
+    `radius_px` and `min_score` are parameters rather than constants only because
+    `brawl_deployment` runs this same search against a different HUD, at `DEPLOY_RADIUS_PX`. Both
+    default to the module constants, so every existing caller is unchanged -- the alternative was
+    a second copy of the Hough call in the deployment package, which would then drift.
     """
     h, w = median.shape[:2]
     rx0, ry0, rx1, ry1 = BUTTON_ROI
@@ -234,7 +249,7 @@ def calibrate_buttons(median: np.ndarray, max_anchors: int = MAX_ANCHORS) -> lis
     gray = cv2.GaussianBlur(cv2.cvtColor(sub, cv2.COLOR_BGR2GRAY), (5, 5), 1.5)
     circles = cv2.HoughCircles(gray, cv2.HOUGH_GRADIENT, dp=1, minDist=60,
                                param1=120, param2=45,
-                               minRadius=RADIUS_PX[0], maxRadius=RADIUS_PX[1])
+                               minRadius=radius_px[0], maxRadius=radius_px[1])
     if circles is None:
         return []
     found = []
@@ -248,7 +263,7 @@ def calibrate_buttons(median: np.ndarray, max_anchors: int = MAX_ANCHORS) -> lis
         found.append({"score": round(score, 4), "cx": round(cx, 1),
                       "cy": round(cy, 1), "r": round(r, 1)})
     found.sort(key=lambda c: -c["score"])
-    if not found or found[0]["score"] < MIN_CALIBRATION_SCORE:
+    if not found or found[0]["score"] < min_score:
         return []
     return found[:max_anchors]
 

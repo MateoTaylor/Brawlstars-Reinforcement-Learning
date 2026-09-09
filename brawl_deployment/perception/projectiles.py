@@ -11,7 +11,8 @@ detector can supply either.
 
 They share `_greedy_match` and nothing else, because almost every other decision differs:
 
-  * **Rate.** Entities are tracked at the 4 Hz decision rate. Projectiles are tracked at **20 Hz**
+  * **Rate.** Entities are tracked at the 4 Hz decision rate. Projectiles are tracked at the
+    **perception rate** (12 Hz, §6.13; the measurements below were taken at 20)
     and read at 4 Hz, because at 4 Hz they are barely observable -- 93% of projectiles never
     survive to a second sample at that rate (BRAWL_DEPLOYMENT_DESIGN.md 9.5), and one sample is a
     position with no direction attached.
@@ -93,11 +94,16 @@ GATE_NOISE_TILES = 0.4
 # "a brawler cannot stand in a wall" test, and it has not been run.
 PROJ_ANCHOR_FRAC = 0.5
 
-# A track older than this is dropped rather than coasted further -- two 20 Hz ticks. Coasting
-# exists so that one missed detection does not split a projectile into two tracks and cost the
-# velocity; it is not a belief that the projectile is still there, and `live` will not report a
-# coasted track.
-MAX_COAST_S = 0.1
+# A track older than this is dropped rather than coasted further. Coasting exists so that one
+# missed detection does not split a projectile into two tracks and cost the velocity; it is not a
+# belief that the projectile is still there, and `live` will not report a coasted track.
+#
+# The number to hold is ONE missed tick tolerated and two not, so it belongs strictly between one
+# and two tick periods. 0.1 was that at 20 Hz (0.05 / 0.10) with the top end exactly on the bound;
+# at the shipped 12 Hz (§6.13) one miss is 0.083 s, which 0.1 admits by only 17 ms -- close enough
+# that a single long tick would drop a track that is merely blinking. 0.15 sits mid-band at 12 Hz
+# (0.083 in, 0.167 out) and is still under two ticks at 16 Hz. Re-check it if the rate moves again.
+MAX_COAST_S = 0.15
 
 # Samples needed before a track reaches the observation. Two, because that is the minimum for a
 # velocity -- and reporting a one-sample projectile with `vel = (0, 0)` would be worse than
@@ -193,7 +199,7 @@ class ProjectileResult:
 
 
 class ProjectileTracker:
-    """Feed it one 20 Hz tick's detections; read tracked projectiles. One instance per match."""
+    """Feed it one perception tick's detections; read tracked projectiles. One per match."""
 
     def __init__(self, min_samples: int = MIN_SAMPLES, max_coast_s: float = MAX_COAST_S,
                  anchor_frac: float = PROJ_ANCHOR_FRAC,

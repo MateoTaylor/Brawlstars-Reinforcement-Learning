@@ -51,6 +51,18 @@ class InputBackend(Protocol):
         """False once the transport has died. `loop.py` checks this rather than assuming a write
         that did not raise actually landed."""
 
+    @property
+    def injects(self) -> bool:
+        """Does this backend actually reach the device?
+
+        False only for `NullBackend`. It exists because the shadow's ammo canary compares what the
+        game did against what our actions should have caused -- and when nothing was injected, the
+        canary is guaranteed to trip, correctly, on a link we broke on purpose. Without this the
+        first live dry run burned 4 of its 5 resyncs in 22 seconds and would have stopped itself.
+
+        Deliberately a property OF THE BACKEND, not a dry-run flag on the loop: the same reasoning
+        that swaps the backend instead of adding a boolean (`deploy_run.py`) applies here."""
+
 
 class NullBackend:
     """Accepts everything, injects nothing, remembers what it was told.
@@ -88,3 +100,8 @@ class NullBackend:
     @property
     def is_alive(self) -> bool:
         return not self._closed
+
+    @property
+    def injects(self) -> bool:
+        """Nothing reaches a device from here; that is the entire point of the class."""
+        return False

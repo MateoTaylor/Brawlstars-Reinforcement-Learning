@@ -72,6 +72,11 @@ def main(argv=None) -> int:
                         "for no extra legibility (default: 1280)")
     p.add_argument("--start", type=int, default=0, help="first frame index")
     p.add_argument("--stop", type=int, default=None, help="last frame index, inclusive")
+    p.add_argument("--no-trim", action="store_true",
+                   help="read the whole file instead of stopping where ClipReader thinks "
+                        "gameplay ends. That detector is tuned to drop outros and full-screen "
+                        "character art, and on an EDITED clip it will take real footage with "
+                        "them -- edited_day14_broll loses its last 195 frames. Recordings only")
     p.add_argument("--config", default=None, help="a vision.yaml to use instead of the default")
     p.add_argument("--list-classes", action="store_true",
                    help="print the model's own class list, read from the ONNX metadata, and exit")
@@ -80,6 +85,8 @@ def main(argv=None) -> int:
 
     if args.no_entities and not args.projectiles:
         p.error("--no-entities with no --projectiles leaves nothing to run")
+    if args.no_trim and args.clip is not None and str(args.clip).startswith("screen"):
+        p.error("--no-trim is a recording option -- a live source has no tail to trim")
 
     cfg = load_vision_config(args.config) if args.config else load_vision_config()
     detector = projectiles = None
@@ -132,7 +139,10 @@ def main(argv=None) -> int:
     t0 = time.perf_counter()
     infer_seconds = 0.0
     try:
-        with open_source(args.clip, cfg) as source:
+        # Only for a file: `open_source` hands kwargs straight to the source it built, and
+        # `ScreenCapture` has no `trim_tail` to receive.
+        opts = {"trim_tail": False} if args.no_trim else {}
+        with open_source(args.clip, cfg, **opts) as source:
             if args.stop is None and is_live(source) and args.out:
                 say("   live capture with no --stop: ctrl-C to finish the file")
             for frame in source:

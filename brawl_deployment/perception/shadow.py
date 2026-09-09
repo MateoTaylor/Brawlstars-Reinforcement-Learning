@@ -140,19 +140,26 @@ gap between noise and signal is wide and both ends are measured (section 6.4):
 
     reader noise      +/-0.06 on one pip, 98.3% of reads within 0.15 of an integer
     smallest desync    1.0    -- a dash that did or did not happen
-    AMMO_TOLERANCE     0.5    -- the midpoint, on a linear or a log scale alike
+    AMMO_TOLERANCE     0.5    -- the read is ABOVE the shadow: the game holds ammo we
+                              already spent, which no amount of missing paint can fake
+    ..._UNPAINTED      1.0    -- the read is BELOW the shadow: a recharging pip the
+                              detector missed, worth a whole pip. See the constants.
 
 Two guards keep a true reading from being called a desync. **A grace window** after each attack,
-because the frame being compared was captured before the tap went in, so a real one-pip gap is
-expected for about one decision. **A debounce**, because `read_ammo` returns None on 12% of frames
-and a single bad read must not trigger a resync -- the resync is destructive, reseeding timers
-conservatively. `DESYNC_STRIKES` consecutive failures outside the grace window is 0.75 s at 4 Hz.
+because the spend takes about a second to reach the screen (see `DESYNC_GRACE_SECONDS`), so a real
+one-pip gap is expected for several decisions. **A debounce**, because `read_ammo` returns None on
+12% of frames and a single bad read must not trigger a resync -- the resync is destructive,
+reseeding timers conservatively. `DESYNC_STRIKES` consecutive failures outside the grace window is
+0.75 s at 4 Hz.
 
-A miss (`None`) neither strikes nor clears; it is not evidence either way.
+A miss (`None`) neither strikes nor clears; it is not evidence either way. The debounce is also
+what absorbs the OTHER failure the first live run showed: `read_ammo` returns a spurious 0.00 or
+1.00 off a full clip roughly once every 60 reads, always for one or two samples, never three.
 
 Worth knowing where the canary is blind: the grace window mutes it during a burst, and Mortis can
-fire every 0.35 s. It is fully live during the 2.25 s reload that follows, which is exactly when
-"did we spend two or three?" is answerable, so the blindness costs little.
+fire every 0.35 s. It is fully live through the tail of the 2.25 s reload that follows and through
+every idle stretch -- about 80% of a real match, measured on run1 -- which is where "did we spend
+two or three?" is answerable anyway.
 
 **Detection and response are separate on purpose.** `check_ammo` never resyncs by itself;
 `loop.py` decides, because it is also the thing that has to count sustained desyncs into section
@@ -199,9 +206,48 @@ DT = 0.05
 N_MOVE_BINS = 16
 
 # See "The canary" in the module docstring for where each of these comes from.
+# **The comparison is ASYMMETRIC, because the sensor's error is.** `read_ammo` sums PAINTED pip
+# fill, and unpainted pixels can only lose ammo -- the read can under-report a partially recharged
+# pip, it cannot invent one. So the two directions carry different evidence:
+#
+#   CV ABOVE the shadow  -- the game holds ammo we did not model. Unexplainable by the read, so
+#                           this side keeps the tight tolerance. It is also the direction that
+#                           means OUR TAPS ARE NOT LANDING, which is the whole point of the canary.
+#   CV BELOW the shadow  -- fully explained by a recharging pip the read missed, for anything up
+#                           to one whole pip.
+#
+# MEASURED on the second live deployment (run1.csv, 2026-09-09): the recharging pip is detected
+# only INTERMITTENTLY -- CV read 2.00 -> 2.56 -> 2.00 inside 0.5 s at t=16.5, and 2.00 -> 2.65 ->
+# 2.00 at t=17.7, while the shadow sat between them the whole time. Outside the grace window the
+# error distribution is median 0.12, p90 0.64, max 1.56, so a symmetric 0.5 sits BELOW the
+# sensor's own noise floor and manufactures desyncs. All three of that run's resyncs were false
+# and all three were on this side.
+#
+# Replaying that run's 100 reads through the strike machine: symmetric 0.5 trips 3 times (exactly
+# the three seen live, at t=17.7/23.5/28.2), asymmetric trips 0 -- while still flagging 6 of 7
+# samples of an injected "no input lands" failure, the same as the tight rule. Flooring both sides
+# to whole pips was tried first and is WORSE (6 trips): it turns a 2.99-vs-3.00 boundary into a
+# full pip of disagreement.
 AMMO_TOLERANCE = 0.5
+AMMO_TOLERANCE_UNPAINTED = 1.0
 DESYNC_STRIKES = 3
-DESYNC_GRACE_SECONDS = 0.30
+# Seconds after a modelled attack during which an ammo disagreement is NOT counted, because the
+# game has not shown the spend yet. MEASURED, not reasoned: the first live deployment (run1.csv,
+# 2026-09-09) put the delay from a modelled tap to the pip bar reading one lower at 0.50-1.25 s,
+# median 1.00 -- and `verify_tap` independently needs a 0.9 s `TROUGH_WINDOW_S` to catch the same
+# drop, which is the same number arrived at from the other side.
+#
+# **0.30 was sized for one decision period and it was wrong by 4x.** All four resyncs of that run
+# followed an attack cluster by 1-2 s: the shadow decrements on the tap, the bar had not moved
+# yet, and the canary called the difference a desync. The second resync was worse than the first,
+# because resyncing ADOPTS the CV value and the value it adopted was stale -- so a false trip does
+# not merely waste budget, it injects the error it claimed to find.
+#
+# It does not matter which half of the delay is actuation (ADB -> emulator -> game) and which is
+# the swing animation plus the bar drain; the canary compares against what is ON SCREEN, so the
+# window has to cover the whole observable path either way. 1.5 s is the worst clean observation
+# plus one decision period.
+DESYNC_GRACE_SECONDS = 1.5
 SUPER_STALE_SECONDS = 1.0
 # Sized against `tracker.GATE_NOISE_TILES = 1.0`, the anchor noise on a hero box, because that is
 # what the CV displacement this gets compared against carries.
@@ -277,7 +323,9 @@ class ShadowHero:
     per perception tick, `observe()` when the assembler needs the `self` group."""
 
     def __init__(self, params: ShadowParams, *, dt: float = DT, n_move_bins: int = N_MOVE_BINS,
-                 ammo_tolerance: float = AMMO_TOLERANCE, desync_strikes: int = DESYNC_STRIKES,
+                 ammo_tolerance: float = AMMO_TOLERANCE,
+                 ammo_tolerance_unpainted: float = AMMO_TOLERANCE_UNPAINTED,
+                 desync_strikes: int = DESYNC_STRIKES,
                  desync_grace_seconds: float = DESYNC_GRACE_SECONDS,
                  super_stale_seconds: float = SUPER_STALE_SECONDS):
         self.p = params
@@ -285,6 +333,7 @@ class ShadowHero:
         self._dt_py = float(dt)
         self.n_move_bins = n_move_bins
         self.ammo_tolerance = float(ammo_tolerance)
+        self.ammo_tolerance_unpainted = float(ammo_tolerance_unpainted)
         self.desync_strikes = int(desync_strikes)
         self.desync_grace_seconds = float(desync_grace_seconds)
         self.super_stale_seconds = float(super_stale_seconds)
@@ -525,7 +574,11 @@ class ShadowHero:
         error = float(reading.ammo) - float(self.ammo)
         if self.elapsed - self._last_attack_at < self.desync_grace_seconds:
             return Desync(GRACE, error, self.strikes)
-        if abs(error) < self.ammo_tolerance:
+        # See `AMMO_TOLERANCE`: negative error (the shadow above the read) is what a missed
+        # recharging pip looks like, so it is allowed a whole pip; positive error is not
+        # explainable by the sensor and keeps the tight bound.
+        allowed = self.ammo_tolerance if error >= 0 else self.ammo_tolerance_unpainted
+        if abs(error) < allowed:
             self.strikes = 0
             return Desync(OK, error, 0)
         self.strikes += 1
