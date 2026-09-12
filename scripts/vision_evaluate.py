@@ -38,9 +38,10 @@ Read the number WITH its confidence -- a covered readout is the one failure that
 clean read; brawl_vision/object_detection/hp_detection/ documents why.
 
 `--projectiles` adds OUR trained projectile model (`object_detection/projectile_detection`) to
-the same layout, in magenta, beside whatever else is on. It is independent of `--detect`: the two
+the same layout, beside whatever else is on. It finds power cubes as well, one colour per class:
+magenta projectiles, blue crates, green dropped cubes. It is independent of `--detect`: the two
 are different models over the same raw frame, and either can run alone. With both, the corner
-tally counts both.
+tally counts both, and it doubles as the colour legend.
 
     python scripts/vision_evaluate.py match.mp4 -o all.mp4 --hp --projectiles
     python scripts/vision_evaluate.py match.mp4 -o shots.mp4 --projectiles --projectile-conf 0.15
@@ -160,8 +161,9 @@ def main(argv=None) -> int:
                         "empty string to keep all of them -- 'teammate' is impossible in Solo "
                         "Showdown but is the canary for a mis-fed detector")
     p.add_argument("--projectiles", action="store_true",
-                   help="also run OUR trained projectile detector over the RAW frame and draw its "
-                        "boxes, in magenta, on the left panel. Independent of --detect -- either "
+                   help="also run OUR trained projectile/power-cube detector over the RAW frame "
+                        "and draw its boxes on the left panel (magenta projectile, blue crate, "
+                        "green dropped cube). Independent of --detect -- either "
                         "model can run alone. Needs a trained model: run "
                         "brawl_vision/object_detection/projectile_detection/train.py, which "
                         "exports the ONNX this loads")
@@ -372,8 +374,14 @@ def main(argv=None) -> int:
         # Reported separately from the entity boxes rather than summed. The two models find
         # different kinds of thing at different rates, and one boxes-per-frame number over both
         # would move for reasons you could not attribute.
-        say(f"   {report.projectile_boxes} projectile boxes over {report.projectile_frames} "
-            f"frames ({report.projectile_boxes / report.projectile_frames:.2f}/frame)")
+        say(f"   {report.projectile_boxes} projectile-model boxes over "
+            f"{report.projectile_frames} frames "
+            f"({report.projectile_boxes / report.projectile_frames:.2f}/frame)")
+        # And per class, for the same reason one level down: a crate sits on screen for the whole
+        # clip and a shot for a few frames, so the combined rate is dominated by whichever of them
+        # this clip happened to have more of.
+        for label, n in sorted(report.projectile_labels.items()):
+            say(f"     {label:<20s} {n:6d}  ({n / report.projectile_frames:.2f}/frame)")
     if report.outside_window:
         say(f"   WARNING: {report.outside_window} observed cells fell outside the canvas pass 1 "
             f"sized. Re-run with a smaller --scan-step.")

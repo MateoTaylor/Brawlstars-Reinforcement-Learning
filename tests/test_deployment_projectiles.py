@@ -15,12 +15,17 @@ import pytest
 
 from brawl_deployment.perception.projectiles import (
     DUPLICATE_TILES, GATE_NOISE_TILES, MAX_COAST_S, MAX_PROJ_TILES_S, MIN_SAMPLES,
-    PROJ_ANCHOR_FRAC, ProjectileTracker, _dedupe,
+    PROJ_ANCHOR_FRAC, ProjectileTracker, _dedupe, require_projectile_class,
 )
 from brawl_vision.object_detection.detector import Detection
 
 PPT = 48
 TICK = 0.05          # 20 Hz, the rate this tracker is designed for
+
+# The other two classes the same model finds, spelled out literally rather than imported from
+# `classes.py`. That module is what the tracker filters with, so a test built from it would agree
+# with any typo in it.
+CRATE, CUBE = "Power Cube Box", "Power Cube Dropped"
 
 
 class StubPlan:
@@ -39,10 +44,10 @@ class StubOdo:
         self.segment = segment
 
 
-def det_at(tx, ty, conf=0.9, size=10.0):
+def det_at(tx, ty, conf=0.9, size=10.0, label="Projectile"):
     """A box whose CENTRE lands exactly on tile `(tx, ty)`."""
     px, py = tx * PPT, ty * PPT
-    return Detection(label="Projectile", confidence=conf,
+    return Detection(label=label, confidence=conf,
                      xyxy=(px - size / 2, py - size / 2, px + size / 2, py + size / 2))
 
 
@@ -200,6 +205,97 @@ def test_dedupe_measures_against_survivors_not_against_dropped_points():
     collapsing it would hide two of them."""
     chain = [((0.0, 0.0), 0.9), ((0.2, 0.0), 0.8), ((0.4, 0.0), 0.7)]
     assert _dedupe(chain, DUPLICATE_TILES) == [((0.0, 0.0), 0.9), ((0.4, 0.0), 0.7)]
+
+
+# ---------------------------------------------------------------- the model's other classes
+
+def test_a_power_cube_crate_never_becomes_a_projectile():
+    """The failure the label filter exists for. A crate sits still, so a track on it would get
+    `vel = (0, 0)` after two ticks, `closest_approach` would give it t = 0, and `obs_select`'s
+    ascending sort would put it ahead of every real incoming shot -- one crate per slot until the
+    real projectiles are evicted from all twelve."""
+    trk = ProjectileTracker()
+    frames = [[det_at(3.0, 3.0, label=CRATE), det_at(5.0, 5.0, label=CUBE),
+               det_at(0.4 * i, 0.0)] for i in range(4)]
+    res = run(trk, frames)
+    assert len(trk.tracks) == 1, "only the projectile is tracked"
+    assert len(res.live) == 1 and res.live[0].vel[0] == pytest.approx(8.0, abs=1e-6)
+    assert res.n_detections == 1
+    assert res.n_other == 2
+    (_, vel, _), = trk.snapshot((0.0, 0.0))
+    assert vel != (0.0, 0.0)
+
+
+def test_a_confident_crate_does_not_merge_away_a_projectile_flying_over_it():
+    """`_dedupe` keeps the more confident of two boxes within 0.3 tiles. A shot crossing a crate
+    projects onto the crate's tile, and a crate is the more confident box -- so if the filter ran
+    after dedupe, the crate would win and the shot would vanish for exactly the frames it is
+    closest to something worth standing next to."""
+    trk = ProjectileTracker()
+    res = trk.update([det_at(1.0, 1.0, conf=0.95, label=CRATE), det_at(1.02, 1.0, conf=0.4)],
+                     StubPlan(), StubOdo(), t=0.0)
+    assert res.n_merged == 0
+    assert len(trk.tracks) == 1 and trk.tracks[0].confidence == pytest.approx(0.4)
+
+
+def test_the_split_is_counted_the_same_way_on_a_refused_tick():
+    """`n_detections` means projectile boxes on every return path, not just the happy one --
+    otherwise the count jumps whenever odometry blinks and a log reader chases a detector
+    regression that is really a counting change."""
+    trk = ProjectileTracker()
+    trk.update([det_at(0.0, 0.0)], StubPlan(), StubOdo(), t=0.0)
+    bad = trk.update([det_at(0.4, 0.0), det_at(2.0, 2.0, label=CRATE)], StubPlan(),
+                     StubOdo(status="uncertain"), t=TICK)
+    reset = trk.update([det_at(0.4, 0.0), det_at(2.0, 2.0, label=CUBE)], StubPlan(),
+                       StubOdo(segment=1), t=2 * TICK)
+    for res in (bad, reset):
+        assert (res.n_detections, res.n_other) == (1, 1), res.status
+
+
+def test_a_frame_of_only_power_cubes_is_a_frame_with_no_projectiles():
+    """And not an error, and not a tick that keeps a coasted projectile alive: it is exactly the
+    tick the detector returned nothing for, as far as tracking is concerned."""
+    trk = ProjectileTracker()
+    run(trk, [[det_at(0.0, 0.0)], [det_at(0.4, 0.0)]])
+    res = trk.update([det_at(0.8, 0.0, label=CRATE)], StubPlan(), StubOdo(), t=2 * TICK)
+    assert res.live == [] and res.n_detections == 0 and res.n_other == 1
+    assert len(trk.tracks) == 1 and trk.tracks[0].hits == 2, "coasting, not advanced"
+
+
+@pytest.mark.parametrize("names", [
+    {0: "Projectile"},                                                 # the model shipped today
+    {0: CRATE, 1: CUBE, 2: "Projectile"},                              # the three-class export
+    ["Projectile", CRATE],
+])
+def test_a_model_with_a_projectile_class_is_accepted(names):
+    require_projectile_class(names)
+
+
+@pytest.mark.parametrize("names", [
+    {0: CRATE, 1: CUBE},             # a cubes-only model promoted by mistake
+    {0: "projectile"},               # renamed in CVAT -- the filter is case-sensitive
+    {},
+])
+def test_a_model_without_one_is_refused_before_it_can_blind_the_policy(names):
+    """The other half of the filter. With no `Projectile` label every box is dropped, the policy
+    sees an empty `projectiles` group forever, and nothing anywhere says why."""
+    with pytest.raises(ValueError, match="Projectile"):
+        require_projectile_class(names)
+
+
+def test_the_live_stack_refuses_such_a_model_at_build_time(monkeypatch):
+    """The check has to be where the REAL model is loaded, not in the tracker, because the tests'
+    fake stacks never have one. Checked on the path the loop actually uses."""
+    from brawl_deployment.loop import VisionStack
+    from brawl_vision.object_detection.projectile_detection.detect import ProjectileDetector
+
+    class _CubesOnly:
+        names = {0: CRATE, 1: CUBE}
+
+    monkeypatch.setattr(ProjectileDetector, "from_config",
+                        classmethod(lambda cls, cfg=None, **kw: _CubesOnly()))
+    with pytest.raises(ValueError, match="Projectile"):
+        VisionStack.build()
 
 
 # ---------------------------------------------------------------- coasting and expiry

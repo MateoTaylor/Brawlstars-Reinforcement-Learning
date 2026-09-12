@@ -162,10 +162,12 @@ def main(argv=None) -> int:
         overrides = deep_merge(smoke, overrides)
     tcfg = load_train_config(args.config, overrides=overrides)
 
+    # Built BEFORE the run directory exists, so a config the builder refuses (e.g.
+    # builder.check_reward_is_observable) does not leave an empty run behind to be mistaken for one.
+    model, venv, parts = build_run(tcfg)
+
     run_dir = _make_run_dir(tcfg, args.out_dir, stamp=not (args.no_stamp or args.smoke))
     (run_dir / "train.yaml").write_text(yaml.safe_dump(tcfg.raw, sort_keys=False))
-
-    model, venv, parts = build_run(tcfg)
 
     curriculum = parts["curriculum"]
     if curriculum is not None and args.curriculum_stage is not None:

@@ -31,9 +31,14 @@ two observable intervals mean different things:
 B is well defined only from full, because below full the reload timer is already running when the
 shot lands and the interval measures whatever was left of it.
 
-So **B - A is `attack_cooldown` measured on its own** -- the constant `configs/brawlers.yaml`
-defers as "Step C1, paired with the reload pause that gives it meaning" -- and **A == B falsifies
-the pause model outright**, which is a result worth having either way.
+So B - A is `attack_cooldown` measured on its own -- the constant `configs/brawlers.yaml` defers
+as "Step C1, paired with the reload pause that gives it meaning" -- and A == B would falsify the
+pause model.
+
+**That test is OUT OF SCOPE and not wanted (operator, 2026-09-11).** The pause is Mortis's attack
+animation and stays in the sim. This script is for refitting `reload_seconds` (family A). Family B
+is still printed, but do not read it as evidence about the pause, record clips to settle it, or
+propose removing the pause. BRAWL_DEPLOYMENT_DESIGN.md 6.15 result 2.
 
 #### Never pooled across sources
 
@@ -294,8 +299,8 @@ def report(r: dict) -> None:
         print(histogram(r["_raw"][key]))
     a, b = r["reload"], r["shot_to_gain"]
     if a and b:
-        print(f"  B - A = {b['median'] - a['median']:+.2f} s  <- attack_cooldown, IF the sim's "
-              f"'firing pauses the reload' model holds here")
+        print(f"  B - A = {b['median'] - a['median']:+.2f} s  <- informational only: whether firing "
+              f"pauses the reload is out of scope (design doc 6.15)")
 
 
 def main() -> int:

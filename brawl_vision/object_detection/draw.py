@@ -31,6 +31,12 @@ is the only strong option no terrain class and no other marker competes for.
     player  (255,255,255)  0.83  0.63  0.89  0.51   0.71 |  0.84    -       0.76    | 0.51 water
     teammate (235,200,60)  0.62  0.42  0.71  0.44   0.67 |  0.76   0.76      -      | 0.42 wall
     Projectile (255,0,255) 0.69  0.41  0.89  0.94   0.83 |  0.84   1.00     0.78    | 0.41 wall
+    Cube Box   (255,96,0)  0.62  0.59  0.78  0.56   0.91 |  1.00   1.00     0.41    | 0.41 teammate
+    Cube Dropped (0,255,0) 0.83  0.78  0.41  0.56   0.91 |  1.00   1.00     0.92    | 0.41 bush
+
+(The two cube rows are also 1.00 against Projectile and against each other. See the note under
+`CLASS_COLORS` for why those two, and for the one thing this table cannot see: brightness. Pure
+blue topped it and was still the hardest box on screen to read.)
 
 Every marker is ALSO drawn over a black rim (`project.draw_markers`), and that is not redundancy
 with the table above -- it is what makes the table's worst row survivable. The palette is
@@ -47,9 +53,12 @@ CLASS_COLORS = {
     "player": (255, 255, 255),     # white -- you, and there should be exactly one. Green is the
                                    # obvious choice and this skin's terrain has taken both of them
     "teammate": (235, 200, 60),    # cyan-ish; meaningless in Solo Showdown, see `--ignore`
-    "Projectile": (255, 0, 255),   # magenta -- our own model's one class. Capitalised because
-                                   # `names` comes out of the ONNX and CVAT's label was
-                                   # `Projectile`; this table is keyed by what the file says.
+    # Our own model's classes, spelled exactly as CVAT labelled them, because `names` comes out
+    # of the ONNX and this table is keyed by what the file says. `projectile_detection/classes.py`
+    # holds the same strings; a test keeps the two in step.
+    "Projectile": (255, 0, 255),           # magenta
+    "Power Cube Box": (255, 96, 0),        # azure -- the crate
+    "Power Cube Dropped": (0, 255, 0),     # green -- the cube itself
 }
 _FALLBACK = (0, 235, 235)          # yellow, for a model whose classes we have no opinion about
 
@@ -71,6 +80,31 @@ _FALLBACK = (0, 235, 235)          # yellow, for a model whose classes we have n
 # harder to follow than it was. It survives because a projectile box is small, moving, and drawn
 # with a centre dot -- motion carries it where contrast alone would be marginal. If a future skin
 # pushes it lower, that is the point to pick a new hue rather than to keep shaving.
+#
+# **The two power-cube colours came out of a search, then a look at real frames.** Every BGR
+# colour on a 0/64/128/160/192/224/255 grid was scored with the same test against the palette
+# above, UNKNOWN's black, and the four markers already in the table.
+#
+# Pure blue came out on top at 0.59, the best score any colour gets. The player was refused blue
+# on meaning (a second blue beside teammate). The crate has no such problem: it is ORANGE in
+# game, so blue is its complement. **Then it was drawn on footage, and it was the hardest box on
+# screen to read.** The per-channel test has no notion of brightness. Pure blue's luminance
+# contrast is 2.4:1 against the black rim and text stroke, and 1.3:1 against the floor, where
+# every other marker here is 5.6:1 or better against black. A crate outline or the "Power Cube
+# Box" tally line was a dark line on a dark map, and worse after `_side_by_side`'s downscale.
+#
+# (255,96,0) lifts green just enough to double that (4.1:1 against black, 2.2:1 against floor)
+# and still reads as blue. The price is the per-channel gap to teammate: 0.41 on green. That ties
+# the thinnest margin in this file, but against the one marker that is absent in Solo Showdown and
+# is three times brighter (luminance 0.48 against 0.16). More green than 96 starts to lose to
+# teammate outright: 0.35 at 112, 0.28 at 128.
+#
+# The green slot scored 0.41, tied among the pure and near-pure greens and bottoming out on bush
+# every time. The dropped cube IS green, so a green outline reads as "the cube" with no legend,
+# and it is the brightest marker here after white, so the brightness problem does not arise. It
+# ties Projectile for this file's thinnest margin without the motion that rescues Projectile; the
+# black rim in `project.draw_markers` does that work instead. The crate's own orange scored
+# 0.16-0.33 (fence, or enemy red), yellow 0.29 (fence), cyan and teal 0.24-0.29 (teammate).
 
 _FONT = cv2.FONT_HERSHEY_SIMPLEX
 

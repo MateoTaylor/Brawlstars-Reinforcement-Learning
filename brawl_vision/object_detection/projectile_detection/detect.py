@@ -13,8 +13,11 @@ What this class actually changes is three things, all of them about *provenance*
     ours come out of a training run on this machine. `weights.py` here explains the split.
   * **Which config section applies.** `projectile.*`, not `detector.*` -- and the thresholds
     genuinely differ. See `from_config`.
-  * **No `ignore`.** The model has one class. A per-class suppression list would be a setting with
-    no reachable effect, and shipping one invites someone to conclude it does something.
+  * **No `ignore` in config.** The model has three classes now (`classes.py`). Each consumer
+    decides for itself which ones it wants: the render scripts draw all three, and the deploy
+    tracker keeps only `Projectile`. A config-wide suppression list would hide the power cubes from
+    the renders too, and there is no consumer that needs them gone everywhere. The parent's
+    `ignore=` is still reachable through `from_config(..., ignore=...)` for a one-off.
 
 **This model is NMS-free and that changes what `conf` does.** YOLO26 emits a fixed 300 rows per
 frame, sorted, one box per object, with no objectness gate ahead of them -- so the padding rows
@@ -41,10 +44,16 @@ __all__ = ["Detection", "ProjectileDetector"]
 class ProjectileDetector(ObjectDetector):
     """The projectile model, constructed the same way every other detector in this package is.
 
-    `Detection.label` comes back as whatever the export says, which for our training set is
-    `Projectile` -- capital P, because that is the CVAT label and `train.py` writes it into
-    `yolo_data.yaml` unchanged. `object_detection/draw.py` keys its colour table on that exact
-    string, so renaming the class in the dataset renames it in every drawing call too.
+    `Detection.label` comes back as whatever the export says. For our training set that is one of
+    `Projectile`, `Power Cube Box` or `Power Cube Dropped`, spelled as CVAT spells them, because
+    `prepare.py` carries the export's names into `yolo_data.yaml` unchanged. `classes.py` holds
+    those strings. `object_detection/draw.py` keys its colours on them and the deploy tracker
+    filters on them, so a class renamed in CVAT silently loses its colour and, for `Projectile`,
+    its track too. That is why `prepare.py` refuses labels it does not know, and why deployment
+    refuses a model with no `Projectile` class (`perception.projectiles.require_projectile_class`).
+
+    The name is historical. It is the model that finds projectiles AND power cubes, and callers
+    that want only one kind filter by label.
 
     Stateless between frames, like its parent. **That is a real limitation here and worth naming**:
     projectiles are the one thing in this game where a track across frames carries information the

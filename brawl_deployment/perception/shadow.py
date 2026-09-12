@@ -157,7 +157,7 @@ what absorbs the OTHER failure the first live run showed: `read_ammo` returns a 
 1.00 off a full clip roughly once every 60 reads, always for one or two samples, never three.
 
 Worth knowing where the canary is blind: the grace window mutes it during a burst, and Mortis can
-fire every 0.35 s. It is fully live through the tail of the 2.25 s reload that follows and through
+fire every 0.35 s. It is fully live through the tail of the 2.50 s reload that follows and through
 every idle stretch -- about 80% of a real match, measured on run1 -- which is where "did we spend
 two or three?" is answerable anyway.
 
@@ -339,8 +339,12 @@ class ShadowHero:
         self.super_stale_seconds = float(super_stale_seconds)
 
         self._max_ammo = _F32(params.max_ammo)
-        # `cfg.dt / reload_seconds` from tick_timers, at the precision the sim computes it.
-        self._ammo_gain = _F32(dt) / _F32(params.reload_seconds)
+        # `cfg.dt / reload_seconds` from tick_timers, at the precision AND IN THE ORDER the sim
+        # computes it. A Python scalar over a tensor is `Tensor.__rtruediv__`, which torch
+        # implements as `reciprocal(tensor) * scalar` -- two float32 roundings, not one. The direct
+        # quotient agrees at 2.25 and is one ULP low at 2.50 (and at Brock's 1.75), which the
+        # parity test caught the moment reload_seconds was refit. Measured, CPU and CUDA alike.
+        self._ammo_gain = (_F32(1.0) / _F32(params.reload_seconds)) * _F32(dt)
         self._attack_cooldown = _F32(params.attack_cooldown)
         self._dash_duration = _F32(params.dash_duration)
         self._bin_step = _TWO_PI / n_move_bins

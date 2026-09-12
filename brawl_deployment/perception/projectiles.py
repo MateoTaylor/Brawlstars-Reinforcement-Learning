@@ -52,20 +52,37 @@ and `projectiles.vel` will carry values the sim never produced. And the measurem
 with every error term (projection, odometry drift, the anchor), so it is an upper bound on speed
 rather than a speed.
 
+#### The detector finds more than projectiles, and this keeps only those
+
+The same model also boxes power-cube crates and dropped cubes (`projectile_detection/classes.py`).
+Both are STATIONARY, and a stationary thing in this group causes a specific, bad failure:
+`closest_approach` gives a zero-velocity point t = 0, and `obs_select` sorts ascending and keeps
+twelve. So every crate on screen would take a slot ahead of the real incoming shots and could evict
+all of them. It would also be wrong before it got that far. `_dedupe` keeps the more confident of
+two boxes that project close together, so a crate could "merge away" a projectile flying over it.
+
+So `update` filters on the label FIRST, before projection or dedupe, and counts what it dropped
+in `ProjectileResult.n_other`. It filters here rather than in the loop because the tracker is the
+thing that knows what a projectile track is. `require_projectile_class` is the other half. A model
+exported without a `Projectile` class would make this filter drop every box, and the policy would
+see no projectiles at all. That fails at startup instead of silently.
+
 #### What is deliberately NOT here
 
 No kind, no owner, no damage, no radius. `agent_obs_deploy.yaml` asks for four fields and calls a
-projectile *"a moving dot and nothing more"*; the detector has one class and could not supply more
-if the spec wanted it.
+projectile *"a moving dot and nothing more"*; the detector says only "Projectile" and could not
+supply more if the spec wanted it. Power cubes are not in any observation group yet. The sim has
+no cubes, so a policy trained there would have nothing to read one with.
 """
 import math
 from dataclasses import dataclass
 
 from brawl_vision.object_detection.project import to_tiles
+from brawl_vision.object_detection.projectile_detection.classes import PROJECTILE
 
 from .tracker import _greedy_match
 
-__all__ = ["Projectile", "ProjectileResult", "ProjectileTracker",
+__all__ = ["Projectile", "ProjectileResult", "ProjectileTracker", "require_projectile_class",
            "MAX_PROJ_TILES_S", "GATE_NOISE_TILES", "PROJ_ANCHOR_FRAC",
            "MAX_COAST_S", "MIN_SAMPLES", "DUPLICATE_TILES"]
 
@@ -116,6 +133,24 @@ MIN_SAMPLES = 2
 # Two projected points closer than this are treated as one projectile detected twice. In TILES,
 # after projection, and measured -- see `_dedupe` for why distance beat the more obvious IoU test.
 DUPLICATE_TILES = 0.3
+
+
+def require_projectile_class(names) -> None:
+    """Raise unless the detector's classes include `Projectile`.
+
+    `names` is `ObjectDetector.names` (id -> label, read from the ONNX metadata) or any iterable of
+    labels. It is checked once, when the stack is built. Without this check, a model exported
+    without a `Projectile` class would load cleanly and run at full speed, and the tracker's label
+    filter would then drop every box. The resulting agent plays as if nobody ever shoots at it,
+    and nothing in the telemetry says why.
+    """
+    labels = set(names.values()) if isinstance(names, dict) else set(names)
+    if PROJECTILE not in labels:
+        raise ValueError(
+            f"the projectile model has no {PROJECTILE!r} class (it has {sorted(labels)}), so the "
+            f"projectile tracker would see nothing. Check `projectile.model` in "
+            f"configs/vision.yaml, and the label spelling in CVAT against "
+            f"brawl_vision/object_detection/projectile_detection/classes.py")
 
 
 def _dedupe(points, threshold: float):
@@ -194,8 +229,9 @@ class ProjectileResult:
     live: list
     status: str                # "ok" | "reset" | odometry's own status when unusable
     segment: int
-    n_detections: int
+    n_detections: int          # PROJECTILE boxes only; the other classes are in `n_other`
     n_merged: int              # boxes dropped as duplicates of a more confident one this tick
+    n_other: int = 0           # boxes of any other class (power cubes), dropped before tracking
 
 
 class ProjectileTracker:
@@ -227,19 +263,27 @@ class ProjectileTracker:
         moves every track by the odometry error and reads as every projectile changing course at
         once. A refused tick does NOT count against a track -- it is not evidence of absence -- but
         it does leave the tracks stale, so nothing is reported until a good tick arrives.
+
+        Only `Projectile` boxes are tracked; see the module docstring for why a power cube must not
+        get this far. The split happens before every early return, so `n_detections` means the
+        same thing on every path.
         """
+        everything = list(detections)
+        detections = [d for d in everything if d.label == PROJECTILE]
+        n_other = len(everything) - len(detections)
+
         self._t = t
         if self._segment is None:
             self._segment = odometry.segment
         elif odometry.segment != self._segment:
             self.reset(odometry.segment)
-            return ProjectileResult([], "reset", odometry.segment, len(detections), 0)
+            return ProjectileResult([], "reset", odometry.segment, len(detections), 0, n_other)
         if odometry.status != "ok":
             self._fresh = False
             self._expire(t)
-            return ProjectileResult([], odometry.status, self._segment, len(detections), 0)
+            return ProjectileResult([], odometry.status, self._segment, len(detections), 0,
+                                    n_other)
 
-        detections = list(detections)
         px, py = odometry.position_tiles
         placed = to_tiles(detections, plan, anchor_frac=self.anchor_frac)
         raw = [((tx + px, ty + py), d.confidence) for d, (tx, ty) in placed]
@@ -257,7 +301,7 @@ class ProjectileTracker:
         self._fresh = True
         self._expire(t)
         return ProjectileResult(self.live(), "ok", self._segment, len(detections),
-                                len(raw) - len(points))
+                                len(raw) - len(points), n_other)
 
     # -- track bookkeeping ---------------------------------------------------
 

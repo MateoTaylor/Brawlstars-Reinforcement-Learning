@@ -13,10 +13,11 @@ debugging, and none of the other stages can be to blame.
 `scripts/vision_evaluate.py --detect` is the other one: the same detector, drawn beside the
 reconstructed map, for looking at both at once.
 
-`--projectiles` adds OUR trained projectile model on top, in magenta; `--no-entities` drops the
-third-party one so you get the projectile model ALONE over the raw footage. That combination is
+`--projectiles` adds OUR trained projectile model on top. It also finds power cubes, so the
+boxes are magenta for projectiles, blue for crates and green for dropped cubes. `--no-entities`
+drops the third-party one so you get our model ALONE over the raw footage. That combination is
 the manual-evaluation tool for a fresh training run -- boxes on a clip the model never saw, and
-the tally at the end for sweeping `--projectile-conf`:
+the per-class tally at the end for sweeping `--projectile-conf`:
 
     # what a new checkpoint does on new footage
     python scripts/vision_detect.py match.mp4 -o shots.mp4 --projectiles --no-entities
@@ -52,7 +53,8 @@ def main(argv=None) -> int:
                    help="comma-separated classes to drop, overriding detector.ignore. Pass '' to "
                         "keep all of them")
     p.add_argument("--projectiles", action="store_true",
-                   help="also run OUR trained projectile detector and draw its boxes in magenta")
+                   help="also run OUR trained projectile/power-cube detector and draw its boxes "
+                        "(magenta projectile, blue crate, green dropped cube)")
     p.add_argument("--no-entities", action="store_true",
                    help="skip the third-party entity detector entirely. Only useful with "
                         "--projectiles, and it is the honest way to look at the projectile model "
@@ -129,7 +131,7 @@ def main(argv=None) -> int:
                                        if detector.ignore else ""))
     if projectiles is not None:
         say(f"{Path(projectiles.path).name} on {projectiles.provider}, classes "
-            f"{projectiles.classes}, conf {projectiles.conf}   [projectiles, magenta]")
+            f"{projectiles.classes}, conf {projectiles.conf}   [our model, colour per class]")
 
     counts: dict[str, int] = {}
     n_in = n_out = 0

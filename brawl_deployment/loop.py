@@ -173,15 +173,21 @@ class VisionStack:
         from brawl_vision.terrain.occupancy import OccupancyMap
         from brawl_vision.terrain.odometry import Odometry
 
+        from .perception.projectiles import require_projectile_class
+
         cfg = vision_cfg or load_vision_config()
         plan = build_rectify_plan(load_camera_model(), load_hud_mask())
+        # Checked here, on the real model, because the tracker filters by label: a promoted model
+        # with no `Projectile` class would otherwise load fine and feed the policy zero shots.
+        projectiles = ProjectileDetector.from_config(cfg)
+        require_projectile_class(projectiles.names)
         return cls(
             plan=plan,
             odometry=Odometry(plan, cfg),
             occupancy=OccupancyMap.from_config(cfg),
             classifier=TerrainClassifier.from_config(cfg),
             entities=ObjectDetector.from_config(cfg),
-            projectiles=ProjectileDetector.from_config(cfg),
+            projectiles=projectiles,
             health=HealthTracker.from_config(cfg),
             hud=HudReader.from_config(cfg),
             cfg=cfg,

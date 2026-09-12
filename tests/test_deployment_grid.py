@@ -203,6 +203,15 @@ def test_a_channel_with_no_supplier_is_refused_by_name(channel, fragment):
         _spec(channels=(channel,)).check()
 
 
+def test_a_deploy3_checkpoint_is_refused_until_crates_and_cubes_have_a_supplier():
+    """`configs/agent_obs_deploy3.yaml` trains on `box` and `pickup` ahead of their detector, on
+    purpose. Deploying what it produces before that detector exists must fail at startup, naming
+    the channel -- the alternative is a policy trained to read two planes and handed zeros in both.
+    When a supplier lands, this test is the one to update, deliberately."""
+    with pytest.raises(ValueError, match="no supplier at deploy time"):
+        GridSpec.load(CONFIGS / "agent_obs_deploy3.yaml")
+
+
 def test_a_typo_lists_what_this_builder_can_actually_fill():
     with pytest.raises(ValueError, match="unknown grid channel"):
         _spec(channels=("blocks_units",)).check()

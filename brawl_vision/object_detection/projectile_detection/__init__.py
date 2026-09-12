@@ -5,6 +5,9 @@ anything. This package is the exception, and it is split so the two halves never
 
     train.py     A standalone script, not a library. Run it directly; it imports ultralytics and
                  torch and is the only thing here that does. Nothing at inference time imports it.
+    prepare.py   What train.py does to a CVAT export before training: check, unpack, split by
+                 recording, audit. No torch, so `train.py --audit-only` and its tests need none.
+    classes.py   The label strings -- `Projectile`, `Power Cube Box`, `Power Cube Dropped`.
     detect.py    `ProjectileDetector`, a thin subclass of `object_detection.ObjectDetector` that
                  runs the exported ONNX. onnxruntime only, no torch.
     weights.py   Which of your `runs/` is the current model, and what to say when there is none.

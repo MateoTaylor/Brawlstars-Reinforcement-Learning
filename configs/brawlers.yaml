@@ -121,7 +121,13 @@ hero_mortis:                        # Undertaker / mortis -- characters.csv, Und
   base_damage: 2000                 # Damage=1000 x2
   move_speed: 2.73                  # Speed=820 / 300
   max_ammo: 3
-  reload_seconds: 2.25              # B1: CHARACTER_DETAILS (was 2.4)
+  # MEASURED off Nulls Brawl (BRAWL_DEPLOYMENT_DESIGN.md 6.15, brawl_deployment/data/
+  # kit_timing.json): pip-to-pip reload with no shot in between, 2.50 s on the one clip of known
+  # provenance and 2.45-2.51 s on six more. That interval is `reload_seconds` whether or not firing
+  # pauses the reload, so it refits this number without taking a side on the C1 pause below --
+  # which stays: it is Mortis's attack animation (operator). Whether firing pauses the reload is
+  # OUT OF SCOPE and not wanted (operator, 2026-09-11): do not measure it or propose removing it.
+  reload_seconds: 2.50              # measured (was 2.25, B1: CHARACTER_DETAILS; 2.4 before that)
   attack_cooldown: 0.35             # C1 (was 0.30). Must EXCEED dash_duration 0.30: a dash is his
                                     # attack, and can_attack also requires dash_t <= 0, so a
                                     # cooldown at or below it would be entirely masked by the dash.

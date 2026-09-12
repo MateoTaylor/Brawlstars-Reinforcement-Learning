@@ -131,6 +131,61 @@ def test_every_class_this_project_cares_about_has_a_distinct_colour():
     assert len(set(colors)) == 3
 
 
+def test_our_own_models_classes_each_have_a_colour_and_none_is_shared():
+    """`classes.py` and `CLASS_COLORS` spell the same three strings independently. `draw.py` cannot
+    import `classes.py`, because the projectile package imports `draw.py`, so this test is what
+    keeps them in step. A label renamed on one side only would draw in the fallback yellow. That
+    is also how "a class nobody has an opinion about" looks, so nobody would notice the rename.
+
+    Spelled out literally as well as read from `KNOWN`. Otherwise a typo made in both places at
+    once, like the CVAT label being `Power Cube Box` and both files saying `Power Cube box`, would
+    agree with itself and pass."""
+    from brawl_vision.object_detection.draw import _FALLBACK
+    from brawl_vision.object_detection.projectile_detection.classes import KNOWN
+
+    assert KNOWN == {"Projectile", "Power Cube Box", "Power Cube Dropped"}
+    assert not KNOWN - CLASS_COLORS.keys(), f"no colour for {sorted(KNOWN - CLASS_COLORS.keys())}"
+    every = [*KNOWN, "enemy", "player", "teammate"]
+    colours = [color_for(c) for c in every]
+    assert len(set(colours)) == len(every), "two classes that can share a frame share a colour"
+    assert _FALLBACK not in colours
+
+
+def test_a_cube_box_draws_blue_and_a_dropped_cube_draws_green_on_the_raw_panel():
+    """What the user actually sees, checked on pixels rather than on the table. The whole
+    `projectile_detection.draw` path goes through `color_for`, and a hard-coded magenta there
+    would pass every table test above while drawing all three classes the same colour."""
+    from brawl_vision.object_detection.projectile_detection import draw_projectiles
+
+    frame = np.zeros((120, 240, 3), np.uint8)
+    out = draw_projectiles(frame, [Detection("Power Cube Box", 0.9, (20.0, 20.0, 100.0, 100.0)),
+                                   Detection("Power Cube Dropped", 0.9,
+                                             (140.0, 20.0, 220.0, 100.0))], centre_dot=False)
+    box_edge, drop_edge = out[20, 60], out[20, 180]       # top edge of each rectangle, BGR
+    assert box_edge.argmax() == 0 and box_edge[0] > 200, box_edge
+    assert drop_edge.argmax() == 1 and drop_edge[1] > 200, drop_edge
+
+
+def test_the_promoted_projectile_model_only_speaks_labels_this_code_knows():
+    """The names that actually come out of the ONNX metadata, not the ones the dataset meant to
+    have. Everything downstream matches on these strings: colours here, and the deploy tracker's
+    `Projectile` filter, which with no match drops every box and blinds the policy. Holds for the
+    old one-class model and must hold for the three-class one once it is promoted.
+
+    CPU on purpose. RL training often holds the one GPU, and this reads metadata."""
+    pytest.importorskip("onnxruntime")
+    from brawl_vision.object_detection.projectile_detection.classes import KNOWN
+    from brawl_vision.object_detection.projectile_detection.detect import ProjectileDetector
+
+    try:
+        det = ProjectileDetector.from_config(load_vision_config(), device="cpu")
+    except FileNotFoundError:                   # trained here, not fetched; none promoted yet
+        pytest.skip("no projectile model has been promoted")
+    labels = set(det.names.values())
+    assert "Projectile" in labels
+    assert labels <= KNOWN, f"labels no code here knows about: {sorted(labels - KNOWN)}"
+
+
 def test_an_unknown_class_still_draws_in_the_fallback_colour():
     """These weights carry three classes; the wall detectors upstream carry three or fifteen
     others. A model with a class nobody wrote a colour for must still be viewable."""

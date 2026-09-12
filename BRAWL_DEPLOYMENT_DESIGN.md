@@ -705,6 +705,10 @@ free once §6.1 lands.
 > `configs/agent_obs_deploy.yaml` is now the eight covered channels and the shape is
 > `(8, 13, 21)`; the operator will add crate and pickup detection in a later pass. So §6.2 is
 > **unblocked**: every remaining channel has a supplier on disk.
+>
+> **REVERSED for training 2026-09-11 (§9.18):** `configs/agent_obs_deploy3.yaml` trains on `box`
+> and `pickup` again, with `cube_pickup` restored. This module still refuses both by name, so a
+> deploy3 checkpoint cannot be deployed until a crate and cube detector and their suppliers exist.
 
 #### Built — `perception/grid.py`, checked cell-for-cell against `_build_grid`
 
@@ -2236,6 +2240,11 @@ window-derived crop box" is answered by `scripts/vision_watch.py deploy`, which 
 
 ### 6.15 `measure_reload.py` — refitting the kit constants off the game — MEASURED 2026-09-09
 
+> **Scope (operator, 2026-09-11):** this section refits `reload_seconds` only. Whether firing
+> pauses the reload (result 2, the Step C1 pause) is **out of scope and not wanted**. It is
+> Mortis's attack animation and stays in the sim. Do not measure it, record clips for it, or
+> propose removing it.
+
 The operator's standing instruction: *"the sim move speed / attack speed / reload speed were all
 approximations. Your measurements from the Nulls brawl will be more accurate than those from
 sim."* This is the first of those refits, and it is the only kit timer that can be refit at all
@@ -2269,7 +2278,8 @@ gives the two observable intervals different meanings:
 B is only well defined from full, because below full the reload clock is already running when the
 shot lands. So `B - A` is `attack_cooldown` measured on its own — the constant
 `configs/brawlers.yaml` defers as *"Step C1, paired with the reload pause that gives it meaning"*
-— and **A == B falsifies the pause outright.**
+— and A == B would falsify the pause. **That test is out of scope and not wanted (result 2).**
+The script still prints family B; its number is not evidence to act on about the pause.
 
 #### What 14 clips say
 
@@ -2303,8 +2313,11 @@ Two results follow, at different confidence:
    recorded provenance and for every other clip in the 2.5 cluster, across independent recordings
    and two HUD layouts. Sample counts are small per clip and the agreement between them is what
    carries it.
-2. **The reload is NOT paused by the attack cooldown.** B − A is **−0.07 s** on the Mortis clip
-   and B alone reads 2.43–2.44 against an A of 2.50 — zero within one sample period, and nowhere
+2. **OUT OF SCOPE, not wanted (operator, 2026-09-11). Do not measure it, refit it, or propose
+   removing the pause again.** Whether firing pauses Mortis's reload is not a question this project
+   is asking: the pause is his attack animation, he cannot chain attacks before one finishes, and
+   the sim keeps it. What follows is the 2026-09-09 reading, kept as history only. B − A is **−0.07 s** on the Mortis clip and B alone reads 2.43–2.44 against an
+   A of 2.50 — zero within one sample period, and nowhere
    near the +0.35 the sim's model predicts. **Caveat, stated because it is the one thing that
    could still explain it:** A times two events of the same kind and B times a spend against a
    gain, so any asymmetry in how fast the widget paints the two enters B and cancels in A. It
@@ -2312,9 +2325,9 @@ Two results follow, at different confidence:
 
 `attack_cooldown` itself is *not* refuted: the shot→shot floor bottoms out at 0.37 s on the 2.5
 cluster against a configured 0.35, which is the closest thing to a confirmation this instrument
-can give. What is refuted is only the *reload pause* that C1 attached to it.
+can give. The *reload pause* C1 attached to it is out of scope (result 2).
 
-#### What is deliberately not done here
+#### What was deliberately not done here — reload APPLIED 2026-09-11, the pause OUT OF SCOPE, see §9.18
 
 **Nothing is written to `configs/brawlers.yaml`.** Changing `reload_seconds` invalidates the
 deployed checkpoint's training distribution, and the operator's priority is explicit: get the
@@ -2323,7 +2336,16 @@ measurement lands in `brawl_deployment/data/kit_timing.json` — the §4.5 split
 and measurements in `data/` — and the yaml edit is a decision, taken deliberately, before the next
 training run rather than as a side effect of a measurement script.
 
+**Applied before the deploy3 run (§9.18), in part:** `reload_seconds: 2.50` only. Result 2 is
+**not** applied, and the C1 pause stays for Mortis as for every bot. The operator's correction:
+the pause is Mortis's attack animation, and he cannot chain attacks before one finishes. **The
+pause question is out of scope and not wanted: do not measure it, record clips for it, or propose
+removing the pause again.**
+
 #### What would sharpen it
+
+These sharpen `reload_seconds` (family A) only. None of them is a reason to revisit the reload
+pause, which is out of scope (result 2).
 
 - **Which clips are Mortis.** One line from the operator, who recorded them, converts a cluster
   into a measurement. Cheap for a human, impossible for this repo — nothing in it records the
@@ -2600,7 +2622,8 @@ stopped agent is recoverable by hand; an agent mashing inputs into a menu is not
 
 11. ~~**`grid.box` / `grid.pickup` — two channels with no detector (§6.2).**~~ **Resolved — drop
     both for this training run**, operator's call, *"although I will return and add them later."*
-    The grid goes from `(10, 13, 21)` to `(8, 13, 21)`.
+    The grid goes from `(10, 13, 21)` to `(8, 13, 21)`. **Reversed 2026-09-11 for the next run,
+    §9.18.**
 
     **This was not a free drop, and the paired half is the part worth remembering.**
     `configs/train.yaml` set `reward.cube_pickup: 0.5`, paying the agent every time it walked over
@@ -2614,6 +2637,8 @@ stopped agent is recoverable by hand; an agent mashing inputs into a menu is not
     runs. Those can restore it per-run with `--set reward.cube_pickup=0.5` and the comment in the
     file says so. `tests/test_configs_files.py` pins the two together in **both** directions —
     restoring the channels without the reward, or the reward without the channels, fails.
+    *(Superseded 2026-09-11: the pairing is now enforced per run in
+    `training/builder.check_reward_is_observable`; see §9.18.)*
 
 12. ~~**⚠ OPEN BLOCKER — both ONNX detectors are running on the CPU.**~~ **RESOLVED — both now
     report `CUDAExecutionProvider`, at 3.6× and 4.4× the speed** (entity 26.1 → **7.2 ms**,
@@ -3108,6 +3133,70 @@ stopped agent is recoverable by hand; an agent mashing inputs into a menu is not
     but differs *between* matches. Both tested magnitudes were free, which is two points of
     evidence for insensitivity, not a curve. If a live run shows position-dependent weirdness,
     this is the first column to suspect and a third magnitude is a 20-minute run.
+
+18. **BUILT 2026-09-11 — `agent_obs_deploy3.yaml`: crates and cubes back on the grid, the reward
+    back with them, and the measured Mortis reload in the sim.** Operator's call, reversing §9.11 as
+    that item said it would be: *the agent cannot see how many cubes an enemy or it has collected,
+    but it should be able to physically see them on the map before they are picked up.*
+
+    **The spec.** `configs/agent_obs_deploy3.yaml` is `deploy2` with the grid's `box` and `pickup`
+    channels restored, at lowinfo's positions: `(8, 13, 21)` → `(10, 13, 21)`, every other group
+    byte-identical. Both halves of the operator's rule were already true of those two channels, so
+    nothing else changed. `box` counts intact crates per cell. `pickup` counts pickup **objects**
+    per cell, not cubes: a corpse drops one pickup however many cubes it held
+    (`combat.drop_cubes_on_death`), so a pile does not leak what its owner carried. `hero.cubes`,
+    `entities.cubes` and `pickups.cubes` stay out of every deploy spec, and
+    `tests/test_configs_files.py` now asserts that for all three.
+
+    **The reward.** `configs/train.yaml` `reward.cube_pickup` is back to `0.5`. §9.11's static test
+    (train.yaml against every deploy spec's channels) could only say "all of them see cubes or none
+    do", and deploy3 is the first spec where the answer differs from its siblings. So the pairing
+    moved to where the two actually meet: `brawl_sim/training/builder.check_reward_is_observable`
+    refuses to build a run that pays `cube_pickup` under a spec with no `pickup` channel and no
+    `pickups.*` field. The error names the escape. **Retraining on `deploy` or `deploy2` now needs
+    `--set reward.cube_pickup=0`.** The deployed run's own archived `train.yaml` has `0.0`, so it
+    still reproduces from its run directory. `scripts/train.py` now builds the run before creating
+    its directory, so a refused config does not leave an empty run behind.
+
+    **⚠ Not deployable yet, by design.** Nothing detects a crate or a cube: the entity detector's
+    classes are `{enemy, teammate, player}`. `perception/grid.py` refuses both channels by name, so
+    `GridSpec.load` on deploy3 raises at startup (pinned in `tests/test_deployment_grid.py`). A
+    deploy3 checkpoint ships only after (1) crate and cube classes in the detector, (2) a supplier
+    for each in `grid.py`, scattered through the same world-frame projection `enemy_revealed`
+    uses, and (3) both moved from `_REFUSED` to `_DYNAMIC`. The run can start before any of that
+    exists; the deployment cannot.
+
+    **The kit, per §6.15 — only the part the data carries.** `configs/brawlers.yaml`
+    `hero_mortis` `reload_seconds` 2.25 → **2.50**. That is family A, pip-to-pip with no shot in
+    between: 2.50 on the known-Mortis clip and 2.45–2.51 on six more. It is `reload_seconds` whether
+    or not firing pauses the reload, so it refits the number without taking a side on the pause.
+    **The Step C1 reload pause stays.** A per-kind opt-out for it was built and then reverted the
+    same day, on the operator's correction: the pause is Mortis's attack animation, he cannot
+    chain attacks before one finishes, and §6.15's evidence against it is one family-B sample on
+    the one clip of known provenance. Sim changes have to be well grounded in game data, and that
+    is not. **The pause question is OUT OF SCOPE and not wanted (operator, 2026-09-11): no future
+    session should measure it, record clips for it, or propose the opt-out again.**
+    `attack_cooldown` (0.35) was never in question. `ShadowHero` loads the same block, so
+    the live shadow now predicts the measured reload too, including for the checkpoint already
+    deployed. `configs/brawlers.yaml` is shared by path, so this applies to every run built from
+    here on; rebuilding the deployed run from its directory would now read 2.50, not the 2.25 it
+    trained on.
+
+    **A latent parity bug the refit exposed.** `ShadowHero` computed the per-tick ammo gain as
+    `f32(dt) / f32(reload)`. The sim's `cfg.dt / reload_seconds` is `Tensor.__rtruediv__`, which
+    torch implements as `reciprocal(t) * scalar`, two float32 roundings instead of one. The two
+    agree at 2.25, which is why the shadow-vs-sim parity test had always passed, and they differ
+    by one ULP at 2.50 (and at Brock's 1.75). The parity test failed on its first run against the
+    new value. The shadow now uses the sim's order, measured identical on CPU and CUDA. One canary
+    test also moved: a single unlanded shot now leaves a 0.54-pip gap at the end of the grace
+    window instead of 0.47, so it logs one SUSPECT before the reload closes it. It still never
+    reaches `DESYNC_STRIKES`, which is now what the test pins.
+
+    The run:
+
+    ```
+    .venv/Scripts/python.exe scripts/train.py --set run.name=mortis_deploy3 --set run.agent_obs=configs/agent_obs_deploy3.yaml
+    ```
 
 ---
 

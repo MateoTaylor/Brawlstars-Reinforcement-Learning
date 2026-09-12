@@ -609,9 +609,11 @@ def test_the_grace_window_outlasts_the_measured_tap_to_pip_delay():
 
 
 def test_the_canary_is_live_again_through_the_reload():
-    """Blind during the delay, awake for the rest. Mortis's reload is 2.25 s per pip, so the
-    window has to expire well inside it or the canary never sees the reload it exists to check."""
-    assert DESYNC_GRACE_SECONDS < 2.25, "a window longer than one reload would mute it forever"
+    """Blind during the delay, awake for the rest. Mortis's reload is 2.50 s per pip (measured,
+    6.15), so the window has to expire well inside it or the canary never sees the reload it exists
+    to check."""
+    assert DESYNC_GRACE_SECONDS < _params().reload_seconds, (
+        "a window longer than one reload would mute it forever")
     shadow = _shadow()
     shadow.advance(1.0)
     shadow.act(1, ATTACK_FIRE)
@@ -623,9 +625,14 @@ def test_the_canary_is_live_again_through_the_reload():
 
 def test_a_SINGLE_unlanded_shot_is_below_the_canary_and_that_is_the_price_of_the_window():
     """**A limitation, asserted so it is a known one.** Widening the grace to the measured 1.5 s
-    tap-to-pip delay costs single-shot sensitivity: the reload refills 0.44 pips/s, so by the time
-    the window expires a lone missing spend has regrown to within `AMMO_TOLERANCE` and reads as
-    agreement.
+    tap-to-pip delay costs single-shot sensitivity: by the time the window expires, a lone missing
+    spend has regrown to within about half a pip of agreement, and it never escalates.
+
+    Pinned as "never reaches DESYNC", not as "reads OK at the first check", because the first
+    check is a coin-flip on the kit constants. At the old `reload_seconds: 2.25` the gap was 0.47
+    at that check, just inside `AMMO_TOLERANCE`. At the measured 2.50 (6.15) it is 0.54, just
+    outside: one SUSPECT, then back inside the tolerance a decision later, two strikes short of
+    `DESYNC_STRIKES`.
 
     That is the right trade rather than a regression. At 0.30 s the canary was not detecting
     dropped shots either -- it was firing on TRUE readings the game had not drawn yet, four times
@@ -639,8 +646,14 @@ def test_a_SINGLE_unlanded_shot_is_below_the_canary_and_that_is_the_price_of_the
     shadow.advance(1.0)
     shadow.act(1, ATTACK_FIRE)
     shadow.advance(DESYNC_GRACE_SECONDS + 0.05)
-    assert shadow.check_ammo(_ammo(3.0)).status == OK
-    assert shadow.observe()["ammo"] > 2.5
+
+    checks = []
+    for _ in range(8):                         # two seconds of 4 Hz checks, CV still full
+        checks.append(shadow.check_ammo(_ammo(3.0)))
+        shadow.advance(0.25)
+    assert all(c.status != DESYNC for c in checks)
+    assert max(c.strikes for c in checks) < 2
+    assert checks[1].status == OK and shadow.observe()["ammo"] > 2.5
 
 
 # ---------------------------------------------------------------------------

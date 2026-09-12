@@ -411,6 +411,9 @@ class RenderReport:
     detected_frames: int = 0       # frames the detector ran on -- the denominator for the above
     projectile_boxes: int = 0      # ditto for our projectile model, counted separately because
     projectile_frames: int = 0     # a boxes-per-frame rate mixing the two means nothing
+    # `projectile_boxes` split by label. The model also finds power cubes now, and "40 boxes" says
+    # nothing about recall when 30 of them could be one crate held on screen for 30 frames.
+    projectile_labels: dict = field(default_factory=dict)
 
     @property
     def realtime_factor(self) -> float:
@@ -479,8 +482,9 @@ def render(source, plan: RectifyPlan, track: Track, path, *, classifier=None, de
 
     **`projectiles` is a `projectile_detection.ProjectileDetector`, and it is a THIRD passenger.**
     Ours, not third-party -- the one model in this repo that gets trained here. Its boxes go on
-    the raw panel in magenta beside the brawler boxes, and it feeds nothing either: not odometry,
-    not the occupancy grid, not the entity detector. It is independent of `detector`, so
+    the raw panel beside the brawler boxes, one colour per class from `object_detection/draw.py`:
+    magenta projectiles, blue power-cube crates, green dropped cubes. It feeds nothing either: not
+    odometry, not the occupancy grid, not the entity detector. It is independent of `detector`, so
     `--projectiles` alone is a valid way to look at just this model, and the per-class tally in
     the corner counts whichever of the two are running.
 
@@ -497,7 +501,10 @@ def render(source, plan: RectifyPlan, track: Track, path, *, classifier=None, de
     homography inverts perspective for the ground plane, and a projectile is not on the ground, so
     every marker lands further from the camera than the shot really is by an unmeasured amount
     that grows with flight height. It is off by default. Turn it on to see roughly where the
-    model is firing; do not read a tile index off it.
+    model is firing; do not read a tile index off it. Power cubes go through the same centre anchor
+    and footprint, and that is wrong in a different way. A cube IS on the ground, but a crate's box
+    includes the HP number above it, so the box's centre sits above where the crate stands. The
+    right anchor for each class has not been measured yet.
 
     **`map_extent` decides how much accumulated map the `side-by-side` right panel shows.**
     `full` (the default, and the old behaviour) is the whole explored map with the current
@@ -705,6 +712,9 @@ def render(source, plan: RectifyPlan, track: Track, path, *, classifier=None, de
                     pdets = projectiles.predict(frame.image)
                     report.projectile_boxes += len(pdets)
                     report.projectile_frames += 1
+                    for d in pdets:
+                        report.projectile_labels[d.label] = (
+                            report.projectile_labels.get(d.label, 0) + 1)
                     # `PROJECTILE_ANCHOR_FRAC`, not the brawler anchor, and no ground offset: the
                     # offset is a correction fitted to where a brawler's feet sit inside its box,
                     # which is not a quantity a projectile has. See that constant for why this
@@ -746,8 +756,8 @@ def render(source, plan: RectifyPlan, track: Track, path, *, classifier=None, de
                 if pplaced:
                     # The same two treatments, for the same reason: the real box warped onto the
                     # rectified picture, the footprint onto the tile grid. `label=False` because
-                    # one class means the text can only say "Projectile" -- the colour already
-                    # does, and there can be six of them in the space two brawlers occupy.
+                    # each class has its own colour and the text would add nothing to it, and
+                    # there can be six projectiles in the space two brawlers occupy.
                     from ..object_detection.project import (PROJECTILE_FOOTPRINT_TILES, draw_boxes,
                                                             draw_markers, to_tile_quads)
                     draw_boxes(left, to_tile_quads([d for d, _ in pplaced], plan),
@@ -818,7 +828,8 @@ def render(source, plan: RectifyPlan, track: Track, path, *, classifier=None, de
 
                     # ONE tally over both models. `draw_summary` counts by label and colours each
                     # line with the same `color_for` the boxes used, so a combined list reads as
-                    # "enemy 2 / player 1 / Projectile 3" and cannot disagree with the picture.
+                    # "enemy 2 / player 1 / Projectile 3 / Power Cube Box 1" and cannot disagree
+                    # with the picture. It is also the only colour legend the raw panel has.
                     # In place, on the copy the draws above already returned.
                     source_frame = draw_summary(source_frame, [*dets, *pdets])
                 if readings:

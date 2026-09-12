@@ -1,0 +1,105 @@
+# DEPLOYABLE agent view, third pass -- configs/agent_obs_deploy2.yaml with the grid's `box` and
+# `pickup` channels RESTORED. Every other group is byte-identical to its parent;
+# tests/test_configs_files.py pins that.
+#
+#   python scripts/train.py --set run.agent_obs=configs/agent_obs_deploy3.yaml
+#
+# WHY A FIFTH FILE RATHER THAN AN EDIT
+# ------------------------------------
+# Same reason as the last two. `runs/*/train.yaml` names its spec BY PATH. agent_obs_deploy2.yaml
+# is the zone rebuild and is correct as it stands; reopening it would make it mean two different
+# widths depending on when you read it.
+#
+# WHAT CHANGED: the operator's TEMPORARY exclusion, reversed (2026-09-11)
+# ----------------------------------------------------------------------
+# agent_obs_deploy2.yaml dropped `box` and `pickup` with the note "explicitly TEMPORARY ... When it
+# returns, restore these two channels AND `reward.cube_pickup`". This is that return. The operator's
+# rule for it, verbatim enough to check against:
+#
+#   the agent cannot see how many cubes an enemy or it has collected, but it CAN physically see
+#   crates and cubes on the map before they are picked up.
+#
+# Both halves are already true of these two channels, which is why nothing else needed changing:
+#
+#   box      an occupancy count of intact crates per cell (`_build_grid` scatters `box_pos` where
+#            `box_alive`). One crate, one count. Box HP is not in it.
+#   pickup   an occupancy count of pickup OBJECTS per cell, NOT of cubes. A corpse drops one pickup
+#            holding `cubes_on_kill_base` plus everything the victim carried
+#            (`combat.drop_cubes_on_death`), and it reads 1 here whether it holds one cube or nine.
+#            So a pile does not leak what its owner was carrying -- the first half of the rule, kept
+#            by construction rather than by a mask.
+#
+# The cube COUNTS stay out, exactly where agent_obs_deploy.yaml put them: `hero.cubes` and
+# `entities.cubes` are in neither this file nor its parents, and `hp_frac -> hp` stays swapped for
+# the reason it was swapped (cubes move max HP by a flat +400 each, invisibly).
+#
+# Neither channel is gated by `fair`, and never was in agent_obs.yaml or agent_obs_lowinfo.yaml:
+# `fair` masks enemies the hero cannot see and projectiles outside the view, and a crate or a cube
+# on the ground is neither.
+#
+# ------------------------------------------------------------------------------------------------
+# NOT YET DEPLOYABLE -- read this before training on it and expecting to ship the result
+# ------------------------------------------------------------------------------------------------
+# brawl_deployment cannot supply these two channels today. The entity detector's classes are
+# exactly {0: enemy, 1: teammate, 2: player}; nothing detects a crate or a cube.
+# `brawl_deployment/perception/grid.py` refuses both by name, so `GridSpec.load` on this file RAISES.
+# That is the intended failure: loud at startup, instead of a checkpoint trained to read two
+# channels and handed zeros in both.
+#
+# What makes a checkpoint trained here deployable, in order:
+#   1. detector classes for a crate and a cube pickup (the labeling pass for the new YOLO set);
+#   2. a supplier in perception/grid.py that scatters their positions into the view, through the
+#      same world-frame projection the `enemy_revealed` channel already uses;
+#   3. `box` / `pickup` moved out of grid.py's `_REFUSED` and into its `_DYNAMIC` channels.
+# The run can start before any of that exists. The deployment cannot.
+#
+# THE REWARD THAT COMES BACK WITH THEM
+# ------------------------------------
+# `reward.cube_pickup` is restored to 0.5 in configs/train.yaml, since the agent can now see what it
+# is paid for. The pairing is no longer checked by comparing a shared file against every deploy spec
+# (which could not express "this spec sees cubes, those two do not"). It is checked where the reward
+# and the spec actually meet: `brawl_sim/training/builder.check_reward_is_observable`, at run build
+# time. That check is also what tells you to pass `--set reward.cube_pickup=0` if you retrain on
+# agent_obs_deploy.yaml or agent_obs_deploy2.yaml.
+#
+# WIDTH CHANGES: the grid group goes (8, 13, 21) -> (10, 13, 21). Not a checkpoint swap; train from
+# scratch.
+fair: true
+normalize: true
+groups:
+  - name: self                          # unchanged from agent_obs_deploy2.yaml
+    per_entity: false
+    dtype: float32
+    fields: [hero.pos_norm, hero.vel, hero.facing_vec, hero.hp, hero.ammo_frac,
+             hero.ammo_whole, hero.attack_cd, hero.can_attack, hero.dashing,
+             hero.dash_t, hero.dash_dir, hero.invuln, hero.in_bush, hero.in_zone,
+             hero.long_dash_ready, hero.long_dash_frac,
+             hero.super_ready, hero.super_charge_frac,
+             meta.time_frac, meta.n_enemies_alive]
+  - name: enemies                       # slots 1..n_enemies, index-stable, gated by fair
+    per_entity: true
+    dtype: float32
+    # Unchanged from agent_obs_deploy2.yaml. agent_obs_deploy.yaml's header explains every removal:
+    # kind_onehot by lowinfo, cubes/can_attack/dashing as unsuppliable, hp_frac -> hp because cubes
+    # move max_hp.
+    fields: [entities.alive, entities.revealed_to_hero,
+             entities.rel_pos, entities.dist, entities.rel_vel, entities.hp,
+             entities.in_bush]
+  - name: projectiles                   # nearest K by time_to_closest, K = 12 -- NOT index-stable
+    per_entity: true
+    max_slots: 12
+    dtype: float32
+    # Unchanged. A moving dot and nothing more.
+    fields: [projectiles.alive, projectiles.rel_pos, projectiles.vel,
+             projectiles.time_to_closest]
+  - name: zone                          # unchanged from agent_obs_deploy2.yaml -- see its header
+    per_entity: false
+    dtype: float32
+    fields: [zone.hero_margin_local, zone.active]
+  - name: grid                          # the ONLY group that differs from agent_obs_deploy2.yaml
+    dtype: uint8
+    # `box` and `pickup` back, at the positions agent_obs_lowinfo.yaml has them (between `hero` and
+    # `projectile`), so the order matches every non-deploy spec. See the header for what each one
+    # counts and for why this group cannot be deployed yet.
+    view_channels: [blocks_unit, blocks_projectile, is_bush, is_water, in_zone,
+                    enemy_revealed, hero, box, pickup, projectile]

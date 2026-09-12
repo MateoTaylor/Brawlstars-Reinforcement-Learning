@@ -61,6 +61,37 @@ def build_spec(tcfg: TrainConfig) -> dict:
     return _deep_merge(base, tcfg.run.env_overrides or {})
 
 
+def sees_pickups(spec: obs_select.AgentObsSpec) -> bool:
+    """Whether any group shows the agent a cube lying on the ground: a grid's `pickup` channel, or
+    any `pickups.*` field. `hero.cubes` does not count -- it says how many the hero HOLDS, which is
+    no help in finding the next one."""
+    for g in spec.groups:
+        if g.view_channels is not None and "pickup" in g.view_channels:
+            return True
+        if any(f.startswith("pickups.") for f in g.fields):
+            return True
+    return False
+
+
+def check_reward_is_observable(reward, spec: obs_select.AgentObsSpec, spec_path) -> None:
+    """Refuses a run that pays `reward.cube_pickup` under a spec that cannot see pickups.
+
+    Such a run trains an approach behaviour toward something the policy has no input for -- it
+    learns to loiter where cubes tend to be -- and nothing in the run's own curves says so. The
+    reward lives in the shared configs/train.yaml and the spec is chosen per run, so this is the
+    first point where the two are both known; a static test over the files cannot tell a spec that
+    sees cubes from one that does not. One direction only: a spec that sees cubes with the term at
+    0 is a legitimate unshaped run.
+    """
+    if reward.cube_pickup != 0.0 and not sees_pickups(spec):
+        raise ValueError(
+            f"reward.cube_pickup is {reward.cube_pickup}, but {spec_path} has no grid `pickup` "
+            "channel and no `pickups.*` field, so the agent would be paid for collecting something "
+            "it cannot see. Pass `--set reward.cube_pickup=0` for this spec (the deploy and deploy2 "
+            "specs need it), or train on one that sees cubes (agent_obs_deploy3.yaml)."
+        )
+
+
 def build_env(tcfg: TrainConfig, n_envs: int | None = None, verbose: bool | None = None):
     """Returns `(venv, parts)` where `venv` is the fully wrapped SB3 `VecEnv` and `parts` is a
     dict of the pieces the caller still needs handles on: `sim` (the native `BrawlVecEnv`),
@@ -70,6 +101,7 @@ def build_env(tcfg: TrainConfig, n_envs: int | None = None, verbose: bool | None
 
     env_cfg = load_config(_resolve(tcfg.run.env_config), overrides=tcfg.run.env_overrides or None)
     agent_spec = obs_select.load_agent_spec(_resolve(tcfg.run.agent_obs), env_cfg)
+    check_reward_is_observable(tcfg.reward, agent_spec, tcfg.run.agent_obs)
     reward_fn = ShapedReward(tcfg.reward)
 
     sim = BrawlVecEnv(

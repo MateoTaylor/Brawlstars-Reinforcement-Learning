@@ -220,9 +220,9 @@ SUPPLIABLE_SUBSTITUTIONS = {
 }
 
 # Every spec in the deploy lineage. The properties below hold for all of them -- each new file is
-# a narrowing of the last for the same reason, so a test that only ever checked the first would
-# stop guarding the file actually being trained on.
-DEPLOY_SPECS = ("agent_obs_deploy.yaml", "agent_obs_deploy2.yaml")
+# a change to the last for a stated reason, so a test that only ever checked the first would stop
+# guarding the file actually being trained on.
+DEPLOY_SPECS = ("agent_obs_deploy.yaml", "agent_obs_deploy2.yaml", "agent_obs_deploy3.yaml")
 
 
 def test_deploy_agent_obs_yaml_loads_as_a_real_agent_spec():
@@ -341,40 +341,71 @@ def test_the_deploy_spec_has_no_unnormalized_field_of_large_magnitude(spec_name)
         )
 
 
+# Which deploy specs can see a cube lying on the ground. deploy and deploy2 dropped `box`/`pickup`
+# as a TEMPORARY operator decision; deploy3 is its reversal (2026-09-11).
+SEES_PICKUPS = {
+    "agent_obs_deploy.yaml": False,
+    "agent_obs_deploy2.yaml": False,
+    "agent_obs_deploy3.yaml": True,
+}
+
+
+def test_every_deploy_spec_says_whether_it_sees_pickups():
+    assert set(SEES_PICKUPS) == set(DEPLOY_SPECS)
+
+
 @pytest.mark.parametrize("spec_name", DEPLOY_SPECS)
-def test_the_cube_pickup_reward_is_paired_with_the_grids_pickup_channel(spec_name):
-    """Two files, one decision, and nothing structural connects them.
+def test_the_shipped_cube_pickup_reward_builds_only_with_a_spec_that_sees_cubes(spec_name):
+    """One weight in a SHARED file, several specs chosen per run, and nothing structural connecting
+    them -- so the pairing is enforced where the two meet, `builder.check_reward_is_observable`,
+    and this test runs the REAL configs/train.yaml through it against every deploy spec.
 
-    Every deploy spec drops the grid's `box`/`pickup` channels because nothing
-    detects a crate or a cube on screen. `configs/train.yaml` zeroes `reward.cube_pickup` for the
-    same reason -- an agent cannot be paid for collecting what it cannot see. The failure this
-    guards is restoring ONE of them: a nonzero weight with no pickup channel trains an approach
-    behaviour that cannot transfer, and it is silent, which is the whole hazard.
-
-    Both directions are checked, because the decision is explicitly temporary -- box/pickup
-    detection is coming back, and when the channels return this test is what says the reward must
-    return with them.
+    Paying `reward.cube_pickup` to an agent that cannot see pickups trains an approach behaviour
+    that cannot transfer, and it is silent -- the run looks fine. This used to be a static
+    comparison of train.yaml against each spec's channels, which could only say "all of them see
+    cubes or none do"; deploy3 is the first spec where the answer differs from its siblings.
     """
-    import yaml
+    from brawl_sim.core.obs_select import load_agent_spec
+    from brawl_sim.training.builder import check_reward_is_observable
+    from brawl_sim.training.config import load_train_config
 
-    spec = yaml.safe_load((CONFIGS / spec_name).read_text(encoding="utf-8"))
-    grid = next(g for g in spec["groups"] if g["name"] == "grid")
-    sees_pickups = "pickup" in grid["view_channels"]
+    cfg = load_config(CONFIGS / "default.yaml")
+    spec = load_agent_spec(CONFIGS / spec_name, cfg)
+    reward = load_train_config(CONFIGS / "train.yaml").reward
+    assert reward.cube_pickup != 0.0, (
+        "configs/train.yaml no longer pays for cubes. deploy3 exists so that it can -- if that "
+        "decision was reversed, say so in agent_obs_deploy3.yaml's header too."
+    )
 
-    weight = yaml.safe_load((CONFIGS / "train.yaml").read_text(encoding="utf-8"))["reward"]["cube_pickup"]
-
-    if sees_pickups:
-        assert weight != 0.0, (
-            f"configs/{spec_name} restored the grid's `pickup` channel, so the agent can "
-            "see cubes again -- restore configs/train.yaml `reward.cube_pickup` (was 0.5) too."
-        )
+    if SEES_PICKUPS[spec_name]:
+        check_reward_is_observable(reward, spec, spec_name)
     else:
-        assert weight == 0.0, (
-            f"configs/train.yaml pays reward.cube_pickup, but {spec_name}'s grid has no "
-            "`pickup` channel -- the agent is being rewarded for collecting something it cannot "
-            "perceive. Zero the weight, or restore the `box`/`pickup` channels and the detector "
-            "behind them."
-        )
+        with pytest.raises(ValueError, match="cube_pickup=0"):
+            check_reward_is_observable(reward, spec, spec_name)
+        # ...and the escape the error names actually works.
+        unpaid = load_train_config(CONFIGS / "train.yaml",
+                                   overrides={"reward": {"cube_pickup": 0.0}}).reward
+        check_reward_is_observable(unpaid, spec, spec_name)
+
+
+def test_seeing_pickups_means_seeing_where_they_are_not_how_many_the_hero_holds():
+    """`hero.cubes` is a count of what the hero already HOLDS -- no help finding the next one --
+    so it must not satisfy the guard. A grid `pickup` channel or any `pickups.*` field does."""
+    from brawl_sim.core.obs_select import AgentObsSpec, GroupSpec
+    from brawl_sim.training.builder import sees_pickups
+
+    def spec(*groups):
+        return AgentObsSpec(fair=True, groups=groups, normalize=True)
+
+    holds = GroupSpec(name="self", dtype="float32", shape=(1,), fields=("hero.cubes",))
+    channel = GroupSpec(name="grid", dtype="uint8", shape=(1, 13, 21), view_channels=("pickup",))
+    crates = GroupSpec(name="grid", dtype="uint8", shape=(1, 13, 21), view_channels=("box",))
+    field = GroupSpec(name="pk", dtype="float32", shape=(4,), fields=("pickups.rel_pos",))
+
+    assert not sees_pickups(spec(holds))
+    assert not sees_pickups(spec(holds, crates)), "a crate is not a cube until it breaks"
+    assert sees_pickups(spec(holds, channel))
+    assert sees_pickups(spec(field))
 
 
 # ---- configs/agent_obs_deploy2.yaml: the same rule, applied to the zone group -----------------
@@ -497,3 +528,85 @@ def test_a_nonpositive_margin_horizon_is_rejected():
     with pytest.raises(ValueError, match="margin_horizon_tiles"):
         _build_and_validate(overrides={"zone": {"margin_horizon_tiles": 0.0}})
 
+
+
+# ---- configs/agent_obs_deploy3.yaml: crates and cubes back on the grid ------------------------
+#
+# deploy2 dropped `box`/`pickup` as an explicitly TEMPORARY operator decision. deploy3 reverses it
+# (2026-09-11) under a rule with two halves -- the agent can SEE crates and cubes on the map before
+# they are picked up, and still cannot see how many cubes anyone holds. The tests below pin both
+# halves, and that nothing else rode along.
+
+# Where the two channels sit in every non-deploy spec, which deploy3 matches.
+CUBE_CHANNELS = ("box", "pickup")
+
+
+def test_deploy3_agent_obs_yaml_loads_as_a_real_agent_spec():
+    from brawl_sim.core.obs_select import load_agent_spec
+
+    cfg = load_config(CONFIGS / "default.yaml")
+    spec = load_agent_spec(CONFIGS / "agent_obs_deploy3.yaml", cfg)
+    assert spec.fair is True
+    assert {g.name for g in spec.groups} == {"self", "enemies", "projectiles", "zone", "grid"}
+
+    grid = next(g for g in spec.groups if g.name == "grid")
+    assert grid.shape == (10, cfg.view_h, cfg.view_w), (
+        "deploy2's eight channels plus box and pickup. A different count means a channel moved "
+        "without the header that justifies it."
+    )
+
+
+def test_deploy3_differs_from_deploy2_by_exactly_the_two_cube_channels():
+    """Pinned in both directions like every other pair in this file. deploy3 exists to restore two
+    grid channels; a change anywhere else is a second decision riding along unannounced."""
+    dep2 = yaml.safe_load((CONFIGS / "agent_obs_deploy2.yaml").read_text(encoding="utf-8"))
+    dep3 = yaml.safe_load((CONFIGS / "agent_obs_deploy3.yaml").read_text(encoding="utf-8"))
+
+    assert dep3["fair"] == dep2["fair"] and dep3["normalize"] == dep2["normalize"]
+
+    by_name = lambda spec: {g["name"]: g for g in spec["groups"]}  # noqa: E731
+    a, b = by_name(dep2), by_name(dep3)
+    assert a.keys() == b.keys()
+    for name in a:
+        if name == "grid":
+            continue
+        assert a[name] == b[name], (
+            f"configs/agent_obs_deploy3.yaml changed the {name!r} group. It is meant to differ "
+            f"from its parent in the grid's box/pickup channels ONLY."
+        )
+
+    old, new = a["grid"]["view_channels"], b["grid"]["view_channels"]
+    assert [ch for ch in new if ch not in CUBE_CHANNELS] == old, (
+        "deploy3's grid must be deploy2's channels, in deploy2's order, plus box and pickup"
+    )
+    assert set(new) - set(old) == set(CUBE_CHANNELS)
+
+
+def test_deploy3_puts_the_cube_channels_where_every_other_spec_has_them():
+    """Channel ORDER is the grid group's layout -- the CNN's first layer is indexed by it. Matching
+    lowinfo's order costs nothing and means a channel index means the same plane in every spec
+    that has it."""
+    low = yaml.safe_load((CONFIGS / "agent_obs_lowinfo.yaml").read_text(encoding="utf-8"))
+    dep3 = yaml.safe_load((CONFIGS / "agent_obs_deploy3.yaml").read_text(encoding="utf-8"))
+    grid = lambda spec: next(g for g in spec["groups"] if g["name"] == "grid")  # noqa: E731
+    low_ch, dep3_ch = grid(low)["view_channels"], grid(dep3)["view_channels"]
+
+    assert [ch for ch in low_ch if ch in dep3_ch] == dep3_ch
+
+
+@pytest.mark.parametrize("spec_name", DEPLOY_SPECS)
+def test_no_deploy_spec_shows_how_many_cubes_anyone_holds(spec_name):
+    """The operator's rule for deploy3, which every deploy spec must satisfy: crates and cubes on the
+    ground may be visible, cube COUNTS may not -- not the hero's, not an enemy's, and not what a
+    pile on the ground is worth (which would leak what its dead owner was carrying).
+
+    The grid's `pickup` channel is a count of pickup OBJECTS per cell, and a corpse drops exactly
+    one however many cubes it held (`combat.drop_cubes_on_death`), so the channel is allowed and
+    `pickups.cubes` is not."""
+    from brawl_sim.core.obs_select import load_agent_spec
+
+    cfg = load_config(CONFIGS / "default.yaml")
+    fields = _spec_fields(load_agent_spec(CONFIGS / spec_name, cfg))
+
+    counts = fields & {"hero.cubes", "entities.cubes", "pickups.cubes"}
+    assert not counts, f"configs/{spec_name} shows cube counts: {sorted(counts)}"

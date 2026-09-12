@@ -9,13 +9,17 @@ both of those break the sibling function's sizing in ways you only see in the ou
     diagonal with a MEDIAN of 97, so a 4 px outline on a median box is ~8% of it and the smallest
     boxes become solid magenta lozenges. Halved to width/1000, and floored at 1 so it survives the
     2.4x downscale `_side_by_side` applies.
-  * **Labels off by default.** One class means the text can only ever say "Projectile", so the
-    label carries no information the colour does not, and there can be six of them at once in a
-    space where the brawler boxes have two. The confidence IS worth seeing while judging a model,
-    so `show_confidence=True` gets it back as a bare number with no filled chip behind it.
+  * **Labels off by default.** The model has three classes now (projectile, crate, dropped cube),
+    and each has its own colour in `CLASS_COLORS`. Every caller also draws `draw_summary`'s tally,
+    which names each class in that colour, so it serves as the legend. A per-box label would add
+    no information and cost a lot of space: there can be six projectiles at once where the
+    brawler boxes have two. The confidence IS worth seeing while judging a model, so
+    `show_confidence=True` gets it back as a bare number with no filled chip behind it.
   * **A centre dot.** A projectile is a blob, and the useful question about it is *where*, not
     *how big*. The box answers a question nobody asked; the dot answers the one that matters and
-    stays visible when the box shrinks below a few pixels after downscaling.
+    stays visible when the box shrinks below a few pixels after downscaling. On a crate it is
+    only the box's middle -- the box includes the HP number above the crate -- so do not read it
+    as where the crate sits.
 
 Colour comes from `object_detection/draw.color_for`, not from a constant here -- one table for
 every box that can land in the same frame, so the class-vs-colour mapping cannot fork.

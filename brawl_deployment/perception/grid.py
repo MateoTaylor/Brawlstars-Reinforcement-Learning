@@ -37,9 +37,11 @@ and (in the sim) `box`/`pickup` are occupancy counts clamped to 255. Reproduced 
 | `hero` | the shadow's `alive` | the constant above |
 | `projectile` | `ProjectileTracker.live()` | `live()` already excludes coasted tracks |
 
-`box` and `pickup` are not here and cannot be: nothing detects a crate or a power cube, which is
-why 9.11 dropped them from the spec and zeroed `reward.cube_pickup` in the same decision. Asking
-for either raises rather than filling zeros. `enemy_any` and `enemy_hidden` are refused for a
+`box` and `pickup` are not here YET: nothing detects a crate or a power cube, which is why 9.11
+dropped them from the spec and zeroed `reward.cube_pickup` in the same decision. That exclusion was
+temporary, and `configs/agent_obs_deploy3.yaml` trains on both channels again ahead of their
+detector -- so a deploy3 checkpoint is refused HERE, by name, until a crate/cube class exists and a
+supplier for each is added to `_DYNAMIC`. Asking for either raises rather than filling zeros. `enemy_any` and `enemy_hidden` are refused for a
 different reason -- they leak the position of an enemy the hero cannot see, and `obs_select`
 already rejects them at spec-load time under `fair: true`.
 
@@ -151,10 +153,11 @@ _DYNAMIC = ("in_zone", "enemy_revealed", "hero", "projectile")
 
 # Why the other four are refused, verbatim enough to act on.
 _REFUSED = {
-    "box": "nothing detects a crate (the entity detector's classes are enemy/teammate/player); "
-           "9.11 dropped this channel from the spec rather than feed it zeros",
-    "pickup": "nothing detects a power-cube pickup; dropped with `box` in the same decision, "
-              "which also zeroed reward.cube_pickup",
+    "box": "nothing detects a crate yet (the entity detector's classes are enemy/teammate/player). "
+           "agent_obs_deploy3.yaml trains on this channel ahead of its detector; a crate class and "
+           "a supplier in _DYNAMIC are what make such a checkpoint deployable",
+    "pickup": "nothing detects a power-cube pickup yet; same position as `box` -- "
+              "agent_obs_deploy3.yaml trains on it ahead of a cube class and a supplier here",
     "enemy_any": "leaks the position of an enemy the hero cannot see; obs_select refuses it "
                  "under fair:true, and so does this",
     "enemy_hidden": "leaks hidden enemies, same as enemy_any",
