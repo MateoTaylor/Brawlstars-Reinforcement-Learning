@@ -7,6 +7,7 @@ tests deliberately break the n_envs=8 rule and use a few thousand envs instead -
 is cheap enough on CPU that it costs a fraction of a second.
 """
 import json
+from dataclasses import replace
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -75,34 +76,57 @@ def test_shipped_curriculum_advance_thresholds_are_well_formed(tcfg):
     assert tcfg.curriculum.stages[-1].advance_win_rate is None   # terminal
 
 
+def test_shipped_tiers_are_listed_weakest_to_strongest(tcfg):
+    """The walk test below reads "stronger" off the ORDER the tiers are listed in, so hold every
+    knob to that order: HP, damage, speed and leading never fall, noise, reaction and decision
+    period never rise, and each tier moves at least one of them."""
+    tiers = list(tcfg.curriculum.tiers.values())
+    for weaker, stronger in zip(tiers, tiers[1:]):
+        pair = f"{weaker.name!r} -> {stronger.name!r}"
+        for knob in ("hp", "damage", "move_speed", "lead_target"):
+            assert getattr(stronger, knob) >= getattr(weaker, knob), f"{knob} falls at {pair}"
+        for knob in ("aim_noise", "reaction_delay", "decision_period"):
+            assert getattr(stronger, knob) <= getattr(weaker, knob), f"{knob} rises at {pair}"
+        assert stronger != replace(weaker, name=stronger.name), f"{pair} changes nothing"
+
+
+def test_shipped_elite_tier_is_the_operator_spec(tcfg):
+    """2x health, 1.75x damage, very good aim -- asked for by name (2026-09-13), not tuned."""
+    elite = tcfg.curriculum.tiers["elite"]
+    assert (elite.hp, elite.damage) == (2.0, 1.75)
+    assert elite.aim_noise <= 0.25 and elite.lead_target >= 1.0
+    assert list(tcfg.curriculum.tiers)[-1] == "elite", "elite is the strongest tier"
+
+
 def test_shipped_curriculum_walks_easy_to_hard(tcfg):
-    """The user-facing shape of the default curriculum: it starts weighted toward the weakest
-    tier and shifts monotonically toward the strongest. If someone reorders the stages, this
-    fails.
+    """The user-facing shape of the default curriculum: every stage's mixture is at least as
+    strong as the one before it, and the terminal stage is mostly the strongest tier.
 
-    Deliberately does NOT require the terminal stage to be a single pure tier. It used to assert
-    `"medium" not in last.tier_weights`, which the shipped config broke when the terminal stage
-    became a MIXTURE (`{medium: 0.3, hard: 0.5, elite: 0.2}`) -- keeping some weaker opponents in
-    the final stage is an anti-overfitting choice, not a regression. What must hold is that the
-    weakest tier drains away and the strongest tier only ever grows.
+    "At least as strong" is checked at every tier boundary: for each tier, the share of bots at
+    that tier OR ABOVE never falls from one stage to the next. That covers the two conditions this
+    test used to spell out with tier names -- the weakest tier's share never grows, and the
+    strongest tiers' combined share never falls -- for any number of tiers.
+
+    Deliberately does NOT require the terminal stage to be a single pure tier. Keeping some
+    weaker opponents in the final stage is an anti-overfitting choice, not a regression.
     """
+    names = list(tcfg.curriculum.tiers)
     stages = tcfg.curriculum.stages
-    first, last = stages[0], stages[-1]
-    share = lambda s, tier: s.tier_weights.get(tier, 0.0) / sum(s.tier_weights.values())  # noqa: E731
 
-    assert first.tier_weights["easy"] == max(first.tier_weights.values())
-    assert "easy" not in last.tier_weights, "the terminal stage must contain no `easy` bots"
+    def at_or_above(stage, k):
+        total = sum(stage.tier_weights.values())
+        return sum(stage.tier_weights.get(n, 0.0) for n in names[k:]) / total
 
-    easy_share = [share(s, "easy") for s in stages]
-    assert easy_share == sorted(easy_share, reverse=True), (
-        f"`easy` share must be non-increasing across the walk, got {easy_share}"
+    for k, name in enumerate(names[1:], start=1):
+        shares = [round(at_or_above(s, k), 9) for s in stages]
+        assert shares == sorted(shares), (
+            f"the share of bots at `{name}` or above must never fall across the walk, got {shares}"
+        )
+    last = stages[-1]
+    assert max(last.tier_weights, key=last.tier_weights.get) == names[-1], (
+        f"the terminal stage's largest share must be the strongest tier, `{names[-1]}`"
     )
-    # The mirror condition, which is what actually makes it a walk toward "hard" rather than
-    # merely away from "easy": the two strongest tiers' combined share only ever grows.
-    top_share = [share(s, "hard") + share(s, "elite") for s in stages]
-    assert top_share == sorted(top_share), (
-        f"combined `hard`+`elite` share must be non-decreasing across the walk, got {top_share}"
-    )
+    assert names[0] not in last.tier_weights, f"the terminal stage must contain no `{names[0]}` bots"
 
 
 def test_unknown_key_is_rejected_not_ignored(tmp_path):
@@ -124,6 +148,17 @@ def test_stage_referencing_undefined_tier_is_rejected():
         CurriculumConfig(
             tiers={"easy": DifficultyTier("easy")},
             stages=(CurriculumStage("s", {"nope": 1.0}),),
+        )
+
+
+def test_a_min_episodes_floor_the_window_cannot_hold_is_rejected():
+    """The callback needs `min_episodes_at_stage` outcomes IN the window as well as at the stage,
+    so a floor above the window size would leave every stage to its timestep budget."""
+    with pytest.raises(ValueError, match="must not exceed"):
+        CurriculumConfig(
+            window_episodes=100, min_episodes_at_stage=101,
+            tiers={"easy": DifficultyTier("easy")},
+            stages=(CurriculumStage("s", {"easy": 1.0}),),
         )
 
 
@@ -706,8 +741,34 @@ def test_callback_demotes_on_collapse():
     ccfg = _cc(demote_win_rate=0.1); mgr = _mgr_for(ccfg); cb = _callback(ccfg, mgr)
     _feed(cb, wins=6, losses=4)
     assert mgr.stage.name == "b"
+    _feed(cb, wins=0, losses=10)     # each env's first finish at "b" still had "a"'s bots
+    assert mgr.stage.name == "b"
     _feed(cb, wins=0, losses=10)
     assert mgr.stage.name == "a" and cb.history[-1]["how"] == "demoted"
+
+
+def test_callback_skips_episodes_whose_bots_came_from_the_previous_stage():
+    """Tiers are drawn at reset, so the episodes in flight when a stage changes finish under the
+    OLD stage's bots. Each env's first finish after a transition is skipped; after that it counts.
+    An env that has not finished yet stays owed, however many times the others finish."""
+    ccfg = _cc(); mgr = _mgr_for(ccfg); cb = _callback(ccfg, mgr)
+    # 10 envs. All win at "a", which advances it.
+    _feed(cb, wins=10, losses=0)
+    assert mgr.stage.name == "b" and cb.episodes_at_stage == 0
+
+    # Envs 0-7 finish (still "a"'s bots), then 0-7 finish again at "b"; envs 8-9 have not finished.
+    for _ in range(2):
+        cb.locals = {"infos": [{"outcome": {"won": True, "rank": 0}}] * 8 + [{}, {}]}
+        cb._on_step()
+    assert cb.episodes_at_stage == 8 and cb.total_episodes == 26
+    assert int(cb._stale.sum()) == 2
+    assert mgr.stage.name == "b", "8 counted episodes are below min_episodes_at_stage=10"
+
+    # Envs 8-9 finally finish. It is their first finish since the transition, so it is skipped.
+    cb.locals = {"infos": [{}] * 8 + [{"outcome": {"won": True, "rank": 0}}] * 2}
+    cb._on_step()
+    assert cb.episodes_at_stage == 8 and not cb._stale.any()
+    assert mgr.stage.name == "b"
 
 
 def test_callback_force_advances_a_stalled_stage():

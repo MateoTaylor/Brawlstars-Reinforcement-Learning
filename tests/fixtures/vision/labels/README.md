@@ -26,6 +26,13 @@ selected (press `g`) before trusting it.
 
 Re-running on a frame you have already labelled resumes it.
 
+`<clip>` is a recording name without `.mp4`, looked up in `tests/fixtures/vision/` and then
+`brawl_vision/data/training_videos/`; quote names with spaces. Recordings at 1080p (the BlueStacks
+and emulator captures) are resized to the calibrated 2002x1126 viewport first, as the deployed
+capture does. Where the same recording exists under two names (`day10_gameplay` is
+`ScreenRecording_08-29-2026 19-39-53_1`), label it under one: `--hold-out` goes by name, and a
+copy under the other name would leak the held-out map into training.
+
 ## How much to do
 
 **Start with ~5 frames per map, and prefer breadth over depth.** Per the plan: 20 labelled cells
@@ -53,6 +60,14 @@ trapezoid the camera actually sees, padded to a rectangle, and the padding is no
 Cells hidden by a **loot box or a brawler** should be left unlabelled. The tool cannot detect
 those yet (that is the entity chunk), so it is on you to skip them; a box sitting on floor is not
 an example of floor.
+
+**Some on-screen buttons show through.** `hud_mask.json` blanks the joystick and the attack/super
+buttons of one HUD layout. The green gadget button is outside it in every recording, and so are the
+emote bubble and the kill feed. Recordings with the smaller buttons further right
+(`day12_recording*`, `ScreenRecording_08-31-2026 10-16-29_1`, all the `09-04` recordings) and the
+1080p emulator captures show their attack and super buttons too, while the mask blanks world
+nobody is covering. Leave cells under any button `?`, and check them after a `c` fill, which will
+assign a button to whatever cluster it resembles.
 
 ## Then
 

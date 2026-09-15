@@ -226,3 +226,105 @@ def test_the_shipped_attack_tap_clears_the_super_and_gadget_buttons():
         assert gap > 4 * b["r"], f"the attack tap is only {gap:.0f} px from {name} (r={b['r']})"
     assert tx > w / 2, "the attack tap must be on the right half of the screen"
     assert 0 < tx < w and 0 < ty < h, "the attack tap must be on screen"
+
+
+# ---------------------------------------------------------------------------------------------
+# `--run`: choosing a run by name.
+# ---------------------------------------------------------------------------------------------
+
+def _runs(tmp_path, *dirs):
+    """A runs/ directory of `(dir name, run.name)` pairs, each with the files a real run has."""
+    for dirname, trained_as in dirs:
+        run = tmp_path / dirname
+        run.mkdir()
+        (run / "train.yaml").write_text(yaml.safe_dump({"run": {"name": trained_as}}))
+        (run / "best_model.zip").write_bytes(b"")
+        (run / "final_model.zip").write_bytes(b"")
+    return tmp_path
+
+
+# The two real runs this was written for: one name is a prefix of the other.
+BASE = ("mortis_deploy3-20260911-203322", "mortis_deploy3")
+ELITE = ("mortis_deploy3_elite-20260913-015933", "mortis_deploy3_elite")
+
+
+def test_a_run_resolves_by_the_name_it_was_trained_as(tmp_path):
+    runs = _runs(tmp_path, BASE, ELITE)
+    assert C.resolve_run("mortis_deploy3", runs).endswith(BASE[0])
+    assert C.resolve_run("mortis_deploy3_elite", runs).endswith(ELITE[0])
+
+
+def test_a_run_resolves_by_directory_name_and_by_path(tmp_path):
+    runs = _runs(tmp_path, BASE, ELITE)
+    assert C.resolve_run(BASE[0], runs).endswith(BASE[0])
+    assert C.resolve_run(str(runs / ELITE[0]), runs).endswith(ELITE[0])
+
+
+def test_a_name_trained_twice_is_refused_with_both_listed(tmp_path):
+    """Resolving to the newest would be a guess about which checkpoint played, in exactly the
+    setting -- comparing runs -- where that is the fact being recorded."""
+    runs = _runs(tmp_path, BASE, ("mortis_deploy3-20260915-090000", "mortis_deploy3"))
+    with pytest.raises(ValueError, match="2 runs were trained as 'mortis_deploy3'") as err:
+        C.resolve_run("mortis_deploy3", runs)
+    assert BASE[0] in str(err.value) and "mortis_deploy3-20260915-090000" in str(err.value)
+
+
+def test_a_prefix_is_not_a_name(tmp_path):
+    """`mortis_deploy3` must not also mean `mortis_deploy3_elite`, and `mortis` must mean nothing."""
+    runs = _runs(tmp_path, ELITE)
+    with pytest.raises(ValueError, match="no run called 'mortis_deploy3'") as err:
+        C.resolve_run("mortis_deploy3", runs)
+    assert "--run mortis_deploy3_elite" in str(err.value), "the error lists what does exist"
+
+
+def test_a_directory_without_train_yaml_is_not_a_run(tmp_path):
+    """`runs/deploy` holds telemetry, not a checkpoint; offering it would fail later and worse."""
+    runs = _runs(tmp_path, BASE)
+    (runs / "deploy").mkdir()
+    with pytest.raises(ValueError, match="no run called 'deploy'"):
+        C.resolve_run("deploy", runs)
+
+
+def _args(**kw):
+    base = {"config": "configs/deployment.yaml", "run": None, "checkpoint": None}
+    return SimpleNamespace(**{**base, **kw})
+
+
+def test_deploy_run_takes_the_run_and_checkpoint_from_the_command_line(tmp_path, monkeypatch):
+    from scripts import deploy_run
+
+    runs = _runs(tmp_path, BASE, ELITE)
+    monkeypatch.setattr(deploy_run, "resolve_run", lambda name: C.resolve_run(name, runs))
+    cfg = deploy_run._config_from_args(_args(run="mortis_deploy3", checkpoint="final"))
+    assert cfg.run_dir.endswith(BASE[0])
+    assert cfg.run_checkpoint == "final_model.zip"
+    # Everything else still comes from the file.
+    assert cfg.loop_tick_hz == C.load_deployment_config().loop_tick_hz
+
+
+def test_deploy_run_without_flags_is_the_config_file(monkeypatch):
+    from scripts import deploy_run
+
+    shipped = C.load_deployment_config()
+    if not (C.REPO_ROOT / shipped.run_dir / shipped.run_checkpoint).is_file():
+        pytest.skip("runs/ is gitignored; the configured checkpoint is not on every machine")
+    monkeypatch.chdir(C.REPO_ROOT)
+    assert deploy_run._config_from_args(_args()) == shipped
+
+
+def test_deploy_run_names_a_missing_checkpoint_before_building_anything(tmp_path, monkeypatch):
+    from scripts import deploy_run
+
+    runs = _runs(tmp_path, BASE)
+    monkeypatch.setattr(deploy_run, "resolve_run", lambda name: C.resolve_run(name, runs))
+    with pytest.raises(SystemExit, match="no checkpoint .*best_model_v2.zip"):
+        deploy_run._config_from_args(_args(run="mortis_deploy3", checkpoint="best_model_v2.zip"))
+
+
+def test_deploy_run_turns_an_unknown_run_into_a_message_not_a_traceback(tmp_path, monkeypatch):
+    from scripts import deploy_run
+
+    runs = _runs(tmp_path, BASE)
+    monkeypatch.setattr(deploy_run, "resolve_run", lambda name: C.resolve_run(name, runs))
+    with pytest.raises(SystemExit, match="no run called 'elite'"):
+        deploy_run._config_from_args(_args(run="elite"))

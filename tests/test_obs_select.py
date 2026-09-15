@@ -2,6 +2,7 @@ import tempfile
 import os
 
 import gymnasium
+import pytest
 import torch
 import yaml
 
@@ -340,3 +341,42 @@ def test_two_specs_with_a_same_named_group_do_not_share_a_normalization_vector()
     finally:
         for p in paths:
             os.remove(p)
+
+
+def _grid_spec(channels):
+    return {"fair": True, "normalize": True,
+            "groups": [{"name": "grid", "dtype": "uint8", "view_channels": list(channels)}]}
+
+
+@pytest.mark.parametrize("first, second", [
+    # The pair that found it: the full suite built agent_obs_deploy3.yaml's grid (10 planes) and
+    # then every agent_obs_deploy.yaml test (8) died on a size mismatch.
+    ("configs/agent_obs_deploy3.yaml", "configs/agent_obs_deploy.yaml"),
+    # The worse half: equal widths, so nothing raises and the second spec just reads the wrong planes.
+    (_grid_spec(["hero", "blocks_unit"]), _grid_spec(["blocks_unit", "hero"])),
+])
+def test_two_specs_with_a_same_named_grid_do_not_share_channel_indices(first, second):
+    """The grid half of the bug above. `_build_grid_group` memoized its channel indices under the
+    group NAME, and every spec calls its view group "grid".
+
+    The reference is the second spec built from an empty cache, so the expected planes do not come
+    from the same channel table the code under test uses.
+    """
+    env, cfg, full_obs = _env_and_obs(n_envs=4, seed=5)
+    paths = [s if isinstance(s, str) else _write_spec(s) for s in (first, second)]
+    try:
+        specs = [obs_select.load_agent_spec(p, cfg) for p in paths]
+
+        def grid(spec):
+            buffers = obs_select.make_agent_obs_buffers(spec, cfg, 4, torch.device("cpu"))
+            return obs_select.build_agent_obs(full_obs, spec, cfg, buffers)["grid"].clone()
+
+        obs_select._tensor_cache.clear()
+        reference = grid(specs[1])
+        obs_select._tensor_cache.clear()
+        assert not torch.equal(grid(specs[0]), reference), "the specs must differ for this to tell"
+        assert torch.equal(grid(specs[1]), reference)
+    finally:
+        for s, p in zip((first, second), paths):
+            if isinstance(s, dict):
+                os.remove(p)

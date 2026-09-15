@@ -27,6 +27,7 @@ jittering period, not a slow one. §6.13 has the measurement.
 | grab, rectify, odometry | the shift bound above |
 | match gate | exit hysteresis is counted in frames |
 | projectile detect + track | a projectile crosses the screen inside one decision (§9.5) |
+| crate/cube map, off the same boxes | the model call is already paid; more sightings confirm sooner |
 | terrain classify + occupancy deposit | accumulating; a skipped frame is evidence thrown away |
 | `grid.observe_zone` | same, and it is what `ZoneEstimator` reads |
 | `shadow.advance` | it spends REAL elapsed seconds as whole sub-ticks, which is what keeps the two rates honest when a decision runs long |
@@ -59,6 +60,7 @@ import time
 from collections import deque
 from dataclasses import dataclass
 from enum import Enum
+from pathlib import Path
 
 import numpy as np
 
@@ -67,8 +69,14 @@ from brawl_sim.constants import Tile
 from .config import DeploymentConfig, resolve_rates
 from .control import Buttons, Joystick
 from .match_state import Calibration, MatchState
-from .perception import (EntityTracker, GridBuilder, ProjectileTracker, ShadowHero, ShadowParams,
-                         ZoneEstimator)
+from .perception import (EntityTracker, GridBuilder, GridSpec, LootMap, ProjectileTracker,
+                         ShadowHero, ShadowParams, ZoneEstimator, box_occlusion,
+                         crate_occlusion, require_loot_classes)
+
+# The emulator's HUD, NOT `brawl_vision`'s default. That one is the iOS recordings' layout and stays
+# what the offline tools read; on BlueStacks frames it masks floor and leaves every button in view,
+# which the terrain map deposits as walls and odometry correlates as a static patch. See the file.
+HUD_MASK_PATH = Path(__file__).parent / "data" / "hud_mask.json"
 
 # How long odometry may report anything but "ok" before the loop gives up.
 #
@@ -176,7 +184,7 @@ class VisionStack:
         from .perception.projectiles import require_projectile_class
 
         cfg = vision_cfg or load_vision_config()
-        plan = build_rectify_plan(load_camera_model(), load_hud_mask())
+        plan = build_rectify_plan(load_camera_model(), load_hud_mask(HUD_MASK_PATH))
         # Checked here, on the real model, because the tracker filters by label: a promoted model
         # with no `Projectile` class would otherwise load fine and feed the policy zero shots.
         projectiles = ProjectileDetector.from_config(cfg)
@@ -291,7 +299,14 @@ class DeployLoop:
                                  desync_strikes=cfg.shadow_ammo_strikes)
         self.tracker = EntityTracker(n_slots=int(self.sim.n_entities) - 1)
         self.projectiles = ProjectileTracker()
-        self.grid = GridBuilder(vision.occupancy)
+        self.loot = LootMap()
+        # The grid's channels come from the spec the policy was built with. The no-argument
+        # `GridSpec.load()` reads agent_obs_deploy.yaml, which is two channels short of deploy3,
+        # and the mismatch would only surface as a shape error in `assemble` on the first decision.
+        self.grid = GridBuilder(vision.occupancy, GridSpec.from_agent_spec(policy.spec, self.sim))
+        # Here rather than in `VisionStack.build`, because it takes both halves: a deploy3 policy
+        # on a model with no crate class would read an empty `box` plane forever, silently.
+        require_loot_classes(vision.projectiles.names, self.grid.spec.channels)
         self.zone = ZoneEstimator(self.sim)
 
         self.phase = Phase.WAITING
@@ -437,9 +452,9 @@ class DeployLoop:
                 return
             if not self._gate_transition(gate, frame, row):
                 return
-            self._perceive(frame, rect, odo)
+            detections = self._perceive(frame, rect, odo)
             if self._is_decision_tick():
-                self._decide(frame, odo, row)
+                self._decide(frame, odo, row, detections)
         finally:
             row.phase = self.phase.value
             row.tick_ms = (time.perf_counter() - t_start) * 1e3
@@ -448,26 +463,42 @@ class DeployLoop:
             if self.phase is Phase.PLAYING:
                 self._ticks_in_match += 1
 
-    def _perceive(self, frame, rect, odo) -> None:
+    def _perceive(self, frame, rect, odo) -> list:
         """The accumulating every-tick stages. Everything here is gated on odometry inside its own
-        `update`; the loop does not re-implement that gate, it relies on it (§6.1)."""
+        `update`; the loop does not re-implement that gate, it relies on it (§6.1).
+
+        Returns this tick's entity detections, which a decision on the same tick reuses rather
+        than running the detector twice on one frame.
+        """
         from brawl_vision.terrain.zone import detect_zone
 
-        zone = detect_zone(rect, self.vision.plan, self.vision.cfg)
-        cells, _ = self.vision.classifier.predict(rect, self.vision.plan)
-        self.vision.occupancy.update(cells, odo, self.vision.plan,
-                                     zone=zone.at_least(0.05), cfg=self.vision.cfg)
-        self.grid.observe_zone(zone, self.vision.plan, odo)
-
+        plan = self.vision.plan
+        # First, because the crate boxes are the occupancy map's fifth gate: a cell a crate
+        # stands on is not evidence about the floor under it (`loot.crate_occlusion`).
         dets = self.vision.projectiles.predict(frame.image)
-        self.projectiles.update(dets, self.vision.plan, odo, frame.t)
+        # Every tick, not only on decisions, for the same gate: a brawler sprite is not floor
+        # either, and two thirds of the deposits would otherwise carry it (`loot.box_occlusion`).
+        # A tick odometry did not place deposits nothing, and `_decide` returns before reading.
+        entities = self.vision.entities.predict(frame.image) if odo.status == "ok" else []
+
+        zone = detect_zone(rect, plan, self.vision.cfg)
+        cells, _ = self.vision.classifier.predict(rect, plan)
+        occluded = crate_occlusion(dets, plan) | box_occlusion(entities, plan)
+        self.vision.occupancy.update(cells, odo, plan, zone=zone.at_least(0.05),
+                                     occluded=occluded, cfg=self.vision.cfg)
+        self.grid.observe_zone(zone, plan, odo)
+
+        # One model, three classes, and each consumer keeps its own label.
+        self.projectiles.update(dets, plan, odo, frame.t)
+        self.loot.update(dets, plan, odo, frame.t)
+        return entities
 
     # -- one decision ---------------------------------------------------------
 
     def _is_decision_tick(self) -> bool:
         return self._ticks_in_match % self.decision_every == 0
 
-    def _decide(self, frame, odo, row: TickRow) -> None:
+    def _decide(self, frame, odo, row: TickRow, detections: list) -> None:
         """One 4 Hz decision.
 
         **A supplier that has nothing to say skips the decision rather than filling a column.**
@@ -487,7 +518,6 @@ class DeployLoop:
             return
 
         image = frame.image
-        detections = self.vision.entities.predict(image)
         row.n_detections = len(detections)
         readings = self.vision.health.update(image, detections)
         tracked = self.tracker.update(detections, self.vision.plan, odo, frame.t)
@@ -527,7 +557,8 @@ class DeployLoop:
             zone=self.zone.estimate(self.grid.gas, hero_pos),
             grid=self.grid.build(hero_pos, alive=self.shadow.alive,
                                  enemies=tracked.enemies,
-                                 projectiles=self.projectiles.live()),
+                                 projectiles=self.projectiles.live(),
+                                 crates=self.loot.crates(), cubes=self.loot.cubes()),
         )
 
         try:
@@ -722,6 +753,7 @@ class DeployLoop:
         self.shadow.reset()
         self.tracker.reset(self.vision.odometry.segment)
         self.projectiles.reset(self.vision.odometry.segment)
+        self.loot.reset(self.vision.odometry.segment)
         self.grid.reset(self.vision.odometry.segment)
         self.vision.health.reset()
         self._enemy_hp.clear()

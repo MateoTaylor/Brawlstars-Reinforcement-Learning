@@ -15,10 +15,11 @@ the threshold is carried by S and V, with H only excluding the non-green half of
 cell that was clear thirty seconds ago says nothing about now.
 
 **Phase I is the consumer, and it needs cells, not pixels.** Gas tints the terrain beneath it, so a
-gas-covered cell is a cell whose colours have been shifted by a full-screen effect; voting on it
-would lock a misclassification permanently. `ZoneMask.cells` is the per-cell boolean that stage
-should consult, and it is deliberately computed against each cell's VALID pixels only -- a cell
-half-covered by the HUD must not be called clear just because the visible half happens to be.
+gas-covered cell is a cell whose colours have been shifted by a full-screen effect, and gas never
+leaves, so votes on it would outvote the real terrain in time. `ZoneMask.cells` is the per-cell
+boolean that stage should consult, and it is deliberately computed against each cell's VALID
+pixels only -- a cell half-covered by the HUD must not be called clear just because the visible
+half happens to be.
 """
 from dataclasses import dataclass
 
@@ -51,9 +52,9 @@ class ZoneMask:
         """Cells at least `fraction` gassed. Phase I should use a value well BELOW
         `min_cell_fraction`, because the two consumers want opposite errors: `cells` answers "is
         this cell in the zone" for the agent, where a wrong answer either way costs the same,
-        while Phase I uses it to REFUSE to vote -- and there, missing gas locks a misclassification
-        permanently while over-flagging only slows the map filling in. Any tinting at all is
-        reason enough to abstain."""
+        while Phase I uses it to REFUSE to vote -- and there, missing gas casts a wrong vote on
+        every frame for the rest of the match while over-flagging only slows the map filling in.
+        Any tinting at all is reason enough to abstain."""
         return self.observed & (self.cell_fraction >= fraction)
 
 

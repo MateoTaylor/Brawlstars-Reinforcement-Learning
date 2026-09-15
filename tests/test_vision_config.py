@@ -47,22 +47,20 @@ def test_shipped_vision_yaml_sets_every_declared_field():
     assert not missing, f"configs/vision.yaml does not mention: {missing}"
 
 
-def test_every_remaining_placeholder_is_still_obviously_fake():
-    """Placeholders in this file ship as values that CANNOT be mistaken for measurements, because
-    a plausible-looking guess half-works and costs a day to find. Each is paired with a test that
-    fails the moment it is replaced -- the prompt to record what it was measured from.
+def test_the_occupancy_lock_is_no_longer_a_placeholder():
+    """Placeholders in this file ship as values that CANNOT be mistaken for measurements, and each
+    was paired with a test that failed the moment it was replaced -- the prompt to record what it
+    was measured from. The zone threshold's guard moved to `test_vision_zone.py` when Phase G
+    measured it. The occupancy pair was the last one here, and this is its record.
 
-    The zone threshold used to be here, shipping as the full HSV cube ("everything is gas"). Phase
-    G measured it across three maps and the guard moved to
-    `tests/test_vision_zone.py::test_the_shipped_threshold_is_no_longer_the_placeholder`, which
-    pins both the numbers and their provenance. What remains is the occupancy pair.
+    It was measured 2026-09-14 against the labelled frames, and the finding was that a lock should
+    not freeze a cell at any threshold tried, so the pair kept its values but lost its effect on the
+    map. The comment has to say so, or the next reader tunes two numbers that change nothing.
     """
     raw = yaml.safe_load(DEFAULT_CONFIG_PATH.read_text())
-    section = DEFAULT_CONFIG_PATH.read_text().split("occupancy:")[1]
-    assert "PLACEHOLDER" in section, (
-        "occupancy.min_votes / lock_ratio look measured now -- record what they were measured "
-        "against in configs/vision.yaml, then update this test."
-    )
+    section = DEFAULT_CONFIG_PATH.read_text().split("occupancy:")[1].split("classifier:")[0]
+    assert "PLACEHOLDER" not in section
+    assert "2026-09-14" in section and "never frozen" in section, "the provenance was dropped"
     assert raw["occupancy"]["min_votes"] == 5 and raw["occupancy"]["lock_ratio"] == 0.8
 
 

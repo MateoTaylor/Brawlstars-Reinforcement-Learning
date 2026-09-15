@@ -22,6 +22,24 @@ RUN = "runs/mortis_deploy-20260907-041522"
 SPEC = "configs/agent_obs_deploy.yaml"
 CONFIGS = "configs/default.yaml"
 
+# The run `scripts/deploy_run.py` loads by default, and every other local run it could be pointed
+# at with `--run`. The end-to-end test used to cover RUN alone, so pointing configs/deployment.yaml
+# at a newer spec was never exercised offline -- and the first live decision on it is where a
+# missing supplier surfaced.
+DEPLOYED_RUN = yaml.safe_load(open("configs/deployment.yaml").read())["run"]["dir"]
+
+
+def _deployable_runs() -> list[str]:
+    """RUN, DEPLOYED_RUN, and every run under runs/ whose train.yaml names a deploy spec."""
+    from pathlib import Path
+
+    found = {RUN, DEPLOYED_RUN}
+    for train_yaml in Path("runs").glob("*/train.yaml"):
+        spec = ((yaml.safe_load(train_yaml.read_text()) or {}).get("run") or {}).get("agent_obs")
+        if spec and Path(spec).name.startswith("agent_obs_deploy"):
+            found.add(train_yaml.parent.as_posix())
+    return sorted(found)
+
 # The smallest train.yaml `load_train_config` will validate. `eval.enabled: false` is only here
 # because evaluation insists on curriculum tiers it has no use for in a load-time guard test.
 BASE_RUN_YAML = {
@@ -228,16 +246,28 @@ def test_deterministic_is_passed_through_and_defaults_to_the_way_the_run_was_sco
 
 # ---- end to end, when the checkpoint is present -------------------------------------------------
 
-@pytest.mark.skipif(not __import__("pathlib").Path(f"{RUN}/best_model.zip").exists(),
-                    reason="runs/ is gitignored; the deployed checkpoint is not on every machine")
-def test_the_real_checkpoint_loads_and_decides_from_an_assembled_observation():
+@pytest.mark.parametrize("run", _deployable_runs())
+def test_the_real_checkpoint_loads_and_decides_from_an_assembled_observation(run):
     """The one test that touches the actual artifact: load the run, build ITS assembler, and push
     a real assembled observation through. It asserts the seam rather than the answer -- that
     `assemble`'s output is exactly what `predict` accepts, with no reshaping in between, and that
-    a masked-off super is never chosen over 30 varied frames."""
-    pol = DeployedPolicy.from_run(RUN)
+    a masked-off super is never chosen over 30 varied frames.
+
+    The zone group comes from the real `ZoneEstimator`, not a hand-written dict. A dict written here
+    carried both margin names while the estimator produced one, which is how this test passed for a
+    deploy3 run that could not make its first live decision."""
+    from brawl_deployment.perception.grid import GasMap
+    from brawl_deployment.perception.zone import ZoneEstimator
+
+    if not __import__("pathlib").Path(f"{run}/best_model.zip").exists():
+        pytest.skip("runs/ is gitignored; the deployed checkpoint is not on every machine")
+    pol = DeployedPolicy.from_run(run)
     asm = pol.make_assembler()
     assert asm.spec is pol.spec and asm.cfg is pol.cfg, "one spec object, not two loads of it"
+    gas = GasMap(128, 128)
+    ox, oy = gas.origin
+    gas.gassed[:, :5 - ox] = True                   # gas at world x <= 4: a real west margin
+    zone = ZoneEstimator(pol.cfg)
 
     shadow_obs = {"facing_vec": (1.0, 0.0), "ammo_frac": 0.8, "ammo_whole": 2.0, "attack_cd": 0.0,
                   "can_attack": True, "dashing": False, "dash_t": 0.0, "dash_dir": (0.0, 0.0),
@@ -251,9 +281,7 @@ def test_the_real_checkpoint_loads_and_decides_from_an_assembled_observation():
             n_enemies_alive=4.0, elapsed_s=float(i) * 5.0, hero_in_bush=False, hero_in_zone=False,
             enemies=[None] * (pol.cfg.n_entities - 1), enemy_hp={}, enemy_in_bush={},
             projectiles=[],
-            zone={"hero_margin": (5.0, 12.0, -1.0, 30.0),
-                  "hero_margin_local": (5.0, 10.0, -1.0, 10.0), "active": True,
-                  "safe_area_frac": 0.4, "next_shrink_in": 3.0},
+            zone=zone.estimate(gas, (10.0 + i, 10.0)),
             grid=rng.integers(0, 2, (len(asm._grid_channels), pol.cfg.view_h, pol.cfg.view_w),
                               dtype=np.uint8),
         )

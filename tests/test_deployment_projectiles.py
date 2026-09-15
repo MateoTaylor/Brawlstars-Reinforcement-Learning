@@ -14,8 +14,8 @@ import numpy as np
 import pytest
 
 from brawl_deployment.perception.projectiles import (
-    DUPLICATE_TILES, GATE_NOISE_TILES, MAX_COAST_S, MAX_PROJ_TILES_S, MIN_SAMPLES,
-    PROJ_ANCHOR_FRAC, ProjectileTracker, _dedupe, require_projectile_class,
+    DUPLICATE_TILES, GATE_NOISE_TILES, MAX_COAST_S, MAX_PROJ_TILES_S, MAX_TRACK_S, MIN_SAMPLES,
+    PROJ_ANCHOR_FRAC, STATIC_TILES_S, ProjectileTracker, _dedupe, require_projectile_class,
 )
 from brawl_vision.object_detection.detector import Detection
 
@@ -425,6 +425,67 @@ def test_snapshot_does_not_order_the_slots():
     assert ttcs != sorted(ttcs), "insertion order, not threat order"
 
 
+# ---------------------------------------------------------------- tracks that do not move
+
+def test_a_still_track_reports_what_the_sim_reports_for_a_hazard():
+    """Anchor noise on something that is not moving, drifting 0.05 tiles toward the hero over two
+    ticks: a whole-span speed of 0.5 tiles/s. Reported raw, `closest_approach` would turn that into
+    a 10 s time-to-closest, a value no sim entry ever takes. The sim's still entry reports
+    vel (0, 0) and time 0, and so does this."""
+    trk = ProjectileTracker()
+    run(trk, [[det_at(5.0, 0.0)], [det_at(4.975, 0.0)], [det_at(4.95, 0.0)]])
+    (_, vel, ttc), = trk.snapshot((0.0, 0.0))
+    assert vel == (0.0, 0.0)
+    assert ttc == 0.0
+
+
+def test_the_snap_is_reporting_only_and_association_keeps_the_real_estimate():
+    trk = ProjectileTracker()
+    run(trk, [[det_at(5.0, 0.0)], [det_at(4.975, 0.0)], [det_at(4.95, 0.0)]])
+    trk.snapshot((0.0, 0.0))
+    assert trk.tracks[0].vel == pytest.approx((-0.5, 0.0), abs=1e-6)
+
+
+def test_the_slowest_mover_the_sim_has_keeps_its_velocity():
+    """A Grom shard, 1.2 tiles in 0.5 s = 2.4 tiles/s."""
+    trk = ProjectileTracker()
+    run(trk, [[det_at(2.4 * TICK * i, 0.0)] for i in range(3)])
+    (_, vel, _), = trk.snapshot((10.0, 0.0))
+    assert vel == pytest.approx((2.4, 0.0), abs=1e-5)
+
+
+def test_a_track_past_the_age_limit_leaves_the_observation_but_keeps_its_detections():
+    """Retired, not dropped. Dropped, the same false positive would be a brand-new track on the
+    next tick with its clock back at zero, and nothing would ever retire it."""
+    trk = ProjectileTracker()
+    n = round((MAX_TRACK_S + 0.5) / TICK)
+    for i in range(n):
+        res = trk.update([det_at(3.0, 3.0)], StubPlan(), StubOdo(), t=i * TICK)
+        if MIN_SAMPLES <= i + 1 and i * TICK < MAX_TRACK_S - TICK:
+            assert len(res.live) == 1, f"retired early, at {i * TICK:.2f} s"
+    assert res.live == [] and trk.snapshot((0.0, 0.0)) == []
+    assert len(trk.tracks) == 1, "the retired track must go on absorbing its detections"
+    assert trk.tracks[0].hits == n
+    assert res.n_detections == 1
+
+
+def test_a_rocket_that_becomes_a_hazard_is_reported_for_its_whole_sim_lifetime():
+    """The reason the age limit is 5.5 s and not the hazard's 4.0. A bot_sniper rocket flies 8
+    tiles at 5.33 tiles/s, and the hazard it leaves sits for 4.0 s in the same slot. This tracker
+    links the two into ONE track, so its age includes the flight."""
+    trk = ProjectileTracker()
+    flight = 8.0 / 5.33
+    t, res = 0.0, None
+    while t < flight + 3.9:
+        x = 5.33 * min(t, flight)
+        res = trk.update([det_at(x, 0.0)], StubPlan(), StubOdo(), t=t)
+        t += TICK
+    assert len(trk.tracks) == 1, "flight and hazard are one track"
+    assert len(res.live) == 1, "still live 5.4 s after the launch"
+    (_, vel, _), = trk.snapshot((20.0, 0.0))
+    assert vel == (0.0, 0.0), "8 tiles over 5.4 s is under the still threshold by now"
+
+
 # ---------------------------------------------------------------- constants
 
 def test_the_gate_is_wider_than_the_fastest_projectile_the_simulator_can_fire():
@@ -439,6 +500,54 @@ def test_the_gate_is_wider_than_the_fastest_projectile_the_simulator_can_fire():
                        if k in ("proj_speed", "super_proj_speed") and isinstance(v, (int, float))]
     assert speeds, "no projectile speeds found -- the roster file moved"
     assert MAX_PROJ_TILES_S > max(speeds)
+
+
+def _kits():
+    import yaml
+    kits = [k for k in yaml.safe_load(open("configs/brawlers.yaml")).values() if isinstance(k, dict)]
+    assert kits, "no kits found -- the roster file moved"
+    return kits
+
+
+def _num(kit, key):
+    v = kit.get(key, 0.0)
+    return float(v) if isinstance(v, (int, float)) else 0.0
+
+
+def test_the_still_threshold_is_under_every_constant_speed_mover_in_the_sim():
+    """The threshold is measured, not derived, so this is the check that it is not ALSO wrong
+    about the sim. Everything that flies at a constant speed has to stay above it: straight shots,
+    supers, and split shards, whose speed is split_distance / split_seconds (Grom's 2.4 is the
+    floor). A timed lob has no constant speed, so it is not in the list."""
+    speeds = []
+    for kit in _kits():
+        if _num(kit, "proj_speed") > 0 and _num(kit, "proj_flight_seconds") == 0:
+            speeds.append(_num(kit, "proj_speed"))
+        if _num(kit, "super_proj_speed") > 0:
+            speeds.append(_num(kit, "super_proj_speed"))
+        if _num(kit, "split_distance") > 0 and _num(kit, "split_seconds") > 0:
+            speeds.append(_num(kit, "split_distance") / _num(kit, "split_seconds"))
+    assert min(speeds) == pytest.approx(2.4), "the slowest mover changed; re-read the docstring"
+    assert STATIC_TILES_S < min(speeds)
+
+
+def test_the_age_limit_is_the_longest_any_sim_entry_holds_a_projectile_slot():
+    """Residency the way `brawl_sim.config` sizes the projectile buffer: flight (a timed lob's
+    flight seconds, else range / speed), plus the longer of the hazard and the shards that inherit
+    the slot. Both directions are bugs, so it is pinned to a hundredth of a second, well under one
+    tick."""
+    residency = []
+    for kit in _kits():
+        speed = _num(kit, "proj_speed")
+        if speed <= 0 or _num(kit, "attack_range") <= 0:
+            continue
+        flight = _num(kit, "proj_flight_seconds") or _num(kit, "attack_range") / speed
+        hazard = _num(kit, "on_hit_area_ticks") * _num(kit, "on_hit_area_interval")
+        shards = 0.0
+        if _num(kit, "split_distance") > 0:
+            shards = _num(kit, "split_seconds") or _num(kit, "split_distance") / speed
+        residency.append(flight + max(hazard, shards))
+    assert MAX_TRACK_S == pytest.approx(max(residency), abs=0.01)
 
 
 def test_min_samples_is_two_because_a_velocity_needs_two_points():

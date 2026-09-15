@@ -88,6 +88,7 @@ import cv2
 import numpy as np
 
 from .draw import color_for
+from .projectile_detection.classes import CUBE_BOX, CUBE_DROPPED
 
 
 DEFAULT_ANCHOR_FRAC = 0.30
@@ -126,6 +127,27 @@ PROJECTILE_FOOTPRINT_TILES = 0.6
 # one of these markers and you will be reading the projectile's shadow position, displaced away
 # from the camera by an amount nobody has measured.
 PROJECTILE_ANCHOR_FRAC = 0.5
+
+# The projectile model's other two classes DO sit on the ground, so unlike a projectile they have a
+# contact point to find, and both were measured. The numbers are in brawl_deployment/perception/
+# loot.py, under "Where a box is on the ground: the two anchors":
+#
+#   crate   0.30   the brawler default, and right for a crate too: sd 0.03 tiles on the
+#                  calibration clip, the one clip with true tile positions
+#   cube   -0.15   NEGATIVE, so below the box. A dropped cube floats, and its ground point is the
+#                  shadow under it, a median 10 px below a median 65 px box
+#
+# They live here rather than in loot.py so the render projects with them too. A demo and the
+# deployed bot should not disagree about where a crate is.
+CRATE_ANCHOR_FRAC = 0.30
+CUBE_ANCHOR_FRAC = -0.15
+LOOT_ANCHOR_FRAC = {CUBE_BOX: CRATE_ANCHOR_FRAC, CUBE_DROPPED: CUBE_ANCHOR_FRAC}
+
+
+def projectile_model_anchor(label: str) -> float:
+    """The anchor for one of the projectile model's classes: measured for a crate or a cube, the
+    centre (`PROJECTILE_ANCHOR_FRAC`) for a projectile and for any label not listed above."""
+    return LOOT_ANCHOR_FRAC.get(label, PROJECTILE_ANCHOR_FRAC)
 
 
 def to_tiles(detections, plan, ground_offset_tiles: float = 0.0,

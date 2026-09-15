@@ -23,7 +23,10 @@ run:
   # spec. Those are deliberately NOT repeated here: a spec path in this file could disagree with
   # the one the checkpoint was trained against, and policy.py's guards exist because that
   # disagreement is silent -- the observation is the right WIDTH with the wrong columns in it.
-  dir: runs/mortis_deploy-20260907-041522
+  #
+  # This is the DEFAULT run. `scripts/deploy_run.py --run <name> [--checkpoint best|final]` plays a
+  # different one for a single invocation, by the name it was trained as, without editing this file.
+  dir: runs/mortis_deploy3_elite-20260913-015933
   checkpoint: best_model.zip
 
 policy:

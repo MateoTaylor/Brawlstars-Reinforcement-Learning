@@ -134,7 +134,7 @@ def draw_detections(image: np.ndarray, detections, *, thickness: int | None = No
     A copy, not in place: the caller's frame is also what odometry and the classifier see in the
     same iteration of the render loop, and annotating the array they are handed would put box
     outlines into the terrain pipeline's input. That failure is subtle and permanent-looking --
-    a locked cell that disagrees with the footage -- so the copy is not optional.
+    a map cell that disagrees with the footage -- so the copy is not optional.
     """
     out = image.copy()
     h, w = out.shape[:2]

@@ -64,12 +64,15 @@ DEFAULT_TRAIN_CONFIG = REPO_ROOT / "configs" / "train.yaml"
 # actual stage transition, action masking, both schedules, VecNormalize, checkpointing) end to
 # end. Not a training run. `presets/debug_tiny.yaml` is layered in as env_overrides specifically
 # so episodes cap at 300 steps instead of 3000 -- without it, no episode would finish inside the
-# smoke budget and the curriculum half would never be exercised at all.
+# smoke budget and the curriculum half would never be exercised at all. The stage budget is what
+# makes the transitions happen: an untrained policy wins nothing against the first stage's bots
+# (since 2026-09-13 medium and hard), so the win-rate gate alone never opens.
 _SMOKE = {
     "run": {"device": "cpu", "n_envs": 8, "total_timesteps": 8192, "name": "smoke",
             "checkpoint_every_steps": 4096, "tensorboard": False},
     "ppo": {"n_steps": 64, "batch_size": 128, "n_epochs": 2},
-    "curriculum": {"window_episodes": 8, "min_episodes_at_stage": 8},
+    "curriculum": {"window_episodes": 8, "min_episodes_at_stage": 8,
+                   "max_timesteps_at_stage": 2048},
     "eval": {"every_timesteps": 4096, "episodes_per_tier": 2},
 }
 _SMOKE_PRESET = REPO_ROOT / "configs" / "presets" / "debug_tiny.yaml"

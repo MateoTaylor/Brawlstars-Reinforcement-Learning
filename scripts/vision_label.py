@@ -29,6 +29,10 @@ them does nothing.
 
 Output goes to `tests/fixtures/vision/labels/<clip>_f<frame>.json` -- tracked text in the map-CSV
 legend, one line per grid row, so a change to one cell is one character in a diff.
+
+`clip` is looked up in `tests/fixtures/vision/` and then `brawl_vision/data/training_videos/`
+(`labeling.CLIP_DIRS`). Recordings at 1080p are resized to the calibrated viewport first, the way
+the deployed capture does, so their rectified grid is the one the bot will see.
 """
 import argparse
 import sys
@@ -42,15 +46,13 @@ from brawl_sim.constants import TILE_TO_CHAR
 from brawl_sim.render.viewer import TILE_COLORS
 from brawl_vision.camera import build_rectify_plan, load_camera_model, load_hud_mask
 from brawl_vision.config import load_vision_config
-from brawl_vision.sources import open_source
 from brawl_vision.terrain.labeling import (
-    CLASS_CHARS, CLASSES, UNLABELLED, LabelGrid, propose_clusters,
+    CLASS_CHARS, CLASSES, UNLABELLED, LabelGrid, propose_clusters, read_label_frames,
 )
 from brawl_vision.terrain.zone import detect_zone
 
 REPO = Path(__file__).resolve().parent.parent
-CLIPS = REPO / "tests" / "fixtures" / "vision"
-LABELS = CLIPS / "labels"
+LABELS = REPO / "tests" / "fixtures" / "vision" / "labels"
 KEYS = {"1": CLASS_CHARS[0], "2": CLASS_CHARS[1], "3": CLASS_CHARS[2],
         "4": CLASS_CHARS[3], "5": CLASS_CHARS[4], "0": UNLABELLED}
 _OURS = set(KEYS) | {"c", "g", "s", "u", "q"}
@@ -71,15 +73,17 @@ def _release_matplotlib_keys():
                 matplotlib.rcParams[name] = keep
 
 
-def _frame_at(clip, index, cfg):
+def _frame_at(clip, index, viewport=None):
     """Sequential read, deliberately: a label is addressed by frame index, and seeking returns a
     frame NEAR the requested one rather than that one (see tests/fixtures/vision/README.md). A
     label file that points at an approximately-right frame is worse than useless."""
-    with open_source(CLIPS / f"{clip}.mp4", cfg) as src:
-        for frame in src:
-            if frame.index == index:
-                return frame.image
-    raise SystemExit(f"{clip}.mp4 has no frame {index}")
+    try:
+        frames = read_label_frames(clip, [index], viewport)
+    except FileNotFoundError as e:
+        raise SystemExit(str(e))
+    if index not in frames:
+        raise SystemExit(f"{clip}.mp4 has no frame {index}")
+    return frames[index]
 
 
 class Labeller:
@@ -238,7 +242,7 @@ def main(argv=None) -> int:
 
     cfg = load_vision_config()
     plan = build_rectify_plan(load_camera_model(), load_hud_mask())
-    rect = plan.rectify(_frame_at(args.clip, args.frame, cfg))
+    rect = plan.rectify(_frame_at(args.clip, args.frame, plan.viewport))
 
     path = Path(args.out) if args.out else LABELS / f"{args.clip}_f{args.frame}.json"
     if path.exists():

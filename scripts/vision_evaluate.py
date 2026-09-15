@@ -46,10 +46,12 @@ tally counts both, and it doubles as the colour legend.
     python scripts/vision_evaluate.py match.mp4 -o all.mp4 --hp --projectiles
     python scripts/vision_evaluate.py match.mp4 -o shots.mp4 --projectiles --projectile-conf 0.15
 
-`--projectiles-on-map` projects them onto the map too, and it is the shakiest thing here: the
-homography inverts perspective for the GROUND plane and a projectile is in the air, so every
-marker lands further from the camera than the shot really is. Off by default, and for looking
-rather than for reading a tile off. See `object_detection/project.PROJECTILE_ANCHOR_FRAC`.
+`--projectiles-on-map` projects them onto the map too. For crates and dropped cubes that is a real
+position: both sit on the ground, and each goes through the anchor measured for it
+(`object_detection/project.LOOT_ANCHOR_FRAC`, the same one the deployed loot map uses). For
+projectiles it is the shakiest thing here: the homography inverts perspective for the GROUND plane
+and a projectile is in the air, so every marker lands further from the camera than the shot really
+is. Look at those; don't read a tile off them. See `project.PROJECTILE_ANCHOR_FRAC`.
 
 `--cv-fps` separates how often the CV runs from how often a frame is written. The output rate is
 a playback question; the CV rate is the pipeline's real budget (4-8 Hz against the 250 ms decision
@@ -77,7 +79,10 @@ render), and a live source cannot be rewound.
 """
 import argparse
 import sys
+from dataclasses import replace
 from pathlib import Path
+
+import cv2
 
 from brawl_vision.camera import build_rectify_plan, load_camera_model, load_hud_mask
 from brawl_vision.config import load_vision_config
@@ -88,12 +93,22 @@ from brawl_vision.terrain.evaluate import render, scan_track
 DEFAULT_TERRAIN = Path(__file__).resolve().parent.parent / "brawl_vision" / "data" / "terrain.pt"
 
 
-def _window(source, start, stop):
+def _window(source, start, stop, viewport=None):
+    """Frames `start..stop`, resized to `viewport` when they arrive at another size.
+
+    The resize is for 1080p BlueStacks recordings, the live bot's own footage. `ClipReader`
+    normalizes a clip's crop and aspect but not its size, and the camera model is calibrated at
+    2002x1126, so those frames would otherwise fail in `rectify`. The deployed capture resizes the
+    same way (`brawl_deployment.capture.to_viewport`), so this is the geometry the bot actually sees.
+    """
     for frame in source:
         if frame.index < start:
             continue
         if stop is not None and frame.index > stop:
             break
+        if viewport is not None and frame.image.shape[1::-1] != viewport:
+            frame = replace(frame, image=cv2.resize(frame.image, viewport,
+                                                    interpolation=cv2.INTER_AREA))
         yield frame
 
 
@@ -168,11 +183,13 @@ def main(argv=None) -> int:
                         "brawl_vision/object_detection/projectile_detection/train.py, which "
                         "exports the ONNX this loads")
     p.add_argument("--projectiles-on-map", action="store_true",
-                   help="ALSO mark each projectile on the predicted map. Implies --projectiles. "
-                        "READ THIS FIRST: the homography inverts perspective for the ground "
-                        "plane, and a projectile is above it, so every marker lands further from "
-                        "the camera than the shot actually is by an unmeasured amount. Useful for "
-                        "'roughly over there', not for reading a tile index")
+                   help="ALSO mark the projectile model's detections on the predicted map. "
+                        "Implies --projectiles. Crates and cubes go through their measured ground "
+                        "anchors, so their markers are real positions. Projectiles do not: the "
+                        "homography inverts perspective for the ground plane, and a projectile is "
+                        "above it, so every projectile marker lands further from the camera than "
+                        "the shot actually is by an unmeasured amount. Useful for 'roughly over "
+                        "there', not for reading a tile index")
     p.add_argument("--projectile-conf", type=float, default=None,
                    help="override projectile.conf from the config (default: 0.30, a starting "
                         "point rather than a measurement). This model is NMS-free, so its 300 "
@@ -300,8 +317,13 @@ def main(argv=None) -> int:
     say = (lambda *a: None) if args.quiet else (lambda *a: print(*a, flush=True))
 
     say(f"pass 1/2  odometry over {clip.name} (every {args.scan_step} frames, canvas sizing only)")
+    viewport = tuple(plan.viewport)
     with open_source(clip, cfg, step=args.scan_step) as src:
-        track = scan_track(_window(src, args.start, args.stop), plan, cfg,
+        x0, x1, y0, y1 = src.content_box
+        if (y1 - y0 + 1) != viewport[1]:
+            say(f"   {y1 - y0 + 1} px tall, resized to the calibrated {viewport[0]}x{viewport[1]} "
+                f"viewport, as the deployed capture does")
+        track = scan_track(_window(src, args.start, args.stop, viewport), plan, cfg,
                            progress=None if args.quiet else
                            (lambda n, t: print(f"   {n:5d} frames  t={t:7.2f}s", flush=True)))
     lo_x, hi_x, lo_y, hi_y = track.bounds_tiles()
@@ -341,15 +363,16 @@ def main(argv=None) -> int:
             + (".  NOTE: 0% is the raw box bottom, which is barely better than chance -- "
                "see Detection.anchor" if frac == 0 else ""))
     if args.projectiles_on_map:
-        say("   projecting projectiles onto the map from each box CENTRE.")
+        say("   projecting crates and cubes onto the map from their measured ground points, "
+            "projectiles from each box CENTRE.")
         say("     NOTE: the homography inverts perspective for the GROUND plane, and a "
             "projectile is above it,")
-        say("     so every marker lands further from the camera than the shot really is. "
-            "Look at it; do not read a tile off it.")
+        say("     so every projectile marker lands further from the camera than the shot really "
+            "is. Look at it; do not read a tile off it.")
     say(f"pass 2/2  rendering {args.mode} at {args.fps:g} fps"
         + (f", CV at {cv_fps:g} Hz (held in between)" if cv_fps != args.fps else ""))
     with open_source(clip, cfg, step=args.step) as src:
-        report = render(_window(src, args.start, args.stop), plan, track, args.out,
+        report = render(_window(src, args.start, args.stop, viewport), plan, track, args.out,
                         classifier=classifier, detector=detector, health=health,
                         projectiles=projectiles,
                         projectiles_on_map=args.projectiles_on_map,

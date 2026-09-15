@@ -15,8 +15,9 @@ can fail if someone trims the architecture below that.
 **Augmentation is the reskin strategy, not a regularisation detail.** Brawl Stars reskins maps, so a
 classifier that memorises one palette is worthless on the next event. Hue rotation attacks exactly
 that: it destroys absolute colour while leaving structure and texture, which is the signal a human
-player is using too. Flips and 90-degree rotations are free extra data because terrain has no
-canonical orientation on a square grid.
+player is using too. Geometric augmentation is limited to LEFT-RIGHT flips: the camera tilts toward
+the viewer, so a wall's top face always sits north of its footprint, and a vertical flip or a
+90-degree rotation shows the net walls whose parallax points the wrong way. See `flip_pair`.
 
 **Two exclusions, both from Section 2**: cells under Phase G's gas mask and cells occluded by a
 loot box are never trained on and never voted on. `-1` marks them, and the loss ignores it.
@@ -109,15 +110,16 @@ def augment(rect: np.ndarray, rng: np.random.Generator, hue_deg: float = 40.0,
 
 
 def flip_pair(rect: np.ndarray, target: np.ndarray, rng: np.random.Generator):
-    """A random dihedral transform applied consistently to patch and label grid.
+    """A random LEFT-RIGHT flip applied consistently to patch and label grid. Nothing else.
 
-    Terrain has no canonical orientation on a square grid, so these are free extra examples -- and
-    with a few hundred labelled cells, free extra examples are the whole game.
+    This used to draw from all eight dihedral transforms on the grounds that terrain has no
+    canonical orientation. The terrain doesn't, but the camera does: it is tilted, so every wall's
+    visible top face sits ~0.88 tiles NORTH of the footprint the label marks (Phase C). A left-right
+    flip preserves that; a vertical flip or a 90-degree rotation turns it into parallax the game
+    never shows, and the net spends capacity on it. Measured 2026-09-14 on the 54 label frames, with
+    the accumulated map scored on each label's own lattice: 200 epochs with the dihedral set reached
+    blocking F1 0.921; with left-right only, 0.930 (precision 0.965).
     """
-    k = int(rng.integers(4))
-    if k:
-        rect = np.rot90(rect, k, axes=(0, 1)).copy()
-        target = np.rot90(target, k, axes=(0, 1)).copy()
     if rng.random() < 0.5:
         rect = rect[:, ::-1].copy()
         target = target[:, ::-1].copy()
@@ -204,7 +206,7 @@ class TerrainClassifier:
         return cls(net=net, device=device)
 
 
-def train(examples: list[Example], epochs: int = 60, lr: float = 3e-3, seed: int = 0,
+def train(examples: list[Example], epochs: int = 200, lr: float = 3e-3, seed: int = 0,
           device: str = "cpu", augment_data: bool = True,
           cfg: VisionConfig | None = None, log_every: int = 0) -> TerrainClassifier:
     """Fit on whatever labelled cells exist. Deliberately plain: a few hundred cells does not

@@ -501,10 +501,9 @@ def render(source, plan: RectifyPlan, track: Track, path, *, classifier=None, de
     homography inverts perspective for the ground plane, and a projectile is not on the ground, so
     every marker lands further from the camera than the shot really is by an unmeasured amount
     that grows with flight height. It is off by default. Turn it on to see roughly where the
-    model is firing; do not read a tile index off it. Power cubes go through the same centre anchor
-    and footprint, and that is wrong in a different way. A cube IS on the ground, but a crate's box
-    includes the HP number above it, so the box's centre sits above where the crate stands. The
-    right anchor for each class has not been measured yet.
+    model is firing; do not read a tile index off it. Crates and dropped cubes are different: they
+    are on the ground, and each goes through its own measured anchor (`project.LOOT_ANCHOR_FRAC`,
+    the same one the deployed loot map uses), so their markers are real positions.
 
     **`map_extent` decides how much accumulated map the `side-by-side` right panel shows.**
     `full` (the default, and the old behaviour) is the whole explored map with the current
@@ -688,7 +687,7 @@ def render(source, plan: RectifyPlan, track: Track, path, *, classifier=None, de
                 # Once per rendered frame, before the layout branch: 'view' draws the result on
                 # two panels and 'side-by-side' on up to two, and running the model per panel
                 # would double the cost to produce identical boxes.
-                from ..object_detection.project import PROJECTILE_ANCHOR_FRAC, to_tiles
+                from ..object_detection.project import projectile_model_anchor, to_tiles
 
                 # ONE camera reference for both models, set before either runs. They see the same
                 # frame on the same tick, so a held box from either is stale against the same
@@ -715,12 +714,14 @@ def render(source, plan: RectifyPlan, track: Track, path, *, classifier=None, de
                     for d in pdets:
                         report.projectile_labels[d.label] = (
                             report.projectile_labels.get(d.label, 0) + 1)
-                    # `PROJECTILE_ANCHOR_FRAC`, not the brawler anchor, and no ground offset: the
-                    # offset is a correction fitted to where a brawler's feet sit inside its box,
-                    # which is not a quantity a projectile has. See that constant for why this
-                    # projection is approximate no matter what is passed here.
-                    pplaced = to_tiles(pdets, plan,
-                                       anchor_frac=PROJECTILE_ANCHOR_FRAC) if projectiles_on_map                         else []
+                    # Each class at its own anchor (`projectile_model_anchor`): the measured ground
+                    # point for a crate or a cube, the centre for a projectile. No ground offset: it
+                    # is fitted to where a brawler's feet sit inside its box. A projectile's marker
+                    # stays approximate however it is anchored -- see PROJECTILE_ANCHOR_FRAC.
+                    pplaced = [placed_one for d in pdets
+                               for placed_one in to_tiles([d], plan,
+                                                          anchor_frac=projectile_model_anchor(d.label))
+                               ] if projectiles_on_map else []
             if layout == "view":
                 # Both panels are the same 30x19 tiles at the same scale, so a row in one is the
                 # same row in the other. The whole point of this layout is that you can put a

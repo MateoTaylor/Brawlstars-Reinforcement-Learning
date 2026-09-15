@@ -1,26 +1,33 @@
-"""`GasMap` -> the four numbers the spec's `zone` group wants. See BRAWL_DEPLOYMENT_DESIGN.md 9.14-9.16.
+"""`GasMap` -> the fields a deploy spec's `zone` group wants. See BRAWL_DEPLOYMENT_DESIGN.md 9.14-9.16.
 
 **This is the group with no honest full supplier, and that was priced and decided rather than
 worked around.** Two ablation passes put the whole group at 10.4 pp (7 standard errors -- the only
 large reproducible effect in either pass) and every realistic degradation of it at 0-4 pp against a
-1.5 pp standard error. The operator's call (§9.15) was to deploy on the current checkpoint, which
-reads `configs/agent_obs_deploy.yaml`, and to supply the group like this:
+1.5 pp standard error. The operator's call (§9.15) was to deploy on the checkpoint of the day, which
+read `configs/agent_obs_deploy.yaml`, and to supply the group like this:
 
 | field | supplier here | honesty |
 |---|---|---|
 | `hero_margin` | four ray scans over observed gas | recoverable **out to a horizon**; saturates past it |
+| `hero_margin_local` | the same four scans | the name and the values agree; the sim clamps at the same horizon |
 | `active` | has any gas been observed | truthful |
 | `safe_area_frac` | 1 - observed gas area / the sim's map area | the group's weak column, knowingly |
 | `next_shrink_in` | **pinned at 0.0** | a lie, measured at <=1 SE, recorded, reversible |
 
-**The column is `hero_margin`; the values are `hero_margin_local`. That is on purpose and it is
-priced.** The sim's `hero_margin` is unclamped -- a training episode could show 25 tiles -- while
-everything below saturates at the horizon, because a bounded sensor is what deployment has. §9.15's
-second ablation pass measured exactly this substitution at **-1.9 pp** ("clamped at 10 tiles"),
-against a 1.5 pp standard error. `agent_obs_deploy2.yaml` fixes it properly by naming
-`zone.hero_margin_local`, which the sim now emits; until a run exists behind that spec, this is the
-mismatch being knowingly accepted, and it is the thing to look at first if the agent misjudges gas
-at long range.
+`estimate` returns every one of them, and `assemble._put_zone` takes only what the loaded spec
+names: `agent_obs_deploy.yaml` wants the four `hero_margin` / `active` / `safe_area_frac` /
+`next_shrink_in`, and `agent_obs_deploy2.yaml` and `agent_obs_deploy3.yaml` want
+`hero_margin_local` and `active`. Supplying the union rather than asking which spec is loaded keeps
+the estimator from needing to know about specs at all; the spec-driven choice stays in one place.
+
+**On `agent_obs_deploy.yaml` the column is `hero_margin` and the values are `hero_margin_local`.
+That is on purpose and it is priced.** The sim's `hero_margin` is unclamped -- a training episode
+could show 25 tiles -- while everything below saturates at the horizon, because a bounded sensor is
+what deployment has. §9.15's second ablation pass measured exactly this substitution at **-1.9 pp**
+("clamped at 10 tiles"), against a 1.5 pp standard error. `agent_obs_deploy2.yaml` fixes it properly
+by naming `zone.hero_margin_local`, which the sim emits, and `agent_obs_deploy3.yaml` inherits that
+group unchanged. So the mismatch is confined to runs on the first deploy spec, and it is the thing to
+look at first if one of those agents misjudges gas at long range.
 
 **Pinning `next_shrink_in` is a deliberate exception to "never feed a constant for a field you
 cannot supply", not an oversight of it.** The rule exists because a fabricated column is usually an
@@ -80,9 +87,16 @@ class ZoneEstimator:
         `GasMap` deposits in. Passing camera-relative coordinates here would put the scan origin
         wherever the hero happened to start the match, which reads as a plausible margin and is
         wrong by however far they have walked.
+
+        `hero_margin` and `hero_margin_local` are one scan under two names, not two estimates: the
+        scan saturates at the horizon, which is what `hero_margin_local` means and what
+        `hero_margin` knowingly borrows (module docstring). Computing them separately would only
+        make room for them to disagree.
         """
+        margin = self.hero_margin(gas, hero_pos)
         return {
-            "hero_margin": self.hero_margin(gas, hero_pos),
+            "hero_margin": margin,
+            "hero_margin_local": margin,
             "active": self.active(gas),
             "safe_area_frac": self.safe_area_frac(gas),
             "next_shrink_in": PINNED_NEXT_SHRINK_IN,

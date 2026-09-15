@@ -30,11 +30,18 @@ unsuitable as "how is training going" at a glance: it drops to 0%/unfilled right
 advance, which reads like a regression but isn't one. `TrainingMonitorCallback` exists
 specifically to answer that different question -- a continuous, never-reset view under `train/`,
 present even when the curriculum is disabled entirely.
+
+For the same reason the window skips each env's first finish after a transition: that episode's
+bots were drawn at its reset, from the previous stage. `curriculum/envs_on_previous_stage` counts
+the envs that have not finished one yet. Without the skip, `hard_lean` in
+mortis_deploy3-20260911-203322 advanced 28 decisions after it began, on 656 episodes that were
+almost all the stage before it.
 """
 import json
 from collections import deque
 from pathlib import Path
 
+import numpy as np
 from stable_baselines3.common.callbacks import BaseCallback
 
 from . import evaluation
@@ -149,6 +156,9 @@ class CurriculumCallback(BaseCallback):
         self.total_episodes = 0
         self._stage_start_timesteps = 0
         self.history: list[dict] = []
+        # Per env: were the bots of the episode it is playing now drawn from the PREVIOUS stage?
+        # See the module docstring. Sized on the first step, from the infos list (one dict per env).
+        self._stale: np.ndarray | None = None
 
     # ---- SB3 hooks ---------------------------------------------------------------------
 
@@ -157,14 +167,22 @@ class CurriculumCallback(BaseCallback):
         self._banner("curriculum start")
 
     def _on_step(self) -> bool:
-        for info in self.locals.get("infos", ()):
+        infos = self.locals.get("infos", ())
+        if self._stale is None or len(self._stale) != len(infos):
+            self._stale = np.zeros(len(infos), dtype=bool)
+        for i, info in enumerate(infos):
             outcome = info.get("outcome")
             if outcome is None:
+                continue
+            self.total_episodes += 1
+            if self._stale[i]:
+                # Its bots came from the previous stage. The env reset on this same step, under
+                # the current stage, so its next episode counts.
+                self._stale[i] = False
                 continue
             self._window.append(bool(outcome["won"]))
             self._ranks.append(int(outcome["rank"]))
             self.episodes_at_stage += 1
-            self.total_episodes += 1
         self._maybe_transition()
         return True
 
@@ -227,10 +245,13 @@ class CurriculumCallback(BaseCallback):
         self.history.append(entry)
         # Both the window and the per-stage episode count reset: outcomes scored against the
         # previous difficulty say nothing about the new one, and carrying them over would let a
-        # strong easy-stage window instantly clear the next stage too.
+        # strong easy-stage window instantly clear the next stage too. The same holds for the
+        # episodes still in flight, which is what marking every env stale is for.
         self._window.clear()
         self._ranks.clear()
         self.episodes_at_stage = 0
+        if self._stale is not None:
+            self._stale[:] = True
         self._stage_start_timesteps = self.num_timesteps
         self._write_state()
         if self.verbose:
@@ -256,6 +277,8 @@ class CurriculumCallback(BaseCallback):
         rec("curriculum/episodes_at_stage", self.episodes_at_stage)
         rec("curriculum/episodes_total", self.total_episodes)
         rec("curriculum/window_filled", len(self._window))
+        rec("curriculum/envs_on_previous_stage",
+            0 if self._stale is None else int(self._stale.sum()))
         target = m.stage.advance_win_rate
         rec("curriculum/advance_threshold", -1.0 if target is None else target)
 

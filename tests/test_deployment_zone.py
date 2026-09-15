@@ -4,6 +4,8 @@ The interesting cases are the ones where the estimator has to be *wrong in a cho
 standing in gas, standing off the canvas, standing next to gas it has never seen. Every one of
 those is a documented one-sided bias rather than a bug, and the tests say which side.
 """
+from pathlib import Path
+
 import pytest
 
 from brawl_deployment.perception.grid import GasMap
@@ -195,15 +197,47 @@ def test_next_shrink_in_is_pinned_at_zero_and_says_so():
 # The whole group.
 # ---------------------------------------------------------------------------------------------
 
-def test_estimate_supplies_exactly_the_deploy_specs_zone_fields():
-    """The contract with `assemble`: the keys here must be the spec's zone field names, minus the
-    `zone.` prefix. A missing key raises in `_require`; an extra one is silently ignored, which is
-    the direction worth a test."""
+def _zone_fields(spec_path) -> set[str]:
     import yaml
-    spec = yaml.safe_load(open("configs/agent_obs_deploy.yaml").read())
+    spec = yaml.safe_load(open(spec_path).read())
     group = next(g for g in spec["groups"] if g["name"] == "zone")
-    wanted = {f.split(".", 1)[1] for f in group["fields"]}
+    return {f.split(".", 1)[1] for f in group["fields"]}
+
+
+# Globbed rather than listed, so the next deploy spec is covered the day it is added. A listed tuple
+# is how agent_obs_deploy2/3 went unchecked here: the first live run on deploy3 raised
+# "no value supplied for 'zone.hero_margin_local'" on its first decision.
+DEPLOY_SPECS = sorted(str(p).replace("\\", "/") for p in Path("configs").glob("agent_obs_deploy*.yaml"))
+
+
+def test_every_deploy_spec_is_covered_here():
+    assert len(DEPLOY_SPECS) >= 3, DEPLOY_SPECS
+
+
+@pytest.mark.parametrize("spec_path", DEPLOY_SPECS)
+def test_estimate_supplies_every_zone_field_each_deploy_spec_names(spec_path):
+    """The contract with `assemble`: every zone field the loaded spec names, minus the `zone.`
+    prefix. A missing key raises in `_require` -- on the first decision of a live match, which is
+    the worst place to learn it, so it is checked here for every spec that could be deployed."""
+    missing = _zone_fields(spec_path) - set(_est().estimate(_gas(), (0.0, 0.0)))
+    assert not missing, f"{spec_path} names zone fields the estimator never supplies: {missing}"
+
+
+def test_estimate_supplies_nothing_no_deploy_spec_reads():
+    """The other direction. An extra key is silently ignored by `_put_zone`, so a field every spec
+    has since dropped would keep being computed -- and, for a pinned one, keep looking supplied."""
+    wanted = set().union(*(_zone_fields(p) for p in DEPLOY_SPECS))
     assert set(_est().estimate(_gas(), (0.0, 0.0))) == wanted
+
+
+def test_both_margin_names_are_one_scan():
+    """`hero_margin` borrows `hero_margin_local`'s values on the first deploy spec; the two keys
+    must never be able to disagree about the same gas."""
+    gas = _gas()
+    _mark(gas, -40, -5, -40, 40)
+    zone = _est().estimate(gas, (0.0, 0.0))
+    assert zone["hero_margin_local"] == zone["hero_margin"]
+    assert zone["hero_margin_local"][0] == pytest.approx(5.0)
 
 
 def test_the_estimator_holds_no_state_between_calls():
@@ -218,26 +252,28 @@ def test_the_estimator_holds_no_state_between_calls():
     assert est.hero_margin(gas, (0.0, 0.0)) == (HORIZON,) * 4
 
 
-def test_the_group_round_trips_through_the_assembler():
+@pytest.mark.parametrize("spec_path", DEPLOY_SPECS)
+def test_the_group_round_trips_through_the_assembler(spec_path):
     """The real contract: what this produces has to satisfy the assembler, in its units, without
     the caller reshaping anything. `_require` raises on a missing field, so this also proves the
-    estimator covers the spec -- but it would NOT catch a `hero_margin` of the wrong length, which
-    is why the shape is asserted too."""
+    estimator covers the spec -- but it would NOT catch a margin of the wrong length, which is why
+    the shape is asserted too."""
     from brawl_deployment.perception.assemble import ObservationAssembler
     from brawl_sim.core import obs_select
 
-    asm = ObservationAssembler(obs_select.load_agent_spec("configs/agent_obs_deploy.yaml", CFG),
-                               CFG)
+    asm = ObservationAssembler(obs_select.load_agent_spec(spec_path, CFG), CFG)
     gas = _gas()
     _mark(gas, -40, -5, -40, 40)
     zone = _est().estimate(gas, (0.0, 0.0))
 
     full = {}
     asm._put_zone(full, zone)
-    assert set(full["zone"]) == set(zone)
-    assert tuple(full["zone"]["hero_margin"].shape) == (1, 4)
-    assert tuple(full["zone"]["safe_area_frac"].shape) == (1,)
-    assert full["zone"]["hero_margin"][0, 0].item() == pytest.approx(5.0)
+    assert set(full["zone"]) == _zone_fields(spec_path)
+    margin = next(k for k in full["zone"] if k.startswith("hero_margin"))
+    assert tuple(full["zone"][margin].shape) == (1, 4)
+    assert full["zone"][margin][0, 0].item() == pytest.approx(5.0)
+    if "safe_area_frac" in full["zone"]:
+        assert tuple(full["zone"]["safe_area_frac"].shape) == (1,)
 
 
 def test_the_assembler_refuses_a_group_this_estimator_would_never_produce():

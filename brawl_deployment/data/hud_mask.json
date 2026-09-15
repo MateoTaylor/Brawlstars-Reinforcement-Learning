@@ -1,0 +1,101 @@
+{
+  "_comment": [
+    "The DEPLOYED loop's HUD mask: BlueStacks + Nulls Brawl, at the same 2002x1126 normalized",
+    "viewport as brawl_vision/data/hud_mask.json and in the same format. That file describes the",
+    "iOS recordings' Layout A and stays what the offline tools read; on these frames its",
+    "attack/super rects sit on floor while every real button is uncovered. Measured 2026-09-14.",
+    "",
+    "HOW: for each of the three BlueStacks fixture clips, the share of 2 Hz frames in which a pixel",
+    "matches its own temporal median (max channel difference <= 18). The camera follows the hero,",
+    "so the world scrolls and only screen-anchored UI stays put. Every opaque element below came",
+    "out as the same box in all three clips (share > 0.7 in each); boxes are padded ~15-25 px.",
+    "The attack button is semi-transparent and so only faint in that map; its rect is read off",
+    "the frames. The kill-feed card is transient and was read off a 3 s contact sheet, where it",
+    "is up in roughly half the samples.",
+    "",
+    "NOT COVERED, deliberately: the long orange banner behind the kill card (one clip, ~9 s,",
+    "x to ~830). Masking it for good would blind a sixth of the frame's top half for a rare event;",
+    "what it deposits is left to the occupancy map's re-validation.",
+    "GOES STALE if the game's UI scale, the emulator, or the capture crop changes."
+  ],
+  "source": "tests/fixtures/vision/bluestacks-example-{new,3,zone}.mp4",
+  "viewport": [
+    2002,
+    1126
+  ],
+  "notes": "BlueStacks / Nulls Brawl, Solo Showdown, measured 2026-09-14.",
+  "rects": [
+    {
+      "name": "brawlers_left",
+      "note": "match-state readout, top left; static text x[42,378] y[38,88].",
+      "x": 0.00999,
+      "y": 0.017762,
+      "w": 0.18981,
+      "h": 0.071048
+    },
+    {
+      "name": "ping",
+      "note": "connection bars, top centre; static x[790,876] y[38,86].",
+      "x": 0.387113,
+      "y": 0.022202,
+      "w": 0.057443,
+      "h": 0.066607
+    },
+    {
+      "name": "kill_feed",
+      "note": "kill card under brawlers_left, x[0,425] y[130,240]; transient, up about half the time.",
+      "x": 0.0,
+      "y": 0.104796,
+      "w": 0.21978,
+      "h": 0.119005
+    },
+    {
+      "name": "emote_bubble",
+      "note": "emote button, right edge; static x[1814,1914] y[518,604].",
+      "x": 0.899101,
+      "y": 0.44849,
+      "w": 0.064935,
+      "h": 0.102131
+    },
+    {
+      "name": "attack_button",
+      "note": "large semi-transparent red crosshair, centre ~(1825, 857) r ~95; read off frames.",
+      "x": 0.851648,
+      "y": 0.657194,
+      "w": 0.11988,
+      "h": 0.208703
+    },
+    {
+      "name": "button_cluster",
+      "note": "three round buttons as ONE rect: static x[1478,1574] y[996,1090], x[1580,1676] y[894,990], x[1696,1802] y[990,1098]. One rect because they glow and grow when charged, and the gaps between them are under a cell wide.",
+      "x": 0.726773,
+      "y": 0.772647,
+      "w": 0.187313,
+      "h": 0.227353
+    },
+    {
+      "name": "exit_button",
+      "note": "Nulls Brawl 'Exit', bottom centre; static x[922,1070] y[998,1084].",
+      "x": 0.452048,
+      "y": 0.874778,
+      "w": 0.08991,
+      "h": 0.102131
+    },
+    {
+      "name": "joystick_held",
+      "note": "where the deploy loop HOLDS the stick: control_calibration's anchor, (345.6, 669.6) device = (360, 698) viewport. The knob's 92 px (device, 96 viewport) throw plus its own ~54 px radius reach ~150 px out; the ring is r ~100. The loop never releases the contact mid-match, so in play this is the stick's only position, and bluestacks-example3 shows it here with the rest spot empty.",
+      "x": 0.0999,
+      "y": 0.479574,
+      "w": 0.15984,
+      "h": 0.284192
+    },
+    {
+      "name": "joystick_rest",
+      "note": "where the stick sits with NO contact: ring static at x[60,290] y[788,1090] across bluestacks-example-new and -zone. Seen before the loop's first touch and after a release.",
+      "x": 0.01998,
+      "y": 0.68206,
+      "w": 0.134865,
+      "h": 0.30373
+    }
+  ]
+}

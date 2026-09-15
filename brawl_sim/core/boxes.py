@@ -25,11 +25,28 @@ by contrast, DOES reuse alloc_slots/_set_scalar/_set_vec2 from .projectiles for 
 spawn, for exactly the same reason combat.drop_cubes_on_death does: box-breaking happens
 piecemeal, one box at a time, against the same shared pku_* pool other systems are also
 claiming from on the same tick.
+
+Where the cube lands. In the real game a broken crate's cube pops out and lands 0.3-1.8 tiles
+away (measured on footage), not on the crate's tile. `cfg.box_scatter_min_tiles`/`_max_tiles`
+reproduce that: a uniform distance in that band, in a uniform direction. A spot a unit could not
+stand on (`terrain.circle_blocked` at `unit_radius` against blocks_unit: wall, water, off the
+map) is rejected, since a cube nobody can reach is a reward nobody can earn. `_SCATTER_TRIES`
+spots are drawn at once and the first legal one wins; a crate with none drops on itself, which is
+always legal because box spots are floor tiles. Drawn every tick for every slot, broken or not,
+so the cost is fixed and there is no host sync on "did anything break".
 """
+import math
+
 import torch
 
 from ..maps.loader import MAX_BOX_SPOTS
 from . import projectiles as proj
+from . import terrain
+
+# Landing spots drawn per crate per tick. If a wall along one side leaves half the band legal, all
+# four miss 1 time in 16, and that case falls back to the crate itself rather than to an illegal
+# spot.
+_SCATTER_TRIES = 4
 
 
 def spawn_boxes(state, reset_mask: torch.Tensor, bank, params, cfg, gen) -> None:
@@ -79,9 +96,29 @@ def damage_boxes(state, dmg_box: torch.Tensor) -> None:
     state.box_hp.copy_(torch.clamp(state.box_hp - dmg_box, min=0))
 
 
-def resolve_broken_boxes(state, params, cfg):
+def landing_spots(state, bank, params, cfg, gen) -> torch.Tensor:
+    """(N,B,2): where each crate's cube lands if the crate breaks this tick. See the module
+    docstring. With the scatter off (max 0) this is `box_pos` and draws nothing from `gen`."""
+    if cfg.box_scatter_max_tiles <= 0:
+        return state.box_pos
+    N, B = state.box_pos.shape[:2]
+    shape = (N, B, _SCATTER_TRIES)
+    u = torch.rand(shape + (2,), generator=gen, device=state.box_pos.device)
+    lo, hi = cfg.box_scatter_min_tiles, cfg.box_scatter_max_tiles
+    r = lo + (hi - lo) * u[..., 0]
+    theta = u[..., 1] * (2.0 * math.pi)
+    spots = state.box_pos.unsqueeze(2) + r.unsqueeze(-1) * torch.stack([theta.cos(), theta.sin()], dim=-1)
+
+    radius = params.unit_radius.view(N, 1, 1).expand(shape)
+    legal = ~terrain.circle_blocked(bank.blocks_unit, state.map_id, spots, radius, cfg)  # (N,B,K)
+    first = torch.argmax(legal.to(torch.int64), dim=-1)  # first legal draw; 0 when there is none
+    pick = torch.gather(spots, 2, first.view(N, B, 1, 1).expand(N, B, 1, 2)).squeeze(2)
+    return torch.where(legal.any(dim=-1, keepdim=True), pick, state.box_pos)
+
+
+def resolve_broken_boxes(state, bank, params, cfg, gen):
     """MUTATES: box_alive, pku_*, boxes_broken. Returns newly_broken (N,B) bool. One pickup
-    per broken box, holding cubes_per_box cubes, spawned at the box's position -- reuses
+    per broken box, holding cubes_per_box cubes, spawned at `landing_spots` -- reuses
     projectiles.alloc_slots/_set_scalar/_set_vec2 (see module docstring)."""
     newly_broken = state.box_alive & (state.box_hp <= 0)
     state.box_alive.copy_(state.box_alive & ~newly_broken)
@@ -95,7 +132,7 @@ def resolve_broken_boxes(state, params, cfg):
     age_new = torch.zeros_like(state.box_pos[..., 0])
     alive_new = torch.ones_like(ok)
 
-    proj._set_vec2(state.pku_pos, idx, ok, state.box_pos)
+    proj._set_vec2(state.pku_pos, idx, ok, landing_spots(state, bank, params, cfg, gen))
     proj._set_scalar(state.pku_cubes, idx, ok, cubes_new)
     proj._set_scalar(state.pku_age, idx, ok, age_new)
     proj._set_scalar(state.pku_alive, idx, ok, alive_new)

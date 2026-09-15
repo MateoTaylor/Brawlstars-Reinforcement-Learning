@@ -368,7 +368,11 @@ def _build_entity_group(full_obs: dict, g: GroupSpec, fair: bool) -> torch.Tenso
 
 def _build_grid_group(full_obs: dict, g: GroupSpec) -> torch.Tensor:
     view = full_obs["view"]
-    idx = _cached_tensor(("grid_channels", g.name), g.channel_idx, torch.int64, view.device)
+    # Keyed on the channel tuple as well as the name, for the reason _normalize gives below. Every
+    # spec calls its view group "grid", so once agent_obs_deploy3.yaml (10 planes) existed, building
+    # it and then agent_obs_deploy.yaml (8) in one process handed the second the first's indices.
+    idx = _cached_tensor(("grid_channels", g.name, g.channel_idx), g.channel_idx,
+                         torch.int64, view.device)
     return view.index_select(1, idx)
 
 

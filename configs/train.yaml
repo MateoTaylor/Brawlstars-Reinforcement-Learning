@@ -197,12 +197,25 @@ eval:
 # Advancement is adaptive: the win rate over the last `window_episodes` finished episodes must
 # reach a stage's `advance_win_rate` (with at least `min_episodes_at_stage` episodes played at
 # that stage) before it advances. The final stage has advance_win_rate: null and is terminal.
+# Only episodes whose bots were drawn from the CURRENT stage count. The episodes in flight when a
+# stage changes finish afterwards with the previous stage's bots, and are skipped.
+#
+# REBALANCED 2026-09-13. The previous ladder (easy -> elite, gates 0.2/0.3) reached its terminal
+# stage 32M decisions into a 450M run (mortis_deploy3-20260911-203322) and finished at 54% against
+# its own elite. One stage (hard_lean) cleared in 28 decisions, entirely on episodes started under
+# the stage before it. That is why the skip rule above exists. What changed:
+#   - the walk starts where the old one's fourth stage was ({medium 0.3, hard 0.7})
+#   - `veteran` is the OLD elite verbatim, so its eval column compares with that run's elite
+#   - `expert` and the new `elite` step up to 2x HP, 1.75x damage, and near-perfect aim and leading
+#   - gates are 0.35 on a 2000-episode window; no stage may hold the run past 75M decisions
 curriculum:
   enabled: true
-  window_episodes: 500          # rolling window the win rate is measured over
-  min_episodes_at_stage: 500    # floor before a stage may advance, so a lucky window can't skip
-  demote_win_rate: null         # e.g. 0.05 -- drop back a stage if the win rate collapses
-  max_timesteps_at_stage: null  # e.g. 5_000_000 -- force-advance a stalled stage
+  window_episodes: 2000         # rolling window the win rate is measured over (SE ~1 pp at 0.35)
+  min_episodes_at_stage: 2000   # floor before a stage may advance; must not exceed the window
+  demote_win_rate: null         # keep null: the first episodes to finish at a new stage are the
+                                # short ones, i.e. early deaths, so a fresh window starts low
+  max_timesteps_at_stage: 75_000_000   # force-advance a stalled stage, so the run always reaches
+                                       # elite: worst case it gets there at 300M of 450M
 
   # Multipliers on the brawlers.yaml base value, applied to bot kinds only (never the hero).
   #   aim_noise       x aim_noise_std_rad and aim_noise_tiles  (HIGHER = worse aim)
@@ -212,6 +225,17 @@ curriculum:
   #   move_speed      x move_speed
   #   hp              x base_hp
   #   damage          x base_damage
+  #
+  # Listed weakest to strongest (tests/test_training.py holds every knob to that order). `easy`,
+  # `medium` and `hard` are unchanged from earlier runs, so their eval columns still compare;
+  # `easy` is in no stage and is kept only as that yardstick. `move_speed` stays 1.0 at every tier
+  # above hard on purpose: Mortis (2.73 tiles/s) is only 6-14% faster than the ranged bots
+  # (2.40-2.57) and Edgar already matches him, so a faster bot could kite him forever. That would
+  # make a matchup unwinnable rather than hard.
+  #
+  # The elite `hp: 2.0` takes the largest possible normalized `entities.hp` (a bull at 16 cubes)
+  # to 1.32. That is past the 1.0 that obs_select's _NORM_HP_SCALE aims for. It is left that way
+  # because the deployed checkpoints share that constant, and nothing clips the value.
   tiers:
     easy:
       aim_noise: 3.0
@@ -237,7 +261,7 @@ curriculum:
       move_speed: 1.0
       hp: 1.0
       damage: 1.0
-    elite:                      # aim/reaction sharpened past reference, THEN combat stats up
+    veteran:                    # the pre-2026-09-13 `elite`, verbatim
       aim_noise: 0.6
       reaction_delay: 0.6
       lead_target: 1.0
@@ -245,21 +269,38 @@ curriculum:
       move_speed: 1.0
       hp: 1.25
       damage: 1.20
+    expert:                     # about halfway from veteran to elite on every knob
+      aim_noise: 0.4
+      reaction_delay: 0.45
+      lead_target: 1.25
+      decision_period: 0.75     # 4-tick deciders re-decide every 3; 2-tick ones stay at 2
+      move_speed: 1.0
+      hp: 1.6
+      damage: 1.45
+    elite:                      # operator spec: 2x health, 1.75x damage, very good aim
+      aim_noise: 0.25           # Brock's rocket bearing sd 0.06 -> 0.015 rad (0.9 deg)
+      reaction_delay: 0.35
+      lead_target: 1.5          # clamps at 1.0: every leading bot leads fully, Grom to 0.9
+      decision_period: 0.5      # re-decides twice as often
+      move_speed: 1.0
+      hp: 2.0
+      damage: 1.75
 
-  # Walked in order. `tier_weights` need not sum to 1 -- they are normalized.
+  # Walked in order. `tier_weights` need not sum to 1 -- they are normalized. Each stage's mixture
+  # is at least as strong as the one before it at every tier boundary, which the tests check.
   stages:
-    - name: easy_ramp           # "weighted more towards weaker enemies"
-      tier_weights: {easy: 0.50, medium: 0.40, hard: 0.10}
-      advance_win_rate: 0.2
-    - name: mixed
-      tier_weights: {easy: 0.35, medium: 0.45, hard: 0.20}
-      advance_win_rate: 0.3
-    - name: hard_lean
-      tier_weights: {easy: 0.20, medium: 0.45, hard: 0.35}
-      advance_win_rate: 0.3
-    - name: hard_mostly          # "until it's only playing hard bots"
+    - name: hard_intro          # where the old walk's fourth stage was
       tier_weights: {medium: 0.3, hard: 0.7}
-      advance_win_rate: 0.3
-    - name: elite               # terminal stage
-      tier_weights: {medium: 0.1, hard: 0.4, elite: 0.5}
+      advance_win_rate: 0.35
+    - name: veteran_intro
+      tier_weights: {hard: 0.6, veteran: 0.4}
+      advance_win_rate: 0.35
+    - name: veteran
+      tier_weights: {hard: 0.3, veteran: 0.5, expert: 0.2}
+      advance_win_rate: 0.35
+    - name: expert
+      tier_weights: {hard: 0.1, veteran: 0.3, expert: 0.4, elite: 0.2}
+      advance_win_rate: 0.35
+    - name: elite               # terminal; 10% hard is the old terminal's anti-overfitting share
+      tier_weights: {hard: 0.1, veteran: 0.15, expert: 0.25, elite: 0.5}
       advance_win_rate: null

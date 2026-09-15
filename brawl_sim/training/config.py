@@ -184,6 +184,13 @@ class CurriculumConfig:
             raise ValueError("curriculum.enabled is true but no stages are defined")
         if self.window_episodes < 1:
             raise ValueError(f"curriculum.window_episodes must be >= 1, got {self.window_episodes}")
+        if self.min_episodes_at_stage > self.window_episodes:
+            # CurriculumCallback also requires the window to hold min_episodes_at_stage outcomes,
+            # which a smaller window never can: no stage would ever advance on its win rate.
+            raise ValueError(
+                f"curriculum.min_episodes_at_stage ({self.min_episodes_at_stage}) must not exceed "
+                f"curriculum.window_episodes ({self.window_episodes}), or no stage can ever advance"
+            )
         for stage in self.stages:
             for tier_name in stage.tier_weights:
                 if tier_name not in self.tiers:

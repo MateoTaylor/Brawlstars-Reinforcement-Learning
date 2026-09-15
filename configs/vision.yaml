@@ -4,10 +4,11 @@
 # judgment call. MEASUREMENTS live in brawl_vision/data/*.json (the homography, the HUD
 # rectangles): those are outputs of a calibration script, regenerated rather than edited.
 #
-# READ THIS BEFORE TRUSTING ANY NUMBER BELOW. Most of these are PLACEHOLDERS -- nobody has
-# pointed this pipeline at real footage yet. Every value that has not been measured says so and
-# names the phase that replaces it. Treating an unmeasured default as a finding is exactly the
-# failure this file is commented to prevent.
+# READ THIS BEFORE TRUSTING ANY NUMBER BELOW. This file started as PLACEHOLDERS, each saying so
+# and naming the phase that would replace it; the last of them (the occupancy pair) was measured
+# 2026-09-14. A measured value says what it was measured on, and one that was not says that too.
+# Treating an unmeasured default as a finding is exactly the failure this file is commented to
+# prevent.
 
 capture:
   monitor: 1          # mss monitor index; 0 is the virtual "all screens" rectangle
@@ -107,12 +108,16 @@ occupancy:                # Phase I
   # direction before the grid would need to grow.
   grid_h: 128
   grid_w: 128
-  # PLACEHOLDER -- set against the hand-verified ground-truth grid in Phase I.
-  # Minimum observations before a cell may lock, and the share of those votes the winning class
-  # must hold. Both trade map-fill speed against the risk of locking a misclassification, and
-  # LOCKING IS FOREVER (nothing reclassifies a locked cell for the rest of the match), so err
-  # high. lock_ratio must exceed 1/5: with five terrain classes an even split would otherwise
-  # clear the bar and lock whatever the first min_votes frames happened to see.
+  # When a cell counts as LOCKED: at least min_votes votes, with the winning class holding
+  # lock_ratio of them. MEASURED 2026-09-14, and the finding was that no lock should freeze.
+  # A lock used to stop a cell taking votes for the rest of the match, and at 5 / 0.8 that froze
+  # the map's worst errors (a cell's first votes share one viewpoint, so they are wrong together).
+  # Against the 54 labelled frames, map blocking F1 was 0.836 frozen at 5 / 0.8, 0.905 at
+  # 20 / 0.9, 0.906 at 40 / 0.95, and 0.906 never frozen (0.775 -> 0.848 on the weights before
+  # the 09-14 retrain). So every cell in view now votes on every frame, and these two numbers
+  # change nothing the map reports: they only decide when occupancy.py counts a cell as locked,
+  # and a lock is released when another class overtakes it. lock_ratio must still exceed 1/5:
+  # with five terrain classes an even split would otherwise count as locked.
   min_votes: 5
   lock_ratio: 0.8
 
@@ -198,19 +203,25 @@ projectile:               # object_detection/projectile_detection -- OUR model, 
   # file is missing, weights.require() lists the runs that could satisfy it, newest first, with
   # the copy command -- so leaving this blank is the normal state, not an unfinished one.
   model: ""
-  # NOT MEASURED. A placeholder in the sense configs/vision.yaml uses the word, but not an
-  # arbitrary one -- there are two reasons to expect it to sit below detector.conf's 0.5:
+  # MEASURED with scripts/vision_score_projectiles.py on 268 held-out frames (9-10_new3,
+  # ScreenRecording_09-04-2026_16-03-15_1, day12_recording1), IoU 0.5. The model measured is
+  # runs/projectiles-2: the same recipe as the shipped projectiles-final, but with those three
+  # recordings held out. The shipped model trained on every frame (--no-val), so it has no
+  # held-out score of its own. F1 by threshold:
   #
-  #   1. YOLO26 is NMS-FREE. It emits a fixed 300 rows per frame with no objectness score ahead
-  #      of them, padded out at ~0.003 confidence, so this threshold is the ONLY thing thinning
-  #      the field. For the anchor-grid entity model, objectness has already done most of that.
-  #   2. The cost asymmetry runs the other way. A brawler is large and persistent, so a frame
-  #      that misses one is recovered by the next; a projectile is on screen for a handful of
-  #      frames, so a miss loses the whole event. Meanwhile a duplicate projectile box costs
-  #      almost nothing, where a duplicate "player" box means the pipeline is broken.
+  #   conf                0.10  0.20  0.30  0.40  0.50  0.60
+  #   Power Cube Box      0.88  0.91  0.92  0.92  0.93  0.93   326 boxes, recall 0.98 at 0.30
+  #   Power Cube Dropped  0.80  0.80  0.80  0.78  0.77  0.76    60 boxes
+  #   Projectile          0.31  0.29  0.31  0.30  0.23  0.17   169 boxes, P 0.45 R 0.23 at 0.30
   #
-  # Sweep it with --projectile-conf on real footage and replace this comment with the numbers,
-  # the way detector.conf's was replaced. Until then it is a guess with a rationale.
+  # Crates and cubes are flat everywhere, so this threshold is a statement about projectiles.
+  # Their curve is flat to 0.40 and then falls: detector.conf's 0.5 would cost a third of the
+  # projectile hits (39 -> 25). Going down to 0.10 buys 19 more hits for 98 more false boxes.
+  # Projectile recall is the model's limit, not this knob's.
+  #
+  # One threshold for all three classes is enough: a per-class one would gain at most 0.01 F1.
+  # The shipped model's confidence on the same object matches projectiles-2's (median
+  # difference ~0 over six clips neither model saw), so the sweep carries over to it.
   conf: 0.30
   # auto | cpu | cuda, resolved exactly as detector.device is -- 'auto' takes CUDA when the
   # onnxruntime-gpu build is present, 'cuda' fails loudly if it is not.

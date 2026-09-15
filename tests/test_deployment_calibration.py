@@ -569,6 +569,36 @@ def test_update_calibration_leaves_untouched_blocks_byte_identical(tmp_path):
     assert doc["screen"] == [2560, 1440]
 
 
+# --- the deployed HUD mask, against the controls it has to hide ------------------------------
+
+def test_the_deployed_hud_mask_covers_every_calibrated_control_and_leaves_the_hero_clear():
+    """Two measurements of the same screen that must agree, taken independently:
+    `control_calibration.json`'s button centres are ring-score fits and its joystick anchor was
+    measured live, while `hud_mask.json` came from which pixels stay static as the world scrolls.
+    Any control outside the mask gets deposited into the terrain map as a wall on every tick."""
+    from brawl_deployment.loop import HUD_MASK_PATH
+    from brawl_deployment.match_state import Calibration
+    from brawl_vision.camera import load_hud_mask
+
+    w, h = 2002, 1126
+    c = Calibration.load(viewport=(w, h))
+    hud = load_hud_mask(HUD_MASK_PATH)
+    mask = hud.bool_at((h, w))
+    for name in c.buttons:
+        x, y, _ = c.viewport_button(name)
+        assert mask[int(y), int(x)], f"the {name} button is not masked"
+    # The held stick, anywhere the loop can put the contact: the anchor plus the commanded radius,
+    # which is past the knob's 92 px saturation.
+    sx, sy = c.device_to_viewport
+    ax, ay = c.joystick_anchor
+    for a in np.linspace(0.0, 2.0 * np.pi, 16, endpoint=False):
+        r = c.joystick_radius_px
+        assert mask[int((ay + r * np.sin(a)) * sy), int((ax + r * np.cos(a)) * sx)]
+    # The camera centres the hero, and the cells around it are the ones the policy reads hardest.
+    assert not mask[h // 2 - 150:h // 2 + 150, w // 2 - 250:w // 2 + 250].any()
+    assert hud.coverage((h, w)) < 0.25
+
+
 # ---------------------------------------------------------- the operator's first ten seconds
 
 def _load_calibrate_script():

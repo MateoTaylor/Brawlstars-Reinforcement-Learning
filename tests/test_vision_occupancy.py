@@ -61,18 +61,28 @@ def test_votes_accumulate_and_then_lock(plan):
     assert (best[m.observed] == CLASS_INDEX[Tile.WALL]).all()
 
 
-def test_a_locked_cell_stops_taking_votes(plan):
-    """Locking is the efficiency win as much as the robustness one: a locked cell must cost
-    nothing, and must not be reconsidered for the rest of the match."""
-    cfg = VisionConfig()
+def test_a_locked_cell_keeps_voting_and_later_views_can_overturn_it(plan):
+    """Locks used to be forever, and that froze the map's worst errors: a cell's first votes come
+    from nearly one viewpoint at one sub-tile phase, so when they are wrong they are wrong
+    together. Five wrong votes here are that early mistake; the later views must win."""
+    cfg = VisionConfig(occupancy_min_votes=5, occupancy_lock_ratio=0.8)
     m = _map(cfg)
-    for _ in range(cfg.occupancy_min_votes + 1):
-        m.update(_cells(plan, Tile.WALL), _odo(), plan, cfg=cfg)
-    before = m.votes.copy()
-    r = m.update(_cells(plan, Tile.BUSH), _odo(), plan, cfg=cfg)
-    assert r.voted == 0 and r.skipped_locked > 0
-    assert (m.votes == before).all(), "a locked cell was updated"
-    assert (m.best()[m.observed] == CLASS_INDEX[Tile.WALL]).all()
+    for _ in range(5):
+        m.update(_cells(plan, Tile.BUSH), _odo(), plan, cfg=cfg)
+    seen = m.observed
+    assert m.locked[seen].all()
+
+    for _ in range(4):
+        r = m.update(_cells(plan, Tile.WALL), _odo(), plan, cfg=cfg)
+        assert r.voted == seen.sum(), "a locked cell refused a vote"
+    # 5 BUSH against 4 WALL: under lock_ratio, but a lock holds while its class is the majority.
+    assert m.locked[seen].all() and (m.best()[seen] == CLASS_INDEX[Tile.BUSH]).all()
+
+    released = 0
+    for _ in range(2):
+        released += m.update(_cells(plan, Tile.WALL), _odo(), plan, cfg=cfg).released_now
+    assert (m.best()[seen] == CLASS_INDEX[Tile.WALL]).all(), "later views never overturned the lock"
+    assert released == seen.sum() and not m.locked.any()
 
 
 def test_a_single_bad_frame_is_outvoted(plan):

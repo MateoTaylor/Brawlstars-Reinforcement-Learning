@@ -9,6 +9,8 @@ Every assertion about "no input" is against `backend.events`, which is the only 
 come from. Checking `phase` instead would pass for a loop that set the right phase and pressed the
 button anyway, which is the exact bug the interlock exists to make impossible.
 """
+from pathlib import Path
+
 import numpy as np
 import pytest
 
@@ -19,15 +21,24 @@ from brawl_deployment.loop import (ODOMETRY_LOST_SECONDS, TELEMETRY_ROWS, Contro
 from brawl_deployment.config import DeploymentConfig
 from brawl_deployment.control.buttons import Buttons
 from brawl_deployment.control.joystick import Joystick
+from brawl_deployment.perception.assemble import ObservationAssembler
 from brawl_deployment.policy import Decision
 from brawl_deployment.window import WindowFault
 from brawl_sim.config import load_config
+from brawl_sim.core.obs_select import agent_space, load_agent_spec
 from brawl_vision.capture import Frame
 from brawl_vision.hud import BrawlersLeft
+from brawl_vision.object_detection.detector import Detection
+from brawl_vision.object_detection.projectile_detection.classes import (CUBE_BOX, CUBE_DROPPED,
+                                                                        PROJECTILE)
 from brawl_vision.terrain.odometry import OdometryResult
 
 CFG = load_config("configs/default.yaml")
 VIEWPORT = (2002, 1126)
+
+# The shipped projectile model's classes. The ids are the export's (`classes.py` says why they are
+# not pinned anywhere); only the set matters to the loop.
+PROJECTILE_NAMES = {0: CUBE_BOX, 1: CUBE_DROPPED, 2: PROJECTILE}
 
 
 # -- fakes -------------------------------------------------------------------------------------
@@ -162,6 +173,10 @@ class _Detection:
     def __init__(self, label, point):
         self.label = label
         self.point = point
+        # A sprite-sized box standing on the point, for `loot.box_occlusion`: one tile wide, two
+        # tall, feet at the anchor.
+        x, y = point
+        self.xyxy = (x - 24.0, y - 88.0, x + 24.0, y + 8.0)
 
     def anchor(self, frac=0.30):
         return self.point
@@ -178,7 +193,11 @@ class _Plan:
     size_tiles = (21, 13)
     origin_tile = (-10, -6)
     pixels_per_tile = 48
+    size_px = (21 * 48, 13 * 48)
+    viewport = VIEWPORT
     M = np.eye(3, dtype=np.float64)
+    M_inv = np.eye(3, dtype=np.float64)
+    valid = np.ones((13 * 48, 21 * 48), bool)
 
     def rectify(self, image):
         return image
@@ -186,6 +205,10 @@ class _Plan:
     def rect_to_tile(self, rect):
         r = np.asarray(rect, np.float64).reshape(-1, 2)
         return r / self.pixels_per_tile + np.asarray(self.origin_tile, np.float64)
+
+    def tile_to_rect(self, tiles):
+        t = np.asarray(tiles, np.float64).reshape(-1, 2)
+        return (t - np.asarray(self.origin_tile, np.float64)) * self.pixels_per_tile
 
 
 HERO_PX = (10 * 48, 6 * 48)          # -> camera-relative tile (0, 0)
@@ -220,6 +243,7 @@ class _Occupancy:
         self.height = self.width = size
         self._best = np.full((size, size), -1, np.int8)
         self.deposits = 0
+        self.occluded = None
 
     @property
     def origin(self):
@@ -228,13 +252,15 @@ class _Occupancy:
     def best(self):
         return self._best
 
-    def update(self, cells, odometry, plan, zone=None, cfg=None):
+    def update(self, cells, odometry, plan, zone=None, occluded=None, cfg=None):
         self.deposits += 1
+        self.occluded = occluded
 
 
 class _Detector:
-    def __init__(self, detections=()):
+    def __init__(self, detections=(), names=None):
         self.detections = list(detections)
+        self.names = dict(names or {})
         self.calls = 0
 
     def predict(self, image, conf=None):
@@ -278,11 +304,21 @@ class _Assembler:
 
 
 class _Policy:
-    """Real config -- the loop derives its rates and slot counts from it -- and a scripted act."""
+    """Real config and a real agent-obs spec -- the loop derives its rates, slot counts and grid
+    channels from them -- and a scripted act.
 
-    def __init__(self, decision=None):
+    `real_assembler=True` swaps the recording `_Assembler` for the real `ObservationAssembler`,
+    which is what `DeployedPolicy.make_assembler` returns. The recorder accepts any keyword at all,
+    so it cannot see a field the spec needs and the loop never supplies; the real one raises.
+    """
+
+    def __init__(self, decision=None, spec_path="configs/agent_obs_deploy.yaml",
+                 real_assembler=False):
         self.cfg = CFG
-        self.assembler = _Assembler()
+        self.spec = load_agent_spec(spec_path, CFG)
+        self.assembler = (ObservationAssembler(self.spec, CFG) if real_assembler
+                          else _Assembler())
+        self.obs = []
         self.decision = decision or Decision(move_bin=3, attack=ATTACK_NONE,
                                              legal=(True, True, False))
         self.calls = 0
@@ -293,6 +329,7 @@ class _Policy:
 
     def act(self, obs, attack_legal):
         self.calls += 1
+        self.obs.append(obs)
         if self.raises is not None:
             raise self.raises
         return self.decision
@@ -315,7 +352,7 @@ def loop(monkeypatch):
     vision = VisionStack(plan=_Plan(), odometry=_Odometry(), occupancy=_Occupancy(),
                          classifier=_Classifier(),
                          entities=_Detector([_Detection("player", HERO_PX)]),
-                         projectiles=_Detector(),
+                         projectiles=_Detector(names=PROJECTILE_NAMES),
                          health=_Health([_Reading("player", 8000)]),
                          hud=_Hud(), cfg=None)
     lp = DeployLoop(capture=_Capture(), guard=_Guard(), match=_Match(), vision=vision,
@@ -655,14 +692,18 @@ def test_the_decision_PERIOD_is_the_configs_and_the_tick_rate_is_not(loop):
     assert loop.policy.calls == 3
 
 
-def test_the_expensive_stages_run_only_on_a_decision_and_the_cheap_ones_every_tick(loop):
-    """§1.2's split, asserted rather than assumed: the entity detector is 4 Hz, the projectile
-    detector and the terrain deposit are 20 Hz because they accumulate."""
+def test_the_detectors_run_every_tick_and_a_decision_reuses_the_boxes(loop):
+    """§1.2's split, asserted rather than assumed. Both detectors and the terrain deposit run at
+    the perception rate. The entity detector used to run only on decisions; its boxes now mask the
+    deposit on every tick, and a decision on the same tick reads those boxes instead of paying the
+    ~8 ms twice for one frame."""
     n = loop.decision_every * 2
     _play(loop, n)
-    assert loop.vision.entities.calls == 2
+    assert loop.vision.entities.calls == n
     assert loop.vision.projectiles.calls == n
     assert loop.vision.occupancy.deposits == n
+    assert loop.policy.calls == 2
+    assert [r.n_detections for r in _decisions(loop)] == [1, 1]
 
 
 def test_the_shadow_advances_on_wall_clock_not_on_the_nominal_period(loop):
@@ -792,6 +833,135 @@ def test_gas_is_read_from_the_accumulated_map_not_the_frame(loop):
     assert loop._in_gas((0.0, 0.0)) is True
 
 
+# -- the real assembler ------------------------------------------------------------------------
+
+# Globbed, so a new deploy spec is exercised here the day it is added.
+DEPLOY_SPECS = sorted(str(p).replace("\\", "/") for p in Path("configs").glob("agent_obs_deploy*.yaml"))
+
+
+@pytest.mark.parametrize("spec_path", DEPLOY_SPECS)
+def test_a_decision_reaches_the_policy_through_the_real_assembler(loop, spec_path):
+    """Every supplier the loop wires up, fed through the assembler the checkpoint would get.
+
+    Every other test in this file hands the loop `_Assembler`, which accepts any keyword and any
+    value, so none of them can see a field the spec names and the loop never supplies. That is how
+    the first live decision on an agent_obs_deploy3.yaml run raised "no value supplied for
+    'zone.hero_margin_local'": the zone estimator only answered to the first spec's field names.
+    """
+    policy = _Policy(spec_path=spec_path, real_assembler=True)
+    lp = DeployLoop(capture=_Capture(), guard=_Guard(), match=_Match(), vision=loop.vision,
+                    policy=policy, controls=loop.controls, cfg=DeploymentConfig())
+    _play(lp, 1)
+    assert policy.calls == 1, _last_attempt(lp).note
+
+    space = agent_space(policy.spec, CFG)
+    obs = policy.obs[0]
+    assert set(obs) == set(space.spaces)
+    for name, sub in space.spaces.items():
+        assert obs[name].shape == sub.shape, name
+        assert obs[name].dtype == sub.dtype, name
+
+
+# -- crates and cubes --------------------------------------------------------------------------
+
+# A real `Detection`, since `LootMap` reads the box as well as the anchor. Anchor (600, 360) through
+# the identity plan is camera-relative tile (2.5, 1.5): world cell (2, 1), crop (row 7, col 12)
+# with the hero at world (0, 0).
+CRATE = Detection(CUBE_BOX, 0.9, (580.0, 290.0, 620.0, 390.0))
+
+
+def _deploy3_loop(loop, detections=(), names=PROJECTILE_NAMES):
+    """The fixture's loop again with a deploy3 policy. Rebuilt rather than patched, because the
+    grid's channels and the class check are both settled at construction."""
+    loop.vision.projectiles = _Detector(detections, names=names)
+    lp = DeployLoop(capture=_Capture(), guard=_Guard(), match=_Match(), vision=loop.vision,
+                    policy=_Policy(spec_path="configs/agent_obs_deploy3.yaml"),
+                    controls=loop.controls, cfg=DeploymentConfig())
+    lp.backend = loop.backend
+    return lp
+
+
+def test_the_grid_is_built_for_the_policys_spec_not_a_default_one(loop):
+    """`GridSpec.load()` with no arguments is deploy's eight planes. A deploy3 policy built with
+    that would fail its first `assemble` on the shape, mid-match."""
+    assert loop.grid.spec.shape == (8, 13, 21)
+    assert _deploy3_loop(loop).grid.spec.shape == (10, 13, 21)
+
+
+def test_a_deploy3_policy_sees_a_crate_in_its_box_plane_once_it_is_confirmed(loop):
+    lp = _deploy3_loop(loop, [CRATE])
+    _play(lp, lp.decision_every + 1)
+    channels = lp.grid.spec.channels
+    grids = [call["grid"] for call in lp.policy.assembler.calls]
+    assert len(grids) == 2
+    # The first decision is the first tick: one sighting, not yet on the map.
+    assert grids[0][channels.index("box")].sum() == 0
+    box = grids[1][channels.index("box")]
+    assert box[7, 12] == 1 and box.sum() == 1
+    assert grids[1][channels.index("pickup")].sum() == 0
+
+
+def test_each_class_goes_to_its_own_consumer(loop):
+    """One model, one call, three classes. A crate in the projectile tracker would be a still
+    projectile for its whole life; a shot in the loot map would be a crate."""
+    shot = Detection(PROJECTILE, 0.9, (700.0, 300.0, 720.0, 320.0))
+    lp = _deploy3_loop(loop, [CRATE, shot])
+    _play(lp, 4)
+    assert lp.vision.projectiles.calls == 4
+    assert lp.loot.crates() == [(2.5, 1.5)] and lp.loot.cubes() == []
+    assert len(lp.projectiles.tracks) == 1
+
+
+def test_a_crate_box_keeps_the_terrain_map_off_the_floor_under_it(loop):
+    """The occupancy map's fifth gate, and independent of the spec: a deploy policy never reads a
+    crate, but its terrain map still must not lock the crate as a wall."""
+    loop.vision.entities.detections = []         # the crate alone; brawlers are the next test
+    _play(loop, 1)
+    assert loop.vision.occupancy.occluded.shape == (13, 21)
+    assert not loop.vision.occupancy.occluded.any()
+    loop.vision.projectiles.detections = [CRATE]
+    loop.tick()
+    occluded = loop.vision.occupancy.occluded
+    assert occluded[7, 12]
+    assert occluded[:, 12].sum() == occluded.sum() <= 3     # the box is 40 px wide, inside col 12
+
+
+def test_a_brawler_box_keeps_the_terrain_map_off_the_floor_under_it_on_every_tick(loop):
+    """The hero's sprite is not floor. Checked on the ticks BETWEEN decisions too, which are two
+    of every three deposits and the ones a decision-only detector left unmasked."""
+    loop.vision.entities.detections = [_Detection("enemy", (5 * 48, 3 * 48))]
+    _play(loop, 2)                        # the second tick is not a decision tick
+    occluded = loop.vision.occupancy.occluded
+    # The box is x [216, 264], y [56, 152]: half of each of cols 4-5, rows 1-2 almost whole. Row 3
+    # gets its top 8 px, 8% of each cell and under the gate's 10%.
+    assert set(zip(*np.nonzero(occluded))) == {(1, 4), (1, 5), (2, 4), (2, 5)}
+    loop.vision.entities.detections = []
+    loop.tick()
+    assert not loop.vision.occupancy.occluded.any()
+
+
+def test_a_deploy3_policy_refuses_a_projectile_model_that_cannot_see_crates(loop):
+    with pytest.raises(ValueError, match="Power Cube Box"):
+        _deploy3_loop(loop, names={0: PROJECTILE})
+
+
+def test_a_policy_that_reads_no_crates_does_not_need_the_crate_class(loop):
+    loop.vision.projectiles = _Detector(names={0: PROJECTILE})
+    DeployLoop(capture=_Capture(), guard=_Guard(), match=_Match(), vision=loop.vision,
+               policy=_Policy(), controls=loop.controls, cfg=DeploymentConfig())
+
+
+def test_a_new_match_starts_with_no_crates(loop):
+    lp = _deploy3_loop(loop, [CRATE])
+    _play(lp, 4)
+    assert lp.loot.crates()
+    lp.match.gate = False
+    lp.tick()                                            # the gate closes; out of PLAYING
+    lp.vision.projectiles.detections = []
+    _play(lp, 1)
+    assert lp.phase is Phase.PLAYING and lp.loot.crates() == []
+
+
 # -- telemetry ---------------------------------------------------------------------------------
 
 def test_telemetry_is_bounded(loop):
@@ -841,7 +1011,8 @@ def _loop_fixture_value():
                         buttons=Buttons(backend, attack=(1690.0, 594.0), super_=(1462.5, 1000.5)))
     vision = VisionStack(plan=_Plan(), odometry=_Odometry(), occupancy=_Occupancy(),
                          classifier=_Classifier(), entities=_Detector(),
-                         projectiles=_Detector(), health=_Health(), hud=_Hud(), cfg=None)
+                         projectiles=_Detector(names=PROJECTILE_NAMES), health=_Health(),
+                         hud=_Hud(), cfg=None)
     lp = DeployLoop(capture=_Capture(), guard=_Guard(), match=_Match(), vision=vision,
                     policy=_Policy(), controls=controls, cfg=DeploymentConfig())
     lp.backend = backend

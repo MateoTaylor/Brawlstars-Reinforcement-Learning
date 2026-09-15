@@ -67,12 +67,72 @@ thing that knows what a projectile track is. `require_projectile_class` is the o
 exported without a `Projectile` class would make this filter drop every box, and the policy would
 see no projectiles at all. That fails at startup instead of silently.
 
+#### A projectile that never moves
+
+Many tracks sit still. Replaying 27 clips through the shipped detector and this tracker at 12 Hz
+(18,926 ticks), 175 of the 611 projectile tracks that lived long enough to judge (0.15 s) end with
+a whole-span speed under 2 tiles/s. Some are real: the labels box impact flashes and puddle-like
+ground effects. Some are false positives that every model so far has fired on, such as a dark
+crater patch on one map. The sim has stationary entries too: `bot_sniper`'s lingering hazard sits
+at `vel = 0` for `on_hit_area_ticks * on_hit_area_interval` = 4.0 s, and bot_sniper is 22% of the
+enemy roster. So a still track is not wrong in itself. Two things about it are, and each gets one
+rule.
+
+**Its velocity is noise, so it is reported as zero** (`STATIC_TILES_S`, applied in `snapshot`
+only). The whole-span fit divides the anchor noise by the span, so a still object reports a small
+velocity in a random direction. `closest_approach` then gives it `time_to_closest` 0 when the
+noise points away from the hero, and dist/speed -- often tens of seconds, which no sim entry ever
+reports -- when it points toward. The sim's still entry is `vel = 0`, `time_to_closest = 0`, and
+that is what these become. The threshold is measured, not derived, because nothing in the sim
+bounds speed away from zero: a timed lob thrown at a close target crawls. Power-cube crates,
+tracked by this class as a known-static control on the same replay, give the noise:
+
+    span        2 ticks   0.2-0.35 s   0.35-0.75 s   0.75-1.5 s     whole-span speed, tiles/s
+    p90          1.60        1.44          1.19          0.67
+    p99          2.96        2.51          1.78          1.24
+
+2.0 zeroes 95% of still tracks on their second velocity and ~99% after a third of a second. Every
+constant-speed mover in the sim is faster: the slowest is `bot_artillery`'s split shard at
+`split_distance / split_seconds` = 2.4. What falls under it is a lob landing within 2.5 tiles,
+and it loses only its velocity: its position still updates every tick. Association keeps the real
+estimate (`Projectile.vel` is untouched), because zeroing it there would only cost a slow mover
+its gate.
+
+The same replay, before and after both rules: `time_to_closest` over 2 s went from 817 of 3,861
+reported slot-ticks (worst 761 s) to 75 (worst 7.4 s). 45% of what remains reports `vel = 0`.
+
+**Nothing in the sim's projectile group lives longer than 5.5 s, so a track that does is retired**
+(`MAX_TRACK_S`, applied in `live`). The longest-lived entry is bot_sniper's. Its rocket flies for
+up to `attack_range / proj_speed` = 1.5 s, and the hazard it becomes then inherits its slot for
+4.0 s more. So the bound is the whole 5.5 s, not the hazard's 4.0 s of stillness. The age is
+measured from the track's birth, and this tracker links the flight to the hazard when it sees
+both: 13 replay tracks were fast first and still after, one of them alive 4.6 s. Retiring at
+4.0 s would have cut real hazards short by up to the flight time.
+
+A retired track stays in `tracks`, matching and absorbing its own detections, so it cannot respawn
+as a fresh track on the next tick. It just stops reaching the observation and the grid. Two tracks
+crossed 5.5 s in the replay, at 5.6 s and 10.7 s. No moving track lived past 2.1 s, so in practice
+only still tracks ever reach the limit.
+
+What these rules do not catch:
+
+- A false positive that flickers out for longer than `MAX_COAST_S` comes back as a new track with
+  a fresh clock. 3 still sites spanned more than 5.5 s in the replay, and 2 of them were split
+  across 2 and 4 tracks. Remembering retired sites would catch them, at the cost of a second map
+  to keep coherent through resets. What it would buy is small. The feared failure -- still tracks
+  taking all twelve slots, since `obs_select` sorts `time_to_closest` ascending -- did not happen
+  once: live tracks peaked at 8 on any tick, and at most 4 of them were still.
+- A shot that flies and then stops keeps a whole-span velocity that decays as `distance / age`.
+  So it reads as slowly moving, not as still, until that drops under `STATIC_TILES_S`: after 4 s
+  for an 8-tile flight. `_advance`'s estimator assumes one velocity per track, and a stop breaks
+  that. It is 13 tracks of 611, so it is noted rather than fixed.
+
 #### What is deliberately NOT here
 
 No kind, no owner, no damage, no radius. `agent_obs_deploy.yaml` asks for four fields and calls a
 projectile *"a moving dot and nothing more"*; the detector says only "Projectile" and could not
-supply more if the spec wanted it. Power cubes are not in any observation group yet. The sim has
-no cubes, so a policy trained there would have nothing to read one with.
+supply more if the spec wanted it. The model's other two classes, crates and dropped cubes, are
+`loot.py`'s: the loop hands both consumers the same list and each keeps its own label.
 """
 import math
 from dataclasses import dataclass
@@ -84,7 +144,7 @@ from .tracker import _greedy_match
 
 __all__ = ["Projectile", "ProjectileResult", "ProjectileTracker", "require_projectile_class",
            "MAX_PROJ_TILES_S", "GATE_NOISE_TILES", "PROJ_ANCHOR_FRAC",
-           "MAX_COAST_S", "MIN_SAMPLES", "DUPLICATE_TILES"]
+           "MAX_COAST_S", "MIN_SAMPLES", "DUPLICATE_TILES", "STATIC_TILES_S", "MAX_TRACK_S"]
 
 # Measured maximum step at 20 Hz was 18.4 tiles/s over 101 unambiguous pairs; see the module
 # docstring. Above the simulator's fastest projectile (12.0 tiles/s), which is a fact about the
@@ -133,6 +193,19 @@ MIN_SAMPLES = 2
 # Two projected points closer than this are treated as one projectile detected twice. In TILES,
 # after projection, and measured -- see `_dedupe` for why distance beat the more obvious IoU test.
 DUPLICATE_TILES = 0.3
+
+# A track whose whole-span speed is under this is STILL: the observation gets `vel = (0, 0)`, the
+# sim's own value for a hazard. Measured on power-cube crates, not derived from the sim; see
+# "A projectile that never moves" in the module docstring for the table.
+STATIC_TILES_S = 2.0
+
+# A track older than this is retired from the observation. It is the sim's number, not a tuning:
+# the longest any entry holds a projectile slot, which is `bot_sniper`'s rocket (8.0 / 5.33 = 1.5 s)
+# plus the hazard that inherits its slot (2 x 2.0 s), from configs/brawlers.yaml. A test ties the
+# two together in both directions, because each direction is a different bug. Set it longer and
+# phantoms outlive anything the policy was trained on. Set it shorter and real hazards vanish
+# before they end.
+MAX_TRACK_S = 5.5
 
 
 def require_projectile_class(names) -> None:
@@ -239,11 +312,14 @@ class ProjectileTracker:
 
     def __init__(self, min_samples: int = MIN_SAMPLES, max_coast_s: float = MAX_COAST_S,
                  anchor_frac: float = PROJ_ANCHOR_FRAC,
-                 duplicate_tiles: float = DUPLICATE_TILES):
+                 duplicate_tiles: float = DUPLICATE_TILES,
+                 static_tiles_s: float = STATIC_TILES_S, max_track_s: float = MAX_TRACK_S):
         self.min_samples = min_samples
         self.max_coast_s = max_coast_s
         self.anchor_frac = anchor_frac
         self.duplicate_tiles = duplicate_tiles
+        self.static_tiles_s = static_tiles_s
+        self.max_track_s = max_track_s
         self.tracks: list = []
         self._next_id = 0
         self._t = 0.0
@@ -354,11 +430,15 @@ class ProjectileTracker:
         association continuity across one missed detection; it is not a claim that the projectile
         still exists, and the overwhelmingly common reason one stops being detected is that it hit
         something. Reporting it would be telling the policy to dodge a bullet that is gone.
+
+        A track older than `max_track_s` is left out too, though it stays in `tracks`: see "A
+        projectile that never moves" in the module docstring.
         """
         if not self._fresh:
             return []
         return [tr for tr in self.tracks
-                if tr.hits >= self.min_samples and tr.t == self._t]
+                if tr.hits >= self.min_samples and tr.t == self._t
+                and tr.t - tr.t0 <= self.max_track_s]
 
     def snapshot(self, hero_pos) -> list:
         """`[(rel_pos, vel, time_to_closest)]` for the observation's `projectiles` group.
@@ -367,8 +447,13 @@ class ProjectileTracker:
         than reimplemented, because it has to mean exactly what it meant in training -- including
         two conventions a five-line rewrite would plausibly get wrong. The time is clamped to be
         non-negative, so a projectile already past its closest point reports 0 rather than a
-        negative time. And a zero-velocity projectile reports 0 rather than infinity, which is the
-        convention `MIN_SAMPLES` exists to keep this function from ever having to exercise.
+        negative time. And a zero-velocity projectile reports 0 rather than infinity.
+
+        That last convention is exercised on purpose, but only for tracks MEASURED still. A track
+        slower than `static_tiles_s` reports `vel = (0, 0)` and so `time_to_closest = 0`, which is
+        exactly what the sim reports for a hazard. A track with too few samples to have a velocity
+        at all is a different thing, and `MIN_SAMPLES` keeps it out entirely. The stored
+        `Projectile.vel` is left alone, because association still needs the real estimate.
 
         Ordering is NOT this function's job. `obs_select` re-sorts the group by `time_to_closest`
         and keeps the nearest `max_slots`; it has to be the one to do it, so that deployment and
@@ -381,7 +466,8 @@ class ProjectileTracker:
         from brawl_sim.core.geometry import closest_approach
 
         p = torch.tensor([tr.pos for tr in live], dtype=torch.float32)
-        v = torch.tensor([tr.vel for tr in live], dtype=torch.float32)
+        v = torch.tensor([(0.0, 0.0) if tr.speed < self.static_tiles_s else tr.vel
+                          for tr in live], dtype=torch.float32)
         q = torch.tensor(hero_pos, dtype=torch.float32).expand_as(p)
         ttc, _ = closest_approach(p, v, q)
         rel = p - q

@@ -38,20 +38,17 @@
 # on the ground is neither.
 #
 # ------------------------------------------------------------------------------------------------
-# NOT YET DEPLOYABLE -- read this before training on it and expecting to ship the result
+# DEPLOYABLE since 2026-09-12 -- what supplies the two channels
 # ------------------------------------------------------------------------------------------------
-# brawl_deployment cannot supply these two channels today. The entity detector's classes are
-# exactly {0: enemy, 1: teammate, 2: player}; nothing detects a crate or a cube.
-# `brawl_deployment/perception/grid.py` refuses both by name, so `GridSpec.load` on this file RAISES.
-# That is the intended failure: loud at startup, instead of a checkpoint trained to read two
-# channels and handed zeros in both.
-#
-# What makes a checkpoint trained here deployable, in order:
-#   1. detector classes for a crate and a cube pickup (the labeling pass for the new YOLO set);
-#   2. a supplier in perception/grid.py that scatters their positions into the view, through the
-#      same world-frame projection the `enemy_revealed` channel already uses;
-#   3. `box` / `pickup` moved out of grid.py's `_REFUSED` and into its `_DYNAMIC` channels.
-# The run can start before any of that exists. The deployment cannot.
+# Until then brawl_deployment refused this file by name (`GridSpec.load` raised), because nothing
+# detected a crate or a cube. What changed, in the order the old note asked for:
+#   1. the projectile model has `Power Cube Box` and `Power Cube Dropped` classes
+#      (brawl_vision/object_detection/projectile_detection/classes.py);
+#   2. brawl_deployment/perception/loot.py turns their boxes into a sticky map of fixed cells,
+#      `LootMap.crates()` / `.cubes()`, and grid.py scatters those into `box` and `pickup`;
+#   3. both channels are in grid.py's `_DYNAMIC`, and the loop refuses to start a policy that reads
+#      them on a projectile model without the two classes (`loot.require_loot_classes`).
+# loot.py's docstring lists where the deployed channels still differ from the sim's.
 #
 # THE REWARD THAT COMES BACK WITH THEM
 # ------------------------------------

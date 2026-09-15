@@ -2,9 +2,10 @@
 
 The load-bearing test is `test_the_grid_matches_the_sim_channel_for_channel`: it runs a real
 `BrawlVecEnv`, hands `GridBuilder` a perfect-perception view of that env's own world, and asserts
-the eight deployed planes equal `observation._build_grid`'s corresponding channels, cell for cell,
-every decision. Everything the module claims -- the crop origin, the channel order, counts rather
-than booleans, the hero constant, the terrain lookup -- is a claim about matching that function.
+the deployed planes (eight for deploy, ten for deploy3) equal `observation._build_grid`'s
+corresponding channels, cell for cell, every decision. Everything the module claims -- the crop
+origin, the channel order, counts rather than booleans, the hero constant, the terrain lookup -- is
+a claim about matching that function.
 
 **"Perfect perception" is the input, not the thing under test.** The occupancy map is seeded from
 the sim's own padded tile bank and the gas map from the sim's own zone rectangle, because the
@@ -30,6 +31,7 @@ import yaml
 from brawl_sim.bots import perception
 from brawl_sim.config import load_config
 from brawl_sim.constants import Tile
+from brawl_sim.core.obs_select import load_agent_spec
 from brawl_sim.env import BrawlVecEnv
 from brawl_deployment.perception.grid import GasMap, GridBuilder, GridSpec
 from brawl_deployment.perception.projectiles import Projectile
@@ -171,6 +173,32 @@ def _tracks_and_projectiles(env):
     return enemies, projectiles
 
 
+def _crates_and_cubes(env):
+    """What `LootMap.crates()`/`cubes()` would report with perfect perception: every live crate and
+    pickup in the world, as `(x, y)` in the deployment frame. Sticky, like the sim's channels."""
+    state = env.state
+    dx, dy = _frame_offset(env)
+    crates = [(float(state.box_pos[0, k, 0]) + dx, float(state.box_pos[0, k, 1]) + dy)
+              for k in range(state.box_pos.shape[1]) if bool(state.box_alive[0, k])]
+    cubes = [(float(state.pku_pos[0, k, 0]) + dx, float(state.pku_pos[0, k, 1]) + dy)
+             for k in range(state.pku_pos.shape[1]) if bool(state.pku_alive[0, k])]
+    return crates, cubes
+
+
+def _break_the_crates_beside_the_hero(env) -> None:
+    """Zero the HP of the crates within a few tiles of the hero, so the first step breaks them.
+
+    Without it the `pickup` plane is empty for most of the run: nothing in forty decisions breaks a
+    crate on purpose. The region is smaller than the crop, so crates further out stay intact and
+    keep the `box` plane populated too. It also puts the cube scatter in the comparison, since each
+    cube lands off its crate.
+    """
+    hero = env.state.ent_pos[0, 0]
+    d = (env.state.box_pos[0] - hero).abs()
+    near = env.state.box_alive[0] & (d[:, 0] < 6) & (d[:, 1] < 4)
+    env.state.box_hp[0, near] = 0
+
+
 # ---------------------------------------------------------------------------
 # the spec
 # ---------------------------------------------------------------------------
@@ -191,8 +219,6 @@ def test_the_hero_sits_at_the_exact_centre_of_an_odd_view():
 
 
 @pytest.mark.parametrize("channel,fragment", [
-    ("box", "nothing detects a crate"),
-    ("pickup", "power-cube pickup"),
     ("enemy_any", "cannot see"),
     ("enemy_hidden", "hidden"),
 ])
@@ -203,13 +229,23 @@ def test_a_channel_with_no_supplier_is_refused_by_name(channel, fragment):
         _spec(channels=(channel,)).check()
 
 
-def test_a_deploy3_checkpoint_is_refused_until_crates_and_cubes_have_a_supplier():
-    """`configs/agent_obs_deploy3.yaml` trains on `box` and `pickup` ahead of their detector, on
-    purpose. Deploying what it produces before that detector exists must fail at startup, naming
-    the channel -- the alternative is a policy trained to read two planes and handed zeros in both.
-    When a supplier lands, this test is the one to update, deliberately."""
-    with pytest.raises(ValueError, match="no supplier at deploy time"):
-        GridSpec.load(CONFIGS / "agent_obs_deploy3.yaml")
+def test_a_deploy3_spec_loads_now_that_crates_and_cubes_have_a_supplier():
+    """`configs/agent_obs_deploy3.yaml` trained on `box` and `pickup` ahead of their detector, and
+    this used to be the test that refused it. `loot.LootMap` is the supplier now."""
+    spec = GridSpec.load(CONFIGS / "agent_obs_deploy3.yaml")
+    assert spec.shape == (10, 13, 21)
+    assert spec.channels.index("box") == spec.channels.index("hero") + 1
+    assert spec.channels.index("pickup") == spec.channels.index("box") + 1
+
+
+@pytest.mark.parametrize("spec_name", ["agent_obs_deploy.yaml", "agent_obs_deploy2.yaml",
+                                       "agent_obs_deploy3.yaml"])
+def test_the_spec_the_policy_was_built_with_gives_the_same_grid_as_the_yaml(spec_name):
+    """The loop builds its grid from the policy's own `AgentObsSpec`, not from a path, so a deploy3
+    checkpoint cannot be handed deploy's eight planes. Both routes have to agree."""
+    cfg = load_config(CONFIGS / "default.yaml")
+    agent_spec = load_agent_spec(CONFIGS / spec_name, cfg)
+    assert GridSpec.from_agent_spec(agent_spec, cfg) == GridSpec.load(CONFIGS / spec_name)
 
 
 def test_a_typo_lists_what_this_builder_can_actually_fill():
@@ -221,13 +257,21 @@ def test_a_typo_lists_what_this_builder_can_actually_fill():
 # the parity test
 # ---------------------------------------------------------------------------
 
-def test_the_grid_matches_the_sim_channel_for_channel():
-    env = _sim_env()
+# Seed 0 until the cube scatter (`cubes.box_scatter_*` in configs/default.yaml) started drawing from
+# the sim's generator every tick. On the shifted stream the crowded hero dies at decision 35, and the
+# comparison needs forty. Ten keeps it alive and exercises every plane; see the anti-vacuity counts.
+PARITY_SEED = 10
+
+
+@pytest.mark.parametrize("spec_name", ["agent_obs_deploy.yaml", "agent_obs_deploy3.yaml"])
+def test_the_grid_matches_the_sim_channel_for_channel(spec_name):
+    env = _sim_env(seed=PARITY_SEED)
     env.reset()
     _crowd_the_hero(env)
+    _break_the_crates_beside_the_hero(env)
     occ = _occupancy()
     _seed_from_bank(occ, env)
-    builder = _builder(occ)
+    builder = _builder(occ, spec=GridSpec.load(CONFIGS / spec_name))
     spec = builder.spec
 
     rng = Random(0)
@@ -236,11 +280,12 @@ def test_the_grid_matches_the_sim_channel_for_channel():
         view = _sim_view(env)
         _seed_gas(builder.gas, env)
         enemies, projectiles = _tracks_and_projectiles(env)
+        crates, cubes = _crates_and_cubes(env)
         dx, dy = _frame_offset(env)
         hero_pos = (float(env.state.ent_pos[0, 0, 0]) + dx,
                     float(env.state.ent_pos[0, 0, 1]) + dy)
         grid = builder.build(hero_pos, alive=bool(env.state.ent_alive[0, 0]),
-                             enemies=enemies, projectiles=projectiles)
+                             enemies=enemies, projectiles=projectiles, crates=crates, cubes=cubes)
 
         for i, ch in enumerate(spec.channels):
             expected = view[SIM_CHANNEL[ch]]
@@ -253,9 +298,9 @@ def test_the_grid_matches_the_sim_channel_for_channel():
         _, _, terminated, truncated, _ = env.step(action)
         assert not bool(terminated[0] or truncated[0]), "episode ended mid-comparison"
 
-    # Anti-vacuity: agreeing on eight planes of zeros would prove nothing, and one lucky cell is
-    # barely better, so this counts DECISIONS on which each plane was non-empty. Measured on this
-    # seed: terrain and hero 40/40, in_zone 39, projectile 22, enemy_revealed 18.
+    # Anti-vacuity: agreeing on planes of zeros would prove nothing, and one lucky cell is barely
+    # better, so this counts DECISIONS on which each plane was non-empty. Measured on this seed:
+    # terrain and hero 40/40, box 28, pickup 33, enemy_revealed 32, in_zone 14, projectile 14.
     thin = {ch: n for ch, n in seen.items() if n < 5}
     assert not thin, f"barely exercised: {thin} of 40 decisions (all: {seen})"
 
@@ -421,6 +466,33 @@ def test_projectiles_land_in_their_own_plane():
     plane = grid[b.spec.channels.index("projectile")]
     assert plane[3, 9] == 1 and plane.sum() == 1
     assert grid[b.spec.channels.index("enemy_revealed")].sum() == 0
+
+
+def _deploy3_builder() -> GridBuilder:
+    return _builder(spec=GridSpec.load(CONFIGS / "agent_obs_deploy3.yaml"))
+
+
+def test_crates_and_cubes_land_in_their_own_planes():
+    b = _deploy3_builder()
+    grid = b.build((10.5, 6.5), crates=[(12.5, 5.5)], cubes=[(8.5, 9.5)])
+    box = grid[b.spec.channels.index("box")]
+    pickup = grid[b.spec.channels.index("pickup")]
+    assert box[5, 12] == 1 and box.sum() == 1
+    assert pickup[9, 8] == 1 and pickup.sum() == 1
+
+
+def test_two_cubes_in_one_cell_count_two():
+    """A death pile on screen is several cube boxes; each is one object, like the sim's pickups."""
+    b = _deploy3_builder()
+    grid = b.build((10.5, 6.5), cubes=[(8.2, 9.1), (8.8, 9.9)])
+    assert grid[b.spec.channels.index("pickup")][9, 8] == 2
+
+
+def test_a_crate_outside_the_crop_is_dropped():
+    b = _deploy3_builder()
+    grid = b.build((10.5, 6.5), crates=[(40.5, 6.5)], cubes=[(10.5, -40.5)])
+    assert grid[b.spec.channels.index("box")].sum() == 0
+    assert grid[b.spec.channels.index("pickup")].sum() == 0
 
 
 def test_the_output_is_uint8_at_the_declared_shape_and_a_reused_buffer_is_cleared():

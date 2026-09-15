@@ -21,11 +21,11 @@ subtly wrong:
   boundary, at which point the whole grid shifts by one. That is the sim's behaviour and so it is
   this module's; smoothing it would be a different observation.
 
-#### Counts, not booleans, on the four dynamic planes
+#### Counts, not booleans, on the dynamic planes
 
 `_scatter_count` does `+= 1` per occupant, so two enemies sharing a cell give `2`. The terrain
-planes are 0/1 because they come from a per-tile lookup, but `enemy_revealed`, `hero`, `projectile`
-and (in the sim) `box`/`pickup` are occupancy counts clamped to 255. Reproduced here.
+planes are 0/1 because they come from a per-tile lookup, but `enemy_revealed`, `hero`, `projectile`,
+`box` and `pickup` are occupancy counts clamped to 255. Reproduced here.
 
 #### Who supplies what
 
@@ -36,14 +36,16 @@ and (in the sim) `box`/`pickup` are occupancy counts clamped to 255. Reproduced 
 | `enemy_revealed` | `EntityTracker` | tracks with `seen_now`, and only those |
 | `hero` | the shadow's `alive` | the constant above |
 | `projectile` | `ProjectileTracker.live()` | `live()` already excludes coasted tracks |
+| `box` | `LootMap.crates()` | sticky, one fixed cell per crate (`loot.py`) |
+| `pickup` | `LootMap.cubes()` | sticky, one fixed cell per cube on screen |
 
-`box` and `pickup` are not here YET: nothing detects a crate or a power cube, which is why 9.11
-dropped them from the spec and zeroed `reward.cube_pickup` in the same decision. That exclusion was
-temporary, and `configs/agent_obs_deploy3.yaml` trains on both channels again ahead of their
-detector -- so a deploy3 checkpoint is refused HERE, by name, until a crate/cube class exists and a
-supplier for each is added to `_DYNAMIC`. Asking for either raises rather than filling zeros. `enemy_any` and `enemy_hidden` are refused for a
-different reason -- they leak the position of an enemy the hero cannot see, and `obs_select`
-already rejects them at spec-load time under `fair: true`.
+`box` and `pickup` are what `configs/agent_obs_deploy3.yaml` added back after 9.11 dropped them for
+want of a detector. They are sticky where every other dynamic plane here is "seen this tick", and
+that is the sim's rule rather than a choice: `_build_grid` scatters every live crate and pickup in
+the crop, visible or not, and `fair` gates neither. `loot.py` says what that costs and where the
+two lists differ from the sim's. `enemy_any` and `enemy_hidden` are refused: they leak the position
+of an enemy the hero cannot see, and `obs_select` already rejects them at spec-load time under
+`fair: true`.
 
 **`enemy_revealed` takes `Track.seen_now`, not "the track exists".** Under `fair: true` an
 unrevealed enemy appears in NO grid channel at all, so a coasted track -- one carried forward on a
@@ -60,7 +62,7 @@ went under the joystick after being gassed would read "clear" and the policy wou
 
 The deposit uses `ZoneMask.cells`, not `at_least(0.05)`. Those are different questions and
 `zone.py` says so: `at_least` exists for the occupancy map's *abstain* path, where over-flagging is
-free and missing gas locks a misclassification forever, while `cells` answers "is this cell in the
+free and missing gas casts a wrong vote every frame, while `cells` answers "is this cell in the
 zone" for the agent, "where a wrong answer either way costs the same". The agent is the consumer
 here. The sim samples each cell's CENTRE against the zone rectangle; `cells` thresholds a per-cell
 gassed fraction. They disagree only on the cells the zone boundary cuts through.
@@ -149,15 +151,10 @@ _DEFAULT_CFG = _CONFIGS_DIR / "default.yaml"
 # Which of `_build_grid`'s twelve channels this module can fill, and how. The static four are
 # columns of the terrain lookup table; the rest are written by hand.
 _STATIC_COLUMN = {"blocks_unit": 0, "blocks_projectile": 1, "is_bush": 2, "is_water": 3}
-_DYNAMIC = ("in_zone", "enemy_revealed", "hero", "projectile")
+_DYNAMIC = ("in_zone", "enemy_revealed", "hero", "projectile", "box", "pickup")
 
-# Why the other four are refused, verbatim enough to act on.
+# Why the other two are refused, verbatim enough to act on.
 _REFUSED = {
-    "box": "nothing detects a crate yet (the entity detector's classes are enemy/teammate/player). "
-           "agent_obs_deploy3.yaml trains on this channel ahead of its detector; a crate class and "
-           "a supplier in _DYNAMIC are what make such a checkpoint deployable",
-    "pickup": "nothing detects a power-cube pickup yet; same position as `box` -- "
-              "agent_obs_deploy3.yaml trains on it ahead of a cube class and a supplier here",
     "enemy_any": "leaks the position of an enemy the hero cannot see; obs_select refuses it "
                  "under fair:true, and so does this",
     "enemy_hidden": "leaks hidden enemies, same as enemy_any",
@@ -218,6 +215,20 @@ class GridSpec:
         spec.check()
         return spec
 
+    @classmethod
+    def from_agent_spec(cls, agent_spec, cfg) -> "GridSpec":
+        """From an already-loaded `obs_select.AgentObsSpec` and `EnvConfig`: the pair the policy
+        was built from, so the grid cannot be built for a different spec than the one assembling
+        it. `load` with no arguments reads `agent_obs_deploy.yaml`, which a deploy3 checkpoint
+        would get wrong by two channels. The grid group is found the way `assemble.py` finds it,
+        as the one with `view_channels`."""
+        g = next((g for g in agent_spec.groups if g.view_channels is not None), None)
+        if g is None:
+            raise KeyError("the agent spec has no grid group (no group with view_channels)")
+        spec = cls(channels=tuple(g.view_channels), view_h=int(cfg.view_h), view_w=int(cfg.view_w))
+        spec.check()
+        return spec
+
     def check(self) -> None:
         for ch in self.channels:
             if ch in _REFUSED:
@@ -234,7 +245,7 @@ class GasMap:
 
     Same shape and same `origin` as the `OccupancyMap` it accompanies, so one pair of crop indices
     serves both. It is a separate object rather than a channel of the occupancy grid because the
-    two have opposite update rules: occupancy votes and locks and REFUSES to vote on a gassed cell,
+    two have opposite update rules: occupancy keeps voting and REFUSES to vote on a gassed cell,
     while this one latches on first sight and never reconsiders.
     """
 
@@ -346,14 +357,15 @@ class GridBuilder:
             out[r_lo - r0:r_hi - r0, c_lo - c0:c_hi - c0] = source[r_lo:r_hi, c_lo:c_hi]
         return out
 
-    def build(self, hero_pos, *, alive: bool = True, enemies=(), projectiles=(),
-              out: np.ndarray | None = None) -> np.ndarray:
+    def build(self, hero_pos, *, alive: bool = True, enemies=(), projectiles=(), crates=(),
+              cubes=(), out: np.ndarray | None = None) -> np.ndarray:
         """One decision's grid.
 
         `hero_pos` is world tiles. `enemies` is `TrackerResult.enemies` -- slot-ordered, with
         `None` in empty slots -- and only tracks with `seen_now` are deposited. `projectiles` is
-        `ProjectileTracker.live()`. `alive` is the shadow's, and is the only thing that empties
-        the `hero` channel.
+        `ProjectileTracker.live()`. `crates` and `cubes` are `LootMap.crates()`/`cubes()`, world
+        `(x, y)` tuples. `alive` is the shadow's, and is the only thing that empties the `hero`
+        channel.
         """
         h, w = self.spec.view_h, self.spec.view_w
         if out is None:
@@ -382,6 +394,10 @@ class GridBuilder:
                               [t.pos for t in enemies if t is not None and t.seen_now])
             elif ch == "projectile":
                 self._scatter(out[i], origin, [p.pos for p in projectiles])
+            elif ch == "box":
+                self._scatter(out[i], origin, crates)
+            elif ch == "pickup":
+                self._scatter(out[i], origin, cubes)
             elif ch == "hero":
                 if alive:
                     r, c = self.spec.centre

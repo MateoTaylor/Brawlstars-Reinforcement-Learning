@@ -39,6 +39,7 @@ import yaml
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
 DEFAULT_CONFIG_PATH = REPO_ROOT / "configs" / "deployment.yaml"
+RUNS_DIR = REPO_ROOT / "runs"
 
 _MISSING = object()
 _ABSENT = object()
@@ -320,6 +321,52 @@ def load_deployment_config(path=DEFAULT_CONFIG_PATH,
             continue
         kwargs[field_name] = coerce(value)
     return DeploymentConfig(**kwargs)
+
+
+def resolve_run(name: str, runs_dir=RUNS_DIR) -> str:
+    """A run named on the command line -> the directory `run.dir` would hold.
+
+    Accepts, in order: a path to a run directory; a directory name under `runs/`
+    (`mortis_deploy3-20260911-203322`); or the `run.name` the run was trained under, read from its
+    own `train.yaml` (`mortis_deploy3`). The last is what makes switching runs a short argument.
+
+    **The name match is exact, on purpose.** `mortis_deploy3` is a prefix of `mortis_deploy3_elite`,
+    so a prefix rule would make the shorter name mean both runs. A name trained more than once is
+    refused with the candidates listed, not resolved to the newest: which checkpoint played is the
+    one fact a comparison between runs cannot afford to have guessed.
+
+    Returned relative to the repo when it is inside it, the same form `configs/deployment.yaml`
+    uses, so the startup log reads the same whichever way the run was chosen.
+    """
+    runs_dir = Path(runs_dir)
+
+    def _found(path: Path) -> str:
+        path = path.resolve()
+        try:
+            return path.relative_to(REPO_ROOT).as_posix()
+        except ValueError:
+            return str(path)
+
+    for candidate in (Path(name), REPO_ROOT / name, runs_dir / name):
+        if (candidate / "train.yaml").is_file():
+            return _found(candidate)
+
+    runs = {}
+    for train_yaml in sorted(runs_dir.glob("*/train.yaml")):
+        raw = yaml.safe_load(train_yaml.read_text()) or {}
+        runs[train_yaml.parent] = _dget(raw, "run.name", default=None)
+    matches = [path for path, trained_as in runs.items() if trained_as == name]
+    if len(matches) == 1:
+        return _found(matches[0])
+    if matches:
+        listed = "\n  ".join(p.name for p in matches)
+        raise ValueError(f"{len(matches)} runs were trained as {name!r}; pass the directory name "
+                         f"of the one you mean:\n  {listed}")
+    # Offer each run by its short name where that is unambiguous, and by directory where it is not.
+    trained = [t for t in runs.values() if t]
+    listed = "\n  ".join(
+        f"--run {t if t and trained.count(t) == 1 else p.name}" for p, t in runs.items())
+    raise ValueError(f"no run called {name!r} in {runs_dir}. Runs there:\n  {listed}")
 
 
 def validate(cfg: DeploymentConfig, sim_cfg=None, vision_cfg=None) -> None:

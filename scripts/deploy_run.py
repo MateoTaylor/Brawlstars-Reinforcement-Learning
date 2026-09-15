@@ -3,6 +3,14 @@
     python scripts/deploy_run.py --dry-run            # everything except touching the device
     python scripts/deploy_run.py                      # for real
     python scripts/deploy_run.py --matches 0          # keep playing until Ctrl-C
+    python scripts/deploy_run.py --run mortis_deploy3 # a different run, by the name it trained as
+    python scripts/deploy_run.py --run mortis_deploy3_elite --checkpoint final
+
+**`--run` swaps the checkpoint for one invocation** without editing `configs/deployment.yaml`,
+which stays the default. It takes the `run.name` a run was trained under, a directory under
+`runs/`, or a path. The name match is exact (`mortis_deploy3` never means `mortis_deploy3_elite`),
+and a name trained more than once is refused with the candidates listed. `--checkpoint` takes
+`best`, `final`, or a file name in the run.
 
 **Start it before you queue the battle.** It waits on the match gate, emits nothing in the menus,
 and takes the movement contact the moment the gate opens -- so there is nothing to time. The gate's
@@ -33,12 +41,41 @@ REPO = Path(__file__).resolve().parents[1]
 if str(REPO) not in sys.path:
     sys.path.insert(0, str(REPO))
 
-from brawl_deployment.config import load_deployment_config, validate           # noqa: E402
+from brawl_deployment.config import load_deployment_config, resolve_run, validate  # noqa: E402
 from brawl_deployment.loop import Controls, DeployLoop, Phase                  # noqa: E402
+
+# `--checkpoint` shorthands: the two files every run's `scripts/train.py` writes.
+CHECKPOINTS = {"best": "best_model.zip", "final": "final_model.zip"}
 
 
 def _log(message: str) -> None:
     print(f"[{time.strftime('%H:%M:%S')}] {message}", flush=True)
+
+
+def _config_from_args(args):
+    """`configs/deployment.yaml` with `--run` / `--checkpoint` applied, validated.
+
+    Through the loader's `overrides` rather than a `dataclasses.replace` afterwards, so a run picked
+    on the command line takes exactly the path a run picked in the YAML does. The checkpoint is
+    checked here, before the window is located or a detector is built: a typo should cost a second,
+    not a startup.
+    """
+    run = {}
+    if args.run is not None:
+        try:
+            run["dir"] = resolve_run(args.run)
+        except ValueError as exc:
+            raise SystemExit(str(exc)) from None
+    if args.checkpoint is not None:
+        run["checkpoint"] = CHECKPOINTS.get(args.checkpoint, args.checkpoint)
+    cfg = load_deployment_config(args.config, overrides={"run": run} if run else None)
+    validate(cfg)
+
+    path = Path(cfg.run_dir) / cfg.run_checkpoint
+    if not path.is_file():
+        have = sorted(p.name for p in Path(cfg.run_dir).glob("*.zip"))
+        raise SystemExit(f"no checkpoint {path}; {cfg.run_dir} has {have or 'no .zip files'}")
+    return cfg
 
 
 def _summarise(loop: DeployLoop) -> None:
@@ -88,6 +125,11 @@ def main(argv=None) -> int:
     ap = argparse.ArgumentParser(description=__doc__,
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--config", default=str(REPO / "configs" / "deployment.yaml"))
+    ap.add_argument("--run", default=None,
+                    help="run to deploy instead of the config's run.dir: the name it was trained "
+                         "as (mortis_deploy3), a directory under runs/, or a path")
+    ap.add_argument("--checkpoint", default=None,
+                    help="'best', 'final', or a file name in the run (default: run.checkpoint)")
     ap.add_argument("--dry-run", action="store_true",
                     help="build everything and decide for real, but send no touches")
     ap.add_argument("--matches", type=int, default=1,
@@ -97,9 +139,8 @@ def main(argv=None) -> int:
     ap.add_argument("--telemetry", default=None, help="write the tick ring to this CSV on exit")
     args = ap.parse_args(argv)
 
-    cfg = load_deployment_config(args.config)
-    validate(cfg)
-    _log(f"config {args.config}")
+    cfg = _config_from_args(args)
+    _log(f"config {args.config}{' (run from --run)' if args.run else ''}")
     _log(f"run    {cfg.run_dir} ({cfg.run_checkpoint}) on {cfg.policy_device}")
 
     loop = DeployLoop.from_config(cfg, log=_log)

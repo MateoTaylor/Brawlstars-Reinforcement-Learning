@@ -3,7 +3,7 @@ Terrain_Perception_Build_Plan.md Phase H.
 
     python scripts/vision_train_terrain.py                          # train on every label file
     python scripts/vision_train_terrain.py --hold-out showdown_alternate_map
-    python scripts/vision_train_terrain.py --epochs 120 --out brawl_vision/data/terrain.pt
+    python scripts/vision_train_terrain.py --device cuda --out brawl_vision/data/terrain.pt
 
 **Validation is split BY MAP, not by frame.** Holding out random cells from maps the model also
 trained on measures memorisation, which this pipeline explicitly does not want: the goal is to
@@ -21,30 +21,31 @@ import numpy as np
 
 from brawl_vision.camera import build_rectify_plan, load_camera_model, load_hud_mask
 from brawl_vision.config import load_vision_config
-from brawl_vision.sources import open_source
 from brawl_vision.terrain.classifier import build_examples, evaluate, train
-from brawl_vision.terrain.labeling import CLASSES, load_label_dir
+from brawl_vision.terrain.labeling import CLASSES, load_label_dir, read_label_frames
 from brawl_vision.terrain.zone import detect_zone
 
 REPO = Path(__file__).resolve().parent.parent
-CLIPS = REPO / "tests" / "fixtures" / "vision"
-LABELS = CLIPS / "labels"
+LABELS = REPO / "tests" / "fixtures" / "vision" / "labels"
 
 
-def _rects_for(grids, plan, cfg):
-    """Decode each labelled frame once. Sequential, because a label is addressed by frame index and
-    seeking returns a frame near it rather than that one."""
+def _rects_for(grids, plan):
+    """Decode each labelled frame once, one sequential pass per clip, exactly as the labeller did
+    (`labeling.read_label_frames`): same lookup, same frame counting, same resize."""
     wanted = {}
     for g in grids:
         wanted.setdefault(g.clip, set()).add(g.frame)
     out = {}
     for clip, frames in wanted.items():
-        with open_source(CLIPS / f"{clip}.mp4", cfg) as src:
-            for frame in src:
-                if frame.index in frames:
-                    out[(clip, frame.index)] = plan.rectify(frame.image)
-                if frame.index > max(frames):
-                    break
+        try:
+            images = read_label_frames(clip, frames, plan.viewport)
+        except FileNotFoundError as e:
+            raise SystemExit(f"a label points at a missing recording: {e}")
+        missing = sorted(frames - set(images))
+        if missing:
+            raise SystemExit(f"{clip}.mp4 has no frame(s) {missing}, but labels point at them")
+        for index, image in images.items():
+            out[(clip, index)] = plan.rectify(image)
     return out
 
 
@@ -53,7 +54,8 @@ def main(argv=None) -> int:
                                 formatter_class=argparse.RawDescriptionHelpFormatter)
     p.add_argument("--labels", default=str(LABELS), help="directory of label .json files")
     p.add_argument("--hold-out", default=None, help="clip name to keep out of training entirely")
-    p.add_argument("--epochs", type=int, default=60)
+    # 60 underfit: in-sample blocking recall 0.87, map F1 0.874 against 0.930 at 200 (2026-09-14).
+    p.add_argument("--epochs", type=int, default=200)
     p.add_argument("--seed", type=int, default=0)
     p.add_argument("--device", default="cpu", choices=["cpu", "cuda"])
     p.add_argument("--no-augment", action="store_true", help="disable colour/flip augmentation")
@@ -68,7 +70,7 @@ def main(argv=None) -> int:
               file=sys.stderr)
         return 1
 
-    rects = _rects_for(grids, plan, cfg)
+    rects = _rects_for(grids, plan)
     exclude = {(g.clip, g.frame): detect_zone(rects[(g.clip, g.frame)], plan, cfg).at_least(0.05)
                for g in grids}
     examples = build_examples([(g, rects[(g.clip, g.frame)]) for g in grids], plan, exclude)

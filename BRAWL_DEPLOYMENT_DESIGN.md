@@ -150,7 +150,9 @@ of 0.89, 74% of the bound.
 The cheap stages run every tick (odometry ~7.5 ms/frame measured, ring score is a few hundred
 microseconds at 1-3 anchors). The expensive stages -- YOLO, HP reading, projection, assembly,
 policy -- run every decision. Held actions between decisions are exactly the sim's `_held`
-semantics: movement persists, the fire bit does not repeat.
+semantics: movement persists, the fire bit does not repeat. One exception since 2026-09-14: the
+entity detector runs every tick, because its boxes are also the terrain deposit's brawler mask
+(see "The tick budget, measured"). The decision reuses them.
 
 `shadow.advance` sits on the every-tick side because it is the thing that *keeps* those two rates
 honest: it takes the real elapsed seconds and spends them as whole `cfg.dt` sub-ticks, so a
@@ -458,6 +460,33 @@ numbers were measured on.
 A button table calibrated on one layout **taps empty screen on the other**, silently. This is why
 calibration is measured per-setup and cached, never hardcoded.
 
+**The same hazard hit the terrain map, and the loop now has its own HUD mask** (2026-09-14,
+`brawl_deployment/data/hud_mask.json`, read by `VisionStack.build`). BlueStacks + Nulls Brawl is
+neither layout. Under `brawl_vision`'s mask, the attack and super rects sat on floor, while the real
+buttons, the Exit button, the emote bubble and the kill card stayed in view. The classifier
+deposited them as walls that followed the camera, and odometry correlated them as a static patch.
+The new mask was measured from which pixels stay put while the world scrolls, across all three
+BlueStacks clips. It covers 20% of the frame, and `test_deployment_calibration.py` checks it against
+this file's independently fitted button centres and joystick anchor. `brawl_vision/data/hud_mask.json`
+is unchanged; the offline tools still read it.
+
+**What the 2026-09-14 map fixes bought, on the same replays.** The score is how often the hero's own
+cell reads as unit-blocking in the deployed map at a decision. A brawler cannot stand in a wall, so
+every one is an error, and no labels are needed. Rows are cumulative, over the three BlueStacks clips:
+
+| change | example-new | example3 | example-zone |
+|---|---|---|---|
+| before | 15.8% | 43.4% | 6.6% |
+| brawler boxes masked out of the deposit (§6.13) | 15.8% | 23.6% | 0.4% |
+| this HUD mask | 17.6% | 22.5% | 0.0% |
+| `terrain.pt` retrained: 200 epochs, left-right flips only | 9.8% | 15.3% | 0.4% |
+| map cells never freeze (`occupancy.py`) | 7.8% | 5.4% | 0.0% |
+
+The HUD mask's own gain is in odometry, not this score: with static UI no longer pinning it to zero
+shift, "odometry uncertain" decision skips fell from 6.5% to 0.9% on `example-new` and from 9.3% to
+5.1% on `example3`. The extra segment resets it causes all land before the match gate opens. On the
+54 labelled frames, the last two rows moved the map's blocking F1 from 0.775 to 0.906.
+
 ---
 
 ## 5. Match-over detection
@@ -709,6 +738,14 @@ free once §6.1 lands.
 > **REVERSED for training 2026-09-11 (§9.18):** `configs/agent_obs_deploy3.yaml` trains on `box`
 > and `pickup` again, with `cube_pickup` restored. This module still refuses both by name, so a
 > deploy3 checkpoint cannot be deployed until a crate and cube detector and their suppliers exist.
+>
+> **SUPPLIED 2026-09-12:** the projectile model now boxes `Power Cube Box` and `Power Cube Dropped`,
+> and `perception/loot.py` (`LootMap`) turns those boxes into a sticky map of fixed cells that
+> `grid.py` scatters into `box` and `pickup`. Both channels are in `_DYNAMIC`, `GridSpec.load`
+> accepts deploy3, and the loop builds its grid from the policy's own spec and refuses to start a
+> deploy3 policy on a model without the two classes. The same crate boxes fill the occupancy map's
+> occlusion gate. `loot.py`'s docstring has the measurements and where the channels still differ
+> from the sim's.
 
 #### Built — `perception/grid.py`, checked cell-for-cell against `_build_grid`
 
@@ -716,9 +753,9 @@ Nothing in this module is new perception. It crops the accumulated terrain map, 
 tracks §6.1 already produces, and its entire contract is **placement** — putting each of those
 where `brawl_sim/core/observation.py:_build_grid` puts it. So that function is what checks it:
 `tests/test_deployment_grid.py` runs a live `BrawlVecEnv` on `island_invasion`, hands `GridBuilder`
-a perfect-perception view of that env's own world, and asserts all eight planes equal the
-corresponding channels of the sim's own grid, every cell, every decision, for forty decisions.
-34 tests, all passing.
+a perfect-perception view of that env's own world, and asserts every plane (eight for deploy, ten
+for deploy3) equals the corresponding channel of the sim's own grid, every cell, every decision,
+for forty decisions. 40 tests, all passing.
 
 "Perfect perception" is the INPUT, not the thing under test — the occupancy map is seeded from the
 sim's padded tile bank and the gas from the sim's zone rectangle, because the question is
@@ -730,9 +767,10 @@ agree for the wrong reason:
   everything through one offset, which also checks that `GridBuilder` is frame-agnostic.
 - **Ten brawlers on a 60×60 map do not meet inside forty decisions**, so the run would have agreed
   on two planes of zeros. Four bots are moved into the crop and the hero's super is charged
-  (Mortis's own attack is a dash and spawns no projectile). Measured coverage on this seed:
-  terrain and `hero` non-empty on 40/40 decisions, `in_zone` 39, `projectile` 22,
-  `enemy_revealed` 18 — asserted, so a regression to one lucky cell fails.
+  (Mortis's own attack is a dash and spawns no projectile), and the crates beside the hero are
+  broken on the first step so the `pickup` plane has cubes in it. Measured coverage on the seed
+  (10 since the cube scatter shifted the sim's random stream): terrain and `hero` non-empty on
+  40/40 decisions, `box` 28, `pickup` 33, `enemy_revealed` 32, `in_zone` 14, `projectile` 14 — asserted, so a regression to one lucky cell fails.
 - **The gas seeding is cumulative**, which makes the run a live check of the monotonicity
   assumption below rather than a restatement of it.
 
@@ -1958,6 +1996,14 @@ median / 27.5 ms max live.**
 | entity detect | 4 Hz | 7.6 | 8.2 | 8.3 |
 | **decision tick, no grab** | | **34.7** | | **37.7** |
 
+**Since 2026-09-14 the entity detector runs every tick** (`_perceive`). Its boxes mask brawler
+sprites out of the terrain deposit. Before this, BlueStacks replays put a wall under the hero's own
+cell on 6.6% (`example-zone`) and 43% (`example3`) of decisions; masking dropped those to 0.4% and
+24%. `example-new` stayed at 15.8%, all of it WATER under the hero, which masking did not move. A decision
+tick reuses the same boxes rather than running the detector twice on one frame. So a plain tick now
+costs what a decision tick did before, ~34.7 ms median and 37.7 ms max, and a decision tick is
+unchanged. The worst case in the table below is the same row, so the slack it shows still holds.
+
 #### Why this is 12 Hz and not 20
 
 Composed with the live grab, a plain tick is **~51 ms** and a decision tick **~59 ms**, worst
@@ -3075,6 +3121,18 @@ stopped agent is recoverable by hand; an agent mashing inputs into a menu is not
     −1.9 pp measured above. Nothing here has been trained yet; `deploy2` has no run behind it, and
     the retrain stays the lever §9.15 describes.
 
+    **2026-09-14: the deploy side of the rename, wired when the first run behind it went live.**
+    `runs/mortis_deploy3_elite-20260913-015933` trains on `agent_obs_deploy3.yaml`, which inherits
+    deploy2's zone group unchanged, and its first live decision raised `assemble: no value supplied
+    for 'zone.hero_margin_local'`. The estimator had only ever answered to the first spec's names.
+    `ZoneEstimator.estimate` now returns one scan under both names, and `_put_zone` still takes only
+    what the loaded spec names. So on deploy2/3 the column and the values finally agree, and the
+    −1.9 pp substitution above is confined to runs on `agent_obs_deploy.yaml`. The suite missed it
+    because every spec-coverage test was pinned to `agent_obs_deploy.yaml` and every loop test used
+    a recording assembler that accepts any keyword. They are now globbed over
+    `configs/agent_obs_deploy*.yaml`, one loop test runs the real `ObservationAssembler` for each
+    spec, and the end-to-end checkpoint test also loads whatever `configs/deployment.yaml` names.
+
 17. ~~**`hero.pos_norm` has no honest supplier either — and it is in the `self` group.**~~
     **MEASURED AND CLOSED 2026-09-08 — a wrong origin is free, so anchor at the map centre.**
 
@@ -3158,13 +3216,11 @@ stopped agent is recoverable by hand; an agent mashing inputs into a menu is not
     still reproduces from its run directory. `scripts/train.py` now builds the run before creating
     its directory, so a refused config does not leave an empty run behind.
 
-    **⚠ Not deployable yet, by design.** Nothing detects a crate or a cube: the entity detector's
-    classes are `{enemy, teammate, player}`. `perception/grid.py` refuses both channels by name, so
-    `GridSpec.load` on deploy3 raises at startup (pinned in `tests/test_deployment_grid.py`). A
-    deploy3 checkpoint ships only after (1) crate and cube classes in the detector, (2) a supplier
-    for each in `grid.py`, scattered through the same world-frame projection `enemy_revealed`
-    uses, and (3) both moved from `_REFUSED` to `_DYNAMIC`. The run can start before any of that
-    exists; the deployment cannot.
+    **Deployable since 2026-09-12.** This paragraph used to say nothing detected a crate or a cube,
+    and listed three steps before a deploy3 checkpoint could ship. All three are done: the
+    projectile model boxes `Power Cube Box` and `Power Cube Dropped`, `perception/loot.py` supplies
+    both channels, and both are in `_DYNAMIC`. `GridSpec.load` on deploy3 now loads; the test that
+    pinned the refusal was turned around rather than deleted. §6.2 has the rest.
 
     **The kit, per §6.15 — only the part the data carries.** `configs/brawlers.yaml`
     `hero_mortis` `reload_seconds` 2.25 → **2.50**. That is family A, pip-to-pip with no shot in

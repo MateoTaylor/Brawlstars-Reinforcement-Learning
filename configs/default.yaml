@@ -134,6 +134,12 @@ cubes:
   cubes_on_kill_base: 1
   drop_victim_cubes: true
   pickup_radius: 0.6
+  # Where a broken crate's cube lands: this many tiles from the crate, in a random direction.
+  # Measured on real footage, where cubes pop out 0.3-1.8 tiles from the crate rather than sitting
+  # on its tile. A spot a brawler could not stand on (wall, water, off the map) is redrawn, and a
+  # crate hemmed in on every draw drops on itself. 0 and 0 is the old on-the-crate rule.
+  box_scatter_min_tiles: 0.3
+  box_scatter_max_tiles: 1.8
 
 boxes: {n_boxes: 8, hp: 3000}
 

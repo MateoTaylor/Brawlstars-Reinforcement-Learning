@@ -2,13 +2,34 @@
 Terrain_Perception_Build_Plan.md Phase I.
 
 This is where the per-frame stages become a map. Each frame's classified cells are deposited into a
-persistent world-frame grid at the position Phase F reports, every cell accumulates votes, and a
-cell locks once it has been seen enough times with enough agreement -- after which it is never
-reconsidered.
+persistent world-frame grid at the position Phase F reports, every cell in view gets a vote on every
+frame, and the map reports each cell's majority. One frame's misclassification -- a moment of motion
+blur, a damage number over a wall -- is outvoted instead of becoming the map.
 
-**Locking does two jobs at once.** It is the efficiency win (a locked cell costs nothing to keep)
-and the robustness mechanism: one frame's misclassification -- a player standing on a tile, a
-moment of motion blur, a damage number over a wall -- is outvoted instead of becoming the map.
+**No cell is ever frozen (since 2026-09-14).** A cell used to lock once it had `min_votes` votes at
+`lock_ratio` agreement, and then take no more votes for the rest of the match. That froze the map's
+worst errors. A cell's first votes are not independent: they come from nearly one viewpoint at one
+sub-tile phase, so when they are wrong they are wrong together, and five of them locked the mistake
+in. Scored against the 54 labelled frames (blocking F1 of a map built from the views 1-10 s either
+side of each label, never the labelled frame itself; about 195 views per cell):
+
+    freeze after 5 votes at 0.8 (the old rule)   0.836    5-class accuracy 0.879
+    freeze after 20 at 0.9                       0.905                     0.931
+    freeze after 40 at 0.95                      0.906                     0.932
+    never freeze                                 0.906                     0.931
+    summed softmax instead of hard votes         0.909                     0.933
+    votes decayed x0.97 per deposit              0.884                     0.916
+
+Those are the retrained `terrain.pt`; the weights before it moved the same way, 0.775 -> 0.848.
+Raising the bar and never freezing tie, so this takes the one that can also recover from a change.
+Re-validating locked cells (keep voting, release a lock whose class has lost the majority) is
+never-freezing by construction. The classifier re-predicts every visible cell on every frame
+anyway, so re-validation costs a vote and nothing else. Soft votes were not worth an API change for
+0.003.
+
+`locked` survives as a report, not a gate. A cell locks when its votes clear `min_votes` and
+`lock_ratio`, and a lock is released when another class overtakes it, so
+`DepositResult.released_now` counts cells that later views overturned.
 
 **Four gates before any vote is cast**, each tracing back to an earlier phase, and each of them a
 way the map gets silently poisoned if it is missing:
@@ -17,15 +38,20 @@ way the map gets silently poisoned if it is missing:
 2. **Odometry uncertain** -- keep tracking, cast no votes. Phase F distinguishes these precisely so
    this stage can keep its position while declining to trust the frame as evidence.
 3. **Under gas** -- skip. Gas tints the terrain beneath it, so a gassed cell's colours have been
-   shifted by a full-screen effect; voting on it locks a misclassification permanently.
+   shifted by a full-screen effect. Gas never leaves, so those votes would keep arriving until they
+   outvoted everything seen before the gas came.
 4. **Outside the true footprint** -- skip. The rectified patch is a rectangle but the world in it is
    a trapezoid (Phase C: the camera is perspective). Cells near that boundary are interpolated from
    the border fill and classify as garbage. `plan.valid` is the real footprint; the bounding
    rectangle is not.
 
-A fifth gate, **loot-box occlusion**, is specified by the plan and cannot be implemented here: no
-box detector exists until the entity chunk does. `update()` takes an `occluded` mask so the wiring
-is ready, and a box sitting on floor is not evidence about floor until something fills it in.
+A fifth gate, **loot-box occlusion**, is the caller's to fill: `update()` takes an `occluded` mask
+and casts no vote on those cells. The deployment loop builds it from the crate boxes the projectile
+model finds (`brawl_deployment/perception/loot.py`, `crate_occlusion`). A crate stands on its cell
+for as long as the cell is in view, so an unmasked one wins that cell's vote. Since 2026-09-14 it
+adds every entity box too (`box_occlusion`), because brawler sprites, the hero's own included, were
+deposited as WALL. Without the mask (`occluded=None`, as every offline tool here calls it) both are
+voted on like anything else.
 
 **Sub-tile position is never discarded.** Phase F integrates in floating point and this stage
 rounds only at deposit time, so a run of 0.3-tile steps accumulates to 3 tiles after ten frames.
@@ -37,11 +63,11 @@ and `tests/test_vision_occupancy.py` pins it.
 consumes this map must treat UNKNOWN as its own state: a policy that believes unexplored ground is
 walkable will walk into walls.
 
-**Known gap, deliberately deferred: destructible terrain.** "Classify once, cache forever" goes
-stale the moment a locked wall is destroyed. The fix is either low-frequency re-validation of
-locked cells or triggering reclassification near a detected destruction event, and both want the
-entity chunk. Nothing here attempts it; a destroyed wall stays a wall in the map for the rest of
-the match.
+**Known gap, narrowed: destructible terrain.** A destroyed wall no longer stays a wall for the rest
+of the match, but it is slow to go: its cell flips only once the floor has been seen more often
+than the wall was. Decaying old votes would speed that up and scored worse (above), because it
+forgets good views as well as stale ones. Triggering reclassification near a detected destruction
+event is still the real fix, and it still wants the entity chunk.
 """
 from dataclasses import dataclass, field
 
@@ -71,8 +97,8 @@ class DepositResult:
     looking like a slow classifier."""
     voted: int
     locked_now: int
+    released_now: int           # locked cells whose class lost the majority on this frame
     skipped_gas: int
-    skipped_locked: int
     out_of_bounds: int
     status: str                 # "ok" | "uncertain" | "lost" | "reset"
     segment: int
@@ -85,7 +111,7 @@ class OccupancyMap:
     width: int
     n_classes: int = len(CLASSES)
     votes: np.ndarray = field(default=None)
-    locked: np.ndarray = field(default=None)
+    locked: np.ndarray = field(default=None)        # a report of the votes, never a reason to stop
     segment: int = 0
     segments_seen: int = 1
 
@@ -201,29 +227,32 @@ class OccupancyMap:
         c_lo, c_hi = max(col0, 0), min(col0 + cols, self.width)
         oob = rows * cols - max(r_hi - r_lo, 0) * max(c_hi - c_lo, 0)
         if r_hi <= r_lo or c_hi <= c_lo:
-            return DepositResult(0, 0, skipped_gas, 0, oob, "ok", self.segment)
+            return DepositResult(0, 0, 0, skipped_gas, oob, "ok", self.segment)
 
         sub = (slice(r_lo - row0, r_hi - row0), slice(c_lo - col0, c_hi - col0))
         dst = (slice(r_lo, r_hi), slice(c_lo, c_hi))
-        allow_w = allow[sub]
-        locked_w = self.locked[dst]
-        skipped_locked = int((allow_w & locked_w).sum())
-        target = allow_w & ~locked_w
+        target = allow[sub]
         if not target.any():
-            return DepositResult(0, 0, skipped_gas, skipped_locked, oob, "ok", self.segment)
+            return DepositResult(0, 0, 0, skipped_gas, oob, "ok", self.segment)
 
+        # Every cell in view votes, locked or not: see "No cell is ever frozen" above.
         rr, cc = np.where(target)
+        before = self.votes[dst][rr, cc].argmax(axis=1)
         classes = cells[sub][target].astype(np.int64)
         np.add.at(self.votes[dst], (rr, cc, classes), 1)
 
-        # Lock only cells this frame touched: a cell cannot cross the threshold without a new vote.
+        # Only cells this frame touched can lock or release: nothing else got a new vote.
         v = self.votes[dst][rr, cc]
         total = v.sum(axis=1)
         share = v.max(axis=1) / np.maximum(total, 1)
-        newly = (total >= cfg.occupancy_min_votes) & (share >= cfg.occupancy_lock_ratio)
-        if newly.any():
-            self.locked[dst][rr[newly], cc[newly]] = True
-        return DepositResult(int(target.sum()), int(newly.sum()), skipped_gas, skipped_locked,
+        was = self.locked[dst][rr, cc]
+        # A lock holds until another class has the most votes, not until the share dips under
+        # lock_ratio -- so `released_now` counts overturned cells rather than threshold flicker.
+        released = was & (v.argmax(axis=1) != before)
+        newly = ~was & (total >= cfg.occupancy_min_votes) & (share >= cfg.occupancy_lock_ratio)
+        self.locked[dst][rr[released], cc[released]] = False
+        self.locked[dst][rr[newly], cc[newly]] = True
+        return DepositResult(int(target.sum()), int(newly.sum()), int(released.sum()), skipped_gas,
                              oob, "ok", self.segment)
 
     # -- helpers -------------------------------------------------------------

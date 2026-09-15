@@ -98,6 +98,11 @@ class EnvConfig:
     iframes_block_zone: bool = False
     regen_enabled: bool = True
     drop_victim_cubes: bool = True
+    # How far from its crate a broken crate's cube lands: a uniform distance in [min, max] tiles,
+    # in a uniform direction (core/boxes.resolve_broken_boxes). 0 and 0, the defaults, keep the
+    # old rule of landing on the crate itself.
+    box_scatter_min_tiles: float = 0.0
+    box_scatter_max_tiles: float = 0.0
     los_step_tiles: float = 0.5
     max_ray_tiles: float = 24.0
     debug_checks: bool = False
@@ -244,6 +249,8 @@ _ENV_CONFIG_FIELDS = (
     ("zone.iframes_block_zone", "iframes_block_zone", bool),
     ("regen.enabled", "regen_enabled", bool),
     ("cubes.drop_victim_cubes", "drop_victim_cubes", bool),
+    ("cubes.box_scatter_min_tiles", "box_scatter_min_tiles", float),
+    ("cubes.box_scatter_max_tiles", "box_scatter_max_tiles", float),
     ("perception.los_step_tiles", "los_step_tiles", float),
     ("perception.max_ray_tiles", "max_ray_tiles", float),
     ("engine.debug_checks", "debug_checks", bool),
@@ -836,6 +843,11 @@ def validate(cfg: EnvConfig, params: SimParams) -> None:
     if cfg.bots_hunt_timeout_seconds <= 0:
         raise ValueError(
             f"bots_hunt_timeout_seconds must be > 0, got {cfg.bots_hunt_timeout_seconds}"
+        )
+    if not 0 <= cfg.box_scatter_min_tiles <= cfg.box_scatter_max_tiles:
+        raise ValueError(
+            f"cubes.box_scatter_min_tiles ({cfg.box_scatter_min_tiles}) and box_scatter_max_tiles "
+            f"({cfg.box_scatter_max_tiles}) must satisfy 0 <= min <= max"
         )
     for name in (*cfg.map_names, cfg.fixed_map):
         if name not in _KNOWN_MAP_NAMES:

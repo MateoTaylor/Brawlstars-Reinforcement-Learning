@@ -27,8 +27,17 @@ import numpy as np
 from brawl_sim.constants import CHAR_TO_TILE, TILE_TO_CHAR, Tile
 
 from ..camera import RectifyPlan
+from ..clips import load_bounds
+from ..config import DATA_DIR, REPO_ROOT
+from ..gameplay import walk_frames
 
 UNLABELLED = "?"
+
+# Where a label's `clip` name is looked up, in order. The fixtures come first so every existing
+# label resolves exactly where it always has; training_videos holds the recordings that have no
+# fixture copy (the 1080p emulator captures, the 09-04 set).
+CLIP_DIRS: tuple[Path, ...] = (REPO_ROOT / "tests" / "fixtures" / "vision",
+                               DATA_DIR / "training_videos")
 
 # The five physical terrain classes. SPAWN and BOX are placement markers, never classifier outputs
 # (plan Section 2), so they are absent here even though the legend can spell them.
@@ -128,6 +137,49 @@ class LabelGrid:
 def load_label_dir(directory, plan: RectifyPlan | None = None) -> list[LabelGrid]:
     """Every `*.json` in `directory`, sorted, each checked against `plan`."""
     return [LabelGrid.load(p, plan) for p in sorted(Path(directory).glob("*.json"))]
+
+
+# ---------------------------------------------------------------------------
+# the frame a label points at
+# ---------------------------------------------------------------------------
+
+def find_clip(name: str) -> Path:
+    """The recording a label's `clip` names: the first `CLIP_DIRS` entry holding `<name>.mp4`."""
+    for directory in CLIP_DIRS:
+        path = directory / f"{name}.mp4"
+        if path.exists():
+            return path
+    raise FileNotFoundError(
+        f"no {name}.mp4 in any of {[str(d) for d in CLIP_DIRS]}"
+    )
+
+
+def read_label_frames(clip: str, indices, viewport: tuple[int, int] | None = None
+                      ) -> dict[int, np.ndarray]:
+    """`{index: normalized frame}` for each of `indices` that `clip` has, in one decode pass.
+
+    **Sequential, deliberately.** A label is addressed by frame index, and seeking returns a frame
+    NEAR the requested one rather than that one (tests/fixtures/vision/README.md). `walk_frames`
+    counts every decoded frame, so its index is the one `ClipReader` yields, and it is pixel-for-
+    pixel the same image. It `grab()`s the frames in between rather than converting them, which
+    makes a late frame in a long clip ~5x faster to reach.
+
+    Indices past the clip's usable range are left out, as `ClipReader` would never yield them.
+
+    `viewport` resizes frames of another size to it. That is for 1080p recordings (the BlueStacks
+    and emulator captures), which normalize to 1920x1080 against a camera model calibrated at
+    2002x1126. The deployed capture resizes the same way (`brawl_deployment.capture.to_viewport`),
+    so a label drawn here sits on the geometry the bot actually sees.
+    """
+    path = find_clip(clip)
+    bounds = load_bounds(path)
+    wanted = sorted({int(i) for i in indices if 0 <= int(i) <= bounds["usable"][1]})
+    out = {}
+    for index, image in walk_frames(path, tuple(bounds["content_box"]), wanted):
+        if viewport is not None and image.shape[1::-1] != tuple(viewport):
+            image = cv2.resize(image, tuple(viewport), interpolation=cv2.INTER_AREA)
+        out[index] = np.ascontiguousarray(image)
+    return out
 
 
 # ---------------------------------------------------------------------------

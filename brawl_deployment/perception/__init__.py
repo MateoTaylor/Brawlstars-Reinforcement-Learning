@@ -7,8 +7,12 @@ Two trackers, not one, because they run at different rates: `tracker` identifies
 4 Hz decision rate, `projectiles` tracks projectiles at the perception rate because at 4 Hz they are barely
 observable at all (BRAWL_DEPLOYMENT_DESIGN.md 9.5).
 
+`loot` shares the projectile model's boxes and keeps the other two classes: crates and dropped
+power cubes, as a sticky map of fixed cells for the grid's `box` and `pickup` planes. It also
+supplies the occupancy map's occlusion masks, for crates and for brawler sprites.
+
 `grid` is the last stage before assembly: it crops the accumulated terrain map and scatters the
-tracks into the eight hero-centred planes the observation's `grid` group wants (6.2). Everything
+tracks into the hero-centred planes the observation's `grid` group wants (6.2). Everything
 it places was produced upstream, so its whole contract is placement -- matching
 `brawl_sim/core/observation.py:_build_grid` cell for cell.
 
@@ -22,6 +26,8 @@ hero's own timers from the actions we issue, which is where the whole `self` gro
 observation fields and a consumer of CV, which is what this subpackage is.
 """
 from .grid import GasMap, GridBuilder, GridSpec
+from .loot import (Loot, LootMap, LootResult, box_occlusion, crate_occlusion,
+                   require_loot_classes)
 from .projectiles import Projectile, ProjectileResult, ProjectileTracker
 from .shadow import Desync, ShadowHero, ShadowParams
 from .tracker import EntityTracker, Track, TrackerResult
@@ -29,6 +35,8 @@ from .zone import ZoneEstimator
 
 __all__ = ["EntityTracker", "Track", "TrackerResult",
            "Projectile", "ProjectileResult", "ProjectileTracker",
+           "Loot", "LootMap", "LootResult", "box_occlusion", "crate_occlusion",
+           "require_loot_classes",
            "ShadowHero", "ShadowParams", "Desync",
            "GridBuilder", "GridSpec", "GasMap",
            "ZoneEstimator"]

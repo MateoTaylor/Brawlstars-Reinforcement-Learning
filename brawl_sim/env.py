@@ -693,7 +693,7 @@ class BrawlVecEnv:
 
     # -- Section 4 phase 11 (box HP already decremented per-source in phases 6/8/9) --
     def _box_phase(self) -> torch.Tensor:
-        return boxes.resolve_broken_boxes(self.state, self.params, self.cfg)
+        return boxes.resolve_broken_boxes(self.state, self.bank, self.params, self.cfg, self.gen)
 
     # -- Section 4 phase 12 --
     def _pickup_phase(self) -> torch.Tensor:

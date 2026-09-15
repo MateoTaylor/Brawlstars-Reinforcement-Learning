@@ -8,10 +8,12 @@ homography matrix and the HUD rectangles are outputs of a calibration script, re
 than edited, and meaningless to hand-tweak. Mixing the two in one file would invite someone to
 "tune" a homography.
 
-**Most defaults below are PLACEHOLDERS, and say so.** A threshold that has not yet been measured
-against real footage is a guess; shipping it silently as a default would make it look like a
-finding. Each one names the phase that replaces it. `configs/randomization.yaml` sets the same
-precedent -- it ships fully commented rather than pretending to a tuning nobody did.
+**The defaults below started as PLACEHOLDERS, and said so.** A threshold that has not yet been
+measured against real footage is a guess; shipping it silently as a default would make it look
+like a finding. Each named the phase that would replace it, and the last (the occupancy pair) was
+measured 2026-09-14; `configs/vision.yaml` says what each value was measured on.
+`configs/randomization.yaml` sets the same precedent -- it ships fully commented rather than
+pretending to a tuning nobody did.
 
 Mirrors `brawl_sim/config.py`'s shape on purpose: a frozen dataclass of static Python values, a
 `(dotted YAML path, field name, coercion)` table, a loader where an absent key keeps the
@@ -96,9 +98,8 @@ class VisionConfig:
     odometry_min_agreement_ratio: float = 0.75
 
     # --- zone / gas (Phase G) ------------------------------------------------------------
-    # PLACEHOLDER, and the most obviously fake numbers in this file -- nobody has looked at a
-    # gas frame yet. HSV, not RGB, for lighting robustness. OpenCV's H channel is 0-179, S and
-    # V are 0-255. Set in Phase G from real frames spanning a shrink.
+    # MEASURED in Phase G on three visually different maps (configs/vision.yaml names them).
+    # HSV, not RGB, for lighting robustness. OpenCV's H channel is 0-179, S and V are 0-255.
     zone_hsv_low: tuple[int, int, int] = (42, 60, 185)
     zone_hsv_high: tuple[int, int, int] = (75, 165, 255)
     # Opening kernel, in rectified pixels. Gas clouds are tens of pixels across; the false
@@ -121,10 +122,10 @@ class VisionConfig:
     # every direction before the grid needs to grow.
     occupancy_grid_h: int = 128
     occupancy_grid_w: int = 128
-    # PLACEHOLDER. Minimum observations before a cell is eligible to lock, and the share of
-    # those votes the winning class must hold. Both trade map-fill speed against the risk of
-    # locking a misclassification permanently -- and locking is forever, so err high. Set in
-    # Phase I against the hand-verified ground-truth grid.
+    # When a cell counts as locked: this many votes, with the winner holding this share. Since
+    # 2026-09-14 a lock freezes nothing -- every cell in view keeps voting, because freezing at
+    # these values froze the map's worst errors (map F1 0.836 against 0.906 never frozen).
+    # configs/vision.yaml has the measurement; occupancy.py's docstring has the table.
     occupancy_min_votes: int = 5
     occupancy_lock_ratio: float = 0.8
 

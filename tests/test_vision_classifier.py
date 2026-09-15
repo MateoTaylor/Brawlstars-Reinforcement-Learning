@@ -340,9 +340,75 @@ def test_training_script_reports_rather_than_inventing_a_number(tmp_path, capsys
 
 def test_labelling_tool_refuses_a_frame_the_clip_does_not_have():
     from scripts import vision_label
-    from brawl_vision.config import VisionConfig
     with pytest.raises(SystemExit):
-        vision_label._frame_at("standstill", 10 ** 6, VisionConfig())
+        vision_label._frame_at("standstill", 10 ** 6)
+
+
+def test_labelling_tool_names_a_missing_clip_rather_than_raising_a_traceback():
+    from scripts import vision_label
+    with pytest.raises(SystemExit, match="no_such_clip.mp4"):
+        vision_label._frame_at("no_such_clip", 0)
+
+
+# ---------------------------------------------------------------------------
+# finding the frame a label points at
+# ---------------------------------------------------------------------------
+
+def test_a_clip_name_resolves_in_the_fixtures_before_training_videos(tmp_path, monkeypatch):
+    """Several training_videos recordings are copies of fixture clips under the same name, and
+    every label that predates the second directory was drawn on the fixture. Fixtures first keeps
+    those labels on the file they were drawn from."""
+    fixtures, videos = tmp_path / "fixtures", tmp_path / "training_videos"
+    fixtures.mkdir()
+    videos.mkdir()
+    for path in (videos / "only_there.mp4", fixtures / "both.mp4", videos / "both.mp4"):
+        path.write_bytes(b"")
+    monkeypatch.setattr(labeling, "CLIP_DIRS", (fixtures, videos))
+    assert labeling.find_clip("only_there") == videos / "only_there.mp4"
+    assert labeling.find_clip("both") == fixtures / "both.mp4"
+    with pytest.raises(FileNotFoundError):
+        labeling.find_clip("nowhere")
+
+
+def test_label_frames_bring_1080p_footage_to_the_calibrated_viewport(plan, monkeypatch):
+    """The emulator recordings normalize to 1920x1080 and the camera model was fit at 2002x1126,
+    so `rectify` refuses them as they come. The deployed capture resizes the same way."""
+    decoded = []
+
+    def walk(path, box, indices):              # walk_frames' contract: (index, normalized image)
+        decoded.extend(indices)
+        for i in indices:
+            yield i, np.zeros((1080, 1920, 3), np.uint8)
+
+    monkeypatch.setattr(labeling, "find_clip", lambda name: Path(f"{name}.mp4"))
+    monkeypatch.setattr(labeling, "load_bounds", lambda path: {
+        "n_frames": 10, "usable": [0, 5], "content_box": [0, 1920, 0, 1080]})
+    monkeypatch.setattr(labeling, "walk_frames", walk)
+    frames = labeling.read_label_frames("emulator", [3, 9, 3], plan.viewport)
+    assert decoded == [3]             # 9 is past the usable range, and a repeat is decoded once
+    assert list(frames) == [3]
+    plan.rectify(frames[3])           # raises on any size but the calibrated one
+
+
+@pytest.mark.vision
+def test_label_frames_are_the_frames_clip_reader_numbers():
+    """A label is addressed by frame index. The labeller and trainer read through
+    `read_label_frames` while everything else reads through `ClipReader`; if the two numbered
+    frames differently, a label would train on a neighbouring frame and nothing would look wrong."""
+    from brawl_vision.config import VisionConfig
+    from brawl_vision.sources import open_source
+    want = {0, 37, 120}
+    ours = labeling.read_label_frames("showdown_alternate_map", want)
+    theirs = {}
+    with open_source(labeling.find_clip("showdown_alternate_map"), VisionConfig()) as src:
+        for frame in src:
+            if frame.index in want:
+                theirs[frame.index] = frame.image
+            if frame.index >= max(want):
+                break
+    assert set(ours) == set(theirs) == want
+    for i in sorted(want):
+        assert np.array_equal(ours[i], theirs[i]), f"frame {i} differs"
 
 
 # ---------------------------------------------------------------------------

@@ -79,7 +79,7 @@ def _parse(argv=None) -> argparse.Namespace:
     ap.add_argument("--name", default="projectiles", help="run name under runs/")
     ap.add_argument("--epochs", type=int, default=300)
     ap.add_argument("--imgsz", type=int, default=960)
-    ap.add_argument("--batch", type=int, default=16)
+    ap.add_argument("--batch", type=int, default=32)
     ap.add_argument("--weights", default=str(HERE / "yolo26n.pt"),
                     help="checkpoint to fine-tune from (default: the COCO yolo26n.pt)")
     args = ap.parse_args(argv)
