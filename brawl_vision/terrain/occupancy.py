@@ -59,6 +59,31 @@ Accumulating *rounded* increments instead would round each 0.3 to 0 and the map 
 that is the specific mechanism by which a plausible odometry error becomes a visibly sheared map,
 and `tests/test_vision_occupancy.py` pins it.
 
+**Pass a registered plan (since 2026-09-14).** Rounding the position keeps the map from shearing,
+but it still drops each frame's remainder: through the fixed plan, a frame's cells sit up to half a
+tile off the map's cells, by a different amount each frame. Every tool that deposits now rectifies
+each frame with `plan.registered(odometry.position_tiles)`, which moves the frame's content by that
+remainder so the rounding below is exact. The fixed plan still deposits: nothing here checks, and
+the tests use it at whole-tile positions. Scored on the protocol above, never frozen (9939
+deposits, whose remainder averaged 0.24 tile and was over 0.25 on some axis for 72% of them):
+
+                                                 blocking F1   recall  precision  5-class acc
+    fixed plan, position rounded                 0.906         0.890   0.923      0.931
+    registered plan                              0.942         0.938   0.946      0.959
+
+The gain is largest on the walls that touch walkable cells, the ones a policy steers around: F1
+0.869 -> 0.922 there, and 0.880 -> 0.911 inside wall runs.
+
+The protocol is `scripts/vision_score_map.py` since 2026-09-15, which reproduces the registered row
+exactly with `--one-mask phone`: every label then sat under the phone's HUD mask. Since the 19
+emulator labels moved to the emulator mask the same weights score 0.945 (R 0.939, P 0.952, 5-class
+0.961), and 0.932 on those 19 windows alone.
+
+Registration puts every frame on the map's lattice, which is whatever world frame `odometry` is
+in. The offline tools pass Phase F's own, whose whole tiles sit at an arbitrary sub-tile offset
+from the game's. The deploy loop passes a world moved onto the game's lattice from crate sightings
+(`brawl_deployment/perception/lattice.py`), and changes `segment` whenever it moves it.
+
 **Never-observed cells stay UNKNOWN, and that is correct fog-of-war, not a gap to fill.** Whatever
 consumes this map must treat UNKNOWN as its own state: a policy that believes unexplored ground is
 walkable will walk into walls.

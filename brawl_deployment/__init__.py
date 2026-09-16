@@ -23,7 +23,8 @@ full argument):
     mss grab, 2560x1440         18.1 ms mean, 19.3 p95     <- the capture path
     adb exec-out screencap      ~290 ms                     <- NOT the capture path
     persistent adb shell RTT     0.51 ms
-    4 process spawns on device   5.77 ms                    <- one joystick MOVE costs this
+    one builtin write, 13 events 0.58 ms                    <- an aimed press; a MOVE is less
+    one `sendevent` spawn        1.4-45 ms                  <- idle vs game loaded; NOT used (control/adb.py)
 
 `adb screencap` is 16x slower than grabbing the monitor and does not fit in a 50 ms perception
 tick, let alone leave room for anything else. It is a fine diagnostic and a bad frame source.

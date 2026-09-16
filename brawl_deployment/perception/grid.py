@@ -20,6 +20,11 @@ subtly wrong:
 * The crop moves in whole tiles. Sub-tile hero motion changes nothing until it crosses a cell
   boundary, at which point the whole grid shifts by one. That is the sim's behaviour and so it is
   this module's; smoothing it would be a different observation.
+* Whole tiles of WHICH lattice matters. The sim's walls fill whole tiles, and its floor counts in
+  them. Here every position is in the loop's world frame, which `lattice.py` moves onto the game's
+  lattice from crate sightings (to about 0.1 tile). Before a segment locks, or on one with no
+  full-height crate, the world's whole tiles are odometry's arbitrary ones, and every plane here
+  sits off the sim's by that sub-tile phase.
 
 #### Counts, not booleans, on the dynamic planes
 
@@ -291,6 +296,7 @@ class GasMap:
         ox, oy = self.origin
         # Round only here, for the same reason occupancy does: `position_tiles` stays continuous
         # so a run of sub-tile steps accumulates instead of being discarded a fraction at a time.
+        # The loop passes a `registered` plan, for which this sum is already whole.
         col0 = int(round(plan.origin_tile[0] + px)) - ox
         row0 = int(round(plan.origin_tile[1] + py)) - oy
 

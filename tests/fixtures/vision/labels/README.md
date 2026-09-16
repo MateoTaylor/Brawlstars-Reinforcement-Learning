@@ -61,13 +61,21 @@ Cells hidden by a **loot box or a brawler** should be left unlabelled. The tool 
 those yet (that is the entity chunk), so it is on you to skip them; a box sitting on floor is not
 an example of floor.
 
-**Some on-screen buttons show through.** `hud_mask.json` blanks the joystick and the attack/super
-buttons of one HUD layout. The green gadget button is outside it in every recording, and so are the
-emote bubble and the kill feed. Recordings with the smaller buttons further right
-(`day12_recording*`, `ScreenRecording_08-31-2026 10-16-29_1`, all the `09-04` recordings) and the
-1080p emulator captures show their attack and super buttons too, while the mask blanks world
-nobody is covering. Leave cells under any button `?`, and check them after a `c` fill, which will
-assign a button to whatever cluster it resembles.
+**Cells under the recording's buttons are refused**, by the HUD mask the file records (`"hud"`).
+There are two (`brawl_vision/data/`): `hud_mask.json`, the phone's Layout A, and
+`hud_mask_emulator.json`, BlueStacks + Nulls Brawl. A new file on an emulator recording
+(`bluestacks-*`, `9-10_new*`, `edited_day14_broll`: `labeling.EMULATOR_CLIP_PREFIXES`) takes the
+emulator one and anything else the phone one; `--hud emulator` or `--hud phone` overrides that, and
+on an existing file it moves the labels across, clearing any the new mask covers. A new emulator
+recording needs its name added there: a test checks the rule against every recording's size.
+
+**Some on-screen buttons still show through.** The phone mask misses the green gadget button in
+every recording, and its emote bubble. The recordings with the smaller buttons further right
+(`day12_recording*`, `ScreenRecording_08-31-2026 10-16-29_1`, all the `09-04` recordings) are a
+third layout with no mask of their own, so their attack and super buttons are offered while world
+nobody is covering is refused. On the emulator recordings a human's joystick can sit outside the
+two spots the emulator mask covers. Leave cells under any button `?`, and check them after a `c`
+fill, which will assign a button to whatever cluster it resembles.
 
 ## Then
 
@@ -83,7 +91,7 @@ memorisation.
 
 ```json
 { "clip": "...", "frame": 700,
-  "origin_tile": [-8, -8], "size_tiles": [30, 19], "pixels_per_tile": 48,
+  "origin_tile": [-8, -8], "size_tiles": [30, 19], "pixels_per_tile": 48, "hud": "emulator",
   "legend": {".": "FLOOR", "#": "WALL", "b": "BUSH", "~": "WATER", "f": "FENCE", "?": "UNLABELLED"},
   "grid": ["??????????...", "...."] }
 ```
@@ -94,3 +102,10 @@ not distinguish "skipped" from "not reached", because nothing downstream needs i
 The geometry travels with the labels and is checked on load. If the camera is ever recalibrated
 and the rectified window moves, every stored label would point at different world with nothing
 looking wrong, so that mismatch is a hard error rather than a warning.
+
+`hud` names the mask the cells were judged against; a file without it predates the key and was
+drawn under the phone mask. The 19 emulator labels were moved to the emulator mask on 2026-09-15,
+which cleared 634 labelled cells under its buttons and opened 35 cells per frame that the phone
+mask had refused. Those 35 are unlabelled until someone reopens the frame. The same day, 43 cells in
+eleven phone labels were cleared: they sat under the phone's chat-bubble rect, widened after they
+were drawn.

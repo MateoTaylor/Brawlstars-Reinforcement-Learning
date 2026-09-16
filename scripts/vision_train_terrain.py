@@ -12,26 +12,28 @@ survive a reskin, so the only honest question is how it does on a map it has nev
 
 With one map's labels there is nothing to hold out and the script says so rather than reporting a
 same-map number that would look like a result.
+
+Each label is trained under the HUD mask it records (`LabelGrid.hud`): cells under that layout's
+buttons are never targets, and gas is judged against the same mask.
 """
 import argparse
 import sys
 from pathlib import Path
 
-import numpy as np
-
-from brawl_vision.camera import build_rectify_plan, load_camera_model, load_hud_mask
 from brawl_vision.config import load_vision_config
 from brawl_vision.terrain.classifier import build_examples, evaluate, train
-from brawl_vision.terrain.labeling import CLASSES, load_label_dir, read_label_frames
+from brawl_vision.terrain.labeling import CLASSES, hud_plans, load_label_dir, read_label_frames
 from brawl_vision.terrain.zone import detect_zone
 
 REPO = Path(__file__).resolve().parent.parent
 LABELS = REPO / "tests" / "fixtures" / "vision" / "labels"
 
 
-def _rects_for(grids, plan):
+def _rects_for(grids, plans):
     """Decode each labelled frame once, one sequential pass per clip, exactly as the labeller did
-    (`labeling.read_label_frames`): same lookup, same frame counting, same resize."""
+    (`labeling.read_label_frames`): same lookup, same frame counting, same resize. Any plan
+    rectifies alike; the HUD masks differ only in `valid`."""
+    plan = next(iter(plans.values()))
     wanted = {}
     for g in grids:
         wanted.setdefault(g.clip, set()).add(g.frame)
@@ -49,6 +51,15 @@ def _rects_for(grids, plan):
     return out
 
 
+def examples_for(grids, plans, cfg):
+    """The training examples for `grids`, each under its own HUD mask, gas excluded."""
+    rects = _rects_for(grids, plans)
+    exclude = {(g.clip, g.frame): detect_zone(rects[(g.clip, g.frame)], plans[g.hud],
+                                              cfg).at_least(0.05)
+               for g in grids}
+    return build_examples([(g, rects[(g.clip, g.frame)]) for g in grids], plans, exclude)
+
+
 def main(argv=None) -> int:
     p = argparse.ArgumentParser(description=__doc__,
                                 formatter_class=argparse.RawDescriptionHelpFormatter)
@@ -63,17 +74,14 @@ def main(argv=None) -> int:
     args = p.parse_args(argv)
 
     cfg = load_vision_config()
-    plan = build_rectify_plan(load_camera_model(), load_hud_mask())
-    grids = load_label_dir(args.labels, plan)
+    plans = hud_plans()
+    grids = load_label_dir(args.labels, plans["phone"])
     if not grids:
         print(f"no label files in {args.labels}. Run scripts/vision_label.py first.",
               file=sys.stderr)
         return 1
 
-    rects = _rects_for(grids, plan)
-    exclude = {(g.clip, g.frame): detect_zone(rects[(g.clip, g.frame)], plan, cfg).at_least(0.05)
-               for g in grids}
-    examples = build_examples([(g, rects[(g.clip, g.frame)]) for g in grids], plan, exclude)
+    examples = examples_for(grids, plans, cfg)
 
     clips = sorted({e.clip for e in examples})
     labelled = sum(int((e.target >= 0).sum()) for e in examples)

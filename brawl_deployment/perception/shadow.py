@@ -417,9 +417,10 @@ class ShadowHero:
         other direction: there is only ever one attack queued, so sub-ticks 2..K of a decision
         cannot repeat it.
 
-        A second `act` before any sub-tick has run refuses the attack. The device would swallow
-        that tap too -- `Buttons.tap` releases a still-held contact before re-pressing -- and
-        modelling a shot the game did not take is the one error this class must never make.
+        A second `act` before any sub-tick has run refuses the attack. The device would not take
+        that shot on this decision's terms either -- `Buttons.press` finishes a press still in
+        flight before starting another -- and modelling a shot the game did not take is the one
+        error this class must never make.
         """
         self._move = int(move)
         if attack == ATTACK_NONE or self._pending_attack != ATTACK_NONE:
@@ -432,6 +433,25 @@ class ShadowHero:
         else:
             return ATTACK_NONE
         return self._pending_attack
+
+    @property
+    def attack_bearing(self) -> float:
+        """Radians, in the sim's frame: where an attack queued by the last `act` will go. What the
+        loop hands `Buttons.press` to aim the drag.
+
+        The same choice `_start_dash` makes on the next sub-tick -- the held move bin, or `facing`
+        when it is idle (`action.dash_on_idle: facing`) -- read from the same state. Nothing
+        between `act` and that sub-tick can move it: the attack runs in phase 6, before phase 7
+        turns `facing` toward the new bin, and an idle bin never turns it.
+
+        The super reads it too. In the sim an idle super goes along a zero `move_dir` and does not
+        travel; the game has no such shot, and `facing` is the nearest thing to what the policy
+        meant.
+        """
+        move_dir = self._dir_from_bin(self._move)
+        if move_dir is None:
+            return float(self.facing)
+        return math.atan2(float(move_dir[1]), float(move_dir[0]))
 
     def advance(self, seconds: float) -> int:
         """Run whole `dt` sub-ticks out of `seconds` of real time. Returns how many ran.

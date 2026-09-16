@@ -17,8 +17,11 @@ caller to special-case.
 capture -- not zero, not a sentinel large number -- because a progress bar or a bounded loop over
 live capture is a bug, and `None` makes it one at the point it is written.
 """
+from dataclasses import replace
 from pathlib import Path
-from typing import Iterator, Protocol
+from typing import Iterable, Iterator, Protocol
+
+import cv2
 
 from .capture import Frame
 from .config import VisionConfig
@@ -101,3 +104,20 @@ def open_source(spec: str | Path | None = None, cfg: VisionConfig | None = None,
 def is_live(source: FrameSource) -> bool:
     """True when the source never ends. Worth asking before anything that buffers or seeks."""
     return source.n_frames is None
+
+
+def at_viewport(frames: Iterable[Frame], viewport: tuple[int, int]) -> Iterator[Frame]:
+    """`frames`, each resized to `viewport` (a plan's) when it arrives at another size.
+
+    For the 1080p emulator recordings: `ClipReader` crops them and normalizes their aspect, but
+    not their size, and `RectifyPlan.rectify` refuses anything but the calibrated viewport. The
+    deployed capture resizes the same way (`brawl_deployment.capture.to_viewport`), so a recording
+    read through this lands on the geometry the bot sees. A frame already at `viewport` passes
+    through untouched.
+    """
+    viewport = tuple(viewport)
+    for frame in frames:
+        if frame.image.shape[1::-1] != viewport:
+            frame = replace(frame, image=cv2.resize(frame.image, viewport,
+                                                    interpolation=cv2.INTER_AREA))
+        yield frame

@@ -39,8 +39,9 @@ import time
 import matplotlib
 
 from brawl_vision.camera import build_rectify_plan, load_camera_model, load_hud_mask
-from brawl_vision.config import load_vision_config
-from brawl_vision.sources import open_source
+from brawl_vision.config import HUD_MASKS, load_vision_config
+from brawl_vision.sources import at_viewport, open_source
+from brawl_vision.terrain.labeling import default_hud
 from brawl_vision.terrain.odometry import Odometry
 from brawl_vision.terrain.occupancy import UNKNOWN, OccupancyMap
 from brawl_vision.terrain.zone import detect_zone
@@ -63,8 +64,13 @@ def _stages(frames, plan, odometry, cfg, occupancy, classifier=None):
         t3 = time.perf_counter()
         grid = None
         if classifier is not None:
-            cells, _ = classifier.predict(rect, plan)
-            occupancy.update(cells, odo, plan, zone=zone.at_least(0.05), cfg=cfg)
+            # Deposited as the deploy loop deposits: the frame re-rectified onto the map's lattice
+            # (`RectifyPlan.registered`). The panels keep the fixed-plan `rect` and `zone`.
+            reg = plan.registered(odo.position_tiles)
+            reg_rect = reg.rectify(frame.image) if reg is not plan else rect
+            cells, _ = classifier.predict(reg_rect, reg)
+            reg_zone = detect_zone(reg_rect, reg, cfg) if reg is not plan else zone
+            occupancy.update(cells, odo, reg, zone=reg_zone.at_least(0.05), cfg=cfg)
             grid = _occupancy_view(occupancy)
         t4 = time.perf_counter()
         yield StageFrame(
@@ -113,6 +119,16 @@ def _window(source, start, stop, step=1):
         yield frame
 
 
+def _hud(args) -> str:
+    """The HUD mask the source was captured under. Anything live is the emulator, the only thing
+    this runs against live; a recording goes by its name (`labeling.default_hud`)."""
+    if args.hud:
+        return args.hud
+    if args.live or args.source == "deploy" or args.source.split(":")[0] == "screen":
+        return "emulator"
+    return default_hud(args.source)
+
+
 def _open(args, cfg):
     """The source, with one extra mode `open_source` deliberately does not know about.
 
@@ -153,6 +169,9 @@ def main(argv=None) -> int:
     p.add_argument("--terrain", default=None,
                    help="a trained classifier checkpoint; without it the occupancy panel stays "
                         "empty, since there is nothing to accumulate")
+    p.add_argument("--hud", choices=sorted(HUD_MASKS), default=None,
+                   help="the HUD mask the source was captured under (default: a recording's from "
+                        "its name; live capture is the emulator)")
     args = p.parse_args(argv)
 
     # `open_source(None)` would happily grab the screen, but bare `vision_watch.py` typed by
@@ -164,7 +183,9 @@ def main(argv=None) -> int:
         matplotlib.use("Agg")     # must precede pyplot's first figure; no window is wanted here
 
     cfg = load_vision_config(args.config) if args.config else load_vision_config()
-    hud = load_hud_mask()
+    layout = _hud(args)
+    print(f"{layout} HUD mask")
+    hud = load_hud_mask(HUD_MASKS[layout])
     model = load_camera_model()
     plan = build_rectify_plan(model, hud)
 
@@ -176,8 +197,8 @@ def main(argv=None) -> int:
     overlay = TerrainOverlay(plan, hud, model)
     occupancy = OccupancyMap.from_config(cfg)
     with _open(args, cfg) as source:
-        stages = _stages(_window(source, args.start, args.stop, args.step), plan, Odometry(plan, cfg), cfg,
-                         occupancy, classifier)
+        frames = at_viewport(_window(source, args.start, args.stop, args.step), plan.viewport)
+        stages = _stages(frames, plan, Odometry(plan, cfg), cfg, occupancy, classifier)
         if args.save:
             overlay.save(args.save, stages, fps=args.fps)
             print(f"wrote {args.save}")

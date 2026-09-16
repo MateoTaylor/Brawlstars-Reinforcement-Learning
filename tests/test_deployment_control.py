@@ -4,15 +4,19 @@ Everything here runs WITHOUT BlueStacks attached -- the touch backend is exercis
 `NullBackend`, and only the tests that read real footage carry `@pytest.mark.vision`. That is
 deliberate: a test suite that needs an emulator running is a test suite nobody runs.
 """
+import io
 import json
 import math
+import re
+import struct
 
 import numpy as np
 import pytest
 
 from brawl_deployment.control import (ATTACK_FIRE, ATTACK_NONE, ATTACK_SUPER, Buttons, Joystick,
                                       NullBackend, SLOT_MOVE, SLOT_TAP)
-from brawl_deployment.control.adb import AdbTouchBackend, find_adb_serial
+from brawl_deployment.control.adb import (DEVICE_FD, EVENT_STRUCTS, AdbTouchBackend,
+                                          find_adb_serial)
 from brawl_deployment.capture import to_viewport
 from brawl_deployment.match_state import (CALIBRATION_PATH, Calibration, MatchState,
                                           refine_radius)
@@ -87,44 +91,104 @@ def test_apply_acquires_if_not_down():
 
 # ---------------------------------------------------------------- buttons
 
-def test_tap_targets_the_right_button():
+def test_a_press_goes_down_on_the_right_origin():
+    """Fire goes down on the attack clearance point, super on the super button's centre."""
     b = NullBackend()
-    btn = Buttons(b, attack=(1676.5, 999.5), super_=(1462.5, 1000.5))
-    assert btn.tap(ATTACK_FIRE)
-    assert b.contacts[SLOT_TAP] == (1676.5, 999.5)
-    btn.settle()
-    assert btn.tap(ATTACK_SUPER)
-    assert b.contacts[SLOT_TAP] == (1462.5, 1000.5)
+    btn = Buttons(b, attack=(1690.0, 594.0), super_=(1462.5, 1000.5))
+    assert btn.press(ATTACK_FIRE, 0.0)
+    assert b.log[-1] == ("down", SLOT_TAP, 1690.0, 594.0)
+    btn.release()
+    assert btn.press(ATTACK_SUPER, 0.0)
+    assert b.log[-1] == ("down", SLOT_TAP, 1462.5, 1000.5)
 
 
 def test_none_presses_nothing():
     b = NullBackend()
     btn = Buttons(b, attack=(1.0, 2.0), super_=(3.0, 4.0))
-    assert not btn.tap(ATTACK_NONE)
+    assert not btn.press(ATTACK_NONE, 0.0)
     assert b.log == []
+    assert not btn.is_held
+    with pytest.raises(ValueError, match="no aim point"):
+        btn.aim_point(ATTACK_NONE, 0.0)
 
 
-def test_repeat_tap_releases_first():
-    """Two taps in a row must not swallow the second -- a down on an already-held slot is not a
-    fresh press."""
+def test_a_press_is_down_then_drag_then_lift_one_step_per_settle():
+    """Never two steps in one call. A down and a drag landing in the same game frame would put
+    the floating stick's centre at the dragged point -- a zero-length drag, which the game reads
+    as a tap and auto-aims. The lift is what fires, and it comes on the second settle."""
     b = NullBackend()
-    btn = Buttons(b, attack=(1.0, 2.0), super_=(3.0, 4.0))
-    btn.tap(ATTACK_FIRE)
-    btn.tap(ATTACK_FIRE)
-    kinds = [e[0] for e in b.log]
-    assert kinds == ["down", "up", "down"]
+    btn = Buttons(b, attack=(1000.0, 500.0), super_=(3.0, 4.0), aim_radius_px=80.0)
+    btn.press(ATTACK_FIRE, 0.0)
+    assert b.log == [("down", SLOT_TAP, 1000.0, 500.0)]
+    assert btn.is_held
+    btn.settle()
+    assert b.log[1] == ("move", SLOT_TAP, 1080.0, 500.0)
+    assert btn.is_held
+    btn.settle()
+    assert b.log[2] == ("up", SLOT_TAP)
+    assert not btn.is_held and SLOT_TAP not in b.contacts
+    btn.settle()                                  # nothing in flight: nothing sent
+    assert len(b.log) == 3
 
 
-def test_tap_does_not_disturb_the_movement_contact():
-    """The whole point of multitouch here: firing must not lift the held joystick contact."""
+def test_the_drag_follows_the_bearing_with_no_y_flip():
+    """World y and screen y both increase downward, so a quarter turn from +x drags DOWN the
+    screen. A minus sign here would mirror every dash across the horizontal -- the attack twin of
+    `test_bin_directions_have_no_y_flip`."""
+    btn = Buttons(NullBackend(), attack=(0.0, 0.0), super_=(500.0, 500.0), aim_radius_px=100.0)
+    assert btn.aim_point(ATTACK_FIRE, 0.0) == pytest.approx((100.0, 0.0), abs=1e-9)
+    assert btn.aim_point(ATTACK_FIRE, math.pi / 2) == pytest.approx((0.0, 100.0), abs=1e-9)
+    assert btn.aim_point(ATTACK_FIRE, math.pi) == pytest.approx((-100.0, 0.0), abs=1e-9)
+    assert btn.aim_point(ATTACK_FIRE, -math.pi / 2) == pytest.approx((0.0, -100.0), abs=1e-9)
+    # The super drags from ITS origin, not the attack point's.
+    assert btn.aim_point(ATTACK_SUPER, math.pi / 2) == pytest.approx((500.0, 600.0), abs=1e-9)
+
+
+def test_a_press_over_a_press_in_flight_finishes_it_first():
+    """A down on a slot that already holds a contact is not a fresh press, so an in-flight press
+    is completed before the next goes down -- dragged to ITS aim and lifted, so that shot still
+    goes where it was aimed rather than being swallowed or fired as a tap."""
+    b = NullBackend()
+    btn = Buttons(b, attack=(1000.0, 500.0), super_=(3.0, 4.0), aim_radius_px=80.0)
+    btn.press(ATTACK_FIRE, 0.0)                   # not yet dragged
+    btn.press(ATTACK_FIRE, math.pi)
+    assert b.log == [("down", SLOT_TAP, 1000.0, 500.0), ("move", SLOT_TAP, 1080.0, 500.0),
+                     ("up", SLOT_TAP), ("down", SLOT_TAP, 1000.0, 500.0)]
+    btn.settle()                                  # dragged; the next press only has to lift
+    btn.press(ATTACK_FIRE, 0.0)
+    assert [e[0] for e in b.log[4:]] == ["move", "up", "down"]
+    assert b.log[4][2:] == pytest.approx((920.0, 500.0))
+
+
+def test_release_lifts_at_any_stage_and_is_idempotent():
+    """The fail-closed path. `release` lifts NOW -- it does not walk the press on -- and a second
+    call sends nothing, because `Controls.release_all` runs in exception handlers."""
+    for settles, kinds in ((0, ["down", "up"]), (1, ["down", "move", "up"])):
+        b = NullBackend()
+        btn = Buttons(b, attack=(1000.0, 500.0), super_=(3.0, 4.0))
+        btn.press(ATTACK_FIRE, 0.0)
+        for _ in range(settles):
+            btn.settle()
+        btn.release()
+        btn.release()
+        assert [e[0] for e in b.log] == kinds
+        assert not btn.is_held
+
+
+def test_a_press_does_not_disturb_the_movement_contact():
+    """The whole point of multitouch here: firing must not lift or move the held joystick contact,
+    at any step of the press."""
     b = NullBackend()
     j = Joystick(b, anchor=(300.0, 700.0), radius_px=140.0)
     btn = Buttons(b, attack=(1676.5, 999.5), super_=(1462.5, 1000.5))
     j.apply(7)
     held = b.contacts[SLOT_MOVE]
-    btn.tap(ATTACK_FIRE)
+    before = len(b.log)
+    btn.press(ATTACK_FIRE, 1.0)
+    btn.settle()
     btn.settle()
     assert b.contacts[SLOT_MOVE] == held
+    assert [e[1] for e in b.log[before:]] == [SLOT_TAP] * 3
     assert j.is_down
 
 
@@ -149,6 +213,125 @@ def test_offscreen_coordinates_clamp():
     be.screen_w, be.screen_h, be.abs_max = 1920, 1080, 32767
     assert be._to_raw(-50, -50) == (0, 0)
     assert be._to_raw(5000, 5000) == (32767, 32767)
+
+
+# ---------------------------------------------------------------- adb transport
+
+_OCTAL = re.compile(r"\\0([0-7]{3})")
+
+
+class _Shell:
+    """The device-side shell as the backend sees it: a stdin that keeps every line, a stdout
+    scripted by the test."""
+
+    def __init__(self, stdout=b""):
+        self.lines = []
+        self.stdout = io.BytesIO(stdout)
+        self.stdin = self
+        self.terminated = False
+
+    def write(self, data):
+        self.lines.append(data)
+
+    def flush(self):
+        pass
+
+    def poll(self):
+        return None
+
+    def terminate(self):
+        self.terminated = True
+
+
+def _backend(stdout=b"", event_size=24):
+    be = AdbTouchBackend.__new__(AdbTouchBackend)      # no emulator
+    be.serial, be.device = "127.0.0.1:5555", "/dev/input/event4"
+    be.screen_w, be.screen_h, be.abs_max = 1920, 1080, 32767
+    be._contacts, be._next_tracking_id = {}, 1
+    be.event_struct = EVENT_STRUCTS[event_size]
+    be._proc = _Shell(stdout)
+    return be
+
+
+def _decode(line, event_size=24):
+    """A shell line back into `(type, code, value)` events -- by the test's own regex and struct,
+    not the backend's encoder, so a wrong escape or a wrong layout cannot agree with itself."""
+    assert line.startswith(f"print -n '") and line.endswith(f"' >&{DEVICE_FD}\n"), line
+    payload = line[len("print -n '"):-len(f"' >&{DEVICE_FD}\n")]
+    raw = bytes(int(m, 8) for m in _OCTAL.findall(payload))
+    assert len(raw) == len(payload) // 5, "every byte is exactly one five-character escape"
+    assert len(raw) % event_size == 0
+    fmt = "<qqHHi" if event_size == 24 else "<iiHHi"
+    out = []
+    for i in range(0, len(raw), event_size):
+        sec, usec, t, c, v = struct.unpack(fmt, raw[i:i + event_size])
+        assert (sec, usec) == (0, 0), "timestamps are ignored on the write path and go out zero"
+        out.append((t, c, v))
+    return out
+
+
+def test_a_touch_step_is_one_builtin_write_and_spawns_nothing():
+    """The lag of 2026-09-16: `sendevent` is a process spawn per event, ~45 ms each with the game
+    loaded, and an aimed press is 13 of them. One `print` builtin writing the packed structs to a
+    descriptor the shell holds open costs 0.6 ms for the same 13 -- so a touch step must be one
+    line, one write, and never the name of a program."""
+    be = _backend()
+    be.down(SLOT_TAP, 1690.0, 594.0)
+    assert len(be._proc.lines) == 1
+    line = be._proc.lines[0].decode("ascii")
+    assert "sendevent" not in line
+    rx, ry = be._to_raw(1690.0, 594.0)
+    assert _decode(line) == [(3, 47, SLOT_TAP), (3, 57, 1), (3, 53, rx), (3, 54, ry), (3, 48, 8),
+                             (1, 330, 1), (0, 0, 0)]
+
+
+def test_the_line_stays_ascii_for_negative_values():
+    """adb 1.0.36 cannot forward binary on Windows, so the bytes travel as octal escapes. -1 (the
+    Type-B "slot empty" tracking id) is the case with every byte set."""
+    be = _backend()
+    be.down(SLOT_TAP, 100.0, 100.0)
+    be.up(SLOT_TAP)
+    line = be._proc.lines[-1]
+    line.decode("ascii")                       # raises if anything but ASCII went on the pipe
+    assert all(32 <= b < 127 or b == 10 for b in line)
+    assert _decode(line.decode()) == [(3, 47, SLOT_TAP), (3, 57, -1), (1, 330, 0), (0, 0, 0)]
+
+
+def test_a_32_bit_shell_gets_16_byte_events():
+    """The kernel sizes `input_event` by the WRITER's ABI and refuses the wrong length, so the
+    struct follows the shell's ELF class, which the handshake reads."""
+    be = _backend(event_size=16)
+    be.move(SLOT_MOVE, 10.0, 10.0)             # not down: nothing sent
+    assert be._proc.lines == []
+    be.down(SLOT_MOVE, 10.0, 10.0)
+    events = _decode(be._proc.lines[0].decode(), event_size=16)
+    assert [e[:2] for e in events] == [(3, 47), (3, 57), (3, 53), (3, 54), (3, 48), (1, 330), (0, 0)]
+
+
+def test_the_handshake_reads_the_shell_class_and_proves_one_write():
+    be = _backend(stdout=b" 02\nOPEN\nOK\n", event_size=16)   # wrong size on purpose
+    be._handshake()
+    assert be.event_struct is EVENT_STRUCTS[24]
+    sent = [l.decode() for l in be._proc.lines]
+    assert sent[0].startswith("od -An -tx1 -j4 -N1 /proc/$$/exe; [ -w /dev/input/event4 ] && exec 3>/dev/input/event4")
+    assert _decode(sent[1].replace(" && echo OK || echo FAIL", "")) == [(0, 0, 0)]
+    assert sent[1].rstrip("\n").endswith(" && echo OK || echo FAIL")
+
+
+@pytest.mark.parametrize("stdout,match", [
+    (b" 02\nNOOPEN\n", "cannot open"),
+    (b" 02\nOPEN\nFAIL\n", "refused"),
+    (b"", "did not answer"),
+])
+def test_the_handshake_refuses_a_session_that_cannot_write(stdout, match, monkeypatch):
+    """A session whose writes go nowhere would look exactly like a working one from the loop --
+    `_send` never reads a reply -- so the one exchange at startup has to be the check."""
+    monkeypatch.setattr("brawl_deployment.control.adb.HANDSHAKE_TIMEOUT_S", 0.2)
+    be = _backend(stdout=stdout)
+    shell = be._proc
+    with pytest.raises(RuntimeError, match=match):
+        be._handshake()
+    assert shell.terminated and not be.is_alive
 
 
 # ---------------------------------------------------------------- calibration
@@ -211,6 +394,41 @@ def test_every_bin_stays_on_screen():
     for move in range(0, j.n_bins + 1):
         x, y = j.contact_point(move)
         assert 0 <= x < w and 0 <= y < h, f"bin {move} lands off-screen at ({x:.1f}, {y:.1f})"
+
+
+def _shipped_buttons() -> tuple[Buttons, tuple[int, int]]:
+    """Built the way `Controls.build` builds them, from the shipped calibration and config."""
+    from brawl_deployment.config import load_deployment_config
+    cal = Calibration.load()
+    dcfg = load_deployment_config()
+    w, h = cal.screen
+    btn = Buttons(NullBackend(),
+                  attack=(dcfg.control_attack_tap[0] * w, dcfg.control_attack_tap[1] * h),
+                  super_=cal.button("super"), aim_radius_px=dcfg.control_aim_radius_px)
+    return btn, cal.screen
+
+
+def test_every_aim_stays_on_screen():
+    """The attack twin of the test above, and it bites harder: the backend clamps an off-screen
+    point to the edge, so a clamped DRAG lifts somewhere real, aimed the wrong way. The super
+    button sits 81 px above the bottom edge, so downward supers are the case that fails first.
+    Swept over bearings rather than trusting `require_on_screen`'s own arithmetic."""
+    btn, (w, h) = _shipped_buttons()
+    btn.require_on_screen((w, h))
+    for action in (ATTACK_FIRE, ATTACK_SUPER):
+        for k in range(64):
+            x, y = btn.aim_point(action, k * 2.0 * math.pi / 64)
+            assert 0 <= x <= w - 1 and 0 <= y <= h - 1, (
+                f"action {action} at bearing {k}/64 of a turn drags off-screen to ({x:.1f}, {y:.1f})")
+
+
+def test_a_radius_that_drags_the_super_off_screen_is_refused():
+    """What `Controls.build` runs before the first match. 90 px clears the attack point by a mile
+    and still drags a downward super 9 px past the bottom edge."""
+    btn, screen = _shipped_buttons()
+    btn.aim_radius_px = 90.0
+    with pytest.raises(ValueError, match="super"):
+        btn.require_on_screen(screen)
 
 
 # ---------------------------------------------------------------- the in-match gate

@@ -85,10 +85,11 @@ from pathlib import Path
 import cv2
 
 from brawl_vision.camera import build_rectify_plan, load_camera_model, load_hud_mask
-from brawl_vision.config import load_vision_config
+from brawl_vision.config import HUD_MASKS, load_vision_config
 from brawl_vision.sources import open_source
 from brawl_vision.terrain.classifier import TerrainClassifier
 from brawl_vision.terrain.evaluate import render, scan_track
+from brawl_vision.terrain.labeling import default_hud
 
 DEFAULT_TERRAIN = Path(__file__).resolve().parent.parent / "brawl_vision" / "data" / "terrain.pt"
 
@@ -213,6 +214,8 @@ def main(argv=None) -> int:
                         "panels are the same extent tile-for-tile; 'policy' crops further to the "
                         "21x13 window the agent is actually handed. Cropping needs a classifier")
     p.add_argument("--config", default=None, help="a vision.yaml to use instead of the default")
+    p.add_argument("--hud", choices=sorted(HUD_MASKS), default=None,
+                   help="the HUD mask the clip was captured under (default: from its name)")
     p.add_argument("--quiet", action="store_true")
     args = p.parse_args(argv)
 
@@ -221,7 +224,8 @@ def main(argv=None) -> int:
         print(f"no such clip: {clip}", file=sys.stderr)
         return 2
     cfg = load_vision_config(args.config) if args.config else load_vision_config()
-    plan = build_rectify_plan(load_camera_model(), load_hud_mask())
+    hud = args.hud or default_hud(clip)
+    plan = build_rectify_plan(load_camera_model(), load_hud_mask(HUD_MASKS[hud]))
 
     detector = None
     projectiles = None
@@ -316,6 +320,7 @@ def main(argv=None) -> int:
 
     say = (lambda *a: None) if args.quiet else (lambda *a: print(*a, flush=True))
 
+    say(f"{hud} HUD mask")
     say(f"pass 1/2  odometry over {clip.name} (every {args.scan_step} frames, canvas sizing only)")
     viewport = tuple(plan.viewport)
     with open_source(clip, cfg, step=args.scan_step) as src:

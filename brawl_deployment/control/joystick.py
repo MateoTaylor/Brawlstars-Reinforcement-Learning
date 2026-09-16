@@ -68,9 +68,8 @@ class Joystick:
         """Drive one decision's movement. Acquires the contact if it is not already down.
 
         Skips the write when the bin is unchanged, which is the common case at 4 Hz -- an agent
-        holding a direction produces one `down` and then nothing until it turns. Saves ~5.8 ms of
-        device-side process spawns on those ticks and, more usefully, keeps a getevent trace
-        readable.
+        holding a direction produces one `down` and then nothing until it turns. Saves a device
+        write on those ticks and, more usefully, keeps a getevent trace readable.
         """
         if not self._down:
             self.acquire()

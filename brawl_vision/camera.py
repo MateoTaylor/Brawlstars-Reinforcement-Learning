@@ -24,7 +24,7 @@ removed; `bool_at()` is what Phase F and Phase H should consume.
 """
 import csv
 import json
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path
 
 import cv2
@@ -125,8 +125,10 @@ class CameraModel:
     from the one that actually blocks movement. See `solve_camera_model` for how the ground plane
     is recovered from the wall-top fit.
 
-    `H_top` is kept alongside it for diagnostics and because Phase H may want it: a wall's visible
-    appearance lives on that plane even though its collision footprint lives on the ground.
+    `H_top` is kept alongside it because a wall's visible appearance lives on that plane even though
+    its collision footprint lives on the ground. Rectified through it, wall-top edges sit on tile
+    boundaries: `overlay.py` draws that grid, and `brawl_deployment/perception/lattice.py` was
+    validated against it. As a second classifier input it bought nothing (`terrain/classifier.py`).
     """
     H: np.ndarray
     H_inv: np.ndarray
@@ -329,10 +331,13 @@ class RectifyPlan:
     That is precisely why Phase F can recover camera motion with plain 2D phase correlation, and
     why this stage must come before it. It also means tile (0, 0) here is "wherever the calibration
     frame's origin corner was", not a map position -- anchoring to the map is Phase I's job.
+
+    The one per-frame variant is `registered()`, which re-aims the grid so its cells are the
+    occupancy map's cells at a given camera position.
     """
     M: np.ndarray                       # normalized-viewport px -> rectified px
     M_inv: np.ndarray                   # rectified px -> normalized-viewport px
-    origin_tile: tuple[int, int]        # tile coords of rectified pixel (0, 0)
+    origin_tile: tuple[float, float]    # tile coords of rectified pixel (0, 0); whole unless registered
     size_tiles: tuple[int, int]
     size_px: tuple[int, int]            # (w, h)
     pixels_per_tile: int
@@ -359,6 +364,43 @@ class RectifyPlan:
     def rect_to_tile(self, rect: np.ndarray) -> np.ndarray:
         r = np.asarray(rect, np.float64).reshape(-1, 2)
         return r / self.pixels_per_tile + np.asarray(self.origin_tile, np.float64)
+
+    def registered(self, position_tiles) -> "RectifyPlan":
+        """This plan, re-aimed so that its cells ARE the world cells at camera position
+        `position_tiles` (Phase F's continuous position).
+
+        A frame's rectified pixel (0, 0) sits at world tile `origin_tile + position_tiles`, which
+        is fractional almost always, while the occupancy map is a whole-tile grid. Rounding that
+        position at deposit time puts every frame's cells up to half a tile off the map's, and by a
+        different amount each frame; on the labelled clips the remainder averages a quarter of a
+        tile. So each frame used to vote for a blend of two neighbouring tiles, while the hero and
+        every detection are placed continuously, with no rounding at all.
+
+        This shifts the content by the remainder `f` instead, `M' = translate(f * ppt) . M`, and
+        moves `origin_tile` by `-f` to match. Then `origin_tile + position_tiles` is whole and the
+        deposit's rounding is exact. The coordinate helpers stay continuous: a viewport pixel maps
+        through `M'` and `rect_to_tile` to the same camera-relative tile as through the base plan,
+        so projections are unaffected. `valid` moves with the content; pixels shifted in from
+        outside the window are invalid, as they are in the base plan.
+
+        Composes: registering an already-registered plan at its own position returns it unchanged.
+        The deploy loop and the offline map tools call it once per frame on the built plan and
+        rectify the raw frame with the result. Odometry keeps the fixed plan, because it measures
+        motion against a fixed grid and is what produces `position_tiles` in the first place.
+        """
+        at = np.asarray(self.origin_tile, np.float64) + np.asarray(position_tiles, np.float64)
+        f = at - np.round(at)
+        if np.abs(f).max() < 1e-9:
+            return self
+        ppt = self.pixels_per_tile
+        T = np.array([[1.0, 0.0, f[0] * ppt],
+                      [0.0, 1.0, f[1] * ppt],
+                      [0.0, 0.0, 1.0]], np.float64)
+        M = T @ self.M
+        valid = cv2.warpAffine(self.valid.astype(np.uint8), T[:2], self.size_px,
+                               flags=cv2.INTER_NEAREST, borderValue=0).astype(bool)
+        origin = (float(self.origin_tile[0] - f[0]), float(self.origin_tile[1] - f[1]))
+        return replace(self, M=M, M_inv=np.linalg.inv(M), origin_tile=origin, valid=valid)
 
 
 def build_rectify_plan(model: CameraModel, hud: HudMask | None = None,

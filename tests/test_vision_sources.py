@@ -14,7 +14,7 @@ import pytest
 
 from brawl_vision.capture import Frame, ScreenCapture
 from brawl_vision.clips import ClipReader
-from brawl_vision.sources import FrameSource, is_live, open_source
+from brawl_vision.sources import FrameSource, at_viewport, is_live, open_source
 
 CLIPS = Path(__file__).resolve().parent / "fixtures" / "vision"
 CLIP = CLIPS / "standstill.mp4"
@@ -146,6 +146,16 @@ def test_every_clip_normalizes_to_the_calibrated_viewport(name):
     with open_source(CLIPS / f"{name}.mp4") as source:
         frame = next(iter(source))
     assert frame.image.shape == (1126, 2002, 3)
+
+
+def test_an_emulator_sized_frame_is_resized_to_the_viewport_and_a_viewport_one_is_not():
+    """The 1080p emulator recordings normalize in aspect but not in size, and `rectify` refuses
+    them; three of the offline viewers crashed on every emulator frame until 2026-09-15."""
+    small = Frame(image=np.zeros((1080, 1920, 3), np.uint8), t=1.5, index=7)
+    right = Frame(image=np.zeros((1126, 2002, 3), np.uint8), t=0.0, index=0)
+    out = list(at_viewport([small, right], (2002, 1126)))
+    assert out[0].image.shape == (1126, 2002, 3) and (out[0].t, out[0].index) == (1.5, 7)
+    assert out[1] is right
 
 
 @pytest.mark.vision

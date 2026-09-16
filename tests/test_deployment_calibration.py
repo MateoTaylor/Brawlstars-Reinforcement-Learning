@@ -9,13 +9,14 @@ The clock is faked. `verify_tap`'s windows are tuned to a reload rate and a swin
 asserting rather than comments -- and a real clock would spin for 0.9 s a trial to assert them.
 """
 import json
+import math
 from pathlib import Path
 
 import cv2
 import numpy as np
 import pytest
 
-from brawl_deployment.control import ATTACK_FIRE, ATTACK_SUPER
+from brawl_deployment.control import ATTACK_FIRE, ATTACK_SUPER, SLOT_TAP, Buttons, NullBackend
 from brawl_deployment.control import calibration as cal
 from brawl_deployment.window import WindowFault
 
@@ -37,14 +38,15 @@ class Clock:
 
 
 class _Buttons:
-    """`Buttons` reduced to what `verify_tap` touches, recording the down/up order."""
+    """`Buttons` reduced to what `verify_tap` touches, recording the press/settle order. For the
+    trials that must never press; the ones that do use the real class (`_game_buttons`)."""
 
     def __init__(self, attack=(1690.0, 594.0), super_=(1462.5, 1000.5)):
         self.attack, self.super_ = attack, super_
         self.events = []
 
-    def tap(self, action):
-        self.events.append(("tap", action))
+    def press(self, action, bearing):
+        self.events.append(("press", action))
         return action != 0
 
     def settle(self):
@@ -52,8 +54,8 @@ class _Buttons:
 
 
 class _Game:
-    """A pretend Mortis: ammo reloads against the fake clock, and a tap spends one after the
-    swing animation.
+    """A pretend Mortis: ammo reloads against the fake clock, and a press spends one after the
+    swing animation -- counted from the LIFT, which is the touch that fires.
 
     A scripted list of readings would not exercise the thing worth exercising. `verify_tap` waits
     for the bar to refill between trials and hunts a trough that the reload immediately starts
@@ -91,16 +93,24 @@ class _Game:
             self._pending = self.clock.t + self.SWING_S
 
 
-class _GameButtons(_Buttons):
-    """`_Buttons` wired to a `_Game`, so a tap has a consequence to observe."""
+class _GameBackend(NullBackend):
+    """A touchscreen wired to a `_Game`. Lifting SLOT_TAP is what fires, as in the real game: a
+    double that fired on the down would let a `verify_tap` that never lifts pass."""
 
-    def __init__(self, game, **kw):
-        super().__init__(**kw)
+    def __init__(self, game):
+        super().__init__()
         self.game = game
 
-    def tap(self, action):
-        self.game.fire()
-        return super().tap(action)
+    def up(self, slot):
+        if slot == SLOT_TAP and slot in self.contacts:
+            self.game.fire()
+        super().up(slot)
+
+
+def _game_buttons(game) -> Buttons:
+    """The REAL `Buttons` on a backend wired to the game, so the touches under test are the ones
+    the loop sends."""
+    return Buttons(_GameBackend(game), attack=(1690.0, 594.0), super_=(1462.5, 1000.5))
 
 
 # --- temporal_median ------------------------------------------------------------------------
@@ -214,7 +224,7 @@ def test_button_fit_round_trips_through_the_device_conversion():
 def test_verify_tap_passes_when_ammo_drops():
     clock = Clock()
     game = _Game(clock)
-    report = cal.verify_tap(game.read, _GameButtons(game), trials=3,
+    report = cal.verify_tap(game.read, _game_buttons(game), trials=3,
                             sleep=clock.sleep, now=clock.now)
     assert report.ok
     assert game.taps == 3
@@ -231,7 +241,7 @@ def test_verify_tap_fails_the_training_grounds_result():
     single result the whole function exists to say FAIL to."""
     clock = Clock()
     game = _Game(clock, fires=[False, False, False])
-    report = cal.verify_tap(game.read, _GameButtons(game), trials=3,
+    report = cal.verify_tap(game.read, _game_buttons(game), trials=3,
                             sleep=clock.sleep, now=clock.now)
     assert not report.ok
     assert all(t.drop == pytest.approx(0.0, abs=1e-6) for t in report.trials)
@@ -243,7 +253,7 @@ def test_verify_tap_rejects_a_mixed_result_rather_than_taking_the_majority():
     # two times in three, so a majority rule would have called that setup good.
     clock = Clock()
     game = _Game(clock, fires=[True, False, False])
-    report = cal.verify_tap(game.read, _GameButtons(game), trials=3,
+    report = cal.verify_tap(game.read, _game_buttons(game), trials=3,
                             sleep=clock.sleep, now=clock.now)
     assert [t.ok for t in report.valid] == [True, False, False]
     assert not report.ok
@@ -254,7 +264,7 @@ def test_verify_tap_takes_the_trough_not_the_last_sample():
     the bar has partly recovered and read that as a failed tap."""
     clock = Clock()
     game = _Game(clock)
-    trial = cal.verify_tap(game.read, _GameButtons(game), trials=1,
+    trial = cal.verify_tap(game.read, _game_buttons(game), trials=1,
                            sleep=clock.sleep, now=clock.now).trials[0]
     assert trial.trough == pytest.approx(2.0, abs=0.05)
     # By the end of the window the bar has already refilled well past the trough -- a single
@@ -266,7 +276,7 @@ def test_verify_tap_takes_the_trough_not_the_last_sample():
 def test_verify_tap_waits_for_the_bar_to_refill_before_pressing():
     clock = Clock()
     game = _Game(clock, ammo=0.4)
-    report = cal.verify_tap(game.read, _GameButtons(game), trials=1,
+    report = cal.verify_tap(game.read, _game_buttons(game), trials=1,
                             sleep=clock.sleep, now=clock.now)
     assert game.taps == 1
     assert report.trials[0].before >= cal.AMMO_ARMED    # armed, not the 0.4 it started at
@@ -296,34 +306,50 @@ def test_verify_tap_distinguishes_an_unreadable_bar_from_a_failed_tap():
 def test_verify_tap_needs_two_readable_trials():
     clock = Clock()
     game = _Game(clock)
-    report = cal.verify_tap(game.read, _GameButtons(game), trials=1,
+    report = cal.verify_tap(game.read, _game_buttons(game), trials=1,
                             sleep=clock.sleep, now=clock.now)
     assert report.trials[0].ok                 # the one trial passed
     assert not report.ok                       # ...and one is not enough
 
 
-def test_verify_tap_releases_every_press_it_makes():
+def test_verify_tap_walks_every_press_to_its_lift():
+    """Each trial is the loop's own touch sequence -- down, drag, lift -- and nothing is left
+    down at the end. A trial whose press never lifts never fires, and would read as the 6.8
+    failure on a setup that works."""
     clock = Clock()
     game = _Game(clock)
-    buttons = _GameButtons(game)
+    buttons = _game_buttons(game)
     cal.verify_tap(game.read, buttons, trials=3, sleep=clock.sleep, now=clock.now)
-    taps = [e for e in buttons.events if e[0] == "tap"]
-    settles = [e for e in buttons.events if e[0] == "settle"]
-    assert len(taps) == len(settles) == 3
-    assert buttons.events[0][0] == "tap" and buttons.events[1][0] == "settle"
+    kinds = [e[0] for e in buttons.backend.log]
+    assert kinds == ["down", "move", "up"] * 3
+    assert not buttons.is_held and SLOT_TAP not in buttons.backend.contacts
+
+
+def test_verify_tap_drags_along_the_bearing_it_was_given():
+    """Never a bare tap: the game auto-aims those, and the loop never sends one, so a tap passing
+    here would say nothing about the path the loop actually uses."""
+    clock = Clock()
+    game = _Game(clock)
+    buttons = _game_buttons(game)
+    cal.verify_tap(game.read, buttons, bearing=math.pi / 2, trials=1,
+                   sleep=clock.sleep, now=clock.now)
+    (drag,) = [e for e in buttons.backend.log if e[0] == "move"]
+    ax, ay = buttons.attack
+    assert drag[2:] == pytest.approx((ax, ay + buttons.aim_radius_px), abs=1e-6)
 
 
 def test_verify_tap_reports_the_point_for_the_action_it_was_given():
     clock = Clock()
     game = _Game(clock)
-    buttons = _GameButtons(game)
+    buttons = _game_buttons(game)
     fire = cal.verify_tap(game.read, buttons, action=ATTACK_FIRE, trials=1,
                           sleep=clock.sleep, now=clock.now)
     sup = cal.verify_tap(game.read, buttons, action=ATTACK_SUPER, trials=1,
                          sleep=clock.sleep, now=clock.now)
     assert fire.point == buttons.attack
     assert sup.point == buttons.super_
-    assert [e[1] for e in buttons.events if e[0] == "tap"] == [ATTACK_FIRE, ATTACK_SUPER]
+    downs = [e[2:] for e in buttons.backend.log if e[0] == "down"]
+    assert downs == [buttons.attack, buttons.super_]
 
 
 # --- verify_move ----------------------------------------------------------------------------

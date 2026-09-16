@@ -1,9 +1,10 @@
 {
   "_comment": [
-    "The DEPLOYED loop's HUD mask: BlueStacks + Nulls Brawl, at the same 2002x1126 normalized",
-    "viewport as brawl_vision/data/hud_mask.json and in the same format. That file describes the",
-    "iOS recordings' Layout A and stays what the offline tools read; on these frames its",
-    "attack/super rects sit on floor while every real button is uncovered. Measured 2026-09-14.",
+    "The EMULATOR's HUD mask: BlueStacks + Nulls Brawl, at the same 2002x1126 normalized",
+    "viewport as hud_mask.json and in the same format. That file describes the iOS recordings'",
+    "Layout A; on these frames its attack/super rects sit on floor while every real button is",
+    "uncovered. Measured 2026-09-14. The deploy loop reads this one (brawl_deployment/loop.py),",
+    "and so do labels drawn on emulator footage (config.HUD_MASKS['emulator']).",
     "",
     "HOW: for each of the three BlueStacks fixture clips, the share of 2 Hz frames in which a pixel",
     "matches its own temporal median (max channel difference <= 18). The camera follows the hero,",
@@ -13,9 +14,10 @@
     "the frames. The kill-feed card is transient and was read off a 3 s contact sheet, where it",
     "is up in roughly half the samples.",
     "",
-    "NOT COVERED, deliberately: the long orange banner behind the kill card (one clip, ~9 s,",
-    "x to ~830). Masking it for good would blind a sixth of the frame's top half for a rare event;",
-    "what it deposits is left to the occupancy map's re-validation.",
+    "NOT UI, so not covered: the long orange shape that sometimes sits behind the kill card",
+    "(bluestacks-example-new, ~t=25-34 s). It is this environment's WATER, a rounded orange",
+    "pool with a yellow rim: it scrolls with the camera (x0-822 at 26 s, x684-1529 at 33 s),",
+    "and showdown_alternate_map2's labels mark the same pools as WATER.",
     "GOES STALE if the game's UI scale, the emulator, or the capture crop changes."
   ],
   "source": "tests/fixtures/vision/bluestacks-example-{new,3,zone}.mp4",

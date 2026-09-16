@@ -202,7 +202,7 @@ brawl_deployment/
   control/
     __init__.py
     backend.py          # InputBackend protocol + a NullBackend for dry runs         BUILT
-    adb.py              # persistent-contact sendevent backend                       BUILT
+    adb.py              # persistent-contact touch backend (builtin writes, 4.6)     BUILT
     joystick.py         # move_bin -> anchor-relative contact point                  BUILT
     buttons.py          # attack / super tap geometry                                BUILT
     calibration.py      # button re-fit + the live tap/move verifications       BUILT
@@ -262,7 +262,7 @@ the candidates against it:
 |---|---|---|---|---|
 | Win32 `SendInput` **mouse** | **1** | yes | lowest | **Rejected.** Cannot move and shoot. |
 | ADB `input tap` / `input swipe` | 1 per subprocess | **no** | 50–200 ms/call | **Rejected.** A subprocess per action at 4 Hz, and `swipe` cannot hold. |
-| ADB `sendevent` over a **persistent** `adb shell` | yes (multi-slot) | **yes** | low once open | **Candidate A.** Full 16-direction resolution. |
+| ADB touch injection over a **persistent** `adb shell` | yes (multi-slot) | **yes** | low once open | **Candidate A.** Full 16-direction resolution. Shipped; transport revised in 4.6. |
 | BlueStacks keymapping + `SendInput` **keystrokes** | yes (BlueStacks synthesises slots) | yes | lowest | **Candidate B.** But see the resolution problem below. |
 
 **Candidate B's resolution problem.** BlueStacks keymapping binds keys to a synthesised joystick,
@@ -292,12 +292,14 @@ keymap involvement at all**. Candidate C's open question is moot; there is no se
 reconcile. 16-direction movement is preserved, which means **no `n_move_bins` change and no
 retrain**.
 
-**One implementation detail that the measurements forced.** The natural fast path — writing packed
-24-byte `input_event` structs straight into the device — does not work here: BlueStacks ships
-**adb 1.0.36**, whose Windows stdin forwarding fails on binary payloads (`OSError 22` on first
-flush, device-side shell still alive). Text `sendevent` commands through the same persistent pipe
-work fine, and at 5.77 ms per joystick update against a 250 ms decision budget (2.3%) the binary
-path would buy nothing worth a platform-tools dependency. Revisit only if the budget tightens.
+**One implementation detail that the measurements forced — and then REVISED, see §4.6.** The
+natural fast path — writing packed 24-byte `input_event` structs straight into the device — does
+not work over the pipe: BlueStacks ships **adb 1.0.36**, whose Windows stdin forwarding fails on
+binary payloads (`OSError 22` on first flush, device-side shell still alive). Text `sendevent`
+commands through the same persistent pipe worked, and at 5.77 ms per joystick update on an idle
+emulator the binary path looked like nothing worth a platform-tools dependency. With the game
+loaded a spawn is ~45 ms, not 1.4, and that budget argument collapsed (§4.6): the structs now
+travel as text and the device-side shell's builtin `print` writes them.
 
 **VERIFIED: the game honours injected touches.** Everything above is transport — it says the
 events reach the kernel, not that Nulls Brawl acts on them, and some titles ignore synthetic
@@ -403,16 +405,30 @@ that the reachable circle clears the bottom UI strip. And bin 2 landing *down*-r
 up-right is **the no-y-flip convention confirmed empirically**, not just derived. Had the negation
 been there, this is the measurement that would have caught it.
 
-### 4.4 Buttons
+### 4.4 Buttons — REVISED 2026-09-15: aimed drags, not taps
 
-Attack and super are fixed-position binary taps in the bottom right, and the prompt is explicit
-that no aiming is needed — a tap fires in the game's default direction. `attack == 1` taps
-attack; `attack == 2` taps super. **Gadgets are not emitted** (the policy has no gadget action)
-and their button is never touched.
+Attack and super are **aimed drags**. This section used to say they were binary taps needing no
+aim, and that was wrong for this policy: a bare tap auto-aims in the real game, sending Mortis at
+the nearest enemy, while the sim's `hero.start_dash` goes along the decision's move direction, or
+along `facing` when the move bin is idle (`action.dash_on_idle: facing`). The super goes along the
+move direction too. So each press works the attack stick the way the movement stick is worked: a
+contact goes down on the origin, drags `control.aim_radius_px` (75 px) along
+`ShadowHero.attack_bearing`, and lifts. The lift fires. `attack == 1` presses from the attack
+clearance point (§6.8: the attack stick floats), and `attack == 2` from the super button's centre.
+**Gadgets are not emitted** (the policy has no gadget action) and their button is never touched.
+The action space is unchanged. The aim is the choice the policy already made with its move bin.
+
+One step per perception tick: down, drag, lift. Two events in one device write can land in
+one game frame, and a down merged with its drag is a zero-length drag, which the game reads as a
+tap. At 12 Hz that is exactly the three ticks of a decision window, so the lift lands ~167 ms after
+the decision (a tap's release landed at ~83 ms). `config.validate` refuses a tick rate with fewer
+than three ticks per decision. `Controls.build` refuses a radius that would drag either press
+off-screen: the super button sits 81 px above the bottom edge, and the backend clamps rather than
+rejects, so a clamped drag would fire the wrong way.
 
 The sim's fire semantics carry over exactly: **one decision means at most one attack attempt.**
-The tap fires on the first perception tick of the decision window and does not repeat for the
-remaining four — mirroring `env._held`, which zeroes the fire column on sub-ticks 2..K.
+The press starts on the first perception tick of the decision window and does not repeat,
+mirroring `env._held`, which zeroes the fire column on sub-ticks 2..K.
 
 Action masking must be applied at inference the same way `MaskablePPO` saw it in training: if
 super is not charged, bin 2 is masked out. `hero.action_mask` is the sim-side reference; the
@@ -461,14 +477,18 @@ A button table calibrated on one layout **taps empty screen on the other**, sile
 calibration is measured per-setup and cached, never hardcoded.
 
 **The same hazard hit the terrain map, and the loop now has its own HUD mask** (2026-09-14,
-`brawl_deployment/data/hud_mask.json`, read by `VisionStack.build`). BlueStacks + Nulls Brawl is
+`brawl_vision/data/hud_mask_emulator.json`, read by `VisionStack.build`; it moved there from
+`brawl_deployment/data/` on 2026-09-15, when terrain labels started using it). BlueStacks + Nulls Brawl is
 neither layout. Under `brawl_vision`'s mask, the attack and super rects sat on floor, while the real
 buttons, the Exit button, the emote bubble and the kill card stayed in view. The classifier
 deposited them as walls that followed the camera, and odometry correlated them as a static patch.
 The new mask was measured from which pixels stay put while the world scrolls, across all three
 BlueStacks clips. It covers 20% of the frame, and `test_deployment_calibration.py` checks it against
 this file's independently fitted button centres and joystick anchor. `brawl_vision/data/hud_mask.json`
-is unchanged; the offline tools still read it.
+is unchanged and is still the phone recordings' mask. Terrain labels record which of the two masks
+they were drawn under (`LabelGrid.hud`), and the labeller and trainer use that one. The other
+offline tools pick by recording name (`labeling.default_hud`), and treat live capture as the
+emulator.
 
 **What the 2026-09-14 map fixes bought, on the same replays.** The score is how often the hero's own
 cell reads as unit-blocking in the deployed map at a decision. A brawler cannot stand in a wall, so
@@ -481,13 +501,69 @@ every one is an error, and no labels are needed. Rows are cumulative, over the t
 | this HUD mask | 17.6% | 22.5% | 0.0% |
 | `terrain.pt` retrained: 200 epochs, left-right flips only | 9.8% | 15.3% | 0.4% |
 | map cells never freeze (`occupancy.py`) | 7.8% | 5.4% | 0.0% |
+| each deposit registered to the map's lattice (`RectifyPlan.registered`) | 0.0% | 6.3% | 0.9% |
+| world frame moved onto the game's lattice from crates (`perception/lattice.py`, 09-15) | 4.0% | 3.6% | 0.9% |
 
 The HUD mask's own gain is in odometry, not this score: with static UI no longer pinning it to zero
 shift, "odometry uncertain" decision skips fell from 6.5% to 0.9% on `example-new` and from 9.3% to
 5.1% on `example3`. The extra segment resets it causes all land before the match gate opens. On the
-54 labelled frames, the last two rows moved the map's blocking F1 from 0.775 to 0.906.
+54 labelled frames, the retrain and the never-freeze rows moved the map's blocking F1 from 0.775 to
+0.906, and registration moved it to 0.942.
+
+Registration's replay row is small counts: 14 blocking decisions across the three clips became 9
+(8, 6, 0 became 0, 7, 2, out of 102, 111 and 229 decisions). The labelled F1 is the cleaner
+measurement. Before it, a deposit through the fixed plan covered world squares up to half a tile
+off the map cells it voted for, while the hero was placed continuously.
+
+The lattice row is a wash on this score: 9 blocking decisions became 10 (0, 7, 2 became 4, 4, 2).
+Example-new's four are one 0.8 s episode, 10 s after that clip's only re-lock reset the map. This
+score cannot see the change itself, which is which tiles the map calls tiles. So the replays were
+checked against the wall-top edges on the same ticks, the independent check in `lattice.py`:
+
+| clip | wall-top edges say | applied after the lock | off, max axis | phase 0 was off |
+|---|---|---|---|---|
+| example-new | (+0.29, -0.29) | (+0.39, -0.24) from 22 s | 0.10 | 0.29 |
+| example3 | (-0.09, +0.10) | (-0.16, +0.09) from 3 s | 0.07 | 0.10 |
+| example-zone | (-0.37, +0.08) | (-0.30, +0.06) from 48 s | 0.07 | 0.37 |
+
+Each clip locks once, off three crate sightings, and never needs another. Example-zone shows the
+gap: no full-height crate until 48 s, so for 45 s of decisions its tiles sat a third of a tile off
+the game's, though its wall tops said where they were all along. Folding those edges in is the
+open follow-up (`lattice.py`, "What is deliberately NOT here").
 
 ---
+
+### 4.6 The transport — REVISED 2026-09-16: the shell writes the structs, nothing is spawned
+
+Reported as "insane lag in the game, most pronounced when the agent attacks", after the aimed
+drags of §4.4 went in. Measured on the running emulator with SYN-only events (no touch state):
+
+```
+one `sendevent` spawn, game loaded            ~45 ms   (3-event line 140 ms, 13-event line 620 ms)
+one `sendevent` spawn, emulator idle (09-08)   1.4 ms
+13 events, ONE builtin `print` write            0.58 ms  (max 0.61)
+```
+
+`sendevent` is a process per event. An aimed press is 13 events over three ticks — down 6, drag 4,
+lift 3 — against the bare tap's 9, and a joystick turn is 4. With the game loaded, one attack was
+**620 ms of serial device time inside a 250 ms decision**: the pipe backed up, every later touch
+landed seconds late, and the fork storm itself stalled the game's threads on the VM's four vCPUs.
+The drag did not cause it; it added the 45% that tipped a transport already priced by the idle
+emulator over the edge.
+
+The fix spawns nothing. At startup the device-side shell opens the touch device once
+(`exec 3>/dev/input/event4`); each touch step is then `print -n '<octal escapes>' >&3` — an mksh
+**builtin** turning ASCII on the pipe into one `write(2)` of packed `input_event` structs, so the
+cost is the pipe round trip regardless of event count or game load. The pipe still carries text,
+which is what adb 1.0.36 requires. The kernel sizes the struct by the writer's ABI and refuses the
+wrong length, so the session opens with a handshake: read the shell's ELF class (64-bit → 24 bytes),
+open the device, write one `SYN_REPORT` and read back `OK`. A session that cannot write now fails
+at construction with the reason, where before it would have looked exactly like a working one.
+Verified live on this image before shipping: `print` is a builtin, `\0ooo` and `\xhh` both
+produce NUL bytes, uid 2000 opens the device, a 23-byte write is refused and a 24-byte one taken.
+
+The §4.1 measurements table and `adb.py`'s docstring carry the numbers. §7.2's thread-pool caps
+were real waste but were not this lag; they stay because 1.0 core is better than 4.
 
 ## 5. Match-over detection
 
@@ -2426,7 +2502,8 @@ Comfortable. The risk is not steady-state, it is **unbounded growth**, so three 
    scalars, never per-frame images or per-frame tensors.
 3. **No parallelism anywhere.** One capture, one model set, one policy. No vectorised env, no
    worker pool, no async prefetch. The user has stated single-agent is the requirement; honouring
-   it keeps the whole budget trivially satisfied.
+   it keeps the whole budget trivially satisfied. **That includes the parallelism the libraries
+   bring uninvited** — see §7.2, where their default thread pools were the lag.
 
 ### 7.1 Timing, measured
 
@@ -2486,6 +2563,43 @@ than a slow one.
 **The loop must still measure and report its own margin** — `FrameSource.read_seconds` and
 `DeployCapture.resize_seconds` exist precisely so "the pipeline is slow" can be told apart from
 "reading frames is slow."
+
+### 7.2 CPU thread pools — MEASURED 2026-09-16, the in-game lag
+
+Reported as "very large lag in the game whenever the loop runs", suspected to be a throttling bug.
+It was not the tick: replaying the real `DeployLoop.tick` at 12 Hz from a BlueStacks clip (real
+detectors on CUDA, real classifier, real policy, `NullBackend`, the pacer sleeping as it does live)
+gave **55 ms median / 61 p95 / 66 max against the 83 ms budget**, with the uncommitted work of the
+day — `RectifyPlan.registered` plus the second rectify, the lattice — costing 2.5 ms of it.
+
+It was the cores. The same replay, sampled **process-scoped** while it ran:
+
+| configuration | cores held by this process | tick median / p95 (ms) |
+|---|---|---|
+| library defaults: torch 8 OpenMP threads, two ORT sessions with spinning pools, cv2 16 | **3.3–4.2** | 53–55 / 59–61 |
+| torch 1 thread | 1.8 | 46 / 51 |
+| ORT spinning off | 3.0 | 50 / 59 |
+| cv2 1 thread | 2.9 | **68 / 78** — cv2's parallelism is real work |
+| torch 1 + ORT no-spin | 1.4 | 56 / 62 |
+| torch 1 + ORT no-spin + ORT 2 threads | 1.5 | 43 / 49 |
+| **torch 1 + ORT no-spin + ORT 2 + cv2 4** (shipped) | **1.0** | **48 / 53**, max 56 |
+
+The machine has eight physical cores and the emulator is a VM on them. An idle pool thread does
+not sleep — it spin-waits for its next job — so a 1 ms policy call every 250 ms kept seven OpenMP
+threads busy the whole time, and each ONNX Runtime session kept its own pool spinning between
+ticks. None of it was doing work: pinned, the tick got *faster*, because the CPU-side jobs
+(policy, tensor copies, letterbox, NMS) are too small to split. GPU utilisation during the run was
+10%, so the detectors were not the contention either.
+
+Shipped as `compute.*` in `deployment.yaml`, applied by `loop.pin_thread_pools` before anything is
+built and passed to both detector sessions through `VisionStack.build`. The calibration rig does
+the same. `ObjectDetector` gained `cpu_threads` / `spin` for exactly this caller; every other
+script keeps the runtime's own choice, which is right when nothing else needs the cores. Zero is
+refused by `validate` because in all three libraries it means "default", i.e. the thing above.
+
+What this did not measure: the live-only stages (the 1440p `mss` grab, `WindowFromPoint`, and
+the touch transport). **The lag survived these caps, and the transport was it — §4.6.** A
+`--telemetry` CSV from a real match gives the grab and tick tails; the replay cannot.
 
 ---
 

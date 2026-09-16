@@ -13,6 +13,7 @@ over there.
 | File | Written by | Phase | Tracked |
 |---|---|---|---|
 | `hud_mask.json` | `scripts/vision_calibrate.py --hud` | B | yes |
+| `hud_mask_emulator.json` | by hand, from static pixels (see its `_comment`) | B | yes |
 | `homography.json` | `scripts/vision_calibrate.py` | C | yes |
 | `frames/*.png` | you, by hand | A/B/C/G | **no** — see below |
 
@@ -66,6 +67,12 @@ answer to pick the sim's view rectangle.
 
 Rectangles are in **normalized `[0, 1]` screen coordinates**, so the mask survives a resolution
 change without re-annotation.
+
+There are two, because the footage has two button layouts: `hud_mask.json` is the iOS recordings'
+Layout A, and `hud_mask_emulator.json` is BlueStacks + Nulls Brawl, which the deploy loop reads.
+`config.HUD_MASKS` names them "phone" and "emulator", and each terrain label records which one it
+was drawn under. The offline tools pick one from the recording's name
+(`terrain.labeling.default_hud`; `--hud` overrides). The phone's Layout B has no mask yet.
 
 **This mask goes stale silently if Supercell changes the UI layout.** There is no auto-detection
 and it is not worth building one yet; the `notes` field exists so that when the mask does break

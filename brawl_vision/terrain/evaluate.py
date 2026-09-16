@@ -667,9 +667,13 @@ def render(source, plan: RectifyPlan, track: Track, path, *, classifier=None, de
                     if r.segment != occupancy.segment:
                         occupancy.reset(r.segment)
                         report.segments_seen = occupancy.segments_seen
-                    zone = detect_zone(rect, plan, cfg).at_least(0.05)
-                    cells, _ = classifier.predict(rect, plan)
-                    occupancy.update(cells, r, plan, zone=zone, cfg=cfg)
+                    # Onto the map's lattice first, as the deploy loop does: see
+                    # `RectifyPlan.registered`. Odometry above keeps the fixed plan.
+                    reg = plan.registered(r.position_tiles)
+                    reg_rect = reg.rectify(frame.image) if reg is not plan else rect
+                    zone = detect_zone(reg_rect, reg, cfg).at_least(0.05)
+                    cells, _ = classifier.predict(reg_rect, reg)
+                    occupancy.update(cells, r, reg, zone=zone, cfg=cfg)
                     report.classified += 1
                     map_base = render_map(occupancy, window, lut, scale)
                     best = occupancy.best()

@@ -16,6 +16,15 @@ is what makes a diff readable -- a changed cell shows up as one character on one
 `?` means **unlabelled**, and it is not a class. Cells under gas, under a loot box, or simply not
 looked at yet are all `?`: the plan excludes gassed and box-occluded cells from both training and
 inference, and a label file has no reason to distinguish "skipped" from "not reached".
+
+**Each file also records the HUD layout it was drawn under (`hud`, since 2026-09-15).** The phone
+and the emulator put their buttons in different places, so one mask cannot serve both: the phone's
+mask, applied to emulator frames, offered cells under the emulator's buttons for labelling and
+refused ~35 cells of clean world per frame. The mask decides which cells are labellable, trained on
+and scored, and nothing else. It does not blank pixels (`RectifyPlan.rectify` never does), so the
+classifier sees the buttons whichever mask is used; what the mask changes is whether a cell under
+one is ever a training target or a vote. A file without the key predates it and was drawn under the
+phone mask.
 """
 import json
 from dataclasses import dataclass, field
@@ -26,12 +35,21 @@ import numpy as np
 
 from brawl_sim.constants import CHAR_TO_TILE, TILE_TO_CHAR, Tile
 
-from ..camera import RectifyPlan
+from ..camera import RectifyPlan, build_rectify_plan, load_camera_model, load_hud_mask
 from ..clips import load_bounds
-from ..config import DATA_DIR, REPO_ROOT
+from ..config import DATA_DIR, HUD_MASKS, REPO_ROOT
 from ..gameplay import walk_frames
 
 UNLABELLED = "?"
+
+# Recordings captured on the emulator (BlueStacks + Nulls Brawl), by name prefix. Their buttons sit
+# where `config.EMULATOR_HUD_MASK_PATH` says; every other recording is a phone's. All of them, and
+# only they, are 1920x1080, which `test_vision_classifier` checks against the recordings on disk.
+EMULATOR_CLIP_PREFIXES = ("bluestacks-", "9-10_new", "edited_day14_broll")
+
+# Share of a cell that must be real world, clear of the HUD, before it can be labelled. The same
+# bar `OccupancyMap` sets for a vote, so a label is only ever asked of a cell the map can fill.
+_MIN_OBSERVED = 0.9
 
 # Where a label's `clip` name is looked up, in order. The fixtures come first so every existing
 # label resolves exactly where it always has; training_videos holds the recordings that have no
@@ -48,7 +66,7 @@ CLASS_INDEX = {t: i for i, t in enumerate(CLASSES)}
 
 @dataclass
 class LabelGrid:
-    """One frame's labels, plus the geometry they were drawn against."""
+    """One frame's labels, plus the geometry and the HUD mask they were drawn against."""
     clip: str
     frame: int
     origin_tile: tuple[int, int]
@@ -56,6 +74,7 @@ class LabelGrid:
     pixels_per_tile: int
     chars: np.ndarray = field(default=None)     # (rows, cols) of '<legend char>' or '?'
     notes: str = ""
+    hud: str = "phone"                          # a `config.HUD_MASKS` key
 
     def __post_init__(self):
         cols, rows = self.size_tiles
@@ -65,6 +84,8 @@ class LabelGrid:
             raise ValueError(
                 f"label grid is {self.chars.shape} but size_tiles says {(rows, cols)}"
             )
+        if self.hud not in HUD_MASKS:
+            raise ValueError(f"hud {self.hud!r} is not one of the measured masks {list(HUD_MASKS)}")
 
     # -- conversions ---------------------------------------------------------
 
@@ -91,13 +112,21 @@ class LabelGrid:
             )
         self.chars[row, col] = char
 
+    def clear_unobserved(self, plan: RectifyPlan) -> int:
+        """Un-label every cell `plan` does not observe (`observed_cells`), returning how many were
+        labelled. For moving a label to another HUD mask: a cell under a button is not an example of
+        the terrain beneath it."""
+        drop = self.labelled & ~observed_cells(plan)
+        self.chars[drop] = UNLABELLED
+        return int(drop.sum())
+
     # -- persistence ---------------------------------------------------------
 
     def to_dict(self) -> dict:
         return {
             "clip": self.clip, "frame": self.frame,
             "origin_tile": list(self.origin_tile), "size_tiles": list(self.size_tiles),
-            "pixels_per_tile": self.pixels_per_tile, "notes": self.notes,
+            "pixels_per_tile": self.pixels_per_tile, "hud": self.hud, "notes": self.notes,
             "legend": {c: CHAR_TO_TILE[c].name for c in CLASS_CHARS} | {UNLABELLED: "UNLABELLED"},
             "grid": ["".join(row) for row in self.chars],
         }
@@ -112,7 +141,7 @@ class LabelGrid:
         obj = cls(clip=raw["clip"], frame=int(raw["frame"]),
                   origin_tile=tuple(raw["origin_tile"]), size_tiles=tuple(raw["size_tiles"]),
                   pixels_per_tile=int(raw["pixels_per_tile"]), chars=grid,
-                  notes=raw.get("notes", ""))
+                  notes=raw.get("notes", ""), hud=raw.get("hud", "phone"))
         if plan is not None:
             obj.check_plan(plan, source=str(path))
         return obj
@@ -135,8 +164,35 @@ class LabelGrid:
 
 
 def load_label_dir(directory, plan: RectifyPlan | None = None) -> list[LabelGrid]:
-    """Every `*.json` in `directory`, sorted, each checked against `plan`."""
+    """Every `*.json` in `directory`, sorted, each checked against `plan`. Geometry only, so any of
+    `hud_plans()` will do: they differ in `valid` and nowhere else."""
     return [LabelGrid.load(p, plan) for p in sorted(Path(directory).glob("*.json"))]
+
+
+def default_hud(clip) -> str:
+    """The HUD mask `clip` was captured under, from the recording's name (or its path): what a new
+    label on it is drawn under, and what the offline viewers rectify it with.
+
+    The phone's Layout B recordings (`day12_recording*`, `ScreenRecording_08-31-2026 10-16-29_1`,
+    the `09-04` set) get "phone" too, for want of a mask of their own: Layout A's covers world there
+    and leaves their buttons in view.
+    """
+    return "emulator" if Path(clip).name.startswith(EMULATOR_CLIP_PREFIXES) else "phone"
+
+
+def hud_plans(model=None) -> dict[str, RectifyPlan]:
+    """`{hud: plan}` for every measured HUD mask, all on `model` (default: the shipped one). A label
+    is edited, trained and scored against `plans[grid.hud]`."""
+    model = model or load_camera_model()
+    return {name: build_rectify_plan(model, load_hud_mask(path)) for name, path in HUD_MASKS.items()}
+
+
+def observed_cells(plan: RectifyPlan) -> np.ndarray:
+    """(rows, cols) bool: cells with enough real world in them, clear of `plan`'s HUD, to be
+    labelled at all."""
+    cols, rows = plan.size_tiles
+    ppt = plan.pixels_per_tile
+    return plan.valid.reshape(rows, ppt, cols, ppt).mean(axis=(1, 3)) > _MIN_OBSERVED
 
 
 # ---------------------------------------------------------------------------
@@ -214,9 +270,7 @@ def propose_clusters(rect: np.ndarray, plan: RectifyPlan, k: int = 8, seed: int 
     """
     feats = cell_features(rect, plan)
     cols, rows = plan.size_tiles
-    ppt = plan.pixels_per_tile
-    seen = plan.valid.reshape(rows, ppt, cols, ppt).mean(axis=(1, 3))
-    valid = seen > 0.9
+    valid = observed_cells(plan)
     out = np.full((rows, cols), -1, np.int32)
     x = feats[valid].astype(np.float32)
     if len(x) < k:

@@ -31,7 +31,7 @@ cannot open through your terminal, so `--wait` bounds the whole thing on its own
 Nothing needs timing: the script waits for the gate itself, and emits input only while the gate is
 true, same interlock as `loop.py`.
 
-**It plays badly on purpose.** It stands still, taps, and walks in four straight lines. Losing the
+**It plays badly on purpose.** It stands still, dashes right, and walks in four straight lines. Losing the
 match is fine and expected; the point is that every action is one whose consequence is checkable.
 
 Nothing is written unless `--write` is passed, and then only the blocks this run measured -- the
@@ -49,7 +49,7 @@ if str(REPO) not in sys.path:
 from brawl_deployment.config import load_deployment_config, validate            # noqa: E402
 from brawl_deployment.control import ATTACK_FIRE, ATTACK_SUPER                  # noqa: E402
 from brawl_deployment.control import calibration as cal_lib                     # noqa: E402
-from brawl_deployment.loop import Controls, VisionStack                         # noqa: E402
+from brawl_deployment.loop import Controls, VisionStack, pin_thread_pools       # noqa: E402
 from brawl_deployment.match_state import CALIBRATION_PATH, Calibration, MatchState   # noqa: E402
 
 JOBS = ("buttons", "tap", "super", "move")
@@ -58,6 +58,10 @@ JOBS = ("buttons", "tap", "super", "move")
 # so a sign error on either axis is unmistakable in the printed vector rather than shared between
 # both components. `+1` is `hero.decode_action`'s offset -- action 0 is idle.
 CARDINAL_BINS = (1, 5, 9, 13)
+
+# Where the `tap` and `super` jobs drag their presses: 0 rad, screen-right (no y flip, so this is
+# also the sim's +x). One fixed direction so the operator can check the dash by eye.
+AIM_BEARING = 0.0
 
 
 def _log(message: str) -> None:
@@ -80,6 +84,7 @@ class Rig:
         from brawl_deployment.capture import DeployCapture
         from brawl_deployment.window import WindowGuard, find_emulator_window, set_dpi_aware
 
+        pin_thread_pools(cfg)      # the emulator is on these cores too (loop.py, design 7.2)
         set_dpi_aware()
         window = find_emulator_window(cfg.window_exe)
         with mss.mss() as sct:
@@ -90,7 +95,8 @@ class Rig:
         self.capture = DeployCapture.from_window(window, monitors)
         self.cal = Calibration.load()
         self.match = MatchState(self.cal)
-        self.vision = VisionStack.build()
+        self.vision = VisionStack.build(detector_threads=cfg.compute_detector_threads,
+                                        detector_spin=cfg.compute_detector_spin)
         # n_move_bins is 16 here rather than read from the checkpoint, and the checkpoint is not
         # loaded at all: this script issues no policy actions, so pulling in a 300M-step run to
         # read one integer would be cost with no signal. `CARDINAL_BINS` assumes the same 16.
@@ -209,10 +215,16 @@ def job_buttons(rig, args) -> dict:
 
 
 def job_tap(rig, args) -> dict:
-    """The headline check: does `control_attack_tap` consume ammo?"""
-    _log(f"tapping attack at {rig.controls.buttons.attack} x{args.trials}")
+    """The headline check: does `control_attack_tap` consume ammo?
+
+    Pressed the way the loop presses -- down, dragged along `AIM_BEARING`, lifted -- so it proves
+    the aimed path, not a bare tap. Ammo is what it asserts; the direction is for the operator's
+    eyes, which is why every press goes the same way.
+    """
+    _log(f"pressing attack at {rig.controls.buttons.attack} x{args.trials}, dragged "
+         f"{rig.controls.buttons.aim_radius_px:g} px screen-right: each dash should go RIGHT")
     report = cal_lib.verify_tap(rig.ammo, rig.controls.buttons,
-                                action=ATTACK_FIRE, trials=args.trials)
+                                action=ATTACK_FIRE, bearing=AIM_BEARING, trials=args.trials)
     _log("  " + report.summary())
     for t in report.trials:
         if t.note:
@@ -234,10 +246,9 @@ def job_super(rig, args) -> dict:
         state = "unreadable" if reading is None else reading.state
         _log(f"  super not ready ({state}) -- skipped, not failed")
         return {"skipped": state}
-    _log(f"tapping super at {rig.controls.buttons.super_} (charge {reading.charge:.2f}, ready)")
-    rig.controls.buttons.tap(ATTACK_SUPER)
-    time.sleep(cal_lib.SETTLE_S)
-    rig.controls.buttons.settle()
+    _log(f"pressing super at {rig.controls.buttons.super_} (charge {reading.charge:.2f}, ready), "
+         f"dragged screen-right")
+    cal_lib.press_and_lift(rig.controls.buttons, ATTACK_SUPER, AIM_BEARING)
     time.sleep(0.8)
     after = rig.super_charge()
     ok = after is not None and not after.ready

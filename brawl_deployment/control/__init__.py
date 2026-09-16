@@ -1,9 +1,9 @@
 """The input side: touch injection and the geometry that decides where to touch.
 
     backend.py      the InputBackend protocol, slot assignments, and a NullBackend for dry runs
-    adb.py          the real injector -- persistent `adb shell` + `sendevent`
+    adb.py          the real injector -- persistent `adb shell`, builtin writes to the touch device
     joystick.py     move_bin -> screen point, and the held-contact policy
-    buttons.py      attack / super taps
+    buttons.py      attack / super, each a press dragged along the move direction
     calibration.py  where those points come from, and the live checks that prove them
 
 **The first four know nothing about the screen**, which is what keeps them testable with no

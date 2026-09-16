@@ -11,6 +11,10 @@ observable at all (BRAWL_DEPLOYMENT_DESIGN.md 9.5).
 power cubes, as a sticky map of fixed cells for the grid's `box` and `pickup` planes. It also
 supplies the occupancy map's occlusion masks, for crates and for brawler sprites.
 
+`lattice` reads the same crates for something else: where the game's tile lattice sits in the
+odometry frame. The loop hands every consumer odometry shifted onto it, so the grid's cells are
+the game's tiles, and a re-lock resets them all as a new odometry segment would.
+
 `grid` is the last stage before assembly: it crops the accumulated terrain map and scatters the
 tracks into the hero-centred planes the observation's `grid` group wants (6.2). Everything
 it places was produced upstream, so its whole contract is placement -- matching
@@ -26,6 +30,7 @@ hero's own timers from the actions we issue, which is where the whole `self` gro
 observation fields and a consumer of CV, which is what this subpackage is.
 """
 from .grid import GasMap, GridBuilder, GridSpec
+from .lattice import LatticePhase, LatticeResult
 from .loot import (Loot, LootMap, LootResult, box_occlusion, crate_occlusion,
                    require_loot_classes)
 from .projectiles import Projectile, ProjectileResult, ProjectileTracker
@@ -36,7 +41,7 @@ from .zone import ZoneEstimator
 __all__ = ["EntityTracker", "Track", "TrackerResult",
            "Projectile", "ProjectileResult", "ProjectileTracker",
            "Loot", "LootMap", "LootResult", "box_occlusion", "crate_occlusion",
-           "require_loot_classes",
+           "require_loot_classes", "LatticePhase", "LatticeResult",
            "ShadowHero", "ShadowParams", "Desync",
            "GridBuilder", "GridSpec", "GasMap",
            "ZoneEstimator"]

@@ -1,25 +1,41 @@
-"""Touch injection over a PERSISTENT `adb shell`, using `sendevent` on the emulator's multitouch
-device. See BRAWL_DEPLOYMENT_DESIGN.md 4.1.
+"""Touch injection over a PERSISTENT `adb shell`: the device-side shell's builtin `print` writes
+packed `input_event` structs into the emulator's multitouch device. See BRAWL_DEPLOYMENT_DESIGN.md
+4.1 and 4.6.
 
 MEASURED ON THIS SETUP, and every design choice below follows from one of these numbers:
 
-    persistent adb shell, bare round trip      0.51 ms   (p95 0.65)
-    four chained shell builtins                0.48 ms   (p95 0.61)
-    four real process spawns on device         5.77 ms   (p95 5.94)
-    adb exec-out screencap                   ~290 ms     (why capture goes through mss, not here)
+    persistent adb shell, bare round trip                 0.51 ms   (p95 0.65)
+    four chained shell builtins                           0.48 ms   (p95 0.61)
+    13 events in ONE builtin write to the device          0.58 ms   (max 0.61)   <- an aimed press
+    four `sendevent` process spawns, emulator idle        5.77 ms   (p95 5.94)   <- 2026-09-08
+    ONE `sendevent` spawn, game loaded                   ~45 ms                  <- 2026-09-16
+    adb exec-out screencap                              ~290 ms     (why capture goes through mss, not here)
 
-**Why a persistent shell and not `adb shell sendevent ...` per event.** Each `adb shell <cmd>`
-invocation is a fresh TCP conversation, a fresh device-side shell and a process teardown; at the
-six events a touch-down needs, that is six of them. One long-lived shell turns the per-event cost
-into a pipe write, and the whole cost of a joystick update into the ~5.8 ms of spawning four
-`sendevent` processes on the device.
+**Why a persistent shell and not `adb shell <cmd>` per event.** Each `adb shell` invocation is a
+fresh TCP conversation, a fresh device-side shell and a process teardown. One long-lived shell
+turns every touch step into a single pipe write.
 
-**Why TEXT commands and not binary `input_event` structs.** Writing packed 24-byte structs straight
-into `/dev/input/event4` would skip the process spawns entirely and cost microseconds. It does not
-work here: BlueStacks ships **adb 1.0.36**, whose Windows stdin forwarding fails on binary payloads
-(`OSError 22` on the first flush, with the device-side shell still alive). Text stdin through the
-same pipe is fine. Since 5.8 ms against a 250 ms decision budget is 2.3% and the binary path costs
-a platform-tools dependency, text wins on the numbers -- revisit only if the budget tightens.
+**Why the shell writes the bytes itself, and not `sendevent` (REVISED 2026-09-16).** `sendevent`
+is one process spawn per event, and a spawn inside the VM costs whatever the game leaves it: 1.4 ms
+on an idle emulator, ~45 ms with Nulls Brawl loaded. An aimed press is 13 events (down 6, drag 4,
+lift 3) and a joystick turn 4, so with the game running one attack was 620 ms of serial device
+time against a 250 ms decision -- the pipe backed up, touches landed seconds late, and the GAME
+stuttered under the fork storm. That was the "insane lag whenever the agent attacks". The fix is to
+spawn nothing: `print -n '<escaped bytes>' >&3` is an mksh BUILTIN writing to a file descriptor the
+shell opened on the device at startup (`exec 3>/dev/input/event4`), so a whole batch is one
+`write(2)` of packed structs, and its cost does not depend on the event count or on the game.
+
+**Why the bytes travel as TEXT.** BlueStacks ships **adb 1.0.36**, whose Windows stdin forwarding
+fails on binary payloads (`OSError 22` on the first flush, device-side shell still alive). So the
+pipe carries octal escapes (`\\0ooo`, five ASCII characters a byte; ~1.6 KB for a press) and the
+device-side `print` turns them into bytes. Verified on this image: `print` is a builtin, both
+`\\0ooo` and `\\xhh` escapes produce NUL bytes correctly, and the shell can open the device.
+
+**Why the event size is read off the device, not assumed.** The kernel takes `struct input_event`
+in the WRITER's ABI -- 24 bytes from a 64-bit process (two 8-byte time fields), 16 from a 32-bit
+one -- and rejects any other length with EINVAL rather than injecting garbage, which is what makes
+the startup handshake a real check. The timestamps are ignored on the write path (`evdev_write`
+-> `input_inject_event` takes only type/code/value), so they go out as zero.
 
 **Why no root.** `/dev/input/event4` is writable by uid 2000(shell), which is in group
 1004(input). Checked, not assumed: `[ -w /dev/input/event4 ]` returns true over plain adb.
@@ -31,8 +47,9 @@ a units bug.
 """
 import re
 import shutil
+import struct
 import subprocess
-import time
+import threading
 from pathlib import Path
 
 from .backend import SLOT_MOVE, SLOT_TAP
@@ -53,6 +70,15 @@ ABS_MT_TRACKING_ID = 57
 # `find_touch_device` re-derives it and this is the fallback.
 DEFAULT_DEVICE = "/dev/input/event4"
 DEFAULT_ABS_MAX = 32767
+
+# `struct input_event` as the device-side shell writes it: {tv_sec, tv_usec} in the shell's own
+# `long`, then u16 type, u16 code, s32 value. Keyed by the size the shell's ELF class implies.
+EVENT_STRUCTS = {24: struct.Struct("<qqHHi"), 16: struct.Struct("<iiHHi")}
+# The descriptor the device-side shell holds open on the touch device for the life of the session.
+DEVICE_FD = 3
+# How long the device-side shell gets to answer the startup handshake before the session is
+# declared dead. Generous: the first command after `adb shell` waits on the shell itself starting.
+HANDSHAKE_TIMEOUT_S = 15.0
 
 _BLUESTACKS_ADB = Path(r"C:\Program Files\BlueStacks_nxt\HD-Adb.exe")
 _BLUESTACKS_CONF = Path(r"C:\ProgramData\BlueStacks_nxt\bluestacks.conf")
@@ -164,16 +190,69 @@ class AdbTouchBackend:
 
         self._proc = subprocess.Popen(
             [self.adb, "-s", serial, "shell"],
-            stdin=subprocess.PIPE, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+            stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
             bufsize=0,
         )
-        # The device-side shell needs a moment before it will accept commands; writes sent into the
-        # pipe before then are buffered rather than lost, but a caller that immediately checks
-        # `is_alive` deserves a truthful answer.
-        time.sleep(0.4)
-
         self._contacts: dict[int, int] = {}     # slot -> tracking id
         self._next_tracking_id = 1
+        self.event_struct = EVENT_STRUCTS[24]
+        # Opens the device on the shell side and proves the write path -- see `_handshake`. Also
+        # what used to be a 0.4 s sleep: the handshake returns when the shell is actually ready.
+        self._handshake()
+
+    def _handshake(self) -> None:
+        """One exchange that leaves the session ready or raises with the reason.
+
+        The shell reports its own ELF class (byte 4 of its executable: 02 is 64-bit), opens the
+        device on `DEVICE_FD`, and writes ONE `SYN_REPORT` of the size that class implies. A
+        `SYN_REPORT` with no preceding event changes nothing -- the kernel drops it as a duplicate
+        sync -- and a struct of the wrong size is refused with EINVAL, so `OK` here means the whole
+        path works and the size is right. Stdout is read only here, then never again: every later
+        command writes to the device, not to the pipe.
+        """
+        proc = self._proc
+        script = (f"od -An -tx1 -j4 -N1 /proc/$$/exe; "
+                  f"[ -w {self.device} ] && exec {DEVICE_FD}>{self.device} && echo OPEN "
+                  f"|| echo NOOPEN")
+        proc.stdin.write((script + "\n").encode())
+        proc.stdin.flush()
+        lines = self._read_lines(2)
+        if lines is None:
+            self._kill()
+            raise RuntimeError(f"adb shell on {self.serial} did not answer within "
+                               f"{HANDSHAKE_TIMEOUT_S:.0f}s; is the emulator running?")
+        elf_class, opened = lines
+        if opened != "OPEN":
+            self._kill()
+            raise RuntimeError(f"the shell on {self.serial} cannot open {self.device} for "
+                               f"writing; `getevent -pl` should list it and uid 2000 must be in "
+                               f"group input")
+        size = 24 if elf_class == "02" else 16
+        self.event_struct = EVENT_STRUCTS[size]
+        self._send([(EV_SYN, SYN_REPORT, 0)], probe=True)
+        verdict = self._read_lines(1)
+        if verdict != ["OK"]:
+            self._kill()
+            raise RuntimeError(f"a {size}-byte input_event write to {self.device} was refused "
+                               f"(shell ELF class {elf_class!r}): the struct size does not match "
+                               f"the shell's ABI, or the device is not an evdev node")
+
+    def _read_lines(self, n: int) -> list[str] | None:
+        """`n` stripped lines from the shell's stdout, or None on `HANDSHAKE_TIMEOUT_S` or EOF. A
+        thread, because a pipe read has no timeout on Windows -- startup only, never in the loop."""
+        out: list[str] = []
+
+        def reader():
+            for _ in range(n):
+                line = self._proc.stdout.readline()
+                if not line:
+                    return
+                out.append(line.decode(errors="replace").strip())
+
+        t = threading.Thread(target=reader, daemon=True)
+        t.start()
+        t.join(HANDSHAKE_TIMEOUT_S)
+        return out if len(out) == n else None
 
     # -- coordinates --
 
@@ -191,20 +270,32 @@ class AdbTouchBackend:
 
     # -- transport --
 
-    def _send(self, events: list[tuple[int, int, int]]) -> None:
-        """One decision's worth of events as a single `;`-chained line: one pipe write, one round
-        trip, N process spawns on the device. Chaining rather than one line per event is what keeps
-        a MOVE at ~5.8 ms instead of paying a round trip per event."""
+    def _send(self, events: list[tuple[int, int, int]], probe: bool = False) -> None:
+        """One touch step's events as ONE write on the device: a `print` builtin, no spawns.
+
+        The line is `print -n '<octal escapes>' >&3` -- ASCII on the pipe (adb 1.0.36 cannot
+        forward binary), packed structs on the device. `probe` appends a verdict for the
+        handshake to read; the hot path never produces output.
+        """
         if not self.is_alive:
             return
-        line = ";".join(f"sendevent {self.device} {t} {c} {v}" for t, c, v in events)
+        line = self.encode(events)
+        if probe:
+            line += " && echo OK || echo FAIL"
         try:
-            self._proc.stdin.write(line.encode() + b"\n")
+            self._proc.stdin.write(line.encode("ascii") + b"\n")
             self._proc.stdin.flush()
         except (OSError, ValueError, AttributeError):
             # The shell died under us. Do not raise: every caller here is either the hot loop or a
             # fail-closed handler, and both want `is_alive` to go False rather than an exception.
             self._kill()
+
+    def encode(self, events: list[tuple[int, int, int]]) -> str:
+        """The shell command for `events`: every byte of every struct as a `\\0ooo` escape, so the
+        line is plain ASCII whatever the values are. Public so a test can decode it back."""
+        raw = b"".join(self.event_struct.pack(0, 0, t, c, v) for t, c, v in events)
+        payload = "".join(f"\\0{b:03o}" for b in raw)
+        return f"print -n '{payload}' >&{DEVICE_FD}"
 
     def _kill(self) -> None:
         proc, self._proc = self._proc, None

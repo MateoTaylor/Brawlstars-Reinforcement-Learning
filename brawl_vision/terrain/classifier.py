@@ -12,6 +12,42 @@ only its own cell literally cannot see the wall it is being asked to report. `Te
 a 3x3 layer at full stride, giving 161 px -- 3.4 tiles -- and `receptive_field_px` exists so a test
 can fail if someone trims the architecture below that.
 
+**Handing it the wall-top plane as well was measured, and bought nothing (2026-09-15).** The same
+frame rectified through `S @ inv(CameraModel.H_top)` puts each wall's top face IN its footprint
+cell, so stacking that with the ground rectification as 6 input channels gives the head its wall
+locally. Both inputs were retrained from scratch on the shipped recipe: the same 54 labelled frames,
+and the map built from views 1-10 s either side of each label (`occupancy.py`'s protocol, on which
+the shipped weights score 0.942). Blocking F1:
+
+                           all windows        BlueStacks windows   BlueStacks labels held out
+                           seed 0   seed 1    seed 0   seed 1      seed 0
+    ground only            0.944    0.939     0.927    0.923       0.747
+    ground + wall-top      0.939    0.944     0.922    0.913       0.723
+
+The bar for shipping it was to beat ground-only on both seeds and on the held-out clips. It won
+seed 1 and lost seed 0 and the held-out clips. The seeds disagree by more than the inputs do.
+Presumably the 3.4-tile field already reaches the top a cell north. The second plane would also
+cost a second warp per frame and double the augmentation work, so it is not shipped. `H_top` is
+used elsewhere: `brawl_deployment/perception/lattice.py` is checked against it.
+
+The held-out column is the bigger finding. Trained without their own three labels, the three
+BlueStacks recordings -- the deployment setup -- score 0.75, against 0.92 with them (146 blocking
+cells, so a small sample). The live map rests on three labelled frames, and more BlueStacks labels
+look like the likeliest next gain.
+
+Those were all under the phone's HUD mask. Under each label's own (2026-09-15), holding out one
+BlueStacks recording at a time (`scripts/vision_score_map.py --hold-out-each`), so each model still
+trains on the other two:
+
+                           example-new   example3   example-zone   pooled
+    blocking cells              49           66            9          124
+    shipped weights           0.938        0.946        0.762        0.927
+    held out                  0.918        0.846        0.571        0.851
+
+One blocking cell moves recall by 0.008 on 124 and by 0.11 on nine, so example-zone's column is
+noise. A labelling round is judged on the enlarged label set, the new frames on the held-out
+recording included (the script's docstring has the procedure).
+
 **Augmentation is the reskin strategy, not a regularisation detail.** Brawl Stars reskins maps, so a
 classifier that memorises one palette is worthless on the next event. Hue rotation attacks exactly
 that: it destroys absolute colour while leaving structure and texture, which is the signal a human
@@ -20,7 +56,9 @@ the viewer, so a wall's top face always sits north of its footprint, and a verti
 90-degree rotation shows the net walls whose parallax points the wrong way. See `flip_pair`.
 
 **Two exclusions, both from Section 2**: cells under Phase G's gas mask and cells occluded by a
-loot box are never trained on and never voted on. `-1` marks them, and the loss ignores it.
+loot box are never trained on and never voted on. `-1` marks them, and the loss ignores it. So does
+every cell the label's own HUD mask covers (`labeling.LabelGrid.hud`); the net still sees those
+pixels, since rectification blanks nothing, but is never asked what they are.
 """
 from dataclasses import dataclass
 from pathlib import Path
@@ -35,7 +73,7 @@ from ..camera import RectifyPlan
 from ..config import TERRAIN_WEIGHTS_PATH, VisionConfig
 from brawl_sim.constants import Tile
 
-from .labeling import CLASS_INDEX, CLASSES
+from .labeling import CLASS_INDEX, CLASSES, observed_cells
 
 IGNORE_INDEX = -1
 
@@ -133,14 +171,20 @@ class Example:
     clip: str
 
 
-def build_examples(pairs, plan: RectifyPlan, exclude: dict | None = None) -> list[Example]:
-    """`pairs` is an iterable of `(LabelGrid, rect)`. `exclude[key]` optionally supplies a boolean
+def build_examples(pairs, plans, exclude: dict | None = None) -> list[Example]:
+    """`pairs` is an iterable of `(LabelGrid, rect)`.
+
+    `plans` is `{hud: plan}` (`labeling.hud_plans`), and each label is taken against the HUD mask
+    it records; one `RectifyPlan` instead serves every label alike. A cell its plan does not observe
+    is never a target, whatever the file says. `exclude[key]` optionally supplies a boolean
     (rows, cols) of cells to drop -- gas, boxes -- keyed by `(clip, frame)`."""
     out = []
     for grid, rect in pairs:
+        plan = plans[grid.hud] if isinstance(plans, dict) else plans
         grid.check_plan(plan)
         target = grid.as_class_index().astype(np.int64)
         target[target < 0] = IGNORE_INDEX
+        target[~observed_cells(plan)] = IGNORE_INDEX
         drop = (exclude or {}).get((grid.clip, grid.frame))
         if drop is not None:
             target[drop] = IGNORE_INDEX

@@ -67,9 +67,15 @@ release.
 
 ## Fire semantics: once per decision
 
-`attack ∈ {0, 1, 2}` — nothing / attack / super. The tap fires on the **first** perception tick of
-the decision window and does **not** repeat for the remaining four. This mirrors `env._held`,
-which zeroes the fire column on sub-ticks 2..K. A held fire bit is a bug, not an optimization.
+`attack ∈ {0, 1, 2}` — nothing / attack / super. The press starts on the **first** perception tick
+of the decision window and does **not** repeat. This mirrors `env._held`, which zeroes the fire
+column on sub-ticks 2..K. A held fire bit is a bug, not an optimization.
+
+**Every press is an aimed drag, never a bare tap** (design §4.4, revised 2026-09-15). A tap
+auto-aims at the nearest enemy; the sim dashes along the move bin, or `facing` when idle. So
+`Buttons.press` goes down on the origin, `settle()` drags it `control.aim_radius_px` along
+`ShadowHero.attack_bearing` on the next tick and lifts it on the one after (the lift fires), one
+step per tick. Do not "simplify" it back to a tap: that silently changes where every dash goes.
 
 Apply action masking at inference the way `MaskablePPO` saw it in training — an uncharged super
 means bin 2 is masked, not merely ignored.
@@ -113,7 +119,7 @@ covers only one of those. Calibrate per setup anyway; reuse `gameplay.calibrate_
 
 ## Two coordinate spaces, and they are not the same
 
-- **Device pixels** — the Android screen's own 1920x1080. What `adb sendevent` addresses, fixed by
+- **Device pixels** — the Android screen's own 1920x1080. What the touch device addresses, fixed by
   the emulator, unrelated to the monitor. Tap targets and the joystick anchor live here.
 - **Viewport pixels** — 2002x1126, what `brawl_vision` was calibrated at. Every ring score, every
   projection, every homography lives here.
@@ -292,6 +298,11 @@ Target is one agent on 16 GB VRAM / 32 GB RAM. Steady state is comfortable; grow
 - **No parallelism.** One capture, one model set, one policy. No vectorised env, no worker pool,
   no async prefetch. Single-agent is the requirement, not a limitation to design around.
 - Measure memory process-scoped. Do not use `nvidia-smi` for this.
+- **The emulator is a VM on the same eight cores, and idle thread pools spin.** With torch, ORT
+  and cv2 defaults the loop held 3.3–4.2 cores while sleeping a third of every tick, and the GAME
+  lagged, not the tick (design §7.2). `compute.*` in `deployment.yaml` caps them
+  (`loop.pin_thread_pools`, before anything is built); 1.0 core after, faster tick. In-game lag
+  with a healthy tick time means look at process CPU, not at the pipeline.
 
 ## Testing
 

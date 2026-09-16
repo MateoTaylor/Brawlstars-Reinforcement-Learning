@@ -555,6 +555,104 @@ def test_pad_tiles_only_adds_invalid_margin(tmp_path):
     assert b.valid.sum() == pytest.approx(a.valid.sum(), rel=0.02)
 
 
+# --- registration: a frame's cells on the map's lattice ----------------------
+
+POSITIONS = [(0.3, -0.2), (-4.75, 12.5), (17.49, -3.51), (2.0, -6.0)]
+
+
+@pytest.mark.parametrize("position", POSITIONS)
+def test_a_registered_plan_puts_the_camera_position_on_a_whole_tile(tmp_path, position):
+    """What the occupancy deposit rounds is `origin_tile + position`. Registered, that sum is
+    whole, so the rounding moves nothing and the frame's cells are the map's cells."""
+    model, _ = _synth_model(tmp_path)
+    plan = build_rectify_plan(model)
+    reg = plan.registered(position)
+    at = np.asarray(reg.origin_tile) + position
+    assert np.allclose(at, np.round(at), atol=1e-9)
+    assert (reg.size_tiles, reg.size_px, reg.pixels_per_tile) == (
+        plan.size_tiles, plan.size_px, plan.pixels_per_tile)
+
+
+def test_registering_at_a_whole_tile_or_twice_changes_nothing(tmp_path):
+    model, _ = _synth_model(tmp_path)
+    plan = build_rectify_plan(model)
+    assert plan.registered((2.0, -6.0)) is plan
+    reg = plan.registered((0.3, -0.2))
+    assert reg.registered((0.3, -0.2)) is reg
+    assert reg.registered((5.3, 1.8)) is reg          # the same remainder, a whole tile away
+    again = reg.registered((0.6, -0.2))              # a different remainder re-aims from reg
+    assert np.allclose(np.asarray(again.origin_tile) + (0.6, -0.2),
+                       np.round(np.asarray(again.origin_tile) + (0.6, -0.2)))
+
+
+@pytest.mark.parametrize("position", POSITIONS)
+def test_registering_leaves_every_projection_where_it_was(tmp_path, position):
+    """Projections (the hero, loot, projectiles) go viewport px -> `M` -> `rect_to_tile`, and
+    must read the same tile through either plan, or registering the terrain would move the hero."""
+    model, _ = _synth_model(tmp_path)
+    plan = build_rectify_plan(model)
+    reg = plan.registered(position)
+    px = np.array([[100.0, 80.0], [1001.0, 563.0], [1900.0, 1050.0], [640.5, 777.25]])
+
+    def through(p):
+        return p.rect_to_tile(cv2.perspectiveTransform(px.reshape(-1, 1, 2), p.M).reshape(-1, 2))
+
+    assert np.allclose(through(reg), through(plan), atol=1e-6)
+    tiles = np.array([[0.0, 0.0], [4.0, -3.0], [12.5, 6.25]])
+    via_matrix = cv2.perspectiveTransform(
+        model.tile_to_px(tiles).reshape(-1, 1, 2), reg.M).reshape(-1, 2)
+    assert np.allclose(reg.tile_to_rect(tiles), via_matrix, atol=1e-6)
+    assert np.allclose(reg.M_inv @ reg.M, np.eye(3), atol=1e-9)
+
+
+def test_registered_valid_mask_moves_with_the_content(tmp_path):
+    """(+0.25, -0.125) tile is a whole (+12, -6) px, so the shifted mask can be checked exactly."""
+    model, _ = _synth_model(tmp_path)
+    plan = build_rectify_plan(model)
+    ppt = plan.pixels_per_tile
+    reg = plan.registered((0.25, -0.125))
+    dx, dy = round(0.25 * ppt), round(0.125 * ppt)
+    assert np.array_equal(reg.valid[:-dy, dx:], plan.valid[dy:, :-dx])
+    assert not reg.valid[:, :dx].any(), "pixels shifted in from outside the window are invalid"
+    assert not reg.valid[-dy:, :].any()
+
+
+def test_registered_rectification_puts_world_tile_edges_on_cell_edges(tmp_path):
+    """The end-to-end pixel check, against the KNOWN homography: world tile edges, seen by a
+    camera 0.3 / 0.4 of a tile off the lattice, come back on the rectified cell boundaries once
+    registered, and that far off them through the fixed plan. This is what the deposit needs."""
+    model, H_gt = _synth_model(tmp_path)
+    plan = build_rectify_plan(model)
+    w, h = model.viewport
+    position = np.array([3.3, -1.6])                  # camera-relative tile = world tile - position
+    ppt = plan.pixels_per_tile
+
+    frame = np.zeros((h, w), np.uint8)
+    for k in range(-14, 28):
+        for a, b in (((k, -16), (k, 16)), ((-16, k), (28, k))):
+            seg = np.array([[a], [b]], np.float64) - position
+            p = cv2.perspectiveTransform(seg, H_gt).reshape(-1, 2)
+            cv2.line(frame, tuple(np.round(p[0]).astype(int)),
+                     tuple(np.round(p[1]).astype(int)), 255, 2)
+
+    def line_offsets(p):
+        rect = p.rectify(frame, interpolation=cv2.INTER_NEAREST)
+        core = _core_of(p)
+        lit = (rect > 128) & core
+        out = []
+        for axis, size in ((0, p.size_px[0]), (1, p.size_px[1])):
+            mass = lit.sum(axis) / np.maximum(core.sum(axis), 1)
+            peaks = np.where(mass > 0.5)[0]
+            assert len(peaks) > 8, f"axis {axis}: rectification lost the grid lines"
+            grid = np.arange(0, size + 1, ppt)
+            out.append(np.min(np.abs(peaks[:, None] - grid[None, :]), axis=1).max())
+        return out
+
+    assert max(line_offsets(plan.registered(position))) <= 2
+    fixed = line_offsets(plan)
+    assert fixed[0] >= 0.3 * ppt - 3 and fixed[1] >= 0.4 * ppt - 3, fixed
+
+
 # --- the shipped model, and real footage ------------------------------------
 
 def test_shipped_plan_matches_the_recorded_window():

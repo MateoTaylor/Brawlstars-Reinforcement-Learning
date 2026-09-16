@@ -29,7 +29,7 @@ from pathlib import Path
 
 import numpy as np
 
-from .buttons import ATTACK_FIRE
+from .buttons import ATTACK_FIRE, PRESS_TICKS
 
 # --- fitting the button table ---------------------------------------------------------------
 
@@ -136,8 +136,9 @@ TROUGH_WINDOW_S = 0.9
 # the window below. 0.75 covers that plus the pip reader's own quantisation, and is still three
 # times the largest drift a non-firing bar could show over the same window (a reload only goes up).
 MIN_DROP = 0.75
-# Gap between the down and the up, mirroring what the loop does: `Buttons.tap` sends the down and
-# leaves the release to `settle()` on the next perception tick, ~50 ms later.
+# Gap between the steps of a press -- down, drag, lift -- mirroring what the loop does: `Buttons`
+# takes one step per perception tick, ~83 ms apart at the shipped 12 Hz. Shorter here, which is the
+# conservative side: a step that registers after 60 ms registers after 83.
 SETTLE_S = 0.06
 # Gap between ammo samples inside the trough window.
 SAMPLE_S = 0.05
@@ -201,8 +202,23 @@ class TapReport:
                 + "  ".join(parts))
 
 
-def verify_tap(read_ammo, buttons, *, action: int = ATTACK_FIRE, trials: int = 3,
-               sleep=time.sleep, now=time.perf_counter) -> TapReport:
+def press_and_lift(buttons, action: int, bearing: float, *, sleep=time.sleep) -> bool:
+    """One whole aimed press, down to lift, for a caller with no perception tick to step it.
+
+    `Buttons.press` only puts the contact down; the loop's per-tick `settle()` does the rest. This
+    stands in for those ticks, `SETTLE_S` apart, so a calibration press goes through exactly the
+    touch sequence a deployed one does. Returns whether anything was pressed.
+    """
+    if not buttons.press(action, bearing):
+        return False
+    for _ in range(PRESS_TICKS - 1):
+        sleep(SETTLE_S)
+        buttons.settle()
+    return True
+
+
+def verify_tap(read_ammo, buttons, *, action: int = ATTACK_FIRE, bearing: float = 0.0,
+               trials: int = 3, sleep=time.sleep, now=time.perf_counter) -> TapReport:
     """Press `action` `trials` times and check the ammo bar goes down. The venue-independent check.
 
     `read_ammo` is a zero-argument callable returning ammo in 0..3, or `None` when the bar could
@@ -214,8 +230,10 @@ def verify_tap(read_ammo, buttons, *, action: int = ATTACK_FIRE, trials: int = 3
     delays the spend and the reload begins undoing it -- a fixed delay can sample before the drop
     or after it has been partly refilled, and both look like a failed tap.
 
-    The tap's release is sent by this function rather than left to the caller: `Buttons.tap` only
-    presses, and a calibration run has no perception tick to call `settle()` on.
+    Each press is the loop's aimed drag, not a bare tap (`press_and_lift`), dragged along
+    `bearing` -- radians in the sim's frame, so 0 is screen-right. A tap would prove nothing about
+    the path the loop uses: the game auto-aims taps, and the loop never sends one. The trough
+    window opens after the lift, which is the touch that fires.
 
     `sleep` and `now` are injectable as a pair. Not for mocking's sake -- the windows here are
     tuned to a reload rate and a swing animation, and "is the trough window long enough" is a
@@ -242,9 +260,7 @@ def verify_tap(read_ammo, buttons, *, action: int = ATTACK_FIRE, trials: int = 3
         if trial.before is None:
             continue
 
-        buttons.tap(action)
-        sleep(SETTLE_S)
-        buttons.settle()
+        press_and_lift(buttons, action, bearing, sleep=sleep)
 
         end = now() + TROUGH_WINDOW_S
         while now() < end:
@@ -317,7 +333,7 @@ class MoveTrial:
     def onset_seconds(self) -> float | None:
         """Seconds from `joystick.apply` to the hero first moving `ONSET_TILES`, or None.
 
-        **This is end-to-end actuation latency**, and it is not free: `adb sendevent` has to cross
+        **This is end-to-end actuation latency**, and it is not free: the touch write has to cross
         the ADB socket, the emulator has to inject the touch, and the game has to accept it and
         accelerate the hero. The sim has none of it -- `movement.py` applies a velocity the same
         tick the action arrives -- so anything here is a deploy-only discrepancy that the shadow's

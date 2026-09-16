@@ -55,6 +55,16 @@ brawl_vision/object_detection/projectile_detection/*.pt
 # Not ours, not used for training, recreated on demand.
 /weights/
 
+# graphify (local knowledge graph for Claude Code). Kept off the repo entirely: the graph and its
+# build sidecars live in graphify-out/, and `graphify claude install` writes its always-on section
+# to CLAUDE.md and its PreToolUse hooks (absolute exe paths, machine-specific) to
+# .claude/settings.json. Un-ignore those two if the project ever needs a shared CLAUDE.md or
+# settings.json. graphify honours this file when it scans, so everything ignored here stays out
+# of the graph as well.
+graphify-out/
+CLAUDE.md
+.claude/settings.json
+
 Terrain_Perception_Build_Plan.md
 TRAINING.md
 BRAWL_SIM_BUILD_PLAN.md

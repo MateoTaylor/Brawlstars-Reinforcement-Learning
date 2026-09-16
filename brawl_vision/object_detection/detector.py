@@ -256,7 +256,8 @@ class ObjectDetector:
     """
 
     def __init__(self, path: str | Path | None = None, *, conf: float = 0.5,
-                 iou: float = 0.6, ignore=(), providers=None):
+                 iou: float = 0.6, ignore=(), providers=None,
+                 cpu_threads: int | None = None, spin: bool = True):
         try:
             import onnxruntime as ort
         except ImportError as exc:                                  # pragma: no cover
@@ -270,13 +271,23 @@ class ObjectDetector:
         self.iou = float(iou)
         self.ignore = frozenset(ignore)
 
-        # ORT_ENABLE_ALL and default thread counts. PylaAI pins intra/inter op threads from its
-        # own config; here the detector runs offline over a clip alongside nothing else, so the
-        # runtime's own choice is the right one and a pinned number would just be wrong on a
-        # different machine.
+        # ORT_ENABLE_ALL and, by default, the runtime's own thread counts. PylaAI pins intra/inter
+        # op threads from its own config; here the detector usually runs offline over a clip
+        # alongside nothing else, so the runtime's choice is the right one and a pinned number
+        # would just be wrong on a different machine. `cpu_threads` and `spin` exist for the one
+        # caller that does share the machine: the deploy loop, whose emulator is a VM on the same
+        # cores. ORT's pool threads SPIN-WAIT for new work by default, which is right for
+        # back-to-back inference and wrong for a session called once every 83 ms next to a game
+        # (`brawl_deployment.loop.pin_thread_pools` has the measurement). On a CUDA session these
+        # reach only the CPU side -- letterbox, NMS, any node that fell back -- not the GPU work.
         preload_cuda_dlls()
         so = ort.SessionOptions()
         so.graph_optimization_level = ort.GraphOptimizationLevel.ORT_ENABLE_ALL
+        if cpu_threads is not None:
+            so.intra_op_num_threads = int(cpu_threads)
+        if not spin:
+            so.add_session_config_entry("session.intra_op.allow_spinning", "0")
+            so.add_session_config_entry("session.inter_op.allow_spinning", "0")
         if providers is None:
             # CUDA if the GPU build is installed, else CPU. Deliberately not DirectML or Azure,
             # both of which PylaAI accepts: untested here, and an untested provider that silently

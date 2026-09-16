@@ -33,6 +33,11 @@ legend, one line per grid row, so a change to one cell is one character in a dif
 `clip` is looked up in `tests/fixtures/vision/` and then `brawl_vision/data/training_videos/`
 (`labeling.CLIP_DIRS`). Recordings at 1080p are resized to the calibrated viewport first, the way
 the deployed capture does, so their rectified grid is the one the bot will see.
+
+**Cells under the recording's buttons are refused too**, by the HUD mask the file records. A new
+file takes `labeling.default_hud(clip)`: "emulator" for the emulator recordings
+(`labeling.EMULATOR_CLIP_PREFIXES`), "phone" otherwise. `--hud` overrides it; on a file that already exists, that moves the labels to the other
+mask and un-labels whatever the new one covers (saved with the rest, on `s` or `q`).
 """
 import argparse
 import sys
@@ -44,10 +49,10 @@ import numpy as np
 
 from brawl_sim.constants import TILE_TO_CHAR
 from brawl_sim.render.viewer import TILE_COLORS
-from brawl_vision.camera import build_rectify_plan, load_camera_model, load_hud_mask
-from brawl_vision.config import load_vision_config
+from brawl_vision.config import HUD_MASKS, load_vision_config
 from brawl_vision.terrain.labeling import (
-    CLASS_CHARS, CLASSES, UNLABELLED, LabelGrid, propose_clusters, read_label_frames,
+    CLASS_CHARS, CLASSES, UNLABELLED, LabelGrid, default_hud, hud_plans, observed_cells,
+    propose_clusters, read_label_frames,
 )
 from brawl_vision.terrain.zone import detect_zone
 
@@ -144,8 +149,9 @@ class Labeller:
         total = int((~self.zone).sum())
         held = [t.name for t in CLASSES if TILE_TO_CHAR[t] == self.held]
         self.title.set_text(
-            f"{clip} f{index}   holding: {held[0] if held else 'CLEAR'} ({self.held})   "
-            f"{done}/{total} cells   " + "  ".join(f"{k}:{v}" for k, v in counts.items())
+            f"{clip} f{index} ({self.grid.hud} HUD)   holding: {held[0] if held else 'CLEAR'} "
+            f"({self.held})   {done}/{total} cells   "
+            + "  ".join(f"{k}:{v}" for k, v in counts.items())
             + ("   [REVIEW ONLY]" if self.review else "")
         )
         self.overlay.set_data(self._rgba())
@@ -238,24 +244,34 @@ def main(argv=None) -> int:
     p.add_argument("--clusters", type=int, default=8, help="k for the appearance grouping")
     p.add_argument("--review", action="store_true", help="open read-only; never writes")
     p.add_argument("--out", default=None, help="override the label file path")
+    p.add_argument("--hud", default=None, choices=sorted(HUD_MASKS),
+                   help="the recording's HUD layout (default: the file's, or from the clip name)")
     args = p.parse_args(argv)
 
     cfg = load_vision_config()
-    plan = build_rectify_plan(load_camera_model(), load_hud_mask())
-    rect = plan.rectify(_frame_at(args.clip, args.frame, plan.viewport))
-
+    plans = hud_plans()
     path = Path(args.out) if args.out else LABELS / f"{args.clip}_f{args.frame}.json"
     if path.exists():
-        grid = LabelGrid.load(path, plan)
-        print(f"resuming {path} ({int(grid.labelled.sum())} cells already labelled)")
+        grid = LabelGrid.load(path, plans["phone"])
+        print(f"resuming {path} ({int(grid.labelled.sum())} cells already labelled, "
+              f"{grid.hud} HUD)")
+        if args.hud and args.hud != grid.hud:
+            grid.hud = args.hud
+            cleared = grid.clear_unobserved(plans[args.hud])
+            print(f"moved to the {args.hud} HUD mask: {cleared} labelled cells now sit under it "
+                  f"and are cleared (not written until you save)")
     else:
+        plan = plans["phone"]
         grid = LabelGrid(clip=args.clip, frame=args.frame, origin_tile=plan.origin_tile,
-                         size_tiles=plan.size_tiles, pixels_per_tile=plan.pixels_per_tile)
+                         size_tiles=plan.size_tiles, pixels_per_tile=plan.pixels_per_tile,
+                         hud=args.hud or default_hud(args.clip))
+    plan = plans[grid.hud]
+    rect = plan.rectify(_frame_at(args.clip, args.frame, plan.viewport))
 
     zone = detect_zone(rect, plan, cfg).at_least(0.05)
     # `at_least(0.05)`, not `cells`: for training data any tinting at all disqualifies a cell, and
     # over-excluding costs a few examples where under-excluding poisons the label set.
-    unusable = zone | ~grid_observed(plan)
+    unusable = zone | ~observed_cells(plan)
     clusters, _ = propose_clusters(rect, plan, k=args.clusters)
 
     _release_matplotlib_keys()
@@ -269,13 +285,6 @@ def main(argv=None) -> int:
     labeller.fig._brawl_labeller = labeller
     plt.show()
     return 0
-
-
-def grid_observed(plan):
-    """Cells with enough real world in them to be labelled at all."""
-    cols, rows = plan.size_tiles
-    ppt = plan.pixels_per_tile
-    return plan.valid.reshape(rows, ppt, cols, ppt).mean(axis=(1, 3)) > 0.9
 
 
 if __name__ == "__main__":

@@ -164,6 +164,40 @@ def test_the_shadow_matches_the_sim_field_for_field(action_repeat):
             assert s["dash_dir"][i] == pytest.approx(float(h["dash_dir"][0, i]), abs=1e-6), where
 
 
+def test_the_attack_bearing_is_where_the_sims_dash_goes():
+    """What `Buttons.press` drags along, and so where the real dash goes. Read after `act` and
+    BEFORE the step, the way the loop reads it before pressing, then checked against the dash the
+    sim starts. `action_repeat=1` so the observation lands while that dash is still fresh.
+
+    The parity script rarely fires on the idle bin, so a deliberate one is appended: walk down
+    for a second, then fire standing still. That dash goes along `facing`, and a bearing read from
+    the idle bin alone would have nothing to point at."""
+    env = _sim_env(1)
+    env.reset()
+    shadow = _shadow()
+    shadow.reset(facing=float(env.state.ent_facing[0, 0]))
+    override = torch.zeros(1, env.cfg.n_entities, 2, dtype=torch.int64)
+    override[0, 0, 0] = -1
+
+    plan = _script(60) + [(5, ATTACK_NONE)] * 20 + [(0, ATTACK_FIRE)]
+    checked = {"moving": 0, "idle": 0}
+    for decision, (move, attack) in enumerate(plan):
+        modelled = shadow.act(move, attack)
+        bearing = shadow.attack_bearing
+        obs, _, terminated, truncated, _ = env.step(
+            torch.tensor([[move, modelled]], dtype=torch.int64), override)
+        assert not bool(terminated[0]) and not bool(truncated[0]), f"episode ended at {decision}"
+        shadow.advance(env.cfg.dt)
+        if modelled != ATTACK_FIRE:
+            continue
+        dash = obs["hero"]["dash_dir"][0]
+        where = f"decision {decision} (move={move})"
+        assert math.cos(bearing) == pytest.approx(float(dash[0]), abs=1e-5), where
+        assert math.sin(bearing) == pytest.approx(float(dash[1]), abs=1e-5), where
+        checked["idle" if move == 0 else "moving"] += 1
+    assert checked["moving"] >= 3 and checked["idle"] >= 1, checked
+
+
 def test_a_super_costs_the_sim_and_the_shadow_the_same_thing():
     """The super branch is the one attack the parity script cannot reach -- charge comes from
     landing hits, which is not in the action stream. Seeded by hand on both sides instead: it must
@@ -356,6 +390,22 @@ def test_facing_tracks_the_move_bin_and_survives_the_idle_bin():
     assert shadow.observe()["facing"] == pytest.approx(math.pi / 2, abs=1e-6)
 
 
+def test_the_attack_bearing_is_the_move_bin_or_facing_when_idle():
+    """Before anything has moved it is `facing`'s spawn default, screen-right -- `reset` names
+    that as the one idle dash that can go the wrong way. After, the idle bin keeps the last
+    heading, and the dash that follows goes exactly where the bearing said."""
+    shadow = _shadow()
+    shadow.act(0, ATTACK_NONE)
+    assert shadow.attack_bearing == 0.0
+    shadow.act(5, ATTACK_NONE)                # bin 5 -> pi/2, down the screen
+    assert shadow.attack_bearing == pytest.approx(math.pi / 2, abs=1e-6)
+    shadow.advance(0.05)                      # facing turns toward it
+    shadow.act(0, ATTACK_FIRE)
+    assert shadow.attack_bearing == pytest.approx(math.pi / 2, abs=1e-6)
+    shadow.advance(0.05)
+    assert shadow.observe()["dash_dir"] == pytest.approx((0.0, 1.0), abs=1e-6)
+
+
 def test_a_dead_hero_cannot_attack_but_its_timers_keep_running():
     shadow = _shadow()
     shadow.act(1, ATTACK_FIRE)
@@ -382,8 +432,9 @@ def test_act_refuses_what_the_mask_refuses_and_says_so():
 
 
 def test_a_second_act_before_a_sub_tick_cannot_queue_a_second_attack():
-    """The device would swallow the second tap -- `Buttons.tap` releases a still-held contact
-    before re-pressing -- so modelling it would spend ammo the game kept."""
+    """One queued attack per sub-tick, whatever the device side does with a second press
+    (`Buttons.press` finishes the one in flight first) -- modelling two would spend ammo the game
+    kept."""
     shadow = _shadow()
     assert shadow.act(1, ATTACK_FIRE) == ATTACK_FIRE
     assert shadow.act(2, ATTACK_FIRE) == ATTACK_NONE

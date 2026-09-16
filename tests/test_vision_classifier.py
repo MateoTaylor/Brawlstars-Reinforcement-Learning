@@ -1,10 +1,12 @@
 """Per-cell terrain labelling and classification. See Terrain_Perception_Build_Plan.md Phase H.
 
-No real labels exist yet -- that is the phase's outstanding input -- so the network and the label
-store are exercised against synthetic terrain with a known answer. That checks the machinery is
-right; it says nothing about accuracy on real footage, which is exactly the split this file keeps
-explicit rather than blurring.
+The network and the label store are exercised against synthetic terrain with a known answer. That
+checks the machinery is right; it says nothing about accuracy on real footage, which is exactly the
+split this file keeps explicit rather than blurring. Accuracy on the real labels
+(`tests/fixtures/vision/labels`) is measured as a map, and those numbers live in `occupancy.py` and
+`classifier.py`.
 """
+import json
 from pathlib import Path
 
 import numpy as np
@@ -104,6 +106,121 @@ def test_load_label_dir_reads_every_file(plan, tmp_path):
     for i in (1, 2, 3):
         _empty(plan, frame=i).save(tmp_path / f"f{i}.json")
     assert [g.frame for g in labeling.load_label_dir(tmp_path, plan)] == [1, 2, 3]
+
+
+# ---------------------------------------------------------------------------
+# the HUD mask a label was drawn under
+# ---------------------------------------------------------------------------
+
+LABELS = Path(__file__).parent / "fixtures" / "vision" / "labels"
+
+
+@pytest.fixture(scope="module")
+def plans():
+    return labeling.hud_plans()
+
+
+def test_the_hud_masks_share_geometry_and_differ_only_in_what_they_cover(plans):
+    """Why one geometry check serves every label, and why a label must still say which mask it
+    used: the same cell is labellable under one and not the other."""
+    phone, emulator = plans["phone"], plans["emulator"]
+    geometry = lambda p: (tuple(p.origin_tile), tuple(p.size_tiles), p.pixels_per_tile)
+    assert geometry(phone) == geometry(emulator)
+    assert np.allclose(phone.M, emulator.M)
+    obs_p, obs_e = labeling.observed_cells(phone), labeling.observed_cells(emulator)
+    assert (obs_p & ~obs_e).sum() > 20 and (obs_e & ~obs_p).sum() > 20
+
+
+def test_the_hud_round_trips_and_a_file_without_one_was_drawn_under_the_phone_mask(plan, tmp_path):
+    g = _empty(plan)
+    g.hud = "emulator"
+    g.save(tmp_path / "e.json")
+    assert LabelGrid.load(tmp_path / "e.json", plan).hud == "emulator"
+    raw = g.to_dict()
+    del raw["hud"]
+    (tmp_path / "old.json").write_text(json.dumps(raw))
+    assert LabelGrid.load(tmp_path / "old.json", plan).hud == "phone"
+
+
+def test_an_unmeasured_hud_is_refused(plan):
+    with pytest.raises(ValueError, match="not one of the measured masks"):
+        LabelGrid(clip="c", frame=0, origin_tile=plan.origin_tile, size_tiles=plan.size_tiles,
+                  pixels_per_tile=plan.pixels_per_tile, hud="layout_b")
+
+
+def test_emulator_recordings_default_to_the_emulator_mask():
+    assert labeling.default_hud("bluestacks-example-new") == "emulator"
+    assert labeling.default_hud("9-10_new4") == "emulator"
+    assert labeling.default_hud("showdown_alternate_map") == "phone"
+    assert labeling.default_hud("ScreenRecording_09-04-2026 16-01-25_1") == "phone"
+    # The viewers pass a path, and a directory name is not the recording's.
+    assert labeling.default_hud(Path("tests/fixtures/vision/bluestacks-example3.mp4")) == "emulator"
+    assert labeling.default_hud("training_videos/edited_day14_broll.mp4") == "emulator"
+    assert labeling.default_hud("bluestacks-dump/counted_walking.mp4") == "phone"
+
+
+@pytest.mark.vision
+def test_the_name_rule_agrees_with_every_recordings_capture_size():
+    """Every emulator capture is 1920x1080 and every phone recording is not, so a recording whose
+    size and name disagree is one the rule misfiles: `edited_day14_broll`, an emulator capture,
+    defaulted to the phone mask until 2026-09-15. A new emulator recording under a new name fails
+    here until `EMULATOR_CLIP_PREFIXES` learns it."""
+    import cv2
+    paths = sorted(p for d in labeling.CLIP_DIRS for p in d.glob("*.mp4"))
+    if not paths:
+        pytest.skip("no recordings on this machine")
+    misfiled = []
+    for p in paths:
+        cap = cv2.VideoCapture(str(p))
+        size = (int(cap.get(cv2.CAP_PROP_FRAME_WIDTH)), int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT)))
+        cap.release()
+        if (size == (1920, 1080)) != (labeling.default_hud(p) == "emulator"):
+            misfiled.append(f"{p.name} {size} -> {labeling.default_hud(p)}")
+    assert not misfiled, misfiled
+
+
+def test_moving_a_label_to_another_mask_clears_what_that_mask_covers(plans):
+    phone, emulator = plans["phone"], plans["emulator"]
+    g = _empty(phone)
+    obs_p, obs_e = labeling.observed_cells(phone), labeling.observed_cells(emulator)
+    g.chars[obs_p] = TILE_TO_CHAR[Tile.FLOOR]
+    assert g.clear_unobserved(emulator) == int((obs_p & ~obs_e).sum())
+    assert not (g.labelled & ~obs_e).any()
+    assert (g.labelled == (obs_p & obs_e)).all(), "cleared a cell both masks observe"
+
+
+def test_each_label_trains_under_its_own_mask(plans):
+    """The same cell, labelled on a phone frame and on an emulator frame, where only the phone
+    mask observes it. The emulator label must not ask the net what is under a button."""
+    phone, emulator = plans["phone"], plans["emulator"]
+    only_phone = labeling.observed_cells(phone) & ~labeling.observed_cells(emulator)
+    r, c = np.argwhere(only_phone)[0]
+    rect = np.zeros((phone.size_px[1], phone.size_px[0], 3), np.uint8)
+    pairs = []
+    for hud, clip in (("phone", "p"), ("emulator", "e")):
+        g = _empty(phone, clip=clip)
+        g.hud = hud
+        g.set_cell(r, c, TILE_TO_CHAR[Tile.WALL])
+        pairs.append((g, rect))
+    by_mask = build_examples(pairs, plans)
+    assert by_mask[0].target[r, c] == labeling.CLASS_INDEX[Tile.WALL]
+    assert by_mask[1].target[r, c] == IGNORE_INDEX
+    # One plan for every label ignores what each file records -- the older call, still honoured.
+    one = build_examples(pairs, phone)
+    assert one[1].target[r, c] == labeling.CLASS_INDEX[Tile.WALL]
+
+
+def test_every_shipped_label_records_the_mask_its_recording_was_captured_under(plans):
+    """Over the real files. An emulator label drawn before its mask existed, and never moved to
+    it, fails here -- as does a label with cells under its own mask: one moved without clearing
+    them, or one drawn before a rect was widened (eleven phone labels, under the chat bubble, until
+    2026-09-15)."""
+    grids = labeling.load_label_dir(LABELS, plans["phone"])
+    assert len(grids) >= 54
+    for g in grids:
+        assert g.hud == labeling.default_hud(g.clip), f"{g.clip} f{g.frame} is under {g.hud}"
+        outside = g.labelled & ~labeling.observed_cells(plans[g.hud])
+        assert not outside.any(), f"{g.clip} f{g.frame}: {int(outside.sum())} cells under the HUD"
 
 
 # ---------------------------------------------------------------------------
@@ -217,16 +334,17 @@ def test_flips_move_patch_and_labels_together():
 
 
 def test_excluded_cells_are_dropped_from_the_target(plan):
+    (r0, c0), (r1, c1) = np.argwhere(labeling.observed_cells(plan))[:2]
     g = _empty(plan)
-    g.set_cell(0, 0, TILE_TO_CHAR[Tile.WALL])
-    g.set_cell(0, 1, TILE_TO_CHAR[Tile.WALL])
+    g.set_cell(r0, c0, TILE_TO_CHAR[Tile.WALL])
+    g.set_cell(r1, c1, TILE_TO_CHAR[Tile.WALL])
     cols, rows = plan.size_tiles
     drop = np.zeros((rows, cols), bool)
-    drop[0, 1] = True
+    drop[r1, c1] = True
     rect = np.zeros((plan.size_px[1], plan.size_px[0], 3), np.uint8)
     ex = build_examples([(g, rect)], plan, exclude={("c", 1): drop})[0]
-    assert ex.target[0, 0] == labeling.CLASS_INDEX[Tile.WALL]
-    assert ex.target[0, 1] == IGNORE_INDEX
+    assert ex.target[r0, c0] == labeling.CLASS_INDEX[Tile.WALL]
+    assert ex.target[r1, c1] == IGNORE_INDEX
 
 
 # ---------------------------------------------------------------------------
@@ -424,7 +542,7 @@ def _live_labeller(plan, tmp_path):
     rect[:] = (60, 90, 60)
     grid = LabelGrid(clip="c", frame=0, origin_tile=plan.origin_tile,
                      size_tiles=plan.size_tiles, pixels_per_tile=plan.pixels_per_tile)
-    unusable = ~vl.grid_observed(plan)
+    unusable = ~labeling.observed_cells(plan)
     clusters, _ = propose_clusters(rect, plan, k=4)
     vl._release_matplotlib_keys()
     lab = vl.Labeller("c", 0, plan, rect, grid, unusable, clusters, tmp_path / "l.json")
@@ -450,6 +568,41 @@ def test_the_labeller_survives_garbage_collection(plan, tmp_path):
     KeyEvent("key_press_event", fig.canvas, "2")._process()
     assert "WALL" in fig.axes[0].get_title(), "handlers died with the instance"
     plt.close(fig)
+
+
+def _run_labeller(monkeypatch, argv):
+    import matplotlib
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+    from scripts import vision_label as vl
+    monkeypatch.setattr(vl, "_frame_at", lambda clip, index, viewport=None: np.full(
+        (viewport[1], viewport[0], 3), 90, np.uint8))
+    monkeypatch.setattr(plt, "show", lambda: None)
+    assert vl.main(argv) == 0
+    lab = plt.gcf()._brawl_labeller
+    plt.close(lab.fig)
+    return lab
+
+
+def test_the_labeller_opens_emulator_footage_under_the_emulator_mask(plans, monkeypatch, tmp_path):
+    lab = _run_labeller(monkeypatch, ["bluestacks-anything", "0", "--out", str(tmp_path / "l.json")])
+    assert lab.grid.hud == "emulator"
+    assert (lab.zone == ~labeling.observed_cells(plans["emulator"])).all()
+
+
+def test_switching_a_labels_mask_clears_the_newly_covered_cells_on_save(plans, monkeypatch,
+                                                                       tmp_path):
+    path = tmp_path / "l.json"
+    g = _empty(plans["phone"], clip="bluestacks-anything", frame=0)
+    g.chars[labeling.observed_cells(plans["phone"])] = TILE_TO_CHAR[Tile.FLOOR]
+    g.save(path)
+    lab = _run_labeller(monkeypatch,
+                        ["bluestacks-anything", "0", "--out", str(path), "--hud", "emulator"])
+    assert LabelGrid.load(path).hud == "phone", "wrote before being asked to save"
+    lab.save()
+    back = LabelGrid.load(path)
+    assert back.hud == "emulator"
+    assert not (back.labelled & ~labeling.observed_cells(plans["emulator"])).any()
 
 
 def test_matplotlib_does_not_keep_the_keys_the_tool_needs(plan, tmp_path):

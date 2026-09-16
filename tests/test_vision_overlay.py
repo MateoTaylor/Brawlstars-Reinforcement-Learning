@@ -244,6 +244,21 @@ def test_script_requires_exactly_one_source():
             vision_watch.main(argv)
 
 
+@pytest.mark.parametrize("source, live, hud, expected", [
+    ("tests/fixtures/vision/counted_walking.mp4", False, None, "phone"),
+    ("tests/fixtures/vision/bluestacks-example3.mp4", False, None, "emulator"),
+    ("deploy", False, None, "emulator"),
+    ("screen:2", False, None, "emulator"),
+    (None, True, None, "emulator"),
+    ("deploy", False, "phone", "phone"),
+])
+def test_script_picks_the_hud_mask_the_source_was_captured_under(source, live, hud, expected):
+    from types import SimpleNamespace
+
+    from scripts import vision_watch
+    assert vision_watch._hud(SimpleNamespace(source=source, live=live, hud=hud)) == expected
+
+
 @pytest.mark.vision
 def test_script_renders_a_real_clip_end_to_end(tmp_path):
     """Phase E's acceptance, for the stages that exist: every implemented panel updates in sync

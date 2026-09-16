@@ -63,6 +63,22 @@ class DeploymentConfig:
     # already made, and makes every failure unreproducible.
     policy_deterministic: bool = True
 
+    # --- thread pools (§7.2) ----------------------------------------------------------------
+    # The emulator is a VM on the same eight cores, and it is what lags when this process burns
+    # them. MEASURED 2026-09-16, the real tick replayed at 12 Hz, process-scoped CPU: with the
+    # library defaults -- torch 8 OpenMP threads, two ORT sessions with spinning pools, cv2 16 --
+    # the process held 3.3-4.2 cores while sleeping a third of every tick, because an idle pool
+    # thread spin-waits for its next job instead of sleeping. Pinned as below it holds 1.0 core,
+    # and the tick got FASTER (48 vs 55 ms median): the CPU-side work is tiny (policy 1 ms, tensor
+    # copies, letterbox, NMS) and the pools were overhead. torch 1 because the policy is the only
+    # CPU network and 1 thread runs it in the same 0.96 ms. cv2 stays parallel: at 1 thread the
+    # warps and correlations pushed the tick to 68 ms. Detector counts reach the CPU side of a
+    # CUDA session only; the GPU work is unchanged. `loop.pin_thread_pools` applies them.
+    compute_torch_threads: int = 1
+    compute_cv2_threads: int = 4
+    compute_detector_threads: int = 2
+    compute_detector_spin: bool = False
+
     # --- the emulator window (§6.9) --------------------------------------------------------
     window_exe: str = "HD-Player.exe"
     window_require_fullscreen: bool = True
@@ -94,6 +110,16 @@ class DeploymentConfig:
     # UNVERIFIED IN A REAL MATCH -- `scripts/deploy_calibrate.py` confirms it by tapping once and
     # asserting `read_ammo` decrements, which is the venue-independent check.
     control_attack_tap: tuple[float, float] = (0.88, 0.55)
+    # How far an attack or super press is dragged from where it went down, in DEVICE pixels, along
+    # the move direction (`control/buttons.py`). A bare tap auto-aims at the nearest enemy; the sim
+    # dashes along the move bin, so every press is aimed. Direction only -- Mortis's dash and super
+    # travel a fixed distance -- so the one requirement is clearing the game's aim deadzone, past
+    # which a release is an aimed shot rather than a tap. 75 is ~70% of the movement stick's
+    # measured 110 px ring. The ceiling is the super button: it sits 81 px above the bottom edge at
+    # 1920x1080, and `Controls.build` refuses a radius that would drag either press off-screen.
+    # UNVERIFIED IN A REAL MATCH -- run the calibration tap job and watch the dash go the way the
+    # stick was held.
+    control_aim_radius_px: float = 75.0
 
     # --- loop rates (§6.13) -----------------------------------------------------------------
     # Perception ticks per second. A SETTING, unlike the decision period, which is derived and
@@ -158,6 +184,10 @@ _DEPLOYMENT_CONFIG_FIELDS = (
     ("run.checkpoint", "run_checkpoint", str),
     ("policy.device", "policy_device", str),
     ("policy.deterministic", "policy_deterministic", bool),
+    ("compute.torch_threads", "compute_torch_threads", int),
+    ("compute.cv2_threads", "compute_cv2_threads", int),
+    ("compute.detector_threads", "compute_detector_threads", int),
+    ("compute.detector_spin", "compute_detector_spin", bool),
     ("window.exe", "window_exe", str),
     ("window.require_fullscreen", "window_require_fullscreen", bool),
     ("window.check_occlusion", "window_check_occlusion", bool),
@@ -166,6 +196,7 @@ _DEPLOYMENT_CONFIG_FIELDS = (
     ("control.backend", "control_backend", str),
     ("control.adb_instance", "control_adb_instance", lambda v: None if v is None else str(v)),
     ("control.attack_tap", "control_attack_tap", lambda v: tuple(float(x) for x in v)),
+    ("control.aim_radius_px", "control_aim_radius_px", float),
     ("loop.tick_hz", "loop_tick_hz", float),
     ("shadow.ammo_strikes", "shadow_ammo_strikes", int),
     ("shadow.max_resyncs", "shadow_max_resyncs", int),
@@ -390,6 +421,18 @@ def validate(cfg: DeploymentConfig, sim_cfg=None, vision_cfg=None) -> None:
             f"control.attack_tap x={fx} is on the LEFT half of the screen, which is the movement "
             f"joystick's half. Attack only fires from the right side (§6.8)."
         )
+    if cfg.control_aim_radius_px <= 0:
+        raise ValueError(
+            f"control.aim_radius_px must be positive, got {cfg.control_aim_radius_px}. A press "
+            f"that is not dragged is a bare tap, which the game auto-aims."
+        )
+    for name in ("torch_threads", "cv2_threads", "detector_threads"):
+        if getattr(cfg, f"compute_{name}") < 1:
+            raise ValueError(
+                f"compute.{name} must be at least 1, got {getattr(cfg, f'compute_{name}')}. "
+                f"These cap the pools; 0 would hand the choice back to the library, which is "
+                f"the 3-4 spinning cores the setting exists to prevent."
+            )
     if cfg.window_check_every_n_ticks < 1:
         raise ValueError("window.check_every_n_ticks must be at least 1")
     if cfg.shadow_ammo_strikes < 1:
@@ -425,4 +468,21 @@ def validate(cfg: DeploymentConfig, sim_cfg=None, vision_cfg=None) -> None:
                 f"odometry.max_shift_tiles={vision_cfg.odometry_max_shift_tiles}. Every dash "
                 f"would read as a camera cut and reset the world model. Raise the tick rate, or "
                 f"raise max_shift_tiles -- its own comment says to, if the capture rate drops."
+            )
+
+    if sim_cfg is not None:
+        # An attack press is three touch steps, one per tick (`control/buttons.py`). With fewer
+        # ticks than that per decision, a fire right after a fire has to lift the last press and
+        # put the next one down inside a single tick -- the same-sample merge the one-step-per-tick
+        # rule exists to prevent, and it presents as shots that go the wrong way or not at all.
+        # Checked after the odometry bound, which refuses the same slow rates for its own reason.
+        from .control.buttons import PRESS_TICKS
+
+        rates = resolve_rates(sim_cfg, cfg)
+        if rates.decision_every < PRESS_TICKS:
+            raise ValueError(
+                f"loop.tick_hz={rates.tick_hz:g} gives {rates.decision_every} perception ticks per "
+                f"decision; an aimed attack takes {PRESS_TICKS} (down, drag, lift), so "
+                f"back-to-back attacks would overlap. Use {PRESS_TICKS / rates.agent_seconds:g} Hz "
+                f"or faster."
             )

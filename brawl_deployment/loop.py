@@ -31,17 +31,25 @@ jittering period, not a slow one. §6.13 has the measurement.
 | terrain classify + occupancy deposit | accumulating; a skipped frame is evidence thrown away |
 | `grid.observe_zone` | same, and it is what `ZoneEstimator` reads |
 | `shadow.advance` | it spends REAL elapsed seconds as whole sub-ticks, which is what keeps the two rates honest when a decision runs long |
-| `buttons.settle` | releases the previous tick's tap, one tick after it went down |
+| `buttons.settle` | walks an attack press one step: the tick after the down drags it along the aim, the tick after that lifts, which fires |
 
 | every decision (4 Hz) | why not faster |
 |---|---|
 | entity detect, HP read, HUD read | ~9 ms of GPU, and nothing consumes them between decisions |
 | tracker, grid build, assemble, policy | a decision's worth of work, by definition |
 
+**The process shares eight cores with the emulator's VM, and idle thread pools are not idle.**
+torch, ONNX Runtime and OpenCV each bring a pool whose workers spin-wait between jobs; with their
+defaults this loop held 3.3-4.2 cores while sleeping a third of every tick, and the game -- not
+the tick -- is what stuttered. `pin_thread_pools` caps them from `compute.*` before anything is
+built (§7.2); 1.0 core after, with a faster tick.
+
 **Held actions are the sim's `_held` semantics, reached from the device side.** The movement
 contact stays down and only moves when the bin changes; the fire bit does not repeat, because
-`Buttons.tap` is called once per decision and `ShadowHero.act` queues exactly one attack for the
-next sub-tick. Neither is a simplification of the trained behaviour -- both are it.
+`Buttons.press` is called once per decision and `ShadowHero.act` queues exactly one attack for the
+next sub-tick. The press is dragged along `ShadowHero.attack_bearing` -- the move bin, or `facing`
+when idle -- because that is where the sim's dash goes, and a bare tap would auto-aim instead.
+None of it is a simplification of the trained behaviour -- all of it is it.
 
 **Failure routes to one place** (§8). `_stop` releases every contact, drops the gate, and refuses
 to emit again. Occlusion is the single exception: it `_pause`s instead, because a window drawn
@@ -60,23 +68,24 @@ import time
 from collections import deque
 from dataclasses import dataclass
 from enum import Enum
-from pathlib import Path
 
 import numpy as np
 
 from brawl_sim.constants import Tile
+from brawl_vision.config import EMULATOR_HUD_MASK_PATH
 
 from .config import DeploymentConfig, resolve_rates
 from .control import Buttons, Joystick
 from .match_state import Calibration, MatchState
-from .perception import (EntityTracker, GridBuilder, GridSpec, LootMap, ProjectileTracker,
-                         ShadowHero, ShadowParams, ZoneEstimator, box_occlusion,
-                         crate_occlusion, require_loot_classes)
+from .perception import (EntityTracker, GridBuilder, GridSpec, LatticePhase, LootMap,
+                         ProjectileTracker, ShadowHero, ShadowParams, ZoneEstimator,
+                         box_occlusion, crate_occlusion, require_loot_classes)
 
-# The emulator's HUD, NOT `brawl_vision`'s default. That one is the iOS recordings' layout and stays
-# what the offline tools read; on BlueStacks frames it masks floor and leaves every button in view,
-# which the terrain map deposits as walls and odometry correlates as a static patch. See the file.
-HUD_MASK_PATH = Path(__file__).parent / "data" / "hud_mask.json"
+# The emulator's HUD, NOT `brawl_vision`'s default. That one is the iOS recordings' layout; on
+# BlueStacks frames it masks floor and leaves every button in view, which the terrain map deposits
+# as walls and odometry correlates as a static patch. See the file. It sits with the other masks in
+# brawl_vision/data because labels drawn on emulator footage are checked against it too.
+HUD_MASK_PATH = EMULATOR_HUD_MASK_PATH
 
 # How long odometry may report anything but "ok" before the loop gives up.
 #
@@ -146,7 +155,32 @@ class TickRow:
     # to happen anyway. An error column alone cannot: it hides which of the two moved.
     ammo_cv: float = -1.0
     ammo_shadow: float = -1.0
+    # `LatticeResult.status` ("unlocked" / "locked" / "rebased", or odometry's own) and the phase
+    # the world frame is shifted by. A "rebased" row is a tick on which every tracker reset.
+    lattice: str = ""
+    phase_x: float = 0.0
+    phase_y: float = 0.0
     note: str = ""
+
+
+def pin_thread_pools(cfg: DeploymentConfig) -> None:
+    """Cap the CPU thread pools this process shares with the emulator. FIRST, before anything
+    that builds a network -- torch's pool is process-global, and the detectors take their
+    settings at construction (`VisionStack.build`, which the caller passes `cfg.compute_*`).
+
+    Not a tick optimisation; a courtesy to the VM on the other cores, which is what lags when
+    this process burns them. MEASURED 2026-09-16 by replaying the real `tick` at 12 Hz from a
+    BlueStacks clip with process-scoped CPU sampling (§7.2): the library defaults held 3.3-4.2
+    cores of a machine with eight, while the loop slept a third of every tick -- an idle pool
+    thread spin-waits for its next job rather than sleeping, and every library brings its own
+    pool. torch alone (8 OpenMP threads for a 1 ms policy call every 250 ms) was 1.5-2.4 of
+    those cores. Pinned to the shipped `compute.*`: 1.0 core, and the tick got faster.
+    """
+    import cv2
+    import torch
+
+    torch.set_num_threads(cfg.compute_torch_threads)
+    cv2.setNumThreads(cfg.compute_cv2_threads)
 
 
 @dataclass
@@ -169,8 +203,14 @@ class VisionStack:
     cfg: object                 # VisionConfig
 
     @classmethod
-    def build(cls, vision_cfg=None) -> "VisionStack":
-        """The real stack, loaded from `configs/vision.yaml` and the shipped weights."""
+    def build(cls, vision_cfg=None, *, detector_threads: int | None = None,
+              detector_spin: bool = True) -> "VisionStack":
+        """The real stack, loaded from `configs/vision.yaml` and the shipped weights.
+
+        `detector_threads` / `detector_spin` are the ORT CPU-pool settings for both sessions, from
+        `DeploymentConfig.compute_*` when the live builders call this (`pin_thread_pools`). The
+        defaults are the library's, which is right for a script that runs alone.
+        """
         from brawl_vision.camera import build_rectify_plan, load_camera_model, load_hud_mask
         from brawl_vision.config import load_vision_config
         from brawl_vision.hud import HudReader
@@ -187,14 +227,15 @@ class VisionStack:
         plan = build_rectify_plan(load_camera_model(), load_hud_mask(HUD_MASK_PATH))
         # Checked here, on the real model, because the tracker filters by label: a promoted model
         # with no `Projectile` class would otherwise load fine and feed the policy zero shots.
-        projectiles = ProjectileDetector.from_config(cfg)
+        pool = dict(cpu_threads=detector_threads, spin=detector_spin)
+        projectiles = ProjectileDetector.from_config(cfg, **pool)
         require_projectile_class(projectiles.names)
         return cls(
             plan=plan,
             odometry=Odometry(plan, cfg),
             occupancy=OccupancyMap.from_config(cfg),
             classifier=TerrainClassifier.from_config(cfg),
-            entities=ObjectDetector.from_config(cfg),
+            entities=ObjectDetector.from_config(cfg, **pool),
             projectiles=projectiles,
             health=HealthTracker.from_config(cfg),
             hud=HudReader.from_config(cfg),
@@ -243,19 +284,27 @@ class Controls:
         backend = AdbTouchBackend(serial=find_adb_serial(instance=dcfg.control_adb_instance),
                                   screen=cal.screen)
         w, h = cal.screen
+        buttons = Buttons(backend,
+                          attack=(dcfg.control_attack_tap[0] * w, dcfg.control_attack_tap[1] * h),
+                          super_=cal.button("super"),
+                          aim_radius_px=dcfg.control_aim_radius_px)
+        try:
+            buttons.require_on_screen(cal.screen)
+        except ValueError:
+            backend.close()
+            raise
         return cls(
             backend=backend,
             joystick=Joystick(backend, cal.joystick_anchor, cal.joystick_radius_px,
                               n_bins=n_move_bins),
-            buttons=Buttons(backend,
-                            attack=(dcfg.control_attack_tap[0] * w, dcfg.control_attack_tap[1] * h),
-                            super_=cal.button("super")),
+            buttons=buttons,
         )
 
     def release_all(self) -> None:
         """Every path out of `PLAYING` goes through here. Idempotent by construction: both
-        `Joystick.release` and `Buttons.settle` no-op when nothing is held."""
-        self.buttons.settle()
+        `Joystick.release` and `Buttons.release` no-op when nothing is held. `release`, not
+        `settle`: settle would only walk a press one step further, and this path lifts now."""
+        self.buttons.release()
         self.joystick.release()
 
 
@@ -300,6 +349,8 @@ class DeployLoop:
         self.tracker = EntityTracker(n_slots=int(self.sim.n_entities) - 1)
         self.projectiles = ProjectileTracker()
         self.loot = LootMap()
+        # Not `self.phase`, which is the loop's Phase. This is where the game's tiles are.
+        self.lattice = LatticePhase()
         # The grid's channels come from the spec the policy was built with. The no-argument
         # `GridSpec.load()` reads agent_obs_deploy.yaml, which is two channels short of deploy3,
         # and the mismatch would only surface as a shape error in `assemble` on the first decision.
@@ -338,6 +389,7 @@ class DeployLoop:
         from .policy import DeployedPolicy
         from .window import WindowGuard, find_emulator_window, set_dpi_aware
 
+        pin_thread_pools(cfg)
         set_dpi_aware()
         window = find_emulator_window(cfg.window_exe)
         with mss.mss() as sct:
@@ -351,8 +403,10 @@ class DeployLoop:
                                          device=cfg.policy_device,
                                          deterministic=cfg.policy_deterministic)
         cal = Calibration.load()
+        vision = VisionStack.build(detector_threads=cfg.compute_detector_threads,
+                                   detector_spin=cfg.compute_detector_spin)
         return cls(capture=capture, guard=guard, match=MatchState(cal),
-                   vision=VisionStack.build(), policy=policy,
+                   vision=vision, policy=policy,
                    controls=Controls.build(cal, cfg, int(policy.cfg.n_move_bins)),
                    cfg=cfg, log=log)
 
@@ -433,8 +487,9 @@ class DeployLoop:
             if not self._check_window():
                 row.note = "window"
                 return
-            # The tap from the previous tick has had a full frame to register. Release it before
-            # anything else, so a new tap this tick is never swallowed by a stale contact.
+            # An attack press moves one step per tick -- down, drag, lift -- so each step has had a
+            # full frame to register before the next. First thing, so on a decision tick the last
+            # press has lifted before a new one can go down.
             self.controls.buttons.settle()
 
             rect = self.vision.plan.rectify(frame.image)
@@ -452,9 +507,9 @@ class DeployLoop:
                 return
             if not self._gate_transition(gate, frame, row):
                 return
-            detections = self._perceive(frame, rect, odo)
+            detections, world = self._perceive(frame, rect, odo, row)
             if self._is_decision_tick():
-                self._decide(frame, odo, row, detections)
+                self._decide(frame, world, row, detections)
         finally:
             row.phase = self.phase.value
             row.tick_ms = (time.perf_counter() - t_start) * 1e3
@@ -463,19 +518,36 @@ class DeployLoop:
             if self.phase is Phase.PLAYING:
                 self._ticks_in_match += 1
 
-    def _perceive(self, frame, rect, odo) -> list:
+    def _perceive(self, frame, rect, odo, row: TickRow | None = None) -> tuple[list, object]:
         """The accumulating every-tick stages. Everything here is gated on odometry inside its own
         `update`; the loop does not re-implement that gate, it relies on it (§6.1).
 
         Returns this tick's entity detections, which a decision on the same tick reuses rather
-        than running the detector twice on one frame.
+        than running the detector twice on one frame, and the WORLD odometry every consumer was
+        given: `odo` moved onto the game's tile lattice (`perception/lattice.py`).
         """
         from brawl_vision.terrain.zone import detect_zone
 
-        plan = self.vision.plan
-        # First, because the crate boxes are the occupancy map's fifth gate: a cell a crate
-        # stands on is not evidence about the floor under it (`loot.crate_occlusion`).
+        # First: the crates are both the lattice's evidence and the occupancy map's fifth gate
+        # (a cell a crate stands on is not evidence about the floor under it).
         dets = self.vision.projectiles.predict(frame.image)
+        # Before anything deposits, because a re-lock on this tick moves this tick's frame. From
+        # here on nothing sees `odo`: every consumer gets `world`, whose `segment` is the lattice
+        # epoch, so a re-lock resets them all through their own new-segment path.
+        lattice = self.lattice.update(dets, self.vision.plan, odo)
+        world = self.lattice.world(odo)
+        if row is not None:
+            row.lattice = lattice.status
+            row.phase_x, row.phase_y = lattice.phase
+
+        # `rect` came through the fixed plan, which is what odometry measures against. Everything
+        # that deposits cells takes this frame re-rectified onto the map's own lattice instead, so
+        # its cells are the map's cells rather than up to half a tile off (`RectifyPlan.registered`).
+        # With the world frame on the game's lattice, the map's cells are the game's tiles.
+        # Continuous consumers (projectiles, loot) read the same tiles through either plan.
+        plan = self.vision.plan.registered(world.position_tiles)
+        if plan is not self.vision.plan:
+            rect = plan.rectify(frame.image)
         # Every tick, not only on decisions, for the same gate: a brawler sprite is not floor
         # either, and two thirds of the deposits would otherwise carry it (`loot.box_occlusion`).
         # A tick odometry did not place deposits nothing, and `_decide` returns before reading.
@@ -484,14 +556,14 @@ class DeployLoop:
         zone = detect_zone(rect, plan, self.vision.cfg)
         cells, _ = self.vision.classifier.predict(rect, plan)
         occluded = crate_occlusion(dets, plan) | box_occlusion(entities, plan)
-        self.vision.occupancy.update(cells, odo, plan, zone=zone.at_least(0.05),
+        self.vision.occupancy.update(cells, world, plan, zone=zone.at_least(0.05),
                                      occluded=occluded, cfg=self.vision.cfg)
-        self.grid.observe_zone(zone, plan, odo)
+        self.grid.observe_zone(zone, plan, world)
 
         # One model, three classes, and each consumer keeps its own label.
-        self.projectiles.update(dets, plan, odo, frame.t)
-        self.loot.update(dets, plan, odo, frame.t)
-        return entities
+        self.projectiles.update(dets, plan, world, frame.t)
+        self.loot.update(dets, plan, world, frame.t)
+        return entities, world
 
     # -- one decision ---------------------------------------------------------
 
@@ -507,6 +579,8 @@ class DeployLoop:
         produces constantly and the policy has seen. Substituting a zero is not. Every skip is
         named in the telemetry row, because "the agent stood still" and "no observation could be
         built" look identical from outside and mean opposite things.
+
+        `odo` is the WORLD odometry `_perceive` returned, the frame every track and map is in.
         """
         if odo.status != "ok":
             # §8's "hold last action". The tracker would hand back its previous tracks unchanged
@@ -568,11 +642,12 @@ class DeployLoop:
             raise
 
         # `act` returns what the shadow will actually MODEL -- `ATTACK_NONE` if its own mask
-        # refuses. Tapping the policy's choice instead would model a shot the game never took,
-        # which is the one error the shadow must never make.
+        # refuses. Pressing the policy's choice instead would model a shot the game never took,
+        # which is the one error the shadow must never make. The aim is read AFTER `act`, which is
+        # what sets the move bin it is read from.
         modelled = self.shadow.act(decision.move_bin, decision.attack)
         self.controls.joystick.apply(decision.move_bin)
-        self.controls.buttons.tap(modelled)
+        self.controls.buttons.press(modelled, self.shadow.attack_bearing)
         self._last_decision = decision
         row.decision = True
         row.move_bin = decision.move_bin
@@ -751,10 +826,14 @@ class DeployLoop:
 
         self.log(f"match started (gate refined to {score:.3f})")
         self.shadow.reset()
-        self.tracker.reset(self.vision.odometry.segment)
-        self.projectiles.reset(self.vision.odometry.segment)
-        self.loot.reset(self.vision.odometry.segment)
-        self.grid.reset(self.vision.odometry.segment)
+        # A new match is a new world frame even if odometry never cut: a new epoch at phase 0, and
+        # every consumer adopts it. The occupancy map, which has no reset here, sees the new epoch
+        # on its next deposit and drops the last match's votes.
+        self.lattice.reset(self.vision.odometry.segment)
+        self.tracker.reset(self.lattice.epoch)
+        self.projectiles.reset(self.lattice.epoch)
+        self.loot.reset(self.lattice.epoch)
+        self.grid.reset(self.lattice.epoch)
         self.vision.health.reset()
         self._enemy_hp.clear()
         self._slot_ids.clear()

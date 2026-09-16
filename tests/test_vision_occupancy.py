@@ -224,6 +224,30 @@ def test_position_rounds_to_the_nearest_tile(plan):
     assert far.observed_bounds()[2] == zero.observed_bounds()[2] + 1
 
 
+@pytest.mark.parametrize("position", [(0.3, -0.2), (7.45, 3.55), (-2.5, 0.5)])
+def test_a_registered_deposit_covers_exactly_the_map_cell_it_votes_for(plan, position):
+    """Rounding keeps the map from shearing, but through the fixed plan each frame's cell still
+    covers a world square up to half a tile off the map cell it votes for. Through
+    `plan.registered(position)` the two are the same square: the cell's corner, carried through
+    the plan's own coordinates and the camera position, is the map cell's corner exactly."""
+    cfg = VisionConfig()
+    cols, rows = plan.size_tiles
+    r, c = rows // 2, cols // 2
+
+    def corner_error(p):
+        cells = _cells(p)
+        cells[r, c] = CLASS_INDEX[Tile.WALL]
+        m = _map(cfg)
+        m.update(cells, _odo(pos=position), p, cfg=cfg)
+        (i,), (j,) = np.nonzero(m.best() == CLASS_INDEX[Tile.WALL])
+        seen = p.rect_to_tile(np.array([[c, r]], np.float64) * p.pixels_per_tile)[0] + position
+        return np.abs(seen - (j + m.origin[0], i + m.origin[1])).max()
+
+    at = np.asarray(plan.origin_tile, np.float64) + position
+    assert corner_error(plan) == pytest.approx(np.abs(at - np.round(at)).max())
+    assert corner_error(plan.registered(position)) < 1e-9
+
+
 def test_walking_off_the_grid_is_counted_not_crashed(plan):
     m = OccupancyMap(height=24, width=24)
     r = m.update(_cells(plan), _odo(pos=(500.0, 500.0)), plan)

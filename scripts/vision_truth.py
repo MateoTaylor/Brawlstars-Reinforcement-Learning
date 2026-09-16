@@ -36,10 +36,11 @@ import sys
 from pathlib import Path
 
 from brawl_vision.camera import build_rectify_plan, load_camera_model, load_hud_mask
-from brawl_vision.config import load_vision_config
-from brawl_vision.sources import open_source
+from brawl_vision.config import HUD_MASKS, load_vision_config
+from brawl_vision.sources import at_viewport, open_source
 from brawl_vision.terrain import truth as T
 from brawl_vision.terrain.evaluate import Mosaic, scan_track, world_window
+from brawl_vision.terrain.labeling import default_hud
 from brawl_vision.terrain.occupancy import OccupancyMap
 
 DEFAULT_TERRAIN = Path(__file__).resolve().parent.parent / "brawl_vision" / "data" / "terrain.pt"
@@ -53,7 +54,8 @@ def _paths(clip: Path):
 def _build_mosaic(clip, cfg, plan, step, scan_step, stop, say):
     say(f"pass 1/2  odometry over {clip.name} (every {scan_step} frames)")
     with open_source(clip, cfg, step=scan_step) as src:
-        track = scan_track((f for f in src if stop is None or f.index <= stop), plan, cfg)
+        track = scan_track(at_viewport((f for f in src if stop is None or f.index <= stop),
+                                       plan.viewport), plan, cfg)
     lo_x, hi_x, lo_y, hi_y = track.bounds_tiles()
     say(f"   camera track {hi_x - lo_x:.1f} x {hi_y - lo_y:.1f} tiles, "
         f"{track.n_segments} segment(s)")
@@ -68,7 +70,7 @@ def _build_mosaic(clip, cfg, plan, step, scan_step, stop, say):
     with open_source(clip, cfg, step=step) as src:
         from brawl_vision.terrain.odometry import Odometry
         odo = Odometry(plan, cfg)
-        for frame in src:
+        for frame in at_viewport(src, plan.viewport):
             if stop is not None and frame.index > stop:
                 break
             rect = plan.rectify(frame.image)
@@ -98,8 +100,15 @@ def main(argv=None) -> int:
     p.add_argument("--scan-step", type=int, default=4, help="...and when sizing the canvas")
     p.add_argument("--stop", type=int, default=None, help="last frame index, inclusive")
     p.add_argument("--terrain", default=str(DEFAULT_TERRAIN), help="classifier for --check")
+    p.add_argument("--no-register", dest="register", action="store_false",
+                   help="--check with each frame's position rounded onto the map, as deposits "
+                        "worked before RectifyPlan.registered, for comparison")
     p.add_argument("--device", default="cpu")
     p.add_argument("--config", default=None, help="a vision.yaml to use instead of the default")
+    p.add_argument("--hud", choices=sorted(HUD_MASKS), default=None,
+                   help="the HUD mask the clip was captured under (default: from its name). "
+                        "Odometry places the grid through it, so check a grid under the mask it "
+                        "was generated with")
     p.add_argument("--overwrite", action="store_true",
                    help="regenerate a blank CSV over one that already exists. This throws away "
                         "hand-written work; the PNG and JSON are rewritten either way")
@@ -130,7 +139,9 @@ def main(argv=None) -> int:
         return 0
 
     cfg = load_vision_config(args.config) if args.config else load_vision_config()
-    plan = build_rectify_plan(load_camera_model(), load_hud_mask())
+    hud = args.hud or default_hud(clip)
+    say(f"{hud} HUD mask")
+    plan = build_rectify_plan(load_camera_model(), load_hud_mask(HUD_MASKS[hud]))
 
     # -- check: score the pipeline against a filled-in CSV --------------------
     if args.check:
@@ -162,16 +173,18 @@ def main(argv=None) -> int:
         odo = Odometry(plan, cfg)
         say("running the pipeline over the clip")
         with open_source(clip, cfg, step=args.step) as src:
-            for frame in src:
+            for frame in at_viewport(src, plan.viewport):
                 if args.stop is not None and frame.index > args.stop:
                     break
-                rect = plan.rectify(frame.image)
-                r = odo.update(rect)
+                r = odo.update(plan.rectify(frame.image))
                 if r.segment != occ.segment:
                     occ.reset(r.segment)
-                zone = detect_zone(rect, plan, cfg).at_least(0.05)
-                cells, _ = classifier.predict(rect, plan)
-                occ.update(cells, r, plan, zone=zone, cfg=cfg)
+                # The deploy loop's deposit: the frame re-rectified onto the map's lattice.
+                reg = plan.registered(r.position_tiles) if args.register else plan
+                rect = reg.rectify(frame.image)
+                zone = detect_zone(rect, reg, cfg).at_least(0.05)
+                cells, _ = classifier.predict(rect, reg)
+                occ.update(cells, r, reg, zone=zone, cfg=cfg)
 
         r0, r1, c0, c1 = meta["grid_window"]
         got = T.score(occ.to_chars(), grid, Window(row0=r0, row1=r1, col0=c0, col1=c1))

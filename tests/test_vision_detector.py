@@ -648,3 +648,31 @@ def test_both_detectors_run_a_real_inference_on_cuda_with_torch_loaded():
             pytest.skip(f"{name} weights are not present")
         assert det.provider == "CUDAExecutionProvider", name
         det.predict(frame)                              # the assertion is that this does not raise
+
+
+# ---------------------------------------------------------------------------
+# The CPU pool: the library's choice alone, capped when a caller shares the machine
+# ---------------------------------------------------------------------------
+
+@needs_weights
+def test_the_default_session_keeps_the_runtime_thread_choice(detector):
+    """A script running alone over a clip should get onnxruntime's own pool -- 0 is ORT's "you
+    pick", and a pinned number would just be wrong on another machine."""
+    opts = detector.session.get_session_options()
+    assert opts.intra_op_num_threads == 0
+    with pytest.raises(RuntimeError):
+        opts.get_session_config_entry("session.intra_op.allow_spinning")
+
+
+@needs_weights
+def test_cpu_threads_and_spin_reach_the_session_options():
+    """The deploy loop's knobs (`compute.detector_*`): the emulator is a VM on the same cores,
+    and a spinning pool between 83 ms ticks costs it real cores for nothing. The GPU work is not
+    touched by either -- these reach the CPU side of a CUDA session only."""
+    from brawl_vision.object_detection import ObjectDetector
+    det = ObjectDetector.from_config(load_vision_config(), cpu_threads=2, spin=False)
+    opts = det.session.get_session_options()
+    assert opts.intra_op_num_threads == 2
+    assert opts.get_session_config_entry("session.intra_op.allow_spinning") == "0"
+    assert opts.get_session_config_entry("session.inter_op.allow_spinning") == "0"
+

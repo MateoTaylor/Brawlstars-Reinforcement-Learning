@@ -157,7 +157,8 @@ def main(argv=None) -> int:
                                      n_bins=loop.controls.joystick.n_bins),
                                  buttons=type(loop.controls.buttons)(
                                      null, loop.controls.buttons.attack,
-                                     loop.controls.buttons.super_))
+                                     loop.controls.buttons.super_,
+                                     aim_radius_px=loop.controls.buttons.aim_radius_px))
         _log("DRY RUN -- decisions are real, touches go nowhere")
 
     _log(f"capture {loop.capture.viewport[0]}x{loop.capture.viewport[1]} from monitor "

@@ -11,6 +11,7 @@ button anyway, which is the exact bug the interlock exists to make impossible.
 """
 from pathlib import Path
 
+import cv2
 import numpy as np
 import pytest
 
@@ -22,6 +23,7 @@ from brawl_deployment.config import DeploymentConfig
 from brawl_deployment.control.buttons import Buttons
 from brawl_deployment.control.joystick import Joystick
 from brawl_deployment.perception.assemble import ObservationAssembler
+from brawl_deployment.perception.loot import crate_occlusion
 from brawl_deployment.policy import Decision
 from brawl_deployment.window import WindowFault
 from brawl_sim.config import load_config
@@ -48,15 +50,19 @@ class _Backend:
 
     def __init__(self):
         self.events = []
+        self.log = []          # the same touches with their coordinates, `NullBackend.log`'s shape
 
     def down(self, slot, x, y):
         self.events.append(("down", slot))
+        self.log.append(("down", slot, x, y))
 
     def move(self, slot, x, y):
         self.events.append(("move", slot))
+        self.log.append(("move", slot, x, y))
 
     def up(self, slot):
         self.events.append(("up", slot))
+        self.log.append(("up", slot))
 
     def release_all(self):
         self.events.append(("release_all",))
@@ -210,6 +216,23 @@ class _Plan:
         t = np.asarray(tiles, np.float64).reshape(-1, 2)
         return (t - np.asarray(self.origin_tile, np.float64)) * self.pixels_per_tile
 
+    def registered(self, position_tiles):
+        """`RectifyPlan.registered`'s arithmetic: the content shifted by the remainder of
+        `origin_tile + position_tiles`, and the origin moved to match. Only the warp stays trivial."""
+        at = np.asarray(self.origin_tile, np.float64) + np.asarray(position_tiles, np.float64)
+        f = at - np.round(at)
+        if np.abs(f).max() < 1e-9:
+            return self
+        out = _Plan()
+        T = np.array([[1.0, 0.0, f[0] * self.pixels_per_tile],
+                      [0.0, 1.0, f[1] * self.pixels_per_tile], [0.0, 0.0, 1.0]])
+        out.M = T @ self.M
+        out.M_inv = np.linalg.inv(out.M)
+        out.origin_tile = tuple(np.asarray(self.origin_tile, np.float64) - f)
+        out.valid = cv2.warpAffine(self.valid.astype(np.uint8), T[:2], self.size_px,
+                                   flags=cv2.INTER_NEAREST, borderValue=0).astype(bool)
+        return out
+
 
 HERO_PX = (10 * 48, 6 * 48)          # -> camera-relative tile (0, 0)
 
@@ -244,6 +267,7 @@ class _Occupancy:
         self._best = np.full((size, size), -1, np.int8)
         self.deposits = 0
         self.occluded = None
+        self.plan = None
 
     @property
     def origin(self):
@@ -255,6 +279,7 @@ class _Occupancy:
     def update(self, cells, odometry, plan, zone=None, occluded=None, cfg=None):
         self.deposits += 1
         self.occluded = occluded
+        self.plan = plan
 
 
 class _Detector:
@@ -736,13 +761,77 @@ def test_an_idle_decision_does_not_release_the_contact(loop):
 
 
 def test_the_fire_bit_does_not_repeat_across_the_decision_window(loop):
-    """`env._held` zeroes the fire column on sub-ticks 2..K. One tap per decision, and the release
-    lands on the next perception tick rather than inside the same `sendevent` batch."""
+    """`env._held` zeroes the fire column on sub-ticks 2..K. One press per decision, and it is
+    finished inside the window: down, drag, lift, and the slot is free for the next decision."""
     loop.policy.decision = Decision(move_bin=1, attack=ATTACK_FIRE, legal=(True, True, False))
     _play(loop, loop.decision_every)
-    taps = [e for e in loop.backend.events if e == ("down", SLOT_TAP)]
-    assert len(taps) == 1
-    assert ("up", SLOT_TAP) in loop.backend.events
+    taps = [e for e in loop.backend.events if e[1:] == (SLOT_TAP,)]
+    assert taps == [("down", SLOT_TAP), ("move", SLOT_TAP), ("up", SLOT_TAP)]
+    assert not loop.controls.buttons.is_held
+
+
+def _tap_steps_per_tick(loop, ticks):
+    """SLOT_TAP touches, grouped by the tick that sent them."""
+    per_tick = []
+    for _ in range(ticks):
+        before = len(loop.backend.log)
+        loop.tick()
+        per_tick.append([e for e in loop.backend.log[before:] if e[1] == SLOT_TAP])
+    return per_tick
+
+
+def test_an_attack_is_dragged_along_the_move_bin_one_step_per_tick(loop):
+    """The drag IS the aim, because a bare tap auto-aims and the sim's dash goes along the move
+    bin. Bin 5 is a quarter turn from +x, which is DOWN the screen (no y flip): the press goes down
+    on the attack point on the decision tick, drags `aim_radius_px` straight down on the next, and
+    lifts -- which fires -- on the last tick of the window."""
+    loop.policy.decision = Decision(move_bin=5, attack=ATTACK_FIRE, legal=(True, True, False))
+    loop.match.gate = True
+    ax, ay = loop.controls.buttons.attack
+    r = loop.controls.buttons.aim_radius_px
+    down, drag, lift = _tap_steps_per_tick(loop, loop.decision_every)
+    assert down == [("down", SLOT_TAP, ax, ay)]
+    assert len(drag) == 1 and drag[0][:2] == ("move", SLOT_TAP)
+    assert drag[0][2:] == pytest.approx((ax, ay + r), abs=0.01)
+    assert lift == [("up", SLOT_TAP)]
+
+
+def test_an_idle_attack_is_dragged_the_way_the_hero_last_faced(loop):
+    """`action.dash_on_idle: facing`. Walk down for one decision, then fire standing still: the
+    dash goes the way the hero faces, so the drag must still go down -- NOT screen-right, which is
+    where `facing` starts, and not a bare tap."""
+    loop.match.gate = True
+    loop.policy.decision = Decision(move_bin=5, attack=ATTACK_NONE, legal=(True, True, False))
+
+    def tick_in_real_time():
+        # The shadow spends WALL-CLOCK seconds as sub-ticks, and a test tick takes microseconds.
+        # Backdating the last grab by one period is what lets its `facing` turn at all. (Not
+        # before the first grab: 0 means "none yet", and backdating it would read as a stall.)
+        if loop._last_grab_t:
+            loop._last_grab_t -= loop.tick_seconds
+        loop.tick()
+
+    for _ in range(loop.decision_every):
+        tick_in_real_time()
+    loop.policy.decision = Decision(move_bin=0, attack=ATTACK_FIRE, legal=(True, True, False))
+    before = len(loop.backend.log)
+    for _ in range(loop.decision_every):
+        tick_in_real_time()
+    drags = [e for e in loop.backend.log[before:] if e[:2] == ("move", SLOT_TAP)]
+    ax, ay = loop.controls.buttons.attack
+    assert len(drags) == 1
+    assert drags[0][2:] == pytest.approx((ax, ay + loop.controls.buttons.aim_radius_px), abs=0.01)
+
+
+def test_a_press_in_flight_is_lifted_when_the_match_ends(loop):
+    """Every path out of `PLAYING` lifts SLOT_TAP immediately -- `release`, not `settle`, which
+    would only have dragged it one step further and left it down."""
+    loop.policy.decision = Decision(move_bin=1, attack=ATTACK_FIRE, legal=(True, True, False))
+    _play(loop, 1)
+    assert loop.controls.buttons.is_held
+    loop._end_match("test")
+    assert not loop.controls.buttons.is_held
+    assert loop.backend.log[-2:] == [("up", SLOT_TAP), ("up", SLOT_MOVE)]
 
 
 def test_only_what_the_shadow_modelled_is_tapped(loop):
@@ -940,6 +1029,84 @@ def test_a_brawler_box_keeps_the_terrain_map_off_the_floor_under_it_on_every_tic
     assert not loop.vision.occupancy.occluded.any()
 
 
+def test_terrain_is_deposited_through_a_plan_registered_at_this_ticks_position(loop):
+    """The map is a whole-tile grid and the camera almost never sits on a whole tile. A deposit
+    through the fixed plan lands up to half a tile off, differently every tick, while the hero is
+    placed continuously. So what the occupancy map is handed must put the frame's pixel (0, 0)
+    on a whole world tile at THIS tick's position, and the crate mask must come from the same plan."""
+    loop.vision.entities.detections = []
+    loop.vision.projectiles.detections = [CRATE]
+    loop.vision.odometry.position = (3.3, -1.8)
+    _play(loop, 1)
+    plan = loop.vision.occupancy.plan
+    at = np.asarray(plan.origin_tile, np.float64) + (3.3, -1.8)
+    assert np.allclose(at, np.round(at))
+    assert plan is not loop.vision.plan
+    # The crate mask moves with the content. The remainder here is (+0.3, +0.2) tile, and 0.3 of
+    # a tile pushes the 40 px box (x 580-620, inside col 12 on the fixed plan) across into col 13.
+    occluded = loop.vision.occupancy.occluded
+    assert occluded[:, 13].any() and not crate_occlusion([CRATE], loop.vision.plan)[:, 13].any()
+    assert np.array_equal(occluded, crate_occlusion([CRATE], plan))
+
+
+def _lattice_crate(tile):
+    """A crate box at a real crate's on-screen height, anchored on camera-relative `tile`.
+
+    `CRATE` above is 100 px tall, which `perception/lattice.py` reads as a crate half hidden
+    behind something and ignores: every other test here runs at phase 0 because of that.
+    """
+    from brawl_deployment.perception.lattice import CRATE_HEIGHT_PX
+    from brawl_vision.object_detection.project import CRATE_ANCHOR_FRAC
+
+    a, b = CRATE_HEIGHT_PX
+    ax = (tile[0] - _Plan.origin_tile[0]) * _Plan.pixels_per_tile
+    ay = (tile[1] - _Plan.origin_tile[1]) * _Plan.pixels_per_tile
+    y1 = (ay + CRATE_ANCHOR_FRAC * a) / (1.0 - CRATE_ANCHOR_FRAC * b)   # anchor = y1 - 0.3 h
+    return Detection(CUBE_BOX, 0.9, (ax - 60.0, y1 - (a + b * y1), ax + 60.0, y1))
+
+
+def test_every_consumer_moves_onto_the_game_lattice_the_crates_give(loop):
+    """Step B through the real loop. The crate reads (+0.3, -0.25) off a tile centre in the
+    odometry frame. On the third sighting the world frame moves by exactly that. The deposit is
+    registered at the moved position, every tracker starts over in the new frame, and the crate the
+    loot map confirms sits on a tile centre: the cell the sim keeps a crate in."""
+    lp = _deploy3_loop(loop, [_lattice_crate((2.8, 1.25))])
+    _play(lp, 7)
+    rows = list(lp.telemetry)
+    assert [r.lattice for r in rows[:4]] == ["unlocked", "unlocked", "rebased", "locked"]
+    assert (rows[2].phase_x, rows[2].phase_y) == pytest.approx((0.3, -0.25))
+
+    plan = lp.vision.occupancy.plan
+    at = np.asarray(plan.origin_tile, np.float64) + (-0.3, 0.25)      # the WORLD position
+    assert np.allclose(at, np.round(at))
+    assert lp.loot.crates() == [pytest.approx((2.5, 1.5))]
+
+    # The decision on the tick after the re-lock is the tracker's reset tick, and is skipped like
+    # any segment change; the next one goes through. Two decisions of three, not three.
+    assert rows[3].note == "no hero box" and lp.policy.calls == 2
+    # The hero is camera-relative (0, 0), so world (-0.3, 0.25): game tile (-1, 0). The crate is
+    # game tile (2, 1), three columns right of the hero and one row down.
+    channels = lp.grid.spec.channels
+    box = lp.policy.assembler.calls[-1]["grid"][channels.index("box")]
+    assert box.sum() == 1 and box[6 + 1, 10 + 3] == 1
+
+
+def test_a_new_match_is_a_new_lattice_and_its_first_decision_still_goes_through(loop):
+    """The match start hands every tracker the NEW epoch. Handed the odometry segment instead,
+    each would see the lattice's epoch as a change on its first update, reset, and skip the
+    match's first decision, every match."""
+    lp = _deploy3_loop(loop, [_lattice_crate((2.8, 1.25))])
+    _play(lp, 4)
+    assert lp.lattice.phase != (0.0, 0.0)
+    lp.match.gate = False
+    lp.tick()
+    calls = lp.policy.calls
+    lp.vision.projectiles.detections = []
+    _play(lp, 1)
+    assert lp.lattice.phase == (0.0, 0.0)
+    assert lp.policy.calls == calls + 1, _last_attempt(lp).note
+
+
 def test_a_deploy3_policy_refuses_a_projectile_model_that_cannot_see_crates(loop):
     with pytest.raises(ValueError, match="Power Cube Box"):
         _deploy3_loop(loop, names={0: PROJECTILE})
@@ -1018,3 +1185,74 @@ def _loop_fixture_value():
     lp.backend = backend
     lp.vision.warm = lambda image: None
     return lp
+
+
+# -- the process shares its cores with the emulator ---------------------------------------------
+
+def test_pin_thread_pools_caps_torch_and_cv2_from_the_config():
+    """`from_config` and the calibration rig call this before building anything, because torch's
+    pool is process-global and the detectors take theirs at construction. The caps come from
+    `compute.*`, not from constants here: the measurement lives in the config."""
+    import cv2
+    import torch
+
+    from brawl_deployment.loop import pin_thread_pools
+
+    torch_before, cv2_before = torch.get_num_threads(), cv2.getNumThreads()
+    try:
+        pin_thread_pools(DeploymentConfig(compute_torch_threads=1, compute_cv2_threads=3))
+        assert torch.get_num_threads() == 1
+        assert cv2.getNumThreads() == 3
+    finally:
+        torch.set_num_threads(torch_before)
+        cv2.setNumThreads(cv2_before)
+
+
+def test_vision_stack_build_hands_the_detector_pool_settings_to_both_sessions(monkeypatch):
+    """Both detectors, not one: each ORT session has its own pool, and a spinning pool on the
+    session that was forgotten costs the same cores as the one that was not."""
+    import brawl_deployment.loop as loop_mod
+
+    seen = {}
+
+    class _Det:
+        names = {0: "player", 1: "enemy"}
+
+        @classmethod
+        def from_config(cls, cfg, **kw):
+            seen[cls.__name__] = kw
+            return cls()
+
+    class _Proj(_Det):
+        names = {0: "Projectile", 1: "cube_box", 2: "power_cube"}
+
+    class _Any:
+        def __init__(self, *a, **kw):
+            pass
+
+        @classmethod
+        def from_config(cls, cfg):
+            return cls()
+
+    monkeypatch.setattr("brawl_vision.object_detection.detector.ObjectDetector", _Det)
+    monkeypatch.setattr("brawl_vision.object_detection.projectile_detection.detect.ProjectileDetector",
+                        _Proj)
+    for target in ("brawl_vision.terrain.classifier.TerrainClassifier",
+                   "brawl_vision.terrain.occupancy.OccupancyMap",
+                   "brawl_vision.object_detection.hp_detection.smooth.HealthTracker",
+                   "brawl_vision.hud.HudReader"):
+        monkeypatch.setattr(target, _Any)
+    monkeypatch.setattr("brawl_vision.terrain.odometry.Odometry", _Any)
+    monkeypatch.setattr("brawl_vision.camera.build_rectify_plan", lambda *a: _Plan())
+    monkeypatch.setattr("brawl_vision.camera.load_camera_model", lambda: None)
+    monkeypatch.setattr("brawl_vision.camera.load_hud_mask", lambda *a: None)
+    monkeypatch.setattr("brawl_vision.config.load_vision_config", lambda: None)
+
+    loop_mod.VisionStack.build(detector_threads=2, detector_spin=False)
+    assert seen == {"_Det": {"cpu_threads": 2, "spin": False},
+                    "_Proj": {"cpu_threads": 2, "spin": False}}
+
+    seen.clear()
+    loop_mod.VisionStack.build()
+    assert seen["_Det"] == {"cpu_threads": None, "spin": True}, "a script running alone keeps the library defaults"
+

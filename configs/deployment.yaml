@@ -39,6 +39,22 @@ policy:
   # unreproducible.
   deterministic: true
 
+compute:                  # design 7.2
+  # The emulator is a VM on the same eight cores, and it is what lags when this process burns
+  # them. MEASURED 2026-09-16 (the real tick replayed at 12 Hz, process-scoped CPU): with the
+  # library defaults -- torch 8 threads, two ORT sessions with spinning pools, cv2 16 -- the
+  # process held 3.3-4.2 cores while sleeping a third of every tick, because idle pool threads
+  # spin-wait rather than sleep. With these caps it holds 1.0 core and the tick is FASTER (48 vs
+  # 55 ms median): the CPU-side work is tiny and the pools were overhead. The GPU work is
+  # untouched -- detector_threads reaches only the CPU side of a CUDA session (letterbox, NMS).
+  # torch 1: the policy is the only CPU network and 1 thread runs it in the same 0.96 ms.
+  torch_threads: 1
+  # cv2 does real parallel work in the warps and odometry correlations: 1 thread pushed the tick
+  # to 68 ms median, 4 keeps it at 48 with the tightest tail measured.
+  cv2_threads: 4
+  detector_threads: 2
+  detector_spin: false
+
 window:                   # design 6.9
   exe: HD-Player.exe      # matched on the process image; titles and Qt class names are not stable
   # A windowed emulator is a different projection, not a smaller picture of the same one: the
@@ -85,6 +101,20 @@ control:
   # asserting read_ammo decrements, which is the venue-independent check and the one that would
   # have caught the chevron immediately.
   attack_tap: [0.88, 0.55]
+  # HOW FAR TO DRAG an attack or super press, in DEVICE pixels, along the move direction (the move
+  # bin, or the way the hero last faced when idle -- where the sim's dash goes). A press goes down
+  # on attack_tap (or the super button), drags this far on the next tick, and lifts on the one
+  # after; the lift fires. Never a bare tap: the game auto-aims those at the nearest enemy, which
+  # the policy never trained on.
+  #
+  # Direction only -- the dash and the super travel a fixed distance -- so this just has to clear
+  # the game's aim deadzone. 75 is ~70% of the movement stick's 110 px ring. The ceiling is the
+  # super button, 81 px above the bottom edge: a radius past that is refused at startup, because
+  # an off-screen point is clamped to the edge and the shot would go the wrong way.
+  #
+  # UNVERIFIED IN A REAL MATCH. The calibration tap job proves the press fires (ammo drops); watch
+  # that the dash goes the way the stick was held, too.
+  aim_radius_px: 75
 
 loop:                     # design 6.13
   # Perception ticks per second. The DECISION rate is not here: it is dt * action_repeat = 250 ms

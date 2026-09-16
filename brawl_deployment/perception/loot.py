@@ -36,10 +36,13 @@ positions (the last `MAX_SAMPLES`) and, once it has `MIN_HITS` of them, fixes it
 median. That cell is what the grid gets from then on. The median keeps associating (the gate is
 measured from it, not from the cell centre), but the cell does not move. Two reasons to fix it:
 
-  * The world lattice is not the game's. Each odometry segment starts its lattice at whatever
-    sub-tile phase the camera had, so a crate's true tile can straddle two world cells, and a live
-    median near a boundary would flip between them tick to tick. Correcting the phase is out of
-    scope; not amplifying it into flicker is not.
+  * The world lattice is only roughly the game's. Each odometry segment starts its lattice at
+    whatever sub-tile phase the camera had. `lattice.py` moves the world onto the game's lattice
+    from these same crates, but only to about 0.1 tile, only once a segment has three full-height
+    sightings, and wrongly on at least one crate reskin. So a crate's true tile can still straddle
+    two world cells, and a live median near a boundary would flip between them tick to tick. A
+    re-lock arrives as a new epoch, which resets this module like a new segment, so a fixed cell
+    never outlives the phase it was fixed in.
   * It agreed with the terrain map, which locked its cells for good. That map keeps re-voting every
     cell in view since 2026-09-14, so the first reason now stands on its own.
 
@@ -121,7 +124,8 @@ sim. For the cells behind it, it is the grid's usual UNKNOWN trade (`grid.py`).
 #### What is deliberately NOT here
 
   * **Box HP.** Out of scope for this stage, and no spec asks for it.
-  * **The lattice phase**, see above.
+  * **The lattice phase.** `lattice.py` reads it from these crates, and the loop hands this module
+    the corrected world.
   * **Boxes cut by the HUD.** The edge rule is for the frame edge, which was measured. A crate
     half under the joystick is clipped the same way and is not caught.
   * **Collection by proximity.** The sim removes a pickup the tick a brawler comes within

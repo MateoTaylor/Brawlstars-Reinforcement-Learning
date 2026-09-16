@@ -139,6 +139,16 @@ def test_a_slower_capture_rate_is_rejected_against_the_odometry_shift_bound():
         C.validate(C.DeploymentConfig(loop_tick_hz=8.0), SIM, VISION)   # 2.22, past the bound
 
 
+def test_a_rate_too_slow_for_an_aimed_press_is_refused():
+    """An attack press is three touch steps -- down, drag, lift -- one per tick. 8 Hz gives two
+    ticks a decision, so a fire after a fire would lift one press and put the next down inside a
+    single tick. The odometry bound above refuses 8 Hz too, but only when the vision config is
+    passed; this refusal stands on the sim config alone."""
+    C.validate(C.DeploymentConfig(loop_tick_hz=12.0), SIM)
+    with pytest.raises(ValueError, match="aimed attack takes 3"):
+        C.validate(C.DeploymentConfig(loop_tick_hz=8.0), SIM)
+
+
 def test_the_shipped_rate_keeps_real_headroom_on_the_shift_bound():
     """Pin the actual margin rather than only the pass/fail. 12 Hz is 74% of the bound, which is
     the number the choice was made on -- if a future edit takes it past ~90% that is a different
@@ -182,6 +192,10 @@ def test_an_attack_tap_outside_the_unit_square_is_rejected(tap):
     ({"safety_capture_stall_seconds": 0.0}, "must be positive"),
     ({"safety_max_match_seconds": -1.0}, "must be positive"),
     ({"telemetry_frame_dump": -1}, "must be >= 0"),
+    ({"control_aim_radius_px": 0.0}, "aim_radius_px"),
+    ({"compute_torch_threads": 0}, "compute.torch_threads"),
+    ({"compute_cv2_threads": 0}, "compute.cv2_threads"),
+    ({"compute_detector_threads": -1}, "compute.detector_threads"),
 ])
 def test_validate_rejects(patch, match):
     with pytest.raises(ValueError, match=match):
@@ -198,6 +212,19 @@ def test_an_occlusion_probe_more_than_ten_decisions_apart_is_rejected():
     with pytest.raises(ValueError, match="ten"):
         C.validate(C.DeploymentConfig(window_check_every_n_ticks=31), _sim())
     C.validate(C.DeploymentConfig(window_check_every_n_ticks=50, loop_tick_hz=20.0), _sim())
+
+
+def test_the_shipped_thread_caps_are_the_measured_ones():
+    """The emulator is a VM on the same cores. With the library defaults the loop held 3.3-4.2
+    cores of spinning pool threads while sleeping a third of every tick (design 7.2); these caps
+    took it to 1.0 with a faster tick. A cap of 0 would mean "library default" in every one of
+    these libraries, which is exactly the setting this block exists to prevent -- so it is
+    refused by `validate`, not treated as a wildcard."""
+    cfg = C.load_deployment_config()
+    assert cfg.compute_torch_threads == 1
+    assert cfg.compute_cv2_threads == 4
+    assert cfg.compute_detector_threads == 2
+    assert cfg.compute_detector_spin is False
 
 
 def test_the_null_backend_is_a_supported_setting_not_a_test_hook():

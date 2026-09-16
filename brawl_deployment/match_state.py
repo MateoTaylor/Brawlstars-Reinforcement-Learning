@@ -34,7 +34,7 @@ few frames in the MIDDLE of a match, and those frames are gameplay. So exit need
 sub-threshold samples, just a shorter one than entry.
 
 **Two coordinate spaces, and this module is where they meet.** The stored anchors are DEVICE
-pixels -- the Android screen's own 1920x1080, which is what `adb sendevent` addresses and what a
+pixels -- the Android screen's own 1920x1080, which is what the touch device addresses and what a
 tap target must be in. The frames arriving here are VIEWPORT pixels, 2002x1126, because that is
 what `brawl_vision` was calibrated at (`capture.py` explains why the resize targets that and not
 the device size). So a button has two positions, and `Calibration` exposes both: `button()` for

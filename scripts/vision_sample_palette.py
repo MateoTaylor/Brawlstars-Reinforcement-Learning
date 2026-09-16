@@ -32,10 +32,10 @@ import numpy as np
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from brawl_vision.camera import build_rectify_plan, load_camera_model, load_hud_mask
-from brawl_vision.config import load_vision_config
-from brawl_vision.sources import open_source
+from brawl_vision.config import HUD_MASKS, load_vision_config
+from brawl_vision.sources import at_viewport, open_source
 from brawl_vision.terrain.classifier import TerrainClassifier
-from brawl_vision.terrain.labeling import CLASSES
+from brawl_vision.terrain.labeling import CLASSES, default_hud
 
 DEFAULT_TERRAIN = Path(__file__).resolve().parent.parent / "brawl_vision" / "data" / "terrain.pt"
 
@@ -53,17 +53,21 @@ def main(argv=None) -> int:
                         "the pixels that would drag both medians toward each other (default: .85)")
     p.add_argument("--terrain", default=str(DEFAULT_TERRAIN))
     p.add_argument("--device", default="cpu")
+    p.add_argument("--hud", choices=sorted(HUD_MASKS), default=None,
+                   help="the HUD mask the clip was captured under (default: from its name)")
     args = p.parse_args(argv)
 
     cfg = load_vision_config()
-    plan = build_rectify_plan(load_camera_model(), load_hud_mask())
+    hud = args.hud or default_hud(args.clip)
+    print(f"{hud} HUD mask")
+    plan = build_rectify_plan(load_camera_model(), load_hud_mask(HUD_MASKS[hud]))
     clf = TerrainClassifier.load(args.terrain, device=args.device)
     ppt = plan.pixels_per_tile
     cols, rows = plan.size_tiles
 
     by_class: dict[int, list] = defaultdict(list)
     with open_source(args.clip, cfg, step=args.step) as src:
-        for n, frame in enumerate(src):
+        for n, frame in enumerate(at_viewport(src, plan.viewport)):
             rect = plan.rectify(frame.image)
             cells, conf = clf.predict(rect, plan)
             for r in range(rows):
