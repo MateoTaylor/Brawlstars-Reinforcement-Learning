@@ -20,9 +20,10 @@ drags `aim_radius_px` along the bearing, and lifts. **The lift is what fires**, 
 thumb. The bearing comes from `ShadowHero.attack_bearing`, which reads the same state the shadow's
 `_start_dash` does, so the device and the shadow agree on the direction by construction.
 
-This is not an action-space change. The policy's action is still `(move_bin, attack)` with
-`attack in {0, 1, 2}` (`brawl_sim/config.py`'s `action_nvec = (n_move_bins + 1, 3)`): the aim is
-not a new choice, it is the one the policy already made with its move bin.
+This is not an action-space change. The policy's action is still `(move_bin, attack)`, and what
+deployment emits is `attack in {0, 1, 2}`: `brawl_sim/config.py`'s `action_nvec` is
+`(n_move_bins + 1, 4)` since SIM_OVERHAUL Step G3, and the fourth value, the gadget, stays masked
+until Step G5. The aim is not a new choice, it is the one the policy already made with its move bin.
 
 **One step per perception tick: down, drag, lift.** Never two in one call. The game samples touch
 state on its own frame clock, and two events inside one device write can land in one sample.

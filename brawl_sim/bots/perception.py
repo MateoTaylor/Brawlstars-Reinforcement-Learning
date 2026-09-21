@@ -16,10 +16,15 @@ from dataclasses import dataclass
 import torch
 
 from ..core import geometry as geo
+from ..core import stats
 from ..core import terrain
 
 _EPS = 1e-6
 _INF = float("inf")
+# Entity slot 0 is always the hero (core/observation.py's `_HERO`, core/spawn's layout, and
+# bots/policy.all_bot_intents' "zero entity 0" rule all rely on it). `hero_focus` discounts THIS
+# COLUMN of the distance matrix -- it is an entity slot along the target axis, not a Kind value.
+_HERO_SLOT = 0
 
 
 def in_bush(state, bank) -> torch.Tensor:
@@ -131,7 +136,7 @@ def team_id(kind: torch.Tensor, cfg) -> torch.Tensor:
     return kind.clone()
 
 
-def select_target(state, vis: torch.Tensor, cfg) -> None:
+def select_target(state, vis: torch.Tensor, params, cfg) -> None:
     """MUTATES ent_target. Sticky: keeps the current target as long as it's still alive and
     visible, only re-picking (nearest visible other entity) when it isn't -- this is what
     prevents oscillation between two ~equidistant targets.
@@ -142,7 +147,19 @@ def select_target(state, vis: torch.Tensor, cfg) -> None:
     dropped, not held forever, or the sight limit would only apply to acquiring targets and not to
     keeping them. ent_target < 0 means "no target";
     spawn/reset (Step 24) is responsible for initializing it that way, since allocate()'s
-    blanket zero-init would otherwise leave it at entity index 0."""
+    blanket zero-init would otherwise leave it at entity index 0.
+
+    **Hero focus (SIM_OVERHAUL_PLAN.md Step B2).** `params.hero_focus` in [0, 1], per kind,
+    discounts the hero's distance by `(1 - hero_focus)` before the nearest pick, so at 0.5 a hero
+    7 tiles away (3.5 effective) beats a bot 4 tiles away and a hero 9 tiles away (4.5) does not.
+    When the discounted hero WINS that comparison the bot switches to the hero even if it holds a
+    valid sticky target -- without that override "favour the hero" would only ever apply to bots
+    that happened to be idle when the hero walked into view. Sight is unchanged: the hero is a
+    candidate only where `vis[:, e, 0]` already says so, so a concealed or out-of-range hero is
+    never picked. With `hero_focus = 0` (the hero kind's own value, and any hand-built partial
+    spec's) `prefer_hero` is False everywhere and the result is bit-for-bit today's
+    `where(current_valid, current, picked)`: the scale is exactly 1.0, so `dist * scale == dist`.
+    """
     E = state.ent_pos.shape[1]
     device = state.ent_pos.device
 
@@ -155,12 +172,24 @@ def select_target(state, vis: torch.Tensor, cfg) -> None:
     not_self = ~torch.eye(E, dtype=torch.bool, device=device).unsqueeze(0)
     candidates = vis & not_self
 
-    dist_for_min = torch.where(candidates, dist, torch.full_like(dist, float("inf")))
-    nearest = torch.argmin(dist_for_min, dim=-1)
+    # Discount column `_HERO_SLOT` only (the hero as a TARGET), per observer's own kind. The
+    # hero's own row (observer 0) gets the hero kind's 0 and is discarded downstream like every
+    # other per-entity result computed for slot 0.
+    focus = stats.gather_kind(params.hero_focus, state.ent_kind)  # (N,E)
+    scale = torch.ones_like(dist)
+    scale[:, :, _HERO_SLOT] = 1.0 - focus
+
+    dist_eff = torch.where(candidates, dist * scale, torch.full_like(dist, float("inf")))
+    nearest = torch.argmin(dist_eff, dim=-1)
     has_candidate = candidates.any(dim=-1)
     picked = torch.where(has_candidate, nearest, torch.full_like(nearest, -1))
 
-    state.ent_target.copy_(torch.where(current_valid, current, picked))
+    # Visible AND wins the discounted comparison -> overrides stickiness (see docstring).
+    prefer_hero = has_candidate & (nearest == _HERO_SLOT) & (focus > 0)
+    sticky_or_picked = torch.where(current_valid, current, picked)
+    state.ent_target.copy_(
+        torch.where(prefer_hero, torch.full_like(nearest, _HERO_SLOT), sticky_or_picked)
+    )
 
 
 def incoming_threat(state, params, cfg) -> torch.Tensor:

@@ -39,6 +39,7 @@ almost all the stage before it.
 """
 import json
 from collections import deque
+from copy import deepcopy
 from pathlib import Path
 
 import numpy as np
@@ -334,14 +335,34 @@ class TierEvalCallback(BaseCallback):
 
     Also tracks the best mean win rate seen and saves `best_model.zip` when it improves --
     stationary eval is the only signal in the run that "best" can honestly be defined against.
+
+    **Training maps vs holdout maps (SIM_OVERHAUL M4).** `evaluator` scores the maps the run
+    trains on, so every key above is a TRAINING-MAP number. `holdout_evaluator`, when given, is
+    its twin on maps the run never sees (`eval.holdout_maps`) and is scored at the same moments:
+      - `eval/holdout_win_rate_<tier>`   per tier, next to `eval/win_rate_<tier>`
+      - `eval/holdout_win_rate`          mean over tiers, the mirror of `eval/win_rate_mean`
+      - `eval/holdout_gap`               `win_rate_mean - holdout_win_rate`. The two map sets are
+                                         not equally hard, so read its TREND against the
+                                         `at_start` row, not its sign: a gap that widens as
+                                         training goes on is the policy memorizing maps.
+      - tag `eval/holdout_win_rate` in each `logs/eval_<tier>/`, so TensorBoard draws the same
+        one-line-per-tier overlay for the holdout maps as it does for `eval/win_rate`. That tag
+        is ALSO the run logger's name for the mean (the plan fixes the name), so this one chart
+        carries a line more than `eval/win_rate` does: the six `eval_<tier>` lines plus the
+        run's own, which is the mean over tiers. (`eval/win_rate`'s mean is the separate
+        `eval/win_rate_mean` chart.)
+    `best_model.zip` is selected on the training-map mean ONLY. Picking the checkpoint by its
+    holdout score would fit the selection to the holdout maps, and the number would stop
+    measuring what it exists to measure.
     """
 
     def __init__(
         self, evaluator, every_timesteps: int, log_dir, at_start: bool = True,
-        best_model_path=None, verbose: int = 1,
+        best_model_path=None, verbose: int = 1, holdout_evaluator=None,
     ) -> None:
         super().__init__(verbose)
         self.evaluator = evaluator
+        self.holdout_evaluator = holdout_evaluator
         self.every_timesteps = every_timesteps
         self.log_dir = Path(log_dir)
         self.at_start = at_start
@@ -374,11 +395,9 @@ class TierEvalCallback(BaseCallback):
     # ---- the evaluation ----------------------------------------------------------------
 
     def _evaluate(self) -> None:
-        self._sync_normalization()
+        self._sync_normalization(self.evaluator)
         results = self.evaluator.evaluate(self.model)
-
-        win_rates = [r["win_rate"] for r in results.values()]
-        mean_win_rate = float(sum(win_rates) / len(win_rates)) if win_rates else 0.0
+        mean_win_rate = evaluation.mean_win_rate(results)
 
         for name, r in results.items():
             for metric in evaluation.METRICS:
@@ -388,10 +407,12 @@ class TierEvalCallback(BaseCallback):
             self._tier_writer(name).add_scalar("eval/mean_reward", r["mean_reward"], self.num_timesteps)
         self.logger.record("eval/win_rate_mean", mean_win_rate)
 
-        self.history.append({"timesteps": int(self.num_timesteps),
-                             "mean_win_rate": round(mean_win_rate, 4),
-                             "tiers": {n: round(r["win_rate"], 4) for n, r in results.items()}})
+        entry = {"timesteps": int(self.num_timesteps),
+                 "mean_win_rate": round(mean_win_rate, 4),
+                 "tiers": {n: round(r["win_rate"], 4) for n, r in results.items()}}
 
+        # Best-model selection reads the TRAINING-map mean and nothing below this block: see the
+        # class docstring for why the holdout score must never pick the checkpoint.
         if mean_win_rate > self.best_mean_win_rate:
             self.best_mean_win_rate = mean_win_rate
             self._save_best()
@@ -402,23 +423,52 @@ class TierEvalCallback(BaseCallback):
                   f"{evaluation.summary_line(results)}   (mean {mean_win_rate:.1%})")
             print(evaluation.format_table(results) + "\n")
 
-    def _sync_normalization(self) -> None:
-        """Copies the training env's observation-normalization statistics onto the eval env.
+        if self.holdout_evaluator is not None:
+            entry.update(self._evaluate_holdout(mean_win_rate))
+        self.history.append(entry)
+
+    def _evaluate_holdout(self, training_mean_win_rate: float) -> dict:
+        """Scores the holdout maps and logs them; returns the two history fields."""
+        self._sync_normalization(self.holdout_evaluator)
+        results = self.holdout_evaluator.evaluate(self.model)
+        holdout_mean = evaluation.mean_win_rate(results)
+
+        for name, r in results.items():
+            self.logger.record(f"eval/holdout_win_rate_{name}", r["win_rate"])
+            self._tier_writer(name).add_scalar("eval/holdout_win_rate", r["win_rate"], self.num_timesteps)
+        self.logger.record("eval/holdout_win_rate", holdout_mean)
+        self.logger.record("eval/holdout_gap", training_mean_win_rate - holdout_mean)
+
+        if self.verbose:
+            maps = ", ".join(self.holdout_evaluator.map_names)
+            print(f"[eval holdout: {maps}]  {evaluation.summary_line(results)}   "
+                  f"(mean {holdout_mean:.1%}, training maps {training_mean_win_rate:.1%})\n")
+        return {"holdout_mean_win_rate": round(holdout_mean, 4),
+                "holdout_tiers": {n: round(r["win_rate"], 4) for n, r in results.items()}}
+
+    def _sync_normalization(self, evaluator) -> None:
+        """Copies the training env's observation-normalization statistics onto `evaluator`'s env.
 
         Only matters when `normalize.obs` is on -- but when it is, skipping this silently feeds
         the policy differently-scaled observations than it trained on, and the eval score becomes
         meaningless in a way that looks like a training failure. Reward statistics are
-        deliberately NOT synced: eval reports raw returns."""
+        deliberately NOT synced: eval reports raw returns.
+
+        The statistics are copied directly, NOT through SB3's `sync_envs_normalization`: that
+        helper walks both wrapper stacks in lockstep and asserts they have the same depth, and
+        they never do here -- training is `VecNormalize(VecMonitor(env))` (builder.build_env),
+        an evaluator is `VecNormalize(env)`. Until 2026-09-18 that assertion killed every run
+        with `normalize.obs: true` at its first eval."""
         train_env = self.model.get_vec_normalize_env()
         if train_env is None or not getattr(train_env, "norm_obs", False):
             return
-        from stable_baselines3.common.vec_env import VecNormalize, sync_envs_normalization
-        if not isinstance(self.evaluator.venv, VecNormalize):
-            self.evaluator.venv = VecNormalize(
-                self.evaluator.venv, training=False, norm_obs=True, norm_reward=False,
+        from stable_baselines3.common.vec_env import VecNormalize
+        if not isinstance(evaluator.venv, VecNormalize):
+            evaluator.venv = VecNormalize(
+                evaluator.venv, training=False, norm_obs=True, norm_reward=False,
                 clip_obs=train_env.clip_obs, norm_obs_keys=list(train_env.obs_rms.keys()),
             )
-        sync_envs_normalization(train_env, self.evaluator.venv)
+        evaluator.venv.obs_rms = deepcopy(train_env.obs_rms)
 
     def _tier_writer(self, tier: str):
         """One `SummaryWriter` per tier, each in its own subdirectory -- see the class docstring

@@ -4,7 +4,9 @@
     python scripts/watch.py runs/.../final_model.zip --tier easy
     python scripts/watch.py runs/.../checkpoints/model_4000000_steps.zip --tier elite --episodes 5
     python scripts/watch.py runs/.../best_model.zip --ascii          # terminal, no GUI
-    python scripts/watch.py runs/.../best_model.zip --save match.npz # replay later
+    python scripts/watch.py runs/.../best_model.zip --save match.npz # replay later; also writes
+                                                                     # match.preset.yaml, which the
+                                                                     # printed viewer command needs
 
 The policy drives Mortis against bots pinned to ONE difficulty tier (`--tier`, default `hard`),
 using the same `FixedTierHook` `training/evaluation.py` uses -- so what you watch at `--tier hard`
@@ -22,10 +24,12 @@ trained on, so a mismatched config renders the wrong map or fails to feed the ne
 """
 import argparse
 import sys
+from dataclasses import replace
 from pathlib import Path
 
 import numpy as np
 import torch
+import yaml
 
 from brawl_sim.config import load_config
 from brawl_sim.constants import DeathCause
@@ -33,7 +37,7 @@ from brawl_sim.core import obs_select
 from brawl_sim.core.state import snapshot as state_snapshot
 from brawl_sim.env import BrawlVecEnv
 from brawl_sim.training.builder import REPO_ROOT, _resolve, build_spec
-from brawl_sim.training.config import load_train_config
+from brawl_sim.training.config import load_train_config, resolved_training_maps
 from brawl_sim.training.curriculum import FixedTierHook
 from brawl_sim.training.reward import ShapedReward
 from brawl_sim.wrappers.sb3_vecenv import BrawlSB3VecEnv
@@ -73,16 +77,41 @@ def load_model(model_path: Path, algo: str, device: str):
     return PPO.load(str(model_path), device=device), False
 
 
+def watch_env_overrides(tcfg, map_name: str | None = None) -> dict:
+    """The env overrides the watch env is ACTUALLY built with: the run's own `run.env_overrides`
+    plus the `--map` pin. The one source for both config views `build_watch_env` builds from AND
+    for the replay preset `save_rollout` writes, so a saved match can never name a different map
+    bank than the one it was recorded on.
+
+    `map_name`, if given, pins `world.map_selection` to `fixed` -- overriding whatever the run's
+    own `train.yaml` used (typically `uniform`, i.e. a random map each episode) -- so `--map`
+    reliably shows the requested map instead of just biasing the odds.
+
+    The run's own `world.maps` may not list it: configs/train.yaml trains on fourteen maps and
+    keeps `eval.holdout_maps` out of its rotation (SIM_OVERHAUL M4), and watching the policy on a
+    map it never saw is the most interesting thing `--map` can show. Such a map is APPENDED to
+    the bank, so every map the run trained on keeps its `map_id` index."""
+    overrides = dict(tcfg.run.env_overrides or {})
+    if map_name is not None:
+        world = {**overrides.get("world", {}), "map_selection": "fixed", "fixed_map": map_name}
+        run_maps = resolved_training_maps(tcfg.run)
+        if map_name not in run_maps:
+            world["maps"] = [*run_maps, map_name]
+        overrides["world"] = world
+    return overrides
+
+
 def build_watch_env(tcfg, tier: str, seed: int, device: str, map_name: str | None = None):
     """An `n_envs=1` env pinned to `tier`, with autoreset OFF so a finished match FREEZES on its
     terminal state instead of silently starting a new episode mid-recording.
 
-    `map_name`, if given, pins `world.map_selection` to `fixed` -- overriding whatever the run's
-    own `train.yaml` used (typically `uniform`, i.e. a random map each episode) -- so `--map`
-    reliably shows the requested map instead of just biasing the odds."""
-    overrides = dict(tcfg.run.env_overrides or {})
-    if map_name is not None:
-        overrides["world"] = {**overrides.get("world", {}), "map_selection": "fixed", "fixed_map": map_name}
+    `map_name` is `--map`; see `watch_env_overrides` for what it does to the map bank."""
+    overrides = watch_env_overrides(tcfg, map_name)
+    # Patched into `run.env_overrides` (as TierEvaluator does for its holdout twin), because the
+    # env is built from TWO views of that dict -- `load_config` here and `build_spec` below --
+    # and they must agree. `replace`, not `with_overrides`: a `--map <holdout>` config lists a
+    # holdout map in world.maps, which validate_train_config exists to refuse for TRAINING.
+    tcfg = replace(tcfg, run=replace(tcfg.run, env_overrides=overrides))
     env_cfg = load_config(_resolve(tcfg.run.env_config), overrides=overrides or None)
     agent_spec = obs_select.load_agent_spec(_resolve(tcfg.run.agent_obs), env_cfg)
     sim = BrawlVecEnv(
@@ -195,6 +224,27 @@ def _hero_stats(sim) -> dict:
     }
 
 
+def save_rollout(save_path, frames: dict, tcfg, map_name: str | None = None) -> str:
+    """Writes the rollout `.npz` AND, beside it, the viewer preset it can only be replayed with;
+    returns the replay command.
+
+    A frame stores `map_id`, an INDEX into the recording env's `cfg.map_names`, not a map name.
+    `python -m brawl_sim.render.viewer` rebuilds its bank from configs/default.yaml (sixteen maps)
+    unless told otherwise, while a run records against its own `run.env_overrides` -- fourteen
+    maps in another order under configs/train.yaml, plus one appended by `--map <holdout>`. Replayed
+    bare, every match on `map_id >= 10` is drawn over the WRONG terrain, silently. The preset is
+    `watch_env_overrides` verbatim -- the dict this env was built from -- in the format the
+    viewer's `--preset` already takes (a `load_config` overrides file)."""
+    np.savez_compressed(save_path, **frames)
+    preset = Path(save_path).with_suffix(".preset.yaml")
+    preset.write_text(yaml.safe_dump(watch_env_overrides(tcfg, map_name), sort_keys=False))
+    command = f"python -m brawl_sim.render.viewer {save_path} --preset {preset}"
+    env_config = _resolve(tcfg.run.env_config)
+    if env_config.resolve() != (REPO_ROOT / "configs" / "default.yaml").resolve():
+        command += f" --config {env_config}"   # the viewer's own default is configs/default.yaml
+    return command
+
+
 def print_summary(summary: dict, tier: str, index: int, total: int) -> None:
     outcome = "WON" if summary.get("won") else ("timeout" if summary["truncated"] else "died")
     label = f"match {index + 1}/{total}" if total > 1 else "match"
@@ -222,9 +272,12 @@ def _parse_args(argv=None):
                         "configs/brawlers.yaml verbatim with no tier multipliers")
     p.add_argument("--map", default=None,
                    help="pin a specific map (default: whatever the run's train.yaml uses, "
-                        "usually a random pick from world.maps each episode); must be one of "
-                        "world.maps in the resolved env config, e.g. open, bushy, walled, "
-                        "skull_creek, feast_or_famine, scorched_stone, island_invasion")
+                        "usually a random pick from world.maps each episode); any registered "
+                        "map of the run's size: the six originals (open, bushy, "
+                        "skull_creek, feast_or_famine, scorched_stone, island_invasion), the ten "
+                        "generated ones (brawl_sim/maps/README.md), or walled by hand. A map "
+                        "outside the run's own world.maps (its eval.holdout_maps: split_river, "
+                        "hollow_ring) is added to the bank for the match")
     p.add_argument("--train-config", default=None,
                    help="training config the model was trained with (default: auto-detect)")
     p.add_argument("--episodes", type=int, default=1,
@@ -252,7 +305,10 @@ def main(argv=None) -> int:
         return 1
 
     train_config = Path(args.train_config) if args.train_config else find_train_config(model_path)
-    tcfg = load_train_config(train_config)
+    # No holdout eval runs here, so a holdout map that has since left the registry must not make
+    # an archived run unwatchable -- the opt-out DeployedPolicy.from_run takes. A run whose
+    # TRAINING map left the registry is still refused, by BrawlVecEnv's own validation.
+    tcfg = load_train_config(train_config, check_holdout=False)
     tier = None if args.tier == "none" else args.tier
     print(f"[watch] {model_path.name}  vs  {tier or 'brawlers.yaml (no tier)'} bots"
           f"   [config: {train_config}]")
@@ -271,9 +327,11 @@ def main(argv=None) -> int:
         print_summary(summary, tier or "default", i, args.episodes)
 
     if args.save:
-        np.savez_compressed(args.save, **frames)
-        print(f"\n[watch] rollout -> {args.save}  "
-              f"(replay with: python -m brawl_sim.render.viewer {args.save})")
+        command = save_rollout(args.save, frames, tcfg, args.map)
+        print(f"\n[watch] rollout -> {args.save}\n"
+              f"        replay with: {command}\n"
+              "        (the .preset.yaml beside it is this run's map bank; without --preset the "
+              "viewer draws configs/default.yaml's maps, which are not this run's)")
 
     if args.ascii:
         from brawl_sim.render.ascii import render_ascii, status_line
@@ -303,6 +361,16 @@ def _check_spaces(model, venv, train_config: Path) -> None:
             f"but {train_config} builds\n  {venv.observation_space}\n"
             "This config is not the one the model was trained with -- pass the right "
             "--train-config (the run directory's own archived train.yaml)."
+        )
+    # The action space is code, not config: SIM_OVERHAUL Step G3 widened the attack column
+    # 3 -> 4 (gadget), so a checkpoint trained before it has a 3-wide attack head that no
+    # train.yaml can bring back. Without this the first `predict` dies on a 20-vs-21 mask shape.
+    if model.action_space != venv.action_space:
+        raise SystemExit(
+            f"action space mismatch: the model has {model.action_space} but this build of the "
+            f"sim has {venv.action_space}. The checkpoint predates an action-space change (the "
+            "attack column is [none, attack, super, gadget] since Step G3) and cannot be "
+            "watched with this code."
         )
 
 

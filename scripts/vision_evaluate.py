@@ -17,6 +17,15 @@ that row in the other and you can read a disagreement off cell by cell. The yell
 `--layout side-by-side` puts the raw frame next to the WHOLE accumulated map, with the current
 frame's footprint outlined -- useful for watching coverage grow. `--layout map` is the artifact.
 
+`--layout stacked` is side-by-side rotated: raw frame on top, map below, both resized to one
+`--width`. Same panels, same annotations, same `--map-extent` crops; the only difference is which
+axis the panels are matched on. It exists for vertical video -- a 9x16 frame is 1080 px wide and
+1920 tall, so a horizontal pair lands as a 2470x728 letterbox strip across a third of the screen
+while a stacked one fills it:
+
+    python scripts/vision_evaluate.py match.mp4 -o short.mp4 --layout stacked --width 1080
+        --detect-on-map --projectiles-on-map --map-extent policy --fps 30 --scale 28
+
 `--detect` adds the third-party entity detector (`brawl_vision.object_detection`) to that layout:
 its boxes go on the raw frame, the reconstructed map stays exactly as it was. The two run in the
 same loop but not through each other -- no detection touches odometry, the classifier, or the
@@ -119,12 +128,19 @@ def main(argv=None) -> int:
     p.add_argument("clip", help="a gameplay .mp4")
     p.add_argument("-o", "--out", required=True, help="output .mp4 (or .gif, for short clips)")
     p.add_argument("--mode", choices=("map", "mosaic"), default="map")
-    p.add_argument("--layout", choices=("map", "side-by-side", "view"), default="map",
+    p.add_argument("--layout", choices=("map", "side-by-side", "stacked", "view"),
+                   default="map",
                    help="map: the reconstruction alone, the artifact. side-by-side: the raw frame "
-                        "next to the whole map, with the current frame's tiles outlined. view: the "
-                        "RECTIFIED frame next to the map cropped to exactly those tiles, both at "
-                        "the same scale -- the only layout where a tile in one panel is the same "
-                        "tile in the other")
+                        "next to the whole map, with the current frame's tiles outlined. stacked: "
+                        "the same pair turned vertical, raw frame on top and map below, matched on "
+                        "WIDTH (--width) instead of height -- the shape a 9x16 short-form frame "
+                        "wants. view: the RECTIFIED frame next to the map cropped to exactly those "
+                        "tiles, both at the same scale -- the only layout where a tile in one "
+                        "panel is the same tile in the other")
+    p.add_argument("--width", type=int, default=None,
+                   help="output width, --layout stacked only: both panels are resized to it, so "
+                        "it sets the whole video's width (default: the raw panel's own, 2002). "
+                        "1080 is the useful one for short-form")
     p.add_argument("--fps", type=float, default=8.0,
                    help="OUTPUT rate. Frames are sampled on the clip's own timestamps, so this is "
                         "the real rate rather than a nominal one (default: 8)")
@@ -208,11 +224,16 @@ def main(argv=None) -> int:
                         "RAW frame). Read the number WITH its confidence: see "
                         "brawl_vision/object_detection/hp_detection/")
     p.add_argument("--map-extent", choices=("full", "view", "policy"), default="full",
-                   help="how much accumulated map the right panel of --layout side-by-side shows. "
+                   help="how much accumulated map the map panel of --layout side-by-side / "
+                        "stacked shows. "
                         "'full' (default) is the whole explored map with this frame's footprint "
                         "outlined; 'view' crops to just the tiles this frame covers, so both "
                         "panels are the same extent tile-for-tile; 'policy' crops further to the "
                         "21x13 window the agent is actually handed. Cropping needs a classifier")
+    p.add_argument("--no-label", dest="label", action="store_false",
+                   help="drop the 'map  t=..s  frame N' stamp from the top-left corner. It is a "
+                        "diagnostic, and it is the one thing in the frame that should not be there "
+                        "when the render is going into a video someone watches")
     p.add_argument("--config", default=None, help="a vision.yaml to use instead of the default")
     p.add_argument("--hud", choices=sorted(HUD_MASKS), default=None,
                    help="the HUD mask the clip was captured under (default: from its name)")
@@ -233,7 +254,7 @@ def main(argv=None) -> int:
         args.detect = True
     if args.projectiles_on_map:
         args.projectiles = True
-    if args.hp and args.layout in ("map", "view"):
+    if args.hp and args.layout in ("map", "view"):   # 'stacked' has a raw panel; leave it
         # Same courtesy --detect gets, and said out loud for the same reason: HP is read inside a
         # box and written next to it, so it needs the one layout with a raw frame. 'view' has
         # none, so this is a genuine override rather than filling in a default.
@@ -386,7 +407,7 @@ def main(argv=None) -> int:
                         ground_offset_tiles=args.detect_ground_offset,
                         anchor_frac=args.detect_anchor,
                         cfg=cfg, layout=args.layout, out_fps=args.fps, cv_fps=args.cv_fps,
-                        scale=args.scale,
+                        scale=args.scale, out_width=args.width, label=args.label,
                         progress=None if args.quiet else
                         (lambda n, t: print(f"   {n:5d} frames  t={t:7.2f}s", flush=True)))
 

@@ -46,7 +46,9 @@ Shared rules implemented here:
   - `Targeting.desired_range`: each archetype's preferred engagement distance, consumed only by
     the movement layer (bots/personality.py's RANGE mode). Was `RANGE_FRACTION_BY_KIND`, a Python
     tuple indexed by Kind carrying an `assert len(...) == N_KINDS`; Step E1 made it the per-kind
-    `desired_range_fraction` param, so a sixth brawler no longer trips that assert.
+    `desired_range_fraction` param, so a sixth brawler no longer trips that assert. Since
+    2026-09-21 it is capped at `Targeting.fire_reach`, which the movement layer also uses as the
+    seek edge, so no KITE bot holds or parks with its target outside its own fire range.
 
 Two decisions filled in beyond the plan's literal text:
   - `bots_avoid_zone` gates `zone_contribution` the same way `bots_break_boxes` /
@@ -88,6 +90,9 @@ _CUBE_COLLECT_ENEMY_CLEARANCE = 6.0
 _CUBE_COLLECT_WEIGHT = 1.0
 _ZONE_ESCAPE_WEIGHT = 3.0
 _ZONE_AVOID_WEIGHT = 2.0
+# SIM_OVERHAUL_PLAN.md Step B3.2: bounds on the KITE hold-distance multiplier 1 / aggression.
+_HOLD_SCALE_MIN = 0.6
+_HOLD_SCALE_MAX = 1.4
 
 @dataclass
 class BotIntent:
@@ -122,7 +127,8 @@ class Targeting:
     is_box: torch.Tensor       # (N,E) bool
     los: torch.Tensor          # (N,E) bool physical wall LOS to the effective target
     seen_by_other: torch.Tensor  # (N,E) bool -- does ANY other entity see me? (Camper's gate)
-    desired_range: torch.Tensor  # (N,E) archetype's preferred distance, in tiles
+    desired_range: torch.Tensor  # (N,E) archetype's preferred distance, in tiles, <= fire_reach
+    fire_reach: torch.Tensor     # (N,E) tiles: fire_range_fraction (0 read as 1.0) x attack_range
 
 
 def strafe_sign(n_entities: int, device) -> torch.Tensor:
@@ -186,6 +192,22 @@ def targeting(state, vis: torch.Tensor, los: torch.Tensor, bank, params, cfg) ->
     seen_by_other = (vis & not_self).any(dim=1)
 
     attack_range = stats.gather_kind(params.attack_range, state.ent_kind)
+    # Step B3.2: the KITE hold distance scales by clamp(1 / aggression, 0.6, 1.4) -- an aggressive
+    # kiter holds closer, a timid one farther. `aggression_of` reads 0 as 1.0, so a partial spec
+    # without the key holds exactly `desired_range_fraction * attack_range` as before.
+    hold_scale = torch.clamp(
+        1.0 / stats.aggression_of(state.ent_kind, params), _HOLD_SCALE_MIN, _HOLD_SCALE_MAX,
+    )
+    # ... and never past the bot's own fire reach (operator, 2026-09-21): uncapped, 1.4 x 6.8 put
+    # an easy Brock's hold at 9.52 tiles against an 8.0-tile rocket. The reach is
+    # combat_rules.combat's own `range_ok` bound, so the cap and the fire gate cannot disagree about
+    # where a bot can shoot. bots/personality.py passes the same reach to steering.maintain_range
+    # as the SEEK edge, because that edge is where an approaching kiter parks, and hold +
+    # RANGE_DEADBAND was outside the reach for every easy and medium kind, the hard Brock, Shelly
+    # and Buzz, and Edgar at every tier.
+    fire_fraction = stats.gather_kind(params.fire_range_fraction, state.ent_kind)
+    fire_reach = torch.where(fire_fraction > 0, fire_fraction,
+                             torch.ones_like(fire_fraction)) * attack_range
     box_idx, box_dist = perception.nearest_alive(state.box_pos, state.box_alive, state.ent_pos)
     box_pos = gather_rows(state.box_pos, box_idx)
 
@@ -222,8 +244,12 @@ def targeting(state, vis: torch.Tensor, los: torch.Tensor, bank, params, cfg) ->
         idx=idx, has_enemy=has_enemy, enemy_pos=enemy_pos, enemy_vel=enemy_vel,
         pos=pos, vel=vel, dist=geo.dist(state.ent_pos, pos), has_target=has_target,
         is_box=is_box, los=los_eff, seen_by_other=seen_by_other,
-        desired_range=stats.gather_kind(params.desired_range_fraction, state.ent_kind)
-        * attack_range,
+        desired_range=torch.minimum(
+            stats.gather_kind(params.desired_range_fraction, state.ent_kind) * attack_range
+            * hold_scale,
+            fire_reach,
+        ),
+        fire_reach=fire_reach,
     )
 
 
@@ -363,7 +389,8 @@ def all_bot_intents(state, vis, bank, params, cfg, gen) -> BotIntent:
        `combat()` calls with three of the four results thrown away).
     3. MOVEMENT: bots/personality.movement computes move_dir once for all (N,E), selecting
        per-entity behavior off ent_person. Nothing archetype-specific happens here anymore.
-    4. Personality fire veto: CAMPER holds fire until its target can actually see it.
+    4. Personality fire veto: CAMPER holds fire until something can actually see it, unless
+       its kind's `aggression` is 1.25 or more (Step B3.3).
     5. Decision period gates FIRE only (discrete: this tick must be entity `e`'s turn to
        reconsider firing -- `(step_count + e) % decision_period == 0`, staggering entities so
        they don't all decide in lockstep); reaction delay low-passes MOVEMENT only (continuous
@@ -391,7 +418,7 @@ def all_bot_intents(state, vis, bank, params, cfg, gen) -> BotIntent:
     # perception.bot_visibility for the measurements that made this necessary. `vis` stays
     # unclipped for the hero's observation, which env.py builds separately.
     bot_vis = perception.bot_visibility(state, vis, cfg)
-    perception.select_target(state, bot_vis, cfg)
+    perception.select_target(state, bot_vis, params, cfg)
 
     E = state.ent_pos.shape[1]
     device = state.ent_pos.device
@@ -404,7 +431,9 @@ def all_bot_intents(state, vis, bank, params, cfg, gen) -> BotIntent:
     fire, aim_dir, aim_point = combat_rules.combat(state, tgt, bank, params, cfg, gen)
 
     move_dir, mode = personality.movement(state, tgt, bank, params, cfg, gen)
-    fire = fire & personality.fire_allowed(state, tgt, cfg)
+    # Step B3.3: the CAMPER veto lifts at aggression >= 1.25 (0 read as 1.0 by the helper).
+    aggression = stats.aggression_of(state.ent_kind, params)
+    fire = fire & personality.fire_allowed(state, tgt, aggression, cfg)
 
     # --- decision period: discrete fire-reconsideration gate, staggered by entity slot ---
     decision_period = torch.clamp(stats.gather_kind(params.decision_period, state.ent_kind), min=1)

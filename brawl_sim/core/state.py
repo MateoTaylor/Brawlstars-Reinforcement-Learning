@@ -6,127 +6,150 @@ import torch
 
 F32, I64, I32, BOOL = torch.float32, torch.int64, torch.int32, torch.bool
 
-# (field name, shape(N,E,P,B,U,L) -> tuple, dtype). Declarative so allocate() and the memory
-# report share one source of truth for shapes/dtypes.
+# (field name, shape(N,E,P,B,U,L,K) -> tuple, dtype). Declarative so allocate() and the memory
+# report share one source of truth for shapes/dtypes. K = cfg.history_frames, read only by the
+# _HISTORY_FIELDS rings below; every other lambda ignores it.
 _ENTITY_FIELDS = (
-    ("ent_pos", lambda N, E, P, B, U, L: (N, E, 2), F32),
-    ("ent_vel", lambda N, E, P, B, U, L: (N, E, 2), F32),
-    ("ent_facing", lambda N, E, P, B, U, L: (N, E), F32),
-    ("ent_hp", lambda N, E, P, B, U, L: (N, E), F32),
-    ("ent_max_hp", lambda N, E, P, B, U, L: (N, E), F32),
-    ("ent_alive", lambda N, E, P, B, U, L: (N, E), BOOL),
-    ("ent_kind", lambda N, E, P, B, U, L: (N, E), I64),
-    ("ent_cubes", lambda N, E, P, B, U, L: (N, E), I64),
-    ("ent_ammo", lambda N, E, P, B, U, L: (N, E), F32),
-    ("ent_attack_cd", lambda N, E, P, B, U, L: (N, E), F32),
-    ("ent_dash_t", lambda N, E, P, B, U, L: (N, E), F32),
-    ("ent_dash_dir", lambda N, E, P, B, U, L: (N, E, 2), F32),
-    ("ent_dash_speed", lambda N, E, P, B, U, L: (N, E), F32),
-    ("ent_dash_hits", lambda N, E, P, B, U, L: (N, E, E), BOOL),
-    ("ent_invuln_t", lambda N, E, P, B, U, L: (N, E), F32),
-    ("ent_reveal_t", lambda N, E, P, B, U, L: (N, E), F32),
-    ("ent_react_t", lambda N, E, P, B, U, L: (N, E), F32),
-    ("ent_out_of_combat_t", lambda N, E, P, B, U, L: (N, E), F32),
+    ("ent_pos", lambda N, E, P, B, U, L, K: (N, E, 2), F32),
+    ("ent_vel", lambda N, E, P, B, U, L, K: (N, E, 2), F32),
+    ("ent_facing", lambda N, E, P, B, U, L, K: (N, E), F32),
+    ("ent_hp", lambda N, E, P, B, U, L, K: (N, E), F32),
+    ("ent_max_hp", lambda N, E, P, B, U, L, K: (N, E), F32),
+    ("ent_alive", lambda N, E, P, B, U, L, K: (N, E), BOOL),
+    ("ent_kind", lambda N, E, P, B, U, L, K: (N, E), I64),
+    ("ent_cubes", lambda N, E, P, B, U, L, K: (N, E), I64),
+    ("ent_ammo", lambda N, E, P, B, U, L, K: (N, E), F32),
+    ("ent_attack_cd", lambda N, E, P, B, U, L, K: (N, E), F32),
+    ("ent_dash_t", lambda N, E, P, B, U, L, K: (N, E), F32),
+    ("ent_dash_dir", lambda N, E, P, B, U, L, K: (N, E, 2), F32),
+    ("ent_dash_speed", lambda N, E, P, B, U, L, K: (N, E), F32),
+    ("ent_dash_hits", lambda N, E, P, B, U, L, K: (N, E, E), BOOL),
+    ("ent_invuln_t", lambda N, E, P, B, U, L, K: (N, E), F32),
+    ("ent_reveal_t", lambda N, E, P, B, U, L, K: (N, E), F32),
+    ("ent_react_t", lambda N, E, P, B, U, L, K: (N, E), F32),
+    ("ent_out_of_combat_t", lambda N, E, P, B, U, L, K: (N, E), F32),
     # Seconds since this entity last ATTACKED -- a stopwatch counting UP, like
     # ent_out_of_combat_t and unlike every other timer here. Drives Mortis's long dash (Step D1).
     #
     # Deliberately NOT ent_out_of_combat_t, which looks like the same quantity but is also reset by
     # TAKING DAMAGE. Charging off that would mean a Mortis under fire never builds his long dash --
     # backwards, since being shot at while repositioning is exactly when it should be charging.
-    ("ent_attack_idle_t", lambda N, E, P, B, U, L: (N, E), F32),
+    ("ent_attack_idle_t", lambda N, E, P, B, U, L, K: (N, E), F32),
     # Hits landed on living PLAYERS since this entity's super was last fired (Step D2). Per-ENTITY,
     # not hero-only: only `hero_mortis` configures a super today, but bots are expected to get them,
     # and a charge counter that only tracked slot 0 would have to be rebuilt to allow that.
-    ("ent_super_charge", lambda N, E, P, B, U, L: (N, E), I32),
-    ("ent_target", lambda N, E, P, B, U, L: (N, E), I64),
-    ("ent_move_smooth", lambda N, E, P, B, U, L: (N, E, 2), F32),
+    ("ent_super_charge", lambda N, E, P, B, U, L, K: (N, E), I32),
+    # Seconds until this entity's gadget is usable again (SIM_OVERHAUL_PLAN.md Phase G). A
+    # countdown like ent_attack_cd, and 0 means READY -- chosen so that `zero_`'s blanket reset is
+    # also "starts fully charged", with no per-kind initialisation in core/spawn. Per-entity for
+    # the same reason ent_super_charge is: only `hero_mortis` configures a gadget today.
+    # core/hero.tick_timers decrements it; the fire path (Step G3) sets it to `gadget_cooldown`.
+    ("ent_gadget_cd", lambda N, E, P, B, U, L, K: (N, E), F32),
+    ("ent_target", lambda N, E, P, B, U, L, K: (N, E), I64),
+    ("ent_move_smooth", lambda N, E, P, B, U, L, K: (N, E, 2), F32),
     # --- bot personality (Step 41). All six are per-entity and episode-scoped; core/spawn.py
     # initializes them and bots/personality.py is the only thing that reads or advances them.
     # The hero's slot 0 carries them too (allocate is uniform over E) and they are simply never
     # read for it, exactly like ent_target/ent_move_smooth already are.
-    ("ent_person", lambda N, E, P, B, U, L: (N, E), I64),
-    ("ent_wander_dir", lambda N, E, P, B, U, L: (N, E, 2), F32),
-    ("ent_wander_t", lambda N, E, P, B, U, L: (N, E), F32),
+    ("ent_person", lambda N, E, P, B, U, L, K: (N, E), I64),
+    ("ent_wander_dir", lambda N, E, P, B, U, L, K: (N, E, 2), F32),
+    ("ent_wander_t", lambda N, E, P, B, U, L, K: (N, E), F32),
     # BITMASK, not a count: bit w set means "I have already searched bush waypoint w" (see
     # maps/loader.bush_waypoints, capped at 63 so one int64 covers every waypoint). 0 is the
     # correct fresh value, so core/state.zero_ initializes this one for free.
-    ("ent_hunt_seen", lambda N, E, P, B, U, L: (N, E), I64),
-    ("ent_hunt_t", lambda N, E, P, B, U, L: (N, E), F32),
-    ("ent_death_step", lambda N, E, P, B, U, L: (N, E), I32),
-    ("ent_death_cause", lambda N, E, P, B, U, L: (N, E), I32),
-    ("ent_last_hit_by", lambda N, E, P, B, U, L: (N, E), I64),
-    ("ent_damage_dealt", lambda N, E, P, B, U, L: (N, E), F32),
-    ("ent_damage_taken", lambda N, E, P, B, U, L: (N, E), F32),
-    ("ent_kills", lambda N, E, P, B, U, L: (N, E), I32),
-    ("ent_shots_fired", lambda N, E, P, B, U, L: (N, E), I32),
+    ("ent_hunt_seen", lambda N, E, P, B, U, L, K: (N, E), I64),
+    ("ent_hunt_t", lambda N, E, P, B, U, L, K: (N, E), F32),
+    ("ent_death_step", lambda N, E, P, B, U, L, K: (N, E), I32),
+    ("ent_death_cause", lambda N, E, P, B, U, L, K: (N, E), I32),
+    ("ent_last_hit_by", lambda N, E, P, B, U, L, K: (N, E), I64),
+    ("ent_damage_dealt", lambda N, E, P, B, U, L, K: (N, E), F32),
+    ("ent_damage_taken", lambda N, E, P, B, U, L, K: (N, E), F32),
+    ("ent_kills", lambda N, E, P, B, U, L, K: (N, E), I32),
+    ("ent_shots_fired", lambda N, E, P, B, U, L, K: (N, E), I32),
 )
 
 _PROJECTILE_FIELDS = (
-    ("prj_pos", lambda N, E, P, B, U, L: (N, P, 2), F32),
-    ("prj_vel", lambda N, E, P, B, U, L: (N, P, 2), F32),
-    ("prj_target", lambda N, E, P, B, U, L: (N, P, 2), F32),
-    ("prj_dist_left", lambda N, E, P, B, U, L: (N, P), F32),
-    ("prj_damage", lambda N, E, P, B, U, L: (N, P), F32),
-    ("prj_radius", lambda N, E, P, B, U, L: (N, P), F32),
-    ("prj_aoe", lambda N, E, P, B, U, L: (N, P), F32),
-    ("prj_age", lambda N, E, P, B, U, L: (N, P), F32),
-    ("prj_owner", lambda N, E, P, B, U, L: (N, P), I64),
-    ("prj_kind", lambda N, E, P, B, U, L: (N, P), I64),
+    ("prj_pos", lambda N, E, P, B, U, L, K: (N, P, 2), F32),
+    ("prj_vel", lambda N, E, P, B, U, L, K: (N, P, 2), F32),
+    ("prj_target", lambda N, E, P, B, U, L, K: (N, P, 2), F32),
+    ("prj_dist_left", lambda N, E, P, B, U, L, K: (N, P), F32),
+    ("prj_damage", lambda N, E, P, B, U, L, K: (N, P), F32),
+    ("prj_radius", lambda N, E, P, B, U, L, K: (N, P), F32),
+    ("prj_aoe", lambda N, E, P, B, U, L, K: (N, P), F32),
+    ("prj_age", lambda N, E, P, B, U, L, K: (N, P), F32),
+    ("prj_owner", lambda N, E, P, B, U, L, K: (N, P), I64),
+    ("prj_kind", lambda N, E, P, B, U, L, K: (N, P), I64),
     # constants.ProjClass: how this projectile MOVES and DAMAGES, independent of which weapon
     # fired it (that is prj_kind). Replaced the `prj_lobbed` bool in Step C3, which was already a
     # two-value version of the same idea. PROJECTILE is 0, so state.zero_'s blanket reset leaves a
     # freed slot in the ordinary class rather than an exotic one.
-    ("prj_class", lambda N, E, P, B, U, L: (N, P), I64),
+    ("prj_class", lambda N, E, P, B, U, L, K: (N, P), I64),
     # PIERCE (Step D2): this projectile passes through walls and units instead of dying on the
     # first thing it touches. A property of the SHOT, not of its class -- a future piercing
     # artillery shell or piercing hazard is expressible without a fourth ProjClass.
-    ("prj_pierce", lambda N, E, P, B, U, L: (N, P), BOOL),
+    ("prj_pierce", lambda N, E, P, B, U, L, K: (N, P), BOOL),
     # Which entities a piercing projectile has ALREADY damaged. Without it a bolt would re-damage
     # the same victim on every tick it overlaps them. Exactly the shape and purpose of
     # ent_dash_hits, which solves the identical problem for the dash capsule.
     #
     # (N,P,E) bool is the largest new buffer in the whole overhaul: 7.9 MB at n_envs=4096, P=192,
     # E=10 -- against a measured 2.2 GB total, and only allocated once.
-    ("prj_hits", lambda N, E, P, B, U, L: (N, P, E), BOOL),
-    ("prj_alive", lambda N, E, P, B, U, L: (N, P), BOOL),
+    ("prj_hits", lambda N, E, P, B, U, L, K: (N, P, E), BOOL),
+    ("prj_alive", lambda N, E, P, B, U, L, K: (N, P), BOOL),
 )
 
 _BOX_PICKUP_FIELDS = (
-    ("box_pos", lambda N, E, P, B, U, L: (N, B, 2), F32),
-    ("box_hp", lambda N, E, P, B, U, L: (N, B), F32),
-    ("box_max_hp", lambda N, E, P, B, U, L: (N, B), F32),
-    ("box_alive", lambda N, E, P, B, U, L: (N, B), BOOL),
-    ("pku_pos", lambda N, E, P, B, U, L: (N, U, 2), F32),
-    ("pku_cubes", lambda N, E, P, B, U, L: (N, U), I64),
-    ("pku_alive", lambda N, E, P, B, U, L: (N, U), BOOL),
-    ("pku_age", lambda N, E, P, B, U, L: (N, U), F32),
+    ("box_pos", lambda N, E, P, B, U, L, K: (N, B, 2), F32),
+    ("box_hp", lambda N, E, P, B, U, L, K: (N, B), F32),
+    ("box_max_hp", lambda N, E, P, B, U, L, K: (N, B), F32),
+    ("box_alive", lambda N, E, P, B, U, L, K: (N, B), BOOL),
+    ("pku_pos", lambda N, E, P, B, U, L, K: (N, U, 2), F32),
+    ("pku_cubes", lambda N, E, P, B, U, L, K: (N, U), I64),
+    ("pku_alive", lambda N, E, P, B, U, L, K: (N, U), BOOL),
+    ("pku_age", lambda N, E, P, B, U, L, K: (N, U), F32),
 )
 
 _ZONE_EPISODE_FIELDS = (
-    ("zone_lo", lambda N, E, P, B, U, L: (N, 2), F32),
-    ("zone_hi", lambda N, E, P, B, U, L: (N, 2), F32),
-    ("zone_next_t", lambda N, E, P, B, U, L: (N,), F32),
-    ("zone_step", lambda N, E, P, B, U, L: (N,), I32),
-    ("map_id", lambda N, E, P, B, U, L: (N,), I64),
-    ("time", lambda N, E, P, B, U, L: (N,), F32),
-    ("step_count", lambda N, E, P, B, U, L: (N,), I32),
-    ("n_alive", lambda N, E, P, B, U, L: (N,), I32),
-    ("boxes_broken", lambda N, E, P, B, U, L: (N,), I32),
+    ("zone_lo", lambda N, E, P, B, U, L, K: (N, 2), F32),
+    ("zone_hi", lambda N, E, P, B, U, L, K: (N, 2), F32),
+    ("zone_next_t", lambda N, E, P, B, U, L, K: (N,), F32),
+    ("zone_step", lambda N, E, P, B, U, L, K: (N,), I32),
+    ("map_id", lambda N, E, P, B, U, L, K: (N,), I64),
+    ("time", lambda N, E, P, B, U, L, K: (N,), F32),
+    ("step_count", lambda N, E, P, B, U, L, K: (N,), I32),
+    ("n_alive", lambda N, E, P, B, U, L, K: (N,), I32),
+    ("boxes_broken", lambda N, E, P, B, U, L, K: (N,), I32),
 )
 
 _LATENCY_FIELDS = (
-    ("act_buf", lambda N, E, P, B, U, L: (N, L, 2), I64),
-    ("act_head", lambda N, E, P, B, U, L: (N,), I64),
+    ("act_buf", lambda N, E, P, B, U, L, K: (N, L, 2), I64),
+    ("act_head", lambda N, E, P, B, U, L, K: (N,), I64),
+)
+
+# --- observation history rings (SIM_OVERHAUL_PLAN.md Phase H). K = cfg.history_frames DECISIONS
+# deep, newest at slot 0, written only by core/history.push (at the top of env.step, from the
+# pre-step state) and by zero_ -- which is what makes a reset row "no history": hist_valid all
+# False and everything else 0. The observation (Step H2) reads these; nothing in the tick does.
+# Per env, hero-centric: `hist_enemy_*` keep EVERY entity (slot 0 = the hero itself, whose
+# `seen` column is forced False) so the H2 grid channels can be built by a gather, not a loop.
+_HISTORY_FIELDS = (
+    ("hist_valid", lambda N, E, P, B, U, L, K: (N, K), BOOL),
+    ("hist_action", lambda N, E, P, B, U, L, K: (N, K, 2), I64),
+    ("hist_hp", lambda N, E, P, B, U, L, K: (N, K), F32),
+    ("hist_ammo", lambda N, E, P, B, U, L, K: (N, K), F32),
+    ("hist_pos", lambda N, E, P, B, U, L, K: (N, K, 2), F32),
+    ("hist_enemy_pos", lambda N, E, P, B, U, L, K: (N, K, E, 2), F32),
+    ("hist_enemy_seen", lambda N, E, P, B, U, L, K: (N, K, E), BOOL),
 )
 
 # Cached, not part of "state" in the resettable sense -- excluded from zero_ (see below).
 _CACHED_FIELDS = (
-    ("env_idx", lambda N, E, P, B, U, L: (N,), I64),
+    ("env_idx", lambda N, E, P, B, U, L, K: (N,), I64),
 )
 
 _ALL_FIELD_SPECS = (
     _ENTITY_FIELDS + _PROJECTILE_FIELDS + _BOX_PICKUP_FIELDS
-    + _ZONE_EPISODE_FIELDS + _LATENCY_FIELDS + _CACHED_FIELDS
+    + _ZONE_EPISODE_FIELDS + _LATENCY_FIELDS + _HISTORY_FIELDS + _CACHED_FIELDS
 )
 _RESETTABLE_FIELD_NAMES = tuple(name for name, _, _ in _ALL_FIELD_SPECS if name != "env_idx")
 
@@ -135,7 +158,7 @@ class SimState:
     __slots__ = tuple(name for name, _, _ in _ALL_FIELD_SPECS)
 
 
-def _print_memory_report(state: SimState, N, E, P, B, U, L) -> None:
+def _print_memory_report(state: SimState, N, E, P, B, U, L, K) -> None:
     rows = []
     total = 0
     for name, _, _ in _ALL_FIELD_SPECS:
@@ -144,7 +167,7 @@ def _print_memory_report(state: SimState, N, E, P, B, U, L) -> None:
         total += nbytes
         rows.append((name, tuple(t.shape), str(t.dtype), nbytes))
     rows.sort(key=lambda r: -r[3])
-    print(f"SimState memory report (N={N}, E={E}, P={P}, B={B}, U={U}, L={L}):")
+    print(f"SimState memory report (N={N}, E={E}, P={P}, B={B}, U={U}, L={L}, K={K}):")
     for name, shape, dtype, nbytes in rows:
         print(f"  {name:18s} {str(shape):16s} {dtype:14s} {nbytes / 1e6:9.4f} MB")
     print(f"  {'TOTAL':18s} {'':16s} {'':14s} {total / 1e6:9.4f} MB")
@@ -153,14 +176,15 @@ def _print_memory_report(state: SimState, N, E, P, B, U, L) -> None:
 def allocate(cfg, n_envs: int, device, verbose: bool = True) -> SimState:
     N, E = n_envs, cfg.n_entities
     P, B, U, L = cfg.max_projectiles, cfg.max_boxes, cfg.max_pickups, cfg.latency_buf_len
+    K = cfg.history_frames
 
     state = SimState()
     for name, shape_fn, dtype in _ALL_FIELD_SPECS:
-        setattr(state, name, torch.zeros(shape_fn(N, E, P, B, U, L), dtype=dtype, device=device))
+        setattr(state, name, torch.zeros(shape_fn(N, E, P, B, U, L, K), dtype=dtype, device=device))
     state.env_idx = torch.arange(N, dtype=torch.int64, device=device)
 
     if verbose:
-        _print_memory_report(state, N, E, P, B, U, L)
+        _print_memory_report(state, N, E, P, B, U, L, K)
 
     return state
 
@@ -216,6 +240,12 @@ def check_invariants(state: SimState, cfg, params) -> None:
     dash_duration = torch.gather(params.dash_duration, 1, state.ent_kind)
     if not torch.all(state.ent_dash_t <= dash_duration + 1e-3):
         raise ValueError("check_invariants: ent_dash_t exceeds dash_duration")
+
+    # A countdown that clamps at 0 (hero.tick_timers) and is only ever SET to the kind's
+    # gadget_cooldown, so either bound failing means a write path other than those two.
+    gadget_cooldown = torch.gather(params.gadget_cooldown, 1, state.ent_kind)
+    if not torch.all((state.ent_gadget_cd >= 0) & (state.ent_gadget_cd <= gadget_cooldown + 1e-3)):
+        raise ValueError("check_invariants: ent_gadget_cd out of [0, gadget_cooldown]")
 
     if not torch.all(state.prj_alive.sum(dim=-1) <= state.prj_alive.shape[-1]):
         raise ValueError("check_invariants: live projectile count exceeds P slots")

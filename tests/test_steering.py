@@ -108,6 +108,26 @@ def test_maintain_range_multi_entity_per_row_tensor_desired():
     assert d[0, 1, 0].item() < 0   # entity 1: too close -> flees
 
 
+def test_maintain_range_max_dist_caps_only_the_seek_edge():
+    """`max_dist` moves the seek edge in to min(desired + deadband, max_dist) and leaves the flee
+    edge alone. desired 6.8, deadband 1.5, max_dist 8.0 is a hard-tier KITE Brock: 8.2 tiles sat
+    inside the old band (5.3 to 8.3) and now seeks; 7.9 is still in the band; 5.0 still flees."""
+    pos = torch.zeros(1, 3, 2)
+    target = torch.tensor([[[8.2, 0.0], [7.9, 0.0], [5.0, 0.0]]])
+    desired = torch.full((1, 3), 6.8)
+    reach = torch.full((1, 3), 8.0)
+    old = steering.maintain_range(pos, target, desired, 1.5)
+    new = steering.maintain_range(pos, target, desired, 1.5, max_dist=reach)
+    assert torch.equal(old[0, 0], torch.zeros(2))
+    assert torch.allclose(new[0, 0], torch.tensor([8.2, 0.0]))   # seeks: the unnormalized diff
+    assert torch.equal(new[0, 1], torch.zeros(2))
+    assert torch.allclose(new[0, 2], torch.tensor([-5.0, 0.0]))  # flees, exactly as before
+    assert torch.allclose(old[0, 2], torch.tensor([-5.0, 0.0]))
+    # python scalars take the same path
+    scalar = steering.maintain_range(pos, target, 6.8, 1.5, max_dist=8.0)
+    assert torch.allclose(scalar, new)
+
+
 # ---- avoid_walls (acceptance: escapes a dead end) --------------------------------
 
 def test_avoid_walls_steers_out_of_dead_end():

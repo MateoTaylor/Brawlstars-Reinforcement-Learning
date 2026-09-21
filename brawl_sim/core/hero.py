@@ -33,13 +33,15 @@ _WALL_CLEARANCE = 1e-3
 
 
 def action_mask(state, params, cfg) -> dict:
-    """Hero-only (entity index 0). {"move": (N,17) bool, "attack": (N,3) bool}.
+    """Hero-only (entity index 0). {"move": (N,17) bool, "attack": (N,4) bool}.
 
-    The attack column is `[no-fire, attack, SUPER]` (Step D2 / bot_overhaul.md D1). Widening the
-    existing dimension rather than adding a third keeps `action.shape == (N,2)`, so every wrapper,
-    `act_buf`, and `env._held`'s fire-clearing keep working untouched -- the super is a distinct
-    VALUE in the attack column, not a new column, which is why one decision still means at most one
-    attack attempt for supers too.
+    The attack column is `[no-fire, attack, SUPER, GADGET]` (Step D2 / bot_overhaul.md D1 for the
+    super; SIM_OVERHAUL_PLAN.md Step G3 / S7 for the gadget). Widening the existing dimension
+    rather than adding a third keeps `action.shape == (N,2)`, so every wrapper, `act_buf`, and
+    `env._held`'s fire-clearing keep working untouched -- the super and the gadget are distinct
+    VALUES in the attack column, not new columns, which is why one decision still means at most
+    one attack attempt for either of them too. The price is that a gadget and a dash cannot share
+    one decision (plan §8).
     """
     hero_alive = state.ent_alive[:, 0]
     hero_ammo = state.ent_ammo[:, 0]
@@ -54,19 +56,23 @@ def action_mask(state, params, cfg) -> dict:
     # A super costs CHARGE, not ammo -- an empty clip must not block it. It shares the cooldown and
     # the no-dashing rule, so it cannot be used to sidestep either.
     super_ok = ready & super_ready(state, params)[:, 0]
+    # The gadget is a separate button on its own timer (S8): deliberately NOT ANDed with `ready`,
+    # so it is legal mid-dash, during the attack cooldown and on an empty clip -- the game lets a
+    # gadget go in all three.
+    gadget_ok = gadget_ready(state, params)[:, 0]
     no_fire_ok = torch.ones_like(fire_ok)
-    attack = torch.stack([no_fire_ok, fire_ok, super_ok], dim=1)
+    attack = torch.stack([no_fire_ok, fire_ok, super_ok, gadget_ok], dim=1)
 
     return {"move": move, "attack": attack}
 
 
 def decode_action(action: torch.Tensor, state, params, cfg):
     """Hero-only. action: (N,2) i64. Returns (move_dir (N,2) f32, fire (N,) bool,
-    super_fire (N,) bool).
+    super_fire (N,) bool, gadget_fire (N,) bool).
 
-    `action[:, 1]` is now three-valued: 0 = nothing, 1 = attack, 2 = super. Both outputs are
-    ANDed with the mask, so an illegal request of either kind is a silent no-op rather than an
-    error -- unchanged in spirit from before, just over three values instead of two."""
+    `action[:, 1]` is four-valued: 0 = nothing, 1 = attack, 2 = super, 3 = gadget. Every output
+    is ANDed with the mask, so an illegal request of any kind is a silent no-op rather than an
+    error. The three are mutually exclusive by construction -- one column, one value."""
     move_bin = action[:, 0]
     is_idle = move_bin == 0
     dirs = geo.dir_from_bin(torch.clamp(move_bin - 1, min=0), cfg.n_move_bins)
@@ -75,12 +81,13 @@ def decode_action(action: torch.Tensor, state, params, cfg):
     mask = action_mask(state, params, cfg)["attack"]
     fire = (action[:, 1] == 1) & mask[:, 1]
     super_fire = (action[:, 1] == 2) & mask[:, 2]
+    gadget_fire = (action[:, 1] == 3) & mask[:, 3]
 
-    return move_dir, fire, super_fire
+    return move_dir, fire, super_fire, gadget_fire
 
 
 def tick_timers(state, params, cfg) -> None:
-    """MUTATES: ent_ammo, ent_attack_cd, ent_invuln_t, ent_reveal_t, ent_react_t,
+    """MUTATES: ent_ammo, ent_attack_cd, ent_gadget_cd, ent_invuln_t, ent_reveal_t, ent_react_t,
     ent_out_of_combat_t (NOT ent_dash_t -- see module docstring). ammo += dt/reload_seconds
     clamped to max_ammo, EXCEPT while attack_cd is running; countdowns clamp at 0;
     ent_out_of_combat_t counts up instead (see module docstring).
@@ -112,6 +119,9 @@ def tick_timers(state, params, cfg) -> None:
     gain = torch.where(reloading, cfg.dt / reload_seconds, torch.zeros_like(reload_seconds))
     state.ent_ammo.copy_(torch.clamp(state.ent_ammo + gain, max=max_ammo))
     state.ent_attack_cd.copy_(torch.clamp(state.ent_attack_cd - cfg.dt, min=0))
+    # The gadget cooldown (Phase G) is independent of attack_cd: firing the gadget neither pauses
+    # the reload nor is blocked by the dash -- it is a separate button on its own timer.
+    state.ent_gadget_cd.copy_(torch.clamp(state.ent_gadget_cd - cfg.dt, min=0))
     state.ent_invuln_t.copy_(torch.clamp(state.ent_invuln_t - cfg.dt, min=0))
     state.ent_reveal_t.copy_(torch.clamp(state.ent_reveal_t - cfg.dt, min=0))
     state.ent_react_t.copy_(torch.clamp(state.ent_react_t - cfg.dt, min=0))
@@ -186,6 +196,88 @@ def add_super_charge(state, hits: torch.Tensor, params) -> None:
     needed = stats.gather_kind(params.super_charge_hits, state.ent_kind).to(state.ent_super_charge.dtype)
     charged = state.ent_super_charge + hits.to(state.ent_super_charge.dtype)
     state.ent_super_charge.copy_(torch.where(has_super(state, params), torch.minimum(charged, needed), state.ent_super_charge))
+
+
+def gadget_ready(state, params) -> torch.Tensor:
+    """(N,E) bool -- may this entity throw its gadget right now? `alive & gadget_cd <= 0 & the
+    kind HAS a gadget` and nothing else (S8): not ammo, not `attack_cd`, not `dash_t`.
+
+    The one definition shared by `action_mask` (the hero's legality column) and
+    `env._attack_phase`'s safety net, so the two cannot drift. Every bot kind resolves
+    `gadget_cooldown` to 0 (Step G1), which is what keeps a bot from ever firing one."""
+    cooldown = stats.gather_kind(params.gadget_cooldown, state.ent_kind)
+    return state.ent_alive & (state.ent_gadget_cd <= 0) & (cooldown > 0)
+
+
+def gadget_target(state, vis: torch.Tensor, params, bank, cfg):
+    """Where each entity's gadget spinner would fly THIS tick (SIM_OVERHAUL_PLAN.md Step G2,
+    substep G2.1). Returns `(dir (N,E,2) f32 unit vectors, travel (N,E) f32 tiles)`. Pure --
+    mutates nothing; `env._attack_phase` (Step G3) feeds the pair into `projectiles.spawn_gadget`
+    for the entities that actually fire.
+
+    `vis` is the FAIR `(N,E,E)` visibility (`bots/perception.visibility`: `vis[n,e,j]` = e sees
+    j). For the hero row that is exactly the `enemy_revealed` mask the observation grid draws, so
+    the spinner never homes on something the agent cannot see (S10): a bushed, unrevealed enemy
+    one tile away is skipped in favour of a revealed one two tiles away, and with nothing revealed
+    at all it flies `gadget_range` straight along the entity's facing. The same facing fallback
+    covers a revealed enemy standing ON the thrower (zero vector, no direction to normalize), so
+    `dir` is a unit vector on every row; `travel` is 0 there and the spinner detonates in place.
+
+    Computed for every entity, read for the hero. Bots have `gadget_range 0` and never fire one
+    (Step G1), so their rows are travel-0 noise that nothing consumes; masking them out would cost
+    the same tensor ops it saved.
+
+    `travel` is `min(gadget_range, distance to the nearest revealed enemy)` -- it lands ON a close
+    enemy rather than overshooting -- then clipped against `blocks_proj` with the same march
+    `step_projectiles` runs per projectile. The spinner is an ARTILLERY shell that is NOT stopped
+    in flight, so this pre-clip is the only thing that keeps it from landing (and blasting) on the
+    far side of a wall it was thrown at.
+    """
+    N, E = state.ent_kind.shape
+    device = state.ent_pos.device
+
+    # (N,E,E): e's candidate targets j. `vis` already excludes dead observers and dead targets
+    # when it comes from perception.visibility; the alive AND is re-applied so a hand-built or
+    # stale mask cannot aim at a corpse, and the diagonal is removed so nobody targets themselves
+    # (vis[n,e,e] is True for every living e).
+    eye = torch.eye(E, dtype=torch.bool, device=device).unsqueeze(0)
+    revealed = vis & state.ent_alive.unsqueeze(1) & ~eye
+
+    # diff[n,e,j] = pos_j - pos_e: the vector FROM the thrower TO the candidate.
+    diff = state.ent_pos.unsqueeze(1) - state.ent_pos.unsqueeze(2)  # (N,E,E,2)
+    dist = geo.safe_norm(diff, dim=-1)                                # (N,E,E)
+    dist_eff = torch.where(revealed, dist, torch.full_like(dist, float("inf")))
+    nearest = torch.argmin(dist_eff, dim=-1)                          # (N,E) i64
+    has = revealed.any(dim=-1)                                        # (N,E) -- tensor op, no host sync
+
+    to_vec = diff.gather(2, nearest.view(N, E, 1, 1).expand(N, E, 1, 2)).squeeze(2)  # (N,E,2)
+    nearest_dist = dist.gather(2, nearest.unsqueeze(-1)).squeeze(-1)                 # (N,E)
+    facing_vec = geo.from_angle(state.ent_facing)
+    # `normalize` of a zero vector is zero (its norm is clamped, not the output), so a target
+    # coincident with the thrower falls back to the facing like "nothing revealed" does: the
+    # unit-vector contract holds on every row, and travel is 0 either way.
+    aimed = has & (nearest_dist > _EPS)
+    direction = torch.where(aimed.unsqueeze(-1), geo.normalize(to_vec), facing_vec)
+
+    gadget_range = stats.gather_kind(params.gadget_range, state.ent_kind)
+    travel = torch.where(has, torch.minimum(gadget_range, nearest_dist), gadget_range)
+
+    # Wall clip. `march` samples every `los_step_tiles` and reports the first BLOCKED sample, so
+    # `hit_t` is at or past the true wall face, never before it; landing one full sample short of
+    # it is the same back-off `step_projectiles` and `start_dash` apply, and it guarantees the
+    # landing point (which `spawn_gadget` turns into `prj_target`, the detonation point) is on
+    # the thrower's side of the wall. `hit_pos == pos + hit_t * dir` exactly, so the plan's
+    # `|hit_pos - los_step * dir - pos|` is `hit_t - los_step` wherever `hit_t >= los_step`; the
+    # clamp covers the one case the norm gets wrong -- an entity standing closer than one sample
+    # to a wall, where the endpoint sample itself is the hit and the norm would come back as a
+    # positive distance in the WRONG direction. Default ray budget: `gadget_range` is a per-kind
+    # tensor, and march's budget must be a Python scalar (see its docstring), so this pays the
+    # full `cfg.ray_steps` over an (N,E) grid -- the same cost `start_dash`'s march already pays.
+    hit, _, hit_t = terrain.march(bank.blocks_proj, state.map_id, state.ent_pos, direction, travel, cfg)
+    clipped = torch.clamp(hit_t - cfg.los_step_tiles, min=0.0)
+    travel = torch.where(hit, torch.minimum(clipped, travel), travel)
+
+    return direction, travel
 
 
 def start_dash(state, fire: torch.Tensor, move_dir: torch.Tensor, bank, params, cfg) -> None:

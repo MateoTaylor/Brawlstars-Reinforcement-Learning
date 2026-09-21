@@ -24,7 +24,14 @@ TIER_FIELDS: dict[str, float] = {
     "move_speed": 1.0,
     "hp": 1.0,
     "damage": 1.0,
+    # The two behaviour axes (SIM_OVERHAUL B1-B4). Both scale a brawlers.yaml base that is
+    # authored non-zero on every bot kind (`aggression: 1.0`, `hero_focus: 0.5`); a base of 0 is
+    # the "unset, neutral" value and stays 0 under any multiplier.
+    "aggression": 1.0,
+    "hero_focus": 1.0,
 }
+
+_REPO_ROOT = Path(__file__).resolve().parent.parent.parent
 
 SCHEDULE_KINDS = ("constant", "linear", "cosine", "exponential")
 ALGOS = ("maskable_ppo", "ppo")
@@ -124,6 +131,9 @@ class RewardConfig:
     cube_pickup: float = 0.25
     survive_per_step: float = 0.002
     in_zone_per_step: float = -0.05
+    # x attacks/supers made with a visible enemy in dash reach (SIM_OVERHAUL_PLAN.md §9 R2). Off by
+    # default so a hand-built RewardConfig keeps its meaning; configs/train.yaml turns it on.
+    attack_in_reach: float = 0.0
     scale: float = 1.0
 
 
@@ -140,12 +150,23 @@ class DifficultyTier:
     move_speed: float = 1.0
     hp: float = 1.0
     damage: float = 1.0
+    aggression: float = 1.0     # x aggression; HIGHER = retreats later, holds closer, campers fire on sight
+    hero_focus: float = 1.0     # x hero_focus, the product clamped to [0, 1]; 0.0 = no preference for the hero
 
     def __post_init__(self) -> None:
         for key in TIER_FIELDS:
             value = getattr(self, key)
             if value < 0:
                 raise ValueError(f"tier {self.name!r}: {key} must be >= 0, got {value}")
+        if self.aggression == 0:
+            # core/stats.aggression_of reads a 0 as the NEUTRAL 1.0 (0 is what a missing
+            # brawlers.yaml key resolves to), so `aggression: 0.0` would not mean "as passive as
+            # possible" -- it would silently mean "exactly as aggressive as hard". Refuse it here
+            # rather than let a tier do the opposite of what it says.
+            raise ValueError(
+                f"tier {self.name!r}: aggression must be > 0 -- a 0 product is read as the "
+                "neutral 1.0 by the bots, not as 'never aggressive'; use a small value instead"
+            )
 
 
 @dataclass(frozen=True)
@@ -213,6 +234,14 @@ class EvalConfig:
     ep_rew_mean` is measured against the training distribution, which the curriculum
     deliberately makes harder, so it cannot distinguish "policy improved" from "curriculum got
     easier". Every eval here replays the same seeded scenarios against the same pinned bots.
+
+    **Two map sets (SIM_OVERHAUL M4).** The `eval/*` numbers are measured on the TRAINING maps:
+    the evaluator loads `run.env_config` + `run.env_overrides`, the same resolved `world.maps` the
+    training env draws from. `holdout_maps` names maps the run never trains on; when set, a second
+    evaluator scores the same tiers on those maps only and logs `eval/holdout_*`. The gap between
+    the two is the map-overfitting measurement. `None` or empty = no holdout eval (every config
+    written before 2026-09-18 loads that way). `validate_train_config` refuses a holdout map that
+    the training env also draws, and one that is not a registered map.
     """
     enabled: bool = True
     every_timesteps: int = 500_000
@@ -221,6 +250,7 @@ class EvalConfig:
     deterministic: bool = True
     seed: int = 999_983          # deliberately unrelated to run.seed; see TierEvaluator
     at_start: bool = True        # one eval before any training, as the baseline row
+    holdout_maps: tuple[str, ...] | None = None   # maps held OUT of training; None/() = no holdout eval
 
     def __post_init__(self) -> None:
         if not self.enabled:
@@ -229,6 +259,15 @@ class EvalConfig:
             raise ValueError(f"eval.episodes_per_tier must be >= 1, got {self.episodes_per_tier}")
         if self.every_timesteps < 1:
             raise ValueError(f"eval.every_timesteps must be >= 1, got {self.every_timesteps}")
+        holdout = self.holdout_maps or ()
+        duplicated = sorted({name for name in holdout if holdout.count(name) > 1})
+        if duplicated:
+            raise ValueError(f"eval.holdout_maps lists {duplicated} more than once")
+
+    @property
+    def has_holdout(self) -> bool:
+        """True when a second, holdout-map evaluator should be built."""
+        return self.enabled and bool(self.holdout_maps)
 
 
 @dataclass(frozen=True)
@@ -362,13 +401,53 @@ def _build_eval(data: dict) -> EvalConfig:
     data = dict(data)
     if "tiers" in data and data["tiers"] is not None:
         data["tiers"] = tuple(str(t) for t in data["tiers"])
+    holdout = data.get("holdout_maps")
+    if holdout is not None:
+        if isinstance(holdout, str) or not isinstance(holdout, (list, tuple)):
+            # `holdout_maps: split_river` would otherwise become a tuple of single letters.
+            raise ValueError(f"eval.holdout_maps must be a list of map names, got {holdout!r}")
+        data["holdout_maps"] = tuple(str(m) for m in holdout)
     return _build(EvalConfig, data)
 
 
-def load_train_config(path, overrides: dict | None = None) -> TrainConfig:
+def resolved_training_maps(run: RunConfig) -> tuple[str, ...]:
+    """The `world.maps` the TRAINING env is built with: `run.env_config` with `run.env_overrides`
+    merged on top, through the same `load_config` call `builder.build_env` and `TierEvaluator`
+    make. Reading `configs/default.yaml`'s list instead would miss exactly the override that
+    takes the holdout maps out of the rotation."""
+    from ..config import load_config   # local: keeps this module importable without the sim
+
+    return load_config(_env_config_path(run), overrides=run.env_overrides or None).map_names
+
+
+def _env_config_path(run: RunConfig) -> Path:
+    path = Path(run.env_config)
+    return path if path.is_absolute() else _REPO_ROOT / path   # repo-relative, as builder._resolve
+
+
+def holdout_env_overrides(holdout_maps) -> dict:
+    """The `world` patch that turns a run's env into its holdout twin: ONLY these maps in the
+    bank, drawn uniformly. `map_selection`/`fixed_map` are set too because a run that trains with
+    `map_selection: fixed` names a `fixed_map` that is, by validation, not one of these."""
+    maps = [str(m) for m in holdout_maps]
+    return {"world": {"maps": maps, "map_selection": "uniform", "fixed_map": maps[0]}}
+
+
+def load_train_config(path, overrides: dict | None = None, *,
+                      check_holdout: bool = True) -> TrainConfig:
     """Loads configs/train.yaml (or any file shaped like it), deep-merges `overrides` (from
     `parse_overrides`), and validates the whole thing. Every section is optional -- an empty
-    file yields the dataclass defaults above."""
+    file yields the dataclass defaults above.
+
+    `check_holdout=False` skips `_validate_holdout_maps`, the one check that reads the repo as it
+    is TODAY (the map registry, the resolved rotation, the CSVs on disk) rather than the file. It
+    is for a reader of an ARCHIVED `runs/<name>/train.yaml` that never builds the holdout
+    evaluator, and deployment is the one that passes it: no other step of
+    `DeployedPolicy.from_run` looks at a map name (`load_config` does not check them), so
+    `eval.holdout_maps` would otherwise be the only thing stopping a checkpoint from deploying
+    after a holdout map is renamed or retired. Whatever STARTS or resumes a run keeps the
+    default, and so does `with_overrides`. What the file itself says (a bare string, a repeated
+    name) is refused either way."""
     raw = yaml.safe_load(Path(path).read_text()) or {}
     if overrides:
         raw = _deep_merge(raw, overrides)
@@ -390,12 +469,13 @@ def load_train_config(path, overrides: dict | None = None) -> TrainConfig:
         eval=_build_eval(raw.get("eval") or {}),
         raw=raw,
     )
-    validate_train_config(cfg)
+    validate_train_config(cfg, check_holdout=check_holdout)
     return cfg
 
 
-def validate_train_config(cfg: TrainConfig) -> None:
-    """Cross-section checks -- the ones no single dataclass can make on its own."""
+def validate_train_config(cfg: TrainConfig, *, check_holdout: bool = True) -> None:
+    """Cross-section checks -- the ones no single dataclass can make on its own.
+    `check_holdout`: see `load_train_config`."""
     transitions = cfg.rollout_transitions
     if cfg.ppo.batch_size > transitions:
         raise ValueError(
@@ -434,6 +514,50 @@ def validate_train_config(cfg: TrainConfig) -> None:
                 f"eval.tiers names undefined tier(s) {sorted(unknown)}; defined tiers are "
                 f"{sorted(cfg.curriculum.tiers)}"
             )
+    if check_holdout and cfg.eval.has_holdout:
+        _validate_holdout_maps(cfg)
+
+
+def _validate_holdout_maps(cfg: TrainConfig) -> None:
+    from ..config import _KNOWN_MAP_NAMES   # the registry `config.validate` checks world.maps against
+
+    holdout = cfg.eval.holdout_maps
+    unknown = [name for name in holdout if name not in _KNOWN_MAP_NAMES]
+    if unknown:
+        raise ValueError(
+            f"eval.holdout_maps names unknown map(s) {unknown}; known maps are {_KNOWN_MAP_NAMES}"
+        )
+    training = resolved_training_maps(cfg.run)
+    overlap = [name for name in holdout if name in training]
+    if overlap:
+        raise ValueError(
+            f"eval.holdout_maps {overlap} are also in the training rotation (world.maps of "
+            f"{cfg.run.env_config} + run.env_overrides = {list(training)}). A map the policy trains "
+            "on measures nothing as a holdout: drop it from run.env_overrides.world.maps, or from "
+            "eval.holdout_maps."
+        )
+    _check_holdout_maps_load(cfg.run, holdout)
+
+
+def _check_holdout_maps_load(run: RunConfig, holdout) -> None:
+    """A REGISTERED map can still be one this run's world cannot hold (`blank` is 20x20, every
+    other map 60x60). Left to the evaluator, that surfaces only when the holdout env is built --
+    in scripts/train.py, that used to be after the run directory existed. Loading the two CSVs
+    against the holdout twin's own EnvConfig costs a few ms and names the map at config time."""
+    from ..config import load_config
+    from ..maps.loader import CSV_DIR, load_map_csv, validate_map
+
+    env_cfg = load_config(_env_config_path(run), overrides=deep_merge(
+        run.env_overrides or {}, holdout_env_overrides(holdout)))
+    for name in holdout:
+        try:
+            validate_map(load_map_csv(CSV_DIR / f"{name}.csv", env_cfg), env_cfg)
+        except ValueError as err:
+            raise ValueError(
+                f"eval.holdout_maps: {name!r} cannot be loaded into this run's "
+                f"{env_cfg.map_h}x{env_cfg.map_w} world ({err}). Pick a holdout map of the run's "
+                "own size, or set eval.holdout_maps to [] to switch the holdout eval off."
+            ) from err
 
 
 def with_overrides(cfg: TrainConfig, **sections) -> TrainConfig:

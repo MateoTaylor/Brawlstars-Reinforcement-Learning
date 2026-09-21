@@ -67,7 +67,7 @@ class _StubModel:
     fire" would prove nothing about masking.
     """
 
-    def __init__(self, action=(3, 0), space=None, nvec=(17, 3)):
+    def __init__(self, action=(3, 0), space=None, nvec=(17, 4)):
         self.action = np.array([action])
         self.observation_space = space
         self.action_space = type("A", (), {"nvec": np.array(nvec)})()
@@ -141,24 +141,53 @@ def test_a_checkpoint_with_the_wrong_action_space_is_refused():
     model = _StubModel(space=obs_select.agent_space(spec, cfg), nvec=(17, 2))
     with pytest.raises(ValueError, match="action space"):
         check_spaces(model, spec, cfg, label="stale")
+    # Wider than the sim's, and a different move half, are just as wrong.
+    for nvec in ((17, 5), (16, 4), (9, 3)):
+        with pytest.raises(ValueError, match="action space"):
+            check_spaces(_StubModel(space=obs_select.agent_space(spec, cfg), nvec=nvec),
+                         spec, cfg, label="stale")
+
+
+def test_a_pre_gadget_checkpoint_is_refused():
+    """SIM_OVERHAUL Step G3 widened the sim's attack column 3 -> 4. Deployment briefly kept loading
+    the 3-wide checkpoints trained before it; the operator retired them on 2026-09-21, so `(17, 3)`
+    is now one more stale action space, and the error names the reason and the remedy."""
+    cfg = load_config(CONFIGS)
+    spec = obs_select.load_agent_spec(SPEC, cfg)
+    assert tuple(cfg.action_nvec) == (17, 4)
+    legacy = _StubModel(space=obs_select.agent_space(spec, cfg), nvec=(17, 3))
+    with pytest.raises(ValueError, match="pre-gadget checkpoint .* retrain"):
+        check_spaces(legacy, spec, cfg, label="pre-gadget")
+    # Only that width is named as one; any other mismatch is just a mismatch.
+    with pytest.raises(ValueError) as err:
+        check_spaces(_StubModel(space=obs_select.agent_space(spec, cfg), nvec=(17, 5)),
+                     spec, cfg, label="wide")
+    assert "pre-gadget" not in str(err.value)
 
 
 # ---- the mask ---------------------------------------------------------------------------------
 
 def test_the_mask_handed_to_the_network_is_the_sims_own_layout():
-    """`[move (n_move_bins + 1), attack (3)]` flattened -- what `wrappers/sb3_vecenv.py`'s
+    """`[move (n_move_bins + 1), attack (4)]` flattened -- what `wrappers/sb3_vecenv.py`'s
     `action_masks()` produced on every training step. A different split here would mask the wrong
-    dimension while remaining exactly the right width, which no shape check catches."""
+    dimension while remaining exactly the right width, which no shape check catches.
+
+    The fourth attack column is the gadget (SIM_OVERHAUL Step G3). Deployment cannot press it
+    until Step G5, so it is held ILLEGAL here whatever the shadow says: a policy that could pick
+    it would pick an action the control layer has no button for."""
     pol = _policy()
     obs = {k: np.zeros(v.shape, v.dtype) for k, v in
            obs_select.agent_space(pol.spec, pol.cfg).spaces.items()}
     pol.act(obs, (True, False, True))
 
     mask = pol.model.seen["mask"]
-    n_move = pol.cfg.n_move_bins + 1
-    assert mask.shape == (1, n_move + 3)
-    assert mask[0, :n_move].all(), "hero.action_mask builds the move half all-True"
-    assert list(mask[0, n_move:]) == [True, False, True]
+    assert mask.shape == (1, 21)
+    assert mask[0, :17].all(), "hero.action_mask builds the move half all-True"
+    assert list(mask[0, 17:]) == [True, False, True, False]
+
+    # ...and it stays illegal across calls -- the three shadow legals never spill into it.
+    pol.act(obs, (True, True, True))
+    assert list(pol.model.seen["mask"][0, 17:]) == [True, True, True, False]
 
 
 def test_the_attack_mask_is_the_shadows_and_is_not_recomputed_here():
@@ -176,7 +205,8 @@ def test_the_attack_mask_is_the_shadows_and_is_not_recomputed_here():
     shadow = ShadowHero(ShadowParams.load())
     shadow.reset()
     pol.act(obs, shadow.attack_mask())
-    assert list(pol.model.seen["mask"][0, n_move:]) == list(shadow.attack_mask())
+    assert list(pol.model.seen["mask"][0, n_move:n_move + 3]) == list(shadow.attack_mask())
+    assert list(shadow.attack_mask()) == [True, True, False]   # fresh shadow: full clip, no super
 
 
 def test_an_all_illegal_attack_column_is_rejected_rather_than_producing_nan():
@@ -261,7 +291,15 @@ def test_the_real_checkpoint_loads_and_decides_from_an_assembled_observation(run
 
     if not __import__("pathlib").Path(f"{run}/best_model.zip").exists():
         pytest.skip("runs/ is gitignored; the deployed checkpoint is not on every machine")
-    pol = DeployedPolicy.from_run(run)
+    try:
+        pol = DeployedPolicy.from_run(run)
+    except ValueError as err:
+        # Every run trained before SIM_OVERHAUL Step G3 is refused by design since the operator
+        # retired them (2026-09-21) and is to be deleted, so a machine that still holds one skips
+        # it by name. Only THAT refusal: any other load failure still fails this test.
+        if "pre-gadget checkpoint" not in str(err):
+            raise
+        pytest.skip(f"{run} is a retired pre-gadget checkpoint; delete it")
     asm = pol.make_assembler()
     assert asm.spec is pol.spec and asm.cfg is pol.cfg, "one spec object, not two loads of it"
     gas = GasMap(128, 128)

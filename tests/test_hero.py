@@ -86,7 +86,7 @@ def test_firing_at_ammo_point_nine_does_nothing_and_mask_says_so():
     assert not bool(mask["attack"][0, 1])
 
     action = torch.tensor([[0, 1]], dtype=torch.int64)  # idle move, attempt to fire
-    move_dir, fire, _super = hero.decode_action(action, state, params, cfg)
+    move_dir, fire, _super, _gadget = hero.decode_action(action, state, params, cfg)
     assert not bool(fire[0])  # illegal fire silently becomes a no-op
 
 
@@ -104,7 +104,7 @@ def test_decode_action_idle_gives_zero_move_dir():
     cfg, params = _cfg_and_params()
     state = _fresh_state(cfg)
     action = torch.tensor([[0, 0]], dtype=torch.int64)
-    move_dir, fire, _super = hero.decode_action(action, state, params, cfg)
+    move_dir, fire, _super, _gadget = hero.decode_action(action, state, params, cfg)
     assert torch.allclose(move_dir, torch.zeros(1, 2))
 
 
@@ -112,7 +112,7 @@ def test_decode_action_bin_zero_is_facing_east():
     cfg, params = _cfg_and_params()
     state = _fresh_state(cfg)
     action = torch.tensor([[1, 0]], dtype=torch.int64)  # move bin k=1 -> dir_from_bin(0,16)
-    move_dir, fire, _super = hero.decode_action(action, state, params, cfg)
+    move_dir, fire, _super, _gadget = hero.decode_action(action, state, params, cfg)
     assert torch.allclose(move_dir, torch.tensor([[1.0, 0.0]]), atol=1e-5)
 
 
@@ -123,8 +123,98 @@ def test_decode_action_legal_fire_passes_through():
     state.ent_attack_cd[:, 0] = 0.0
     state.ent_dash_t[:, 0] = 0.0
     action = torch.tensor([[0, 1]], dtype=torch.int64)
-    move_dir, fire, _super = hero.decode_action(action, state, params, cfg)
+    move_dir, fire, _super, _gadget = hero.decode_action(action, state, params, cfg)
     assert bool(fire[0])
+
+
+# ---- the gadget column (SIM_OVERHAUL Step G3.1) --------------------------------
+
+def test_action_mask_is_twenty_one_wide_with_the_gadget_as_the_fourth_attack_column():
+    """17 move bins + [no-fire, attack, super, gadget]. Literal widths: `cfg.action_nvec` is the
+    thing under test, so deriving the expectation from it would compare the change to itself."""
+    cfg, params = _cfg_and_params(n_envs=3)
+    state = _fresh_state(cfg, n_envs=3)
+    state.ent_ammo[:, 0] = 3.0
+    mask = hero.action_mask(state, params, cfg)
+    assert mask["move"].shape == (3, 17)
+    assert mask["attack"].shape == (3, 4)
+    assert torch.cat([mask["move"], mask["attack"]], dim=-1).shape == (3, 21)
+    assert cfg.action_nvec == (17, 4)
+    # Fresh hero: gadget starts charged (gadget_cd 0), no super charge yet.
+    assert mask["attack"][0].tolist() == [True, True, False, True]
+
+
+def test_the_gadget_is_legal_while_dashing_on_cooldown_and_with_an_empty_clip():
+    """S8: the gate is `alive & gadget_cd <= 0 & the kind has a gadget` and NOTHING else -- it is
+    deliberately not ANDed with the `ready` term the attack and the super share."""
+    cfg, params = _cfg_and_params()
+    state = _fresh_state(cfg)
+    state.ent_ammo[:, 0] = 0.0
+    state.ent_attack_cd[:, 0] = 0.30
+    state.ent_dash_t[:, 0] = 0.15
+    state.ent_super_charge[:, 0] = 99
+    mask = hero.action_mask(state, params, cfg)["attack"]
+    assert mask[0].tolist() == [True, False, False, True]
+
+    move_dir, fire, sup, gadget = hero.decode_action(torch.tensor([[0, 3]]), state, params, cfg)
+    assert bool(gadget[0]) and not bool(fire[0]) and not bool(sup[0])
+
+    # The move column decodes on its own, whatever the attack column holds: bin 5 is straight
+    # down the screen (+y), thrown gadget or not (Step G3 review -- this was unpacked, never read).
+    move_dir, _fire, _sup, gadget = hero.decode_action(torch.tensor([[5, 3]]), state, params, cfg)
+    assert bool(gadget[0])
+    assert torch.allclose(move_dir, torch.tensor([[0.0, 1.0]]), atol=1e-6)
+
+
+def test_the_gadget_is_illegal_while_its_cooldown_runs_and_for_the_dead():
+    cfg, params = _cfg_and_params()
+    state = _fresh_state(cfg)
+    state.ent_ammo[:, 0] = 3.0
+
+    state.ent_gadget_cd[:, 0] = 0.05          # one tick left is still "not ready"
+    assert hero.action_mask(state, params, cfg)["attack"][0].tolist() == [True, True, False, False]
+    _mv, _fire, _sup, gadget = hero.decode_action(torch.tensor([[0, 3]]), state, params, cfg)
+    assert not bool(gadget[0]), "a masked gadget request is a silent no-op"
+
+    state.ent_gadget_cd[:, 0] = 17.95
+    assert not bool(hero.action_mask(state, params, cfg)["attack"][0, 3])
+
+    state.ent_gadget_cd[:, 0] = 0.0
+    assert bool(hero.action_mask(state, params, cfg)["attack"][0, 3])
+    state.ent_alive[:, 0] = False
+    assert hero.action_mask(state, params, cfg)["attack"][0].tolist() == [True, False, False, False]
+
+
+def test_a_kind_without_a_gadget_never_gets_the_column():
+    """`gadget_cooldown: 0` is "this kind has no gadget" (Step G1) -- every bot. `gadget_cd <= 0`
+    alone would read a bot's permanently-zero timer as READY, which is the bug the third term of
+    the gate exists to prevent."""
+    cfg, params = _cfg_and_params()
+    state = _fresh_state(cfg)
+    assert float(params.gadget_cooldown[0, int(Kind.HERO_MORTIS)]) == 18.0
+    assert float(params.gadget_cooldown[0, int(Kind.BOT_SNIPER)]) == 0.0
+
+    ready = hero.gadget_ready(state, params)
+    assert ready.shape == (1, cfg.n_entities)
+    assert ready[0].tolist() == [True] + [False] * (cfg.n_entities - 1)
+
+    state.ent_kind[:, 0] = int(Kind.BOT_SNIPER)   # a gadget-less kind in the hero's own slot
+    state.ent_ammo[:, 0] = 3.0
+    assert hero.action_mask(state, params, cfg)["attack"][0].tolist() == [True, True, False, False]
+    _mv, _fire, _sup, gadget = hero.decode_action(torch.tensor([[0, 3]]), state, params, cfg)
+    assert not bool(gadget[0])
+
+
+def test_decode_action_yields_at_most_one_of_attack_super_gadget():
+    cfg, params = _cfg_and_params(n_envs=4)
+    state = _fresh_state(cfg, n_envs=4)
+    state.ent_ammo[:, 0] = 3.0
+    state.ent_super_charge[:, 0] = 99
+    action = torch.tensor([[0, 0], [0, 1], [0, 2], [0, 3]], dtype=torch.int64)
+    _mv, fire, sup, gadget = hero.decode_action(action, state, params, cfg)
+    assert fire.tolist() == [False, True, False, False]
+    assert sup.tolist() == [False, False, True, False]
+    assert gadget.tolist() == [False, False, False, True]
 
 
 # ---- tick_timers ---------------------------------------------------------------
@@ -142,6 +232,25 @@ def test_ammo_regen_zero_to_full_in_max_ammo_times_reload_seconds():
         hero.tick_timers(state, params, cfg)
 
     assert torch.allclose(state.ent_ammo[:, 0], torch.tensor([max_ammo]), atol=1e-3)
+
+
+def test_gadget_cooldown_counts_down_and_clamps_at_zero():
+    """Step G1.4. `ent_gadget_cd` is a countdown like ent_attack_cd, and 0 means READY -- which
+    is also what core/state.zero_ leaves on reset, so "starts fully charged" costs nothing. A
+    full 18 s cooldown runs out in 360 ticks at dt 0.05, for every entity (the decrement is not
+    hero-only), and then sits at exactly 0 rather than going negative."""
+    cfg, params = _cfg_and_params()
+    state = _fresh_state(cfg)
+    assert torch.all(state.ent_gadget_cd == 0)  # fresh = ready
+    cooldown = 18.0
+    state.ent_gadget_cd.fill_(cooldown)
+    n_ticks = int(round(cooldown / cfg.dt))
+    for _ in range(n_ticks - 1):
+        hero.tick_timers(state, params, cfg)
+        assert torch.all(state.ent_gadget_cd > 0)
+    for _ in range(2):  # the 360th tick lands on ~0 (float32 drift either side); the 361st clamps
+        hero.tick_timers(state, params, cfg)
+    assert torch.all(state.ent_gadget_cd == 0)
 
 
 def test_firing_pauses_the_reload_for_exactly_attack_cooldown():

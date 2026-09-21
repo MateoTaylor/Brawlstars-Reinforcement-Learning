@@ -314,3 +314,111 @@ def test_no_nan_batched_smoke():
         for t in (intent.move_dir, intent.aim_dir, intent.aim_point):
             assert torch.all(torch.isfinite(t))
         assert intent.move_dir.shape == (8, cfg.n_entities, 2)
+
+
+# ---- hero_focus reaches select_target through the dispatcher (SIM_OVERHAUL_PLAN.md Step B2.2) --
+
+def test_dispatcher_passes_hero_focus_through_to_target_selection():
+    """all_bot_intents hands `params` to perception.select_target. Same scene, two focus values:
+    bot 1 has the hero 7 tiles east and bot 2 four tiles west. With the sniper kind's hero_focus
+    forced to 0 it takes the nearer bot (slot 2); at 0.5 the discounted hero (3.5 < 4) wins and
+    ent_target reads slot 0. Pinned as literal slots, not as a call through the same function."""
+    for hero_focus, want in ((0.0, 2), (0.5, 0)):
+        cfg, params, gen = _cfg_and_params(n_enemies=2, map_h=40, map_w=40)
+        params.hero_focus[:, int(Kind.BOT_SNIPER)] = hero_focus
+        state = allocate(cfg, n_envs=1, device="cpu", verbose=False)
+        state.ent_alive.fill_(True)
+        state.ent_kind[:, 0] = int(Kind.HERO_MORTIS)
+        state.ent_kind[:, 1] = int(Kind.BOT_SNIPER)
+        state.ent_kind[:, 2] = int(Kind.BOT_SNIPER)
+        state.map_id.fill_(0)
+        state.ent_target.fill_(-1)
+        state.ent_person.fill_(int(Person.RUSH))
+        state.ent_hunt_t.fill_(cfg.bots_hunt_timeout_seconds)
+        max_hp = stats.effective_max_hp(state.ent_kind, state.ent_cubes, params)
+        state.ent_hp.copy_(max_hp)
+        state.ent_max_hp.copy_(max_hp)
+        state.ent_ammo.copy_(stats.gather_kind(params.max_ammo, state.ent_kind))
+        bank = _FakeBank(_grid(40, 40))
+
+        state.ent_pos[0, 1] = torch.tensor([20.0, 20.0])
+        state.ent_pos[0, 0] = torch.tensor([27.0, 20.0])  # hero, 7 tiles
+        state.ent_pos[0, 2] = torch.tensor([16.0, 20.0])  # bot, 4 tiles
+
+        vis = perception.visibility(state, bank, params, cfg)
+        policy.all_bot_intents(state, vis, bank, params, cfg, gen)
+        assert state.ent_target[0, 1].item() == want, hero_focus
+
+
+# ---- KITE hold distance scales by clamp(1 / aggression, 0.6, 1.4) (Step B3.2) ------------------
+
+def test_kite_brock_hold_distance_scales_with_aggression():
+    """`Targeting.desired_range` for a Brock (attack_range 8.0 x desired_range_fraction 0.85 =
+    6.8 tiles): 1.7 clamps the multiplier to 0.6 -> 4.08; 0.6 clamps it to 1.4 -> 9.52, which the
+    fire-reach cap takes down to his 8.0-tile range (operator, 2026-09-21); 1.25 is inside the
+    band -> 0.8 x 6.8 = 5.44; 1.0 and the missing-key 0 both hold the plain 6.8."""
+    for aggression, want in ((1.7, 4.08), (0.6, 8.0), (1.25, 5.44), (1.0, 6.8), (0.0, 6.8)):
+        cfg, params, gen = _cfg_and_params(n_enemies=1, map_h=40, map_w=40)
+        params.aggression[:, int(Kind.BOT_SNIPER)] = aggression
+        state = allocate(cfg, n_envs=1, device="cpu", verbose=False)
+        state.ent_alive.fill_(True)
+        state.ent_kind[:, 0] = int(Kind.HERO_MORTIS)
+        state.ent_kind[:, 1] = int(Kind.BOT_SNIPER)
+        state.map_id.fill_(0)
+        state.ent_target.fill_(-1)
+        state.ent_person.fill_(int(Person.KITE))
+        max_hp = stats.effective_max_hp(state.ent_kind, state.ent_cubes, params)
+        state.ent_hp.copy_(max_hp)
+        state.ent_max_hp.copy_(max_hp)
+        state.ent_ammo.copy_(stats.gather_kind(params.max_ammo, state.ent_kind))
+        bank = _FakeBank(_grid(40, 40))
+        state.ent_pos[0, 0] = torch.tensor([5.0, 20.0])
+        state.ent_pos[0, 1] = torch.tensor([15.0, 20.0])
+
+        _vis, tgt = build_targeting(state, bank, params, cfg)
+        got = tgt.desired_range[0, 1].item()
+        assert abs(got - want) < 1e-4, (aggression, got)
+
+
+def test_kite_hold_distance_is_capped_at_each_kinds_fire_reach():
+    """The cap is the fire gate's own reach, `fire_range_fraction` (0 read as 1.0) x
+    `attack_range`, so it binds per kind, not just for Brock. Literals from brawlers.yaml, holds at
+    a = 0.6 / 0.8 / 1.0 (multiplier 1.4 / 1.25 / 1.0):
+
+        kind    range  fire frac  reach  a = 0.6        a = 0.8       a = 1.0
+        Brock   8.0    unset      8.0    9.52 -> 8.0    8.5 -> 8.0    6.8
+        Shelly  8.0    0.9        7.2    8.4 -> 7.2     7.5 -> 7.2    6.0
+        Spike   8.0    unset      8.0    8.4 -> 8.0     7.5           6.0
+        Grom    7.33   unset      7.33   7.1834         6.41375       5.131
+        Bull    7.0    0.9        6.3    5.88           5.25          4.2
+    """
+    table = {
+        Kind.BOT_SNIPER: (8.0, (8.0, 8.0, 6.8)),
+        Kind.BOT_RIFLE: (7.2, (7.2, 7.2, 6.0)),
+        Kind.BOT_SPIKE: (8.0, (8.0, 7.5, 6.0)),
+        Kind.BOT_ARTILLERY: (7.33, (7.1834, 6.41375, 5.131)),
+        Kind.BOT_BULL: (6.3, (5.88, 5.25, 4.2)),
+    }
+    for kind, (reach, holds) in table.items():
+        for aggression, want in zip((0.6, 0.8, 1.0), holds):
+            cfg, params, _gen = _cfg_and_params(n_enemies=1, map_h=40, map_w=40)
+            params.aggression[:, int(kind)] = aggression
+            state = allocate(cfg, n_envs=1, device="cpu", verbose=False)
+            state.ent_alive.fill_(True)
+            state.ent_kind[:, 0] = int(Kind.HERO_MORTIS)
+            state.ent_kind[:, 1] = int(kind)
+            state.map_id.fill_(0)
+            state.ent_target.fill_(-1)
+            state.ent_person.fill_(int(Person.KITE))
+            max_hp = stats.effective_max_hp(state.ent_kind, state.ent_cubes, params)
+            state.ent_hp.copy_(max_hp)
+            state.ent_max_hp.copy_(max_hp)
+            state.ent_ammo.copy_(stats.gather_kind(params.max_ammo, state.ent_kind))
+            bank = _FakeBank(_grid(40, 40))
+            state.ent_pos[0, 0] = torch.tensor([5.0, 20.0])
+            state.ent_pos[0, 1] = torch.tensor([15.0, 20.0])
+
+            _vis, tgt = build_targeting(state, bank, params, cfg)
+            assert abs(tgt.fire_reach[0, 1].item() - reach) < 1e-4, (kind.name, aggression)
+            got = tgt.desired_range[0, 1].item()
+            assert abs(got - want) < 1e-4, (kind.name, aggression, got)

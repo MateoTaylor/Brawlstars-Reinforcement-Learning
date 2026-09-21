@@ -33,6 +33,15 @@ capture does. Where the same recording exists under two names (`day10_gameplay` 
 `ScreenRecording_08-29-2026 19-39-53_1`), label it under one: `--hold-out` goes by name, and a
 copy under the other name would leak the held-out map into training.
 
+## The current round: `2maps_dataset`
+
+`TERRAIN_RELABEL_2MAPS.md` at the repo root holds a picked, reviewed list of 100 frames from
+`2maps_dataset.mp4` — one BlueStacks session, 13 back-to-back matches on 13 distinct maps, six
+graveyard and seven desert. It is meant to be the whole training set on its own, with four matches
+held out for test; the older labels here are not mixed in. That file also carries the map table,
+the per-frame notes and the train/test split, because `--hold-out` cannot split a set whose labels
+all share one clip name.
+
 ## How much to do
 
 **Start with ~5 frames per map, and prefer breadth over depth.** Per the plan: 20 labelled cells
@@ -64,7 +73,8 @@ an example of floor.
 **Cells under the recording's buttons are refused**, by the HUD mask the file records (`"hud"`).
 There are two (`brawl_vision/data/`): `hud_mask.json`, the phone's Layout A, and
 `hud_mask_emulator.json`, BlueStacks + Nulls Brawl. A new file on an emulator recording
-(`bluestacks-*`, `9-10_new*`, `edited_day14_broll`: `labeling.EMULATOR_CLIP_PREFIXES`) takes the
+(`bluestacks-*`, `9-10_new*`, `edited_day14_broll`, `2maps_dataset`:
+`labeling.EMULATOR_CLIP_PREFIXES`) takes the
 emulator one and anything else the phone one; `--hud emulator` or `--hud phone` overrides that, and
 on an existing file it moves the labels across, clearing any the new mask covers. A new emulator
 recording needs its name added there: a test checks the rule against every recording's size.

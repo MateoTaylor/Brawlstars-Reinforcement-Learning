@@ -6,14 +6,21 @@ world:
   map_w: 60
   # skull_creek, feast_or_famine, scorched_stone and island_invasion are modeled on the Solo
   # Showdown maps of the same names; see brawl_sim/maps/README.md. Between them the rotation
-  # covers water as a meaningful hazard, loot concentrated somewhere dangerous, fences as real
-  # cover, and bush density from `open`'s almost-none to `island_invasion`'s 36%.
+  # covers water as a meaningful hazard, loot concentrated somewhere dangerous, dense wall
+  # clutter, and bush density from `open`'s almost-none to `island_invasion`'s 36%. Fences are
+  # not a sim tile (2026-09); the loader refuses the character.
   #
   # `walled` is deliberately NOT here: it is the only 60x60 map with no bush at all, so nothing
   # on it exercises concealment. It stays in the repo as a fixture (tests/test_map_csvs.py
-  # checks its water and fences) and can still be pinned by hand with
+  # checks its water) and can still be pinned by hand with
   # scripts/watch.py --map walled, but nothing trains on it.
-  maps: [open, bushy, skull_creek, feast_or_famine, scorched_stone, island_invasion]
+  # Six hand-authored maps plus the ten generated ones (SIM_OVERHAUL_PLAN.md Step M3,
+  # 2026-09-18; seeds and families in brawl_sim/maps/README.md). Every name must also be in
+  # brawl_sim/config.py `_KNOWN_MAP_NAMES`. Changing this list makes existing checkpoints
+  # mismatched (README "What actually trains"); the plan accepts that.
+  maps: [open, bushy, skull_creek, feast_or_famine, scorched_stone, island_invasion,
+         broken_wall, stone_fort, twin_ponds, cross_creek, split_river, narrow_pass,
+         dry_gulch, thorn_field, reed_marsh, hollow_ring]
   map_selection: uniform
   fixed_map: open
 # MEASURED from the real Solo Showdown camera, not chosen. See Terrain_Perception_Build_Plan.md
@@ -80,6 +87,14 @@ observation:
   include_world_grid: true
   include_privileged: true
   grid_dtype: uint8
+  # --- history rings (SIM_OVERHAUL_PLAN.md Phase H). The sim keeps the hero's last
+  # `history_frames` DECISIONS (hp, ammo, position, the action taken, every entity's position and
+  # whether the hero saw it) in core/state's `hist_*` buffers, pushed at the top of every
+  # env.step; Step H2 turns them into observation fields and three local grid channels reaching
+  # `history_radius_tiles` around the hero. Structural: both size state buffers and the
+  # observation, so changing either breaks every checkpoint.
+  history_frames: 3
+  history_radius_tiles: 4
 
 entities:
   n_enemies: 9                  # 10 players total: 1 hero + 9 enemies

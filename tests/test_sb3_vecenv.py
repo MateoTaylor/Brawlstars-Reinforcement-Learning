@@ -34,11 +34,11 @@ def test_is_a_vecenv_subclass_and_constructs_cleanly():
     venv = _make()
     assert isinstance(venv, VecEnv)
     assert venv.num_envs == 6
-    # 3-valued attack dim as of Step D2 (0 = nothing, 1 = attack, 2 = super); the
+    # 4-valued attack dim (0 = nothing, 1 = attack, 2 = super, 3 = gadget -- Step G3); the
     # SB3 action space must track EnvConfig.action_nvec exactly or MaskablePPO's
     # mask width and the env's own mask disagree.
     assert venv.action_space.nvec.tolist() == list(venv.cfg.action_nvec)
-    assert venv.action_space.nvec.tolist() == [17, 3]
+    assert venv.action_space.nvec.tolist() == [17, 4]
 
 
 def test_vec_monitor_wraps_cleanly():
@@ -186,10 +186,53 @@ def test_action_masks_matches_full_obs_action_mask_bit_for_bit():
     assert np.array_equal(venv.action_masks(), expected)
     # The flat mask must be exactly sum(action_nvec) wide -- MaskablePPO slices it by
     # nvec, so any disagreement silently misaligns the attack mask against the move bins.
-    # Derived rather than pinned at 19: Step D2 widened the attack dim 2 -> 3.
+    # Step D2 widened the attack dim 2 -> 3 (19 -> 20), Step G3 3 -> 4 (20 -> 21).
     assert venv.action_masks().shape == (5, sum(venv.cfg.action_nvec))
-    assert venv.action_masks().shape == (5, 20)
+    assert venv.action_masks().shape == (5, 21)
     assert venv.action_masks().dtype == np.bool_
+
+
+def test_maskable_ppo_builds_a_21_logit_head_and_its_gadget_pick_reaches_the_sim():
+    """SIM_OVERHAUL Step G3.3's criterion, "MaskablePPO builds against the widened space", with
+    literals. tests/test_training.py's smoke run trains against whatever width the env reports
+    and asserts nothing about it, so it would pass unchanged at (17, 3) (Step G3 review); this is
+    the same build -- `MultiInputPolicy` + `default_policy_kwargs` -- pinned where the width is.
+
+    Then the column is driven end to end through SB3: a mask that leaves only the gadget legal
+    makes the policy pick attack value 3, the wrapper hands it to the sim and the 18 s cooldown
+    starts (17.8 after the throw's own 5-tick decision); with the wrapper's real mask, which now
+    refuses the gadget, 50 stochastic picks never return a 3; and a rollout + update at this
+    width runs (the maskable buffer stores 21-wide masks)."""
+    from sb3_contrib import MaskablePPO
+    from brawl_sim.wrappers.sb3_features import default_policy_kwargs
+
+    venv = _make(n_envs=2)
+    model = MaskablePPO("MultiInputPolicy", venv, n_steps=8, batch_size=16, device="cpu", seed=0,
+                        policy_kwargs=default_policy_kwargs(venv.agent_spec, venv.cfg))
+    assert model.action_space.nvec.tolist() == [17, 4]
+    assert model.policy.action_net.out_features == 21
+
+    obs = venv.reset()
+    masks = venv.action_masks()
+    assert masks[:, 17:].tolist() == [[True, True, False, True]] * 2   # charged at reset, no super yet
+    only_gadget = masks.copy()
+    only_gadget[:, 17:] = [False, False, False, True]
+    action, _ = model.predict(obs, deterministic=True, action_masks=only_gadget)
+    assert action[:, 1].tolist() == [3, 3]
+
+    venv.step_async(action)
+    obs, _reward, _dones, _infos = venv.step_wait()
+    gadget_cd = venv.env.env.state.ent_gadget_cd[:, 0].tolist()
+    assert all(abs(cd - 17.8) < 1e-4 for cd in gadget_cd), gadget_cd
+    masks = venv.action_masks()
+    assert masks[:, 20].tolist() == [False, False]                     # column 17 + 3
+    picks = set()
+    for _ in range(50):
+        action, _ = model.predict(obs, deterministic=False, action_masks=masks)
+        picks.update(action[:, 1].tolist())
+    assert 3 not in picks and picks <= {0, 1}
+
+    model.learn(total_timesteps=32)
 
 
 # ---- bounded, counted device->host transfers per step (minimal mode) -------------------------

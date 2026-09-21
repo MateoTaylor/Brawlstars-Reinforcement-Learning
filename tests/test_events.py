@@ -232,6 +232,25 @@ def test_hp_healed_tick_defaults_to_zeros_and_passes_through_what_env_supplies()
     assert torch.equal(info["hp_healed_tick"], healed)
 
 
+# ---- attack_in_reach_tick ------------------------------------------------------------------
+
+def test_attack_in_reach_tick_defaults_to_int32_zeros_and_passes_through_what_env_supplies():
+    """Same contract as hp_healed_tick: only env.py's attack phase knows whether the hero's attack
+    had an enemy in reach, so a caller that doesn't say gets a well-shaped zero count."""
+    cfg, params = _cfg_and_params(n_enemies=3)
+    state = _fresh_state(cfg, params)
+    args = (state, _zeros_by(cfg), torch.zeros_like(state.ent_alive),
+            torch.zeros_like(state.box_alive), torch.zeros_like(state.ent_cubes), cfg)
+
+    info = events.compute_info(*args)
+    assert info["attack_in_reach_tick"].dtype == torch.int32
+    assert info["attack_in_reach_tick"].tolist() == [0]
+
+    counts = torch.tensor([1], dtype=torch.int32)
+    info = events.compute_info(*args, attacks_in_reach=counts)
+    assert torch.equal(info["attack_in_reach_tick"], counts)
+
+
 # ---- dash_hits_tick / shots_fired_tick -----------------------------------------------------
 
 def test_dash_hits_tick_only_counts_dashing_attackers():

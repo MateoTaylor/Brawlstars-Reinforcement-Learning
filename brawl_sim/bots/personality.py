@@ -55,6 +55,7 @@ import torch
 
 from ..constants import Person
 from ..core import geometry as geo
+from ..core import stats
 from ..core import terrain
 from . import perception
 from . import policy as shared
@@ -67,9 +68,20 @@ _WANDER_LOOKAHEAD_TILES = 2.5
 # RANGE_DEADBAND replaces the per-archetype deadbands Steps 17/18/20 each carried separately
 # (sniper 1.5, artillery 2.0, rifle 2.0) -- after the split, "how sloppy is range-keeping" is a
 # property of the KITE behavior, not of the weapon, and only the ideal DISTANCE stays per-archetype
-# (bots/policy.RANGE_FRACTION_BY_KIND).
+# (the `desired_range_fraction` param). The band's far edge is capped at the bot's fire reach
+# (`movement`'s maintain_range call), since that edge is where an approaching kiter parks.
 RANGE_DEADBAND = 1.5
 RETREAT_HP_FRACTION = 0.35
+# SIM_OVERHAUL_PLAN.md Step B3: `aggression` (per kind, gathered per entity by
+# core/stats.aggression_of, which is where 0 is read as 1.0) enters the personality layer in
+# exactly three places and nowhere else -- the HUNTER/KITE retreat threshold (`_select_mode`), the
+# CAMPER fire veto (`fire_allowed`) and the KITE hold distance (bots/policy.targeting). The retreat
+# threshold is RETREAT_HP_FRACTION / a clamped to this band, so the elite tier's 1.7 retreats below
+# ~21% and the easy tier's 0.6 below ~58%; a camper at or above CAMPER_FIRE_ON_SIGHT_AGGRESSION
+# fires on sight instead of waiting to be seen. _MODE_WEIGHTS deliberately stays a constant table.
+RETREAT_HP_FRACTION_MIN = 0.05
+RETREAT_HP_FRACTION_MAX = 0.90
+CAMPER_FIRE_ON_SIGHT_AGGRESSION = 1.25
 
 
 class Mode(IntEnum):
@@ -211,9 +223,14 @@ def advance_hunt(state, hunt, mode: torch.Tensor, cfg) -> None:
 # mode selection
 # ---------------------------------------------------------------------------------------------
 
-def _select_mode(state, tgt, scan, hunt, in_bush_now, clearance, cfg) -> torch.Tensor:
+def _select_mode(state, tgt, scan, hunt, in_bush_now, clearance, aggression, cfg) -> torch.Tensor:
     """(N,E) i64 Mode. Pure function of this tick's state -- no mutation, no randomness, so a
     test can assert one entity's mode directly.
+
+    `aggression` is the (N,E) per-entity value from core/stats.aggression_of (0 already read as
+    1.0). Its only use here is the HUNTER/KITE retreat threshold (Step B3.1): `RETREAT_HP_FRACTION
+    / aggression`, clamped to [RETREAT_HP_FRACTION_MIN, RETREAT_HP_FRACTION_MAX] so a tier can
+    never produce a bot that retreats at full HP or one that fights to the last hit point.
 
     Reads `state.ent_person` as the source of truth. `cfg.bots_personalities` is NOT consulted
     here: it controls only what core/spawn.sample_personalities ASSIGNS (all RUSH when off), so a
@@ -221,7 +238,10 @@ def _select_mode(state, tgt, scan, hunt, in_bush_now, clearance, cfg) -> torch.T
     person = state.ent_person
     has_enemy = tgt.has_enemy
     hp_frac = state.ent_hp / torch.clamp(state.ent_max_hp, min=_EPS)
-    low_hp = hp_frac < RETREAT_HP_FRACTION
+    retreat_below = torch.clamp(
+        RETREAT_HP_FRACTION / aggression, RETREAT_HP_FRACTION_MIN, RETREAT_HP_FRACTION_MAX,
+    )
+    low_hp = hp_frac < retreat_below
     # The specification's "unless the green zone is 2 or less squares away".
     zone_pressed = clearance <= cfg.bots_camper_zone_flee_tiles
 
@@ -301,7 +321,10 @@ def movement(state, tgt, bank, params, cfg, gen):
     clearance = shared.zone_clearance(state, cfg)
     wander_dir = advance_wander(state, bank, cfg, gen)
 
-    mode = _select_mode(state, tgt, scan, hunt, in_bush_now, clearance, cfg)
+    # Step B3.1: gathered once here, 0 read as 1.0 inside the helper; the retreat threshold
+    # below divides by it.
+    aggression = stats.aggression_of(state.ent_kind, params)
+    mode = _select_mode(state, tgt, scan, hunt, in_bush_now, clearance, aggression, cfg)
     advance_hunt(state, hunt, mode, cfg)
 
     # --- steering directions ---
@@ -310,7 +333,8 @@ def movement(state, tgt, bank, params, cfg, gen):
     # a bot with no target is the HERO's position. Ungated, every idle bot on the map would walk
     # straight at the agent with no way of having seen it.
     seek_dir = steering.seek(pos, tgt.enemy_pos)
-    range_dir = steering.maintain_range(pos, tgt.enemy_pos, tgt.desired_range, RANGE_DEADBAND)
+    range_dir = steering.maintain_range(pos, tgt.enemy_pos, tgt.desired_range, RANGE_DEADBAND,
+                                        max_dist=tgt.fire_reach)
     strafe_dir = steering.strafe(pos, tgt.enemy_pos, shared.strafe_sign(E, pos.device))
     flee_dir = steering.flee(pos, tgt.enemy_pos)
     bush_dir = steering.seek(pos, scan.pos)
@@ -351,7 +375,7 @@ def movement(state, tgt, bank, params, cfg, gen):
     return move_dir, mode
 
 
-def fire_allowed(state, tgt, cfg) -> torch.Tensor:
+def fire_allowed(state, tgt, aggression, cfg) -> torch.Tensor:
     """(N,E) bool, ANDed onto every archetype's fire decision by
     bots/policy.all_bot_intents.
 
@@ -363,6 +387,12 @@ def fire_allowed(state, tgt, cfg) -> torch.Tensor:
 
     Note how this composes with `perception.reveal_after_attack`: firing sets the camper's own
     reveal timer, so the shot that breaks its cover also keeps it broken for a second afterward.
-    A camper cannot fire from concealment and stay concealed."""
-    silent = (state.ent_person == int(Person.CAMPER)) & ~tgt.seen_by_other
+    A camper cannot fire from concealment and stay concealed.
+
+    Step B3.3: the veto also needs `aggression < CAMPER_FIRE_ON_SIGHT_AGGRESSION` (1.25). At or
+    above it a camper fires on sight -- the aggressive tiers' campers are ambushers, not
+    passive furniture. `aggression` is the (N,E) value from core/stats.aggression_of (0 already
+    read as 1.0), the same tensor bots/policy.all_bot_intents hands the movement layer."""
+    patient = aggression < CAMPER_FIRE_ON_SIGHT_AGGRESSION
+    silent = (state.ent_person == int(Person.CAMPER)) & ~tgt.seen_by_other & patient
     return ~silent

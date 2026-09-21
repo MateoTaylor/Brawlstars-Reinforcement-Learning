@@ -2505,6 +2505,22 @@ Comfortable. The risk is not steady-state, it is **unbounded growth**, so three 
    it keeps the whole budget trivially satisfied. **That includes the parallelism the libraries
    bring uninvited** — see §7.2, where their default thread pools were the lag.
 
+**Cadence columns on `TickRow` (SIM_OVERHAUL_PLAN.md Step A2).** Each decision row also records
+what the policy was handed: `attack_legal` (the shadow's `attack_mask()` as a bitmask, bit i =
+attack column i, so `& 0b10` is "the dash was legal"), `attack_cd_shadow` and `attack_idle_t_shadow`
+(the shadow's two timers at the decision), `enemy_in_reach` (any enemy track within
+`dash_distance + dash_radius + unit_radius` tiles of the hero, `loop.dash_reach_tiles` from the
+configs), and `resync` / `resync_error` (the ammo canary tripped on this decision, with the CV-minus-
+shadow error that tripped it; the mask on that row is the post-resync one). `-1` / `-1.0` where there
+was no decision. The audit's `ammo` is the existing `ammo_shadow`, which the loop now writes on every
+decision that reaches the bars, hero box or not (the shadow always has a clip; a sentinel beside a
+valid mask would have been summarized as a clip size), and which is the PRE-canary value: on a resync
+row it is the clip that disagreed, not the corrected one, and no statistic reads that row's ammo
+because the reseeded cooldown makes it neither an opportunity nor phased. `scripts/audit_attack_cadence.py --telemetry <csv>` turns these into the sim-side
+audit's rows and computes the same five statistics plus resyncs per minute inside fights; a CSV from
+before the columns still loads (`TickRow.from_record` defaults what a file lacks) but the audit
+refuses it by name.
+
 ### 7.1 Timing, measured
 
 Profiled live at 1440p with the real pipeline, steady state, on this machine:

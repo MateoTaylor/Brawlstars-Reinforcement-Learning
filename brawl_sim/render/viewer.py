@@ -144,6 +144,7 @@ _PROJ_COLOR = {
     Proj.SUPER_BOLT: "#ff3ce0",   # Mortis's super; drawn via super_bolt_circles, not this scatter
     Proj.SPIKE_SHELL: "#7ae82a",  # shell AND its six shards -- same weapon, same Proj (see _spawn_splits)
     Proj.BULL_SLUG: "#a86a2a",
+    Proj.GADGET_SPINNER: "#f0f0f0",  # Mortis's gadget spinner: an ARTILLERY-class burst, drawn as a dot in flight
 }
 # Brock's lingering sphere: a translucent patch of denied ground, not a projectile dot.
 _HAZARD_COLOR = "#2a6ae8"

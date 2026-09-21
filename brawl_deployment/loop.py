@@ -68,6 +68,7 @@ import time
 from collections import deque
 from dataclasses import dataclass
 from enum import Enum
+from pathlib import Path
 
 import numpy as np
 
@@ -105,6 +106,16 @@ ODOMETRY_LOST_SECONDS = 2.0
 # match plus margin, and ~1 MB of scalars. Fixed-size on purpose (§7) -- the resource risk in this
 # package is unbounded growth, not size.
 TELEMETRY_ROWS = 4000
+
+# The repo's configs, for `dash_reach_tiles`: the same directory `perception/shadow.py` and
+# `perception/grid.py` resolve for the kit constants and the view.
+_CONFIGS_DIR = Path(__file__).resolve().parents[1] / "configs"
+
+# The brawler the loop deploys: the `configs/brawlers.yaml` block the shadow dead-reckons from
+# and `dash_reach_tiles` takes `dash_radius` from. One name, so the two cannot default apart
+# (`ShadowParams` carries no `kind`, and shadow.py is not this package's to change for that).
+# Only Mortis deploys today; a second kind would make this a `DeploymentConfig` field.
+HERO_KIND = "hero_mortis"
 
 # Cells `occupancy.best()` has never observed. Mirrors `terrain.occupancy.UNKNOWN` rather than
 # importing it, so a terrain-side rename fails a test here instead of silently reading class 255.
@@ -147,8 +158,11 @@ class TickRow:
     move_bin: int = -1
     attack: int = -1
     n_detections: int = 0
-    # Both sides of the desync canary, `-1` where there is no value: no decision this tick, no
-    # hero box, or `read_ammo` returned None (it misses ~12% of frames). Kept as two columns
+    # Both sides of the desync canary, `-1` where there is no value. `ammo_cv`: no decision this
+    # tick, no hero box, or `read_ammo` returned None (it misses ~12% of frames). `ammo_shadow`:
+    # no decision reached the bars this tick -- the shadow always has a clip, so it is written on
+    # every decision that gets that far, hero box or not (the audit reads it as the row's ammo
+    # next to `attack_legal`, and a sentinel there would count as a clip size). Kept as two columns
     # rather than one error, because the operator has said the kit constants in
     # `configs/brawlers.yaml` are APPROXIMATIONS and the live game is the better source -- so the
     # pair is what lets `reload_seconds` and `attack_cooldown` be REFIT from a run that was going
@@ -161,6 +175,98 @@ class TickRow:
     phase_x: float = 0.0
     phase_y: float = 0.0
     note: str = ""
+    # --- attack cadence (SIM_OVERHAUL_PLAN.md Phase A, Step A2). What the policy was HANDED at
+    # this decision, so `scripts/audit_attack_cadence.py --telemetry` can compute the sim-side
+    # audit's five statistics from a live match on identical definitions. All read BEFORE
+    # `policy.act`, from the same shadow state the mask came from; `-1` / `-1.0` on a tick with
+    # no decision, like `move_bin` above. Appended after `note` so an older CSV's columns keep
+    # their positions and `TickRow.from_record` can default the ones a file lacks.
+    #
+    # `attack_legal`: `ShadowHero.attack_mask()` as a bitmask, bit i = attack column i, so bit 0
+    # (no-fire, always legal) is set on every decision row and `attack_legal & 0b10` is "the
+    # dash was legal" -- the audit's `can_attack`. `attack_cd_shadow` / `attack_idle_t_shadow`
+    # are the shadow's two timers the audit reads (phasing loss and long-dash waiting).
+    # `enemy_in_reach` is the audit's own criterion applied to the tracks the assembler was given:
+    # any enemy within `dash_distance + dash_radius + unit_radius` tiles of the hero
+    # (`DeployLoop.reach_tiles`, from the configs -- not a literal).
+    attack_legal: int = -1
+    attack_cd_shadow: float = -1.0
+    attack_idle_t_shadow: float = -1.0
+    enemy_in_reach: bool = False
+    # The ammo canary tripped on this decision and `ShadowHero.resync` ran BEFORE the mask above
+    # was read (the row records what the policy saw, which is the post-resync "assume not ready"
+    # state). `resync_error` is the `Desync.error` that tripped it, CV minus shadow in pips: a
+    # positive value is a modelled attack the game never took. `0.0` when no resync happened --
+    # unambiguous, because a zero error is inside every tolerance and can never trip the canary.
+    resync: bool = False
+    resync_error: float = 0.0
+
+    @classmethod
+    def from_record(cls, record: dict) -> "TickRow":
+        """A row back from `write_csv`'s CSV (a `csv.DictReader` dict of strings), or from any
+        dict of scalars. **A column the record lacks keeps the field's default**, so telemetry
+        written before a column existed still loads; a record's extra keys are ignored for the
+        same reason in the other direction. Values are coerced by the field's own annotation
+        (`csv` hands everything back as text, and `bool("False")` is True)."""
+        from dataclasses import MISSING, fields
+
+        kwargs = {}
+        for f in fields(cls):
+            if f.name not in record:
+                if f.default is MISSING:
+                    raise KeyError(f"telemetry record has no {f.name!r} column")
+                continue
+            kwargs[f.name] = _coerce(f.type, record[f.name])
+        return cls(**kwargs)
+
+
+def _coerce(annotation, value):
+    """`TickRow.from_record`'s per-field parse. Annotations are strings under
+    `from __future__ import annotations`, so this matches on the name."""
+    if isinstance(value, str):
+        name = annotation if isinstance(annotation, str) else annotation.__name__
+        if name == "bool":
+            return value.strip().lower() in ("true", "1", "yes")
+        if name == "int":
+            return int(float(value))
+        if name == "float":
+            return float(value)
+        return value
+    return value
+
+
+def read_telemetry_csv(path) -> list[TickRow]:
+    """`write_csv`'s inverse: every row of a `--telemetry` CSV as a `TickRow`, in file order,
+    with columns the file predates left at their defaults (see `TickRow.from_record`)."""
+    import csv
+
+    with open(path, newline="", encoding="utf-8") as fh:
+        return [TickRow.from_record(record) for record in csv.DictReader(fh)]
+
+
+def dash_reach_tiles(params: ShadowParams, *, kind: str = HERO_KIND,
+                     brawlers_path=None, env_config_path=None) -> float:
+    """`dash_distance + dash_radius + unit_radius` in tiles: the uncharged dash's "certainly could
+    have hit" radius, which is `scripts/audit_attack_cadence.py`'s `enemy_in_reach` criterion
+    (Step A1.1) restated from the deployment's own sources. `dash_distance` is the shadow's
+    (`ShadowParams`, from `configs/brawlers.yaml`); `dash_radius` is read from the same brawler
+    block, and `unit_radius` from `entities.unit_radius` in `configs/default.yaml`, the way
+    `GridSpec.load` reads that file for the view -- neither is a field the shadow needs, so
+    neither is on `ShadowParams`, and a literal here would drift the moment the sim's changed.
+    A randomized range for either raises for the reason `ShadowParams.load` gives."""
+    import yaml
+
+    brawlers = yaml.safe_load(Path(brawlers_path or _CONFIGS_DIR / "brawlers.yaml").read_text())
+    env = yaml.safe_load(Path(env_config_path or _CONFIGS_DIR / "default.yaml").read_text())
+    try:
+        dash_radius = brawlers[kind]["dash_radius"]
+        unit_radius = env["entities"]["unit_radius"]
+    except KeyError as exc:
+        raise KeyError(f"dash reach needs {kind}.dash_radius and entities.unit_radius: {exc}") from exc
+    for name, raw in (("dash_radius", dash_radius), ("unit_radius", unit_radius)):
+        if isinstance(raw, (list, tuple, dict)):
+            raise ValueError(f"{name} is a randomized range {raw!r}; deployment needs one value")
+    return float(params.dash_distance) + float(dash_radius) + float(unit_radius)
 
 
 def pin_thread_pools(cfg: DeploymentConfig) -> None:
@@ -343,9 +449,14 @@ class DeployLoop:
         self._grab_total = 0.0      # last read of the capture's CUMULATIVE grab_seconds
 
         self.assembler = policy.make_assembler()
-        self.shadow = ShadowHero(ShadowParams.load(), dt=self.sim.dt,
+        self.shadow = ShadowHero(ShadowParams.load(HERO_KIND), dt=self.sim.dt,
                                  n_move_bins=int(self.sim.n_move_bins),
                                  desync_strikes=cfg.shadow_ammo_strikes)
+        # Telemetry only (`TickRow.enemy_in_reach`, Step A2): the cadence audit's "certainly
+        # could have hit" radius, from the same configs the shadow and the sim read. The SAME
+        # kind as the shadow's block: `ShadowParams` does not record which brawler it was loaded
+        # for, so this is the one place both defaults are set.
+        self.reach_tiles = dash_reach_tiles(self.shadow.p, kind=HERO_KIND)
         self.tracker = EntityTracker(n_slots=int(self.sim.n_entities) - 1)
         self.projectiles = ProjectileTracker()
         self.loot = LootMap()
@@ -635,8 +746,17 @@ class DeployLoop:
                                  crates=self.loot.crates(), cubes=self.loot.cubes()),
         )
 
+        # Step A2 cadence columns, written BEFORE the policy call so a policy that raises still
+        # leaves what it was handed on the row. `legal` is the mask the network gets, read once
+        # and used for both, so the bitmask can never disagree with the decision it explains.
+        legal = self.shadow.attack_mask()
+        row.attack_legal = sum(int(bool(v)) << i for i, v in enumerate(legal))
+        row.attack_cd_shadow = float(self.shadow.attack_cd)
+        row.attack_idle_t_shadow = float(self.shadow.attack_idle_t)
+        row.enemy_in_reach = self._enemy_in_reach(hero_pos, tracked.enemies)
+
         try:
-            decision = self.policy.act(obs, self.shadow.attack_mask())
+            decision = self.policy.act(obs, legal)
         except Exception as exc:                      # noqa: BLE001 -- re-raised after failing closed
             self._stop(f"policy raised: {exc!r}")
             raise
@@ -656,21 +776,42 @@ class DeployLoop:
         # never saw.
         row.attack = modelled
 
+    def _enemy_in_reach(self, hero_pos, enemies) -> bool:
+        """`scripts/audit_attack_cadence.py`'s `enemy_in_reach` (Step A1.1), on the deployment's
+        inputs: any enemy track the assembler was handed within `reach_tiles` of the hero, both
+        in WORLD tiles. The sim's "alive and revealed to the hero" is, on this side, "has a track"
+        -- the tracker only holds enemies the detector saw (or is coasting for a few ticks), and
+        those are exactly the enemies the observation carries. Telemetry only; nothing acts on it.
+        """
+        hx, hy = hero_pos
+        for tr in enemies:
+            if tr is None:
+                continue
+            if np.hypot(tr.pos[0] - hx, tr.pos[1] - hy) <= self.reach_tiles:
+                return True
+        return False
+
     def _read_own_bars(self, image, detections, row: "TickRow | None" = None) -> None:
         """Ammo and super off the hero's own box. Ammo is the desync canary (§6.3)."""
         from brawl_vision.object_detection.hp_detection.hero_bars import read_ammo, read_super
 
+        # The shadow's clip is recorded FIRST, whether or not this frame has a hero box: it exists
+        # regardless of the box, and `scripts/audit_attack_cadence.py --telemetry` reads it as the
+        # `ammo` of every decision row (Step A2 review) -- a `-1.0` sentinel next to a valid
+        # `attack_legal` would reach the audit as a clip size. Recorded BEFORE `check_ammo` and
+        # before the resync below, so `ammo_cv` / `ammo_shadow` hold what the two sides actually
+        # disagreed about rather than the corrected value (pre-resync on a resync row; the mask
+        # `_decide` reads after this returns is the post-resync one, which refuses the dash, so no
+        # audit statistic ever reads that row's ammo).
+        if row is not None:
+            row.ammo_shadow = float(self.shadow.ammo)
         hero_det = next((d for d in detections if d.label == "player"), None)
         if hero_det is None:
             return
         self.shadow.set_super(read_super(image, hero_det, self.vision.cfg))
         reading = read_ammo(image, hero_det, self.vision.cfg)
-        # Recorded BEFORE `check_ammo`, and before the resync below, so the row holds what the two
-        # sides actually disagreed about rather than the corrected value.
-        if row is not None:
-            row.ammo_shadow = float(self.shadow.ammo)
-            if reading is not None:
-                row.ammo_cv = float(reading.ammo)
+        if row is not None and reading is not None:
+            row.ammo_cv = float(reading.ammo)
         desync = self.shadow.check_ammo(reading)
         if not desync.tripped:
             return
@@ -681,6 +822,12 @@ class DeployLoop:
         # ever converging. Only a DESYNC verdict reaches here and a DESYNC requires a real read
         # (a miss returns NO_READ, which is not `tripped`), so this is never None in practice.
         self.shadow.resync(reading)
+        # Step A2: the row records that the shadow resynced on this decision and what tripped it,
+        # whether or not the backend injects -- it is a fact about the shadow, and the audit's
+        # "resyncs per minute in fights" is only meaningful on a live backend anyway.
+        if row is not None:
+            row.resync = True
+            row.resync_error = float(desync.error)
         if not self.controls.backend.injects:
             # A dry run breaks the link the canary watches, on purpose: the shadow spends ammo for
             # attacks that were never injected, so the game keeps more than we predicted and the

@@ -34,12 +34,19 @@ from . import terrain
 MAX_PROJ_PER_ENTITY = 5
 BOX_RADIUS = 0.5
 _EPS = 1e-6
+# Relative velocity surplus a gadget spinner is thrown with so it PASSES its landing point on a
+# deterministic tick -- see spawn_gadget. Dimensionless; 1e-4 of the travel distance.
+_LANDING_OVERSHOOT = 1e-4
 
 # constants.ProjClass values as plain ints, for comparing against the (N,P) int64 `prj_class`.
 # Bare ints rather than the IntEnum members so the comparison never builds a temporary on device.
 _PROJECTILE = int(ProjClass.PROJECTILE)
 _ARTILLERY = int(ProjClass.ARTILLERY)
 _HAZARD = int(ProjClass.HAZARD)
+# The one Proj KIND step_projectiles treats specially (Step G2): the gadget spinner never damages
+# its owner and never charges a super, both decided per kind rather than per class so Grom's
+# self-detonating ARTILLERY shell keeps behaving as it does.
+_GADGET_SPINNER = int(Proj.GADGET_SPINNER)
 
 # The RING a detonating shell splits into: `split_count` unit vectors evenly spaced around the
 # circle, starting at +x. Grom's 4 make the original cross (exactly -- see the snap below), Spike's
@@ -343,6 +350,73 @@ def spawn_supers(state, fire_mask: torch.Tensor, origin: torch.Tensor, aim_dir: 
     )
 
 
+def spawn_gadget(state, fire_mask: torch.Tensor, origin: torch.Tensor, direction: torch.Tensor,
+                 travel: torch.Tensor, damage: torch.Tensor, params, cfg) -> None:
+    """fire_mask: (N,E) -- entities throwing their gadget THIS tick. origin: (N,E,2). direction:
+    (N,E,2) unit vectors and travel: (N,E) tiles, both straight from `hero.gadget_target`.
+    damage: (N,E), from `stats.effective_gadget_damage`. MUTATES: all prj_*.
+
+    One ARTILLERY-class `Proj.GADGET_SPINNER` per firing entity (SIM_OVERHAUL_PLAN.md Step G2,
+    substep G2.2), a sibling of `spawn_supers` for the same reason that one is not a branch of
+    `spawn_volley`: a gadget shares none of the fan/spread machinery, is always exactly one
+    projectile, and reads the `gadget_*` stat block rather than the weapon's.
+
+    The slot is a timed lob in `spawn_volley`'s sense: it lands on `target = origin + dir *
+    travel` after exactly `gadget_flight_seconds`, whatever the distance (`vel = dir * travel /
+    flight`), and `step_projectiles`' existing artillery path does everything after that --
+    `arrived` (dot <= 0) once it passes the target, detonation ON the stored target, blast over
+    every entity and box within `prj_aoe = gadget_radius`. Nothing special-cases it in flight:
+    an ARTILLERY shell is already immune to walls, units and boxes until it lands, which is why
+    `gadget_target` clips `travel` against terrain BEFORE the throw. A zero `travel` (enemy on
+    top of the thrower) is a legal input: `vel` is 0, the target is the origin, `dot <= 0` holds
+    on the first tick, and it detonates in place. `dist_left = travel + eps` so the range check
+    can never fire a tick before `arrived` does and move the detonation off the target.
+
+    `prj_radius` is 0: nothing collides with the spinner in flight (ARTILLERY skips the unit and
+    box sweeps), and the hero has no `split_count`, so the one reader left -- `_spawn_splits`'
+    rim -- never runs for it. **Not hero-specific**, like `spawn_supers`: every stat is gathered
+    per kind, so a bot with a `gadget_*` block would need no change here.
+    """
+    N, E = fire_mask.shape
+    device = fire_mask.device
+
+    flight_seconds = stats.gather_kind(params.gadget_flight_seconds, state.ent_kind)
+    gadget_radius = stats.gather_kind(params.gadget_radius, state.ent_kind)
+
+    demand = fire_mask.to(torch.int64)
+    idx, ok = alloc_slots(state.prj_alive, demand, 1)  # (N,E,1)
+
+    # `direction` is used as given: `gadget_target` guarantees unit vectors on every row (facing
+    # fallback for "nothing revealed" and for a coincident target), so the plan's recipe applies
+    # verbatim.
+    target = origin + direction * travel.unsqueeze(-1)
+    # `travel / flight`, plus one part in ten thousand. Without the nudge the landing tick is not
+    # deterministic: `flight_seconds / dt` ticks of `vel * dt` can sum to a hair LESS than
+    # `travel` in float32 (measured: travel 0.3 and 0.8 fell an ulp short and landed on tick 5,
+    # 1.5 and 2.0 on tick 4), and `dist_left = travel + eps` deliberately never fires first.
+    # Overshooting by 1e-4 x travel dwarfs any rounding, so `arrived` is true on exactly
+    # `ceil(flight / dt)` ticks for every travel, and it changes nothing observable: the
+    # detonation point is the stored `prj_target`, not the overshot position, and the
+    # in-flight position is off by at most 2e-4 tiles at max range.
+    vel = direction * (travel * (1.0 + _LANDING_OVERSHOOT) / torch.clamp(flight_seconds, min=_EPS)).unsqueeze(-1)
+    _write_slots(
+        state, idx.reshape(N, E), ok.reshape(N, E),
+        pos=origin,
+        vel=vel,
+        target=target,                         # READ: this is a lob, it detonates here
+        dist_left=travel + _EPS,
+        damage=damage,
+        radius=torch.zeros(N, E, device=device),
+        aoe=gadget_radius,
+        age=torch.zeros(N, E, device=device),
+        owner=torch.arange(E, dtype=torch.int64, device=device).view(1, E).expand(N, E),
+        kind=torch.full((N, E), _GADGET_SPINNER, dtype=torch.int64, device=device),
+        cls=torch.full((N, E), _ARTILLERY, dtype=torch.int64, device=device),
+        pierce=torch.zeros(N, E, dtype=torch.bool, device=device),
+        alive=torch.ones(N, E, dtype=torch.bool, device=device),
+    )
+
+
 def _spawn_splits(state, detonate: torch.Tensor, det_pos: torch.Tensor, params, cfg) -> None:
     """detonate: (N,P) bool -- shells that blew up THIS tick. det_pos: (N,P,2) where each did.
     MUTATES: all prj_*. Every detonating shell whose owner has split_distance/
@@ -534,8 +608,14 @@ def _earliest_only(valid_hit: torch.Tensor, hit_t: torch.Tensor) -> torch.Tensor
 
 def step_projectiles(state, bank, params, cfg):
     """MUTATES: all prj_*. Returns (dmg_ent (N,E), dmg_by (N,E,E), dmg_box (N,B),
-    heal_ent (N,E)) -- all four reported here, applied by combat.apply_damage /
-    combat.apply_heal (Step 14 / Step D2)."""
+    heal_ent (N,E), charge_hit (N,E,E)) -- the first four reported here, applied by
+    combat.apply_damage / combat.apply_heal (Step 14 / Step D2).
+
+    `charge_hit[n,a,v]` is "attacker a landed a SUPER-CHARGING hit on victim v this tick": it is
+    `dmg_by > 0` with the gadget spinner's damage left out (Step G2.4, S12). `env._bookkeeping`
+    counts charge from it instead of from the damage matrix, because the spinner is the one
+    weapon whose hits deal damage but do not charge the super -- a rule that cannot be recovered
+    from `dmg_by` after the per-projectile kinds have been summed away."""
     N, P = state.prj_pos.shape[:2]
     E = state.ent_pos.shape[1]
     B = state.box_pos.shape[1]
@@ -599,6 +679,17 @@ def step_projectiles(state, bank, params, cfg):
     owner_exp_e = state.prj_owner.unsqueeze(-1).expand(-1, -1, E)
     dmg_by.scatter_add_(1, owner_exp_e, dmg_by_unit)
 
+    # SUPER-CHARGE EXCLUSION (Step G2.4, S12). A second attacker x victim matrix that receives
+    # everything `dmg_by` does EXCEPT damage dealt by a `GADGET_SPINNER` slot; `charge_hit` at the
+    # end is `> 0` of this one. Kept as a parallel accumulator rather than subtracted afterwards
+    # because per-projectile identity is gone once the (N,P,E) contributions are scattered into
+    # (N,E,E). Filtered by KIND, not class, so Grom's and Spike's artillery keep charging. The
+    # spinner only ever damages through the blast below, but the unit-hit term is masked too so
+    # the rule holds even if a future kind gave it a body.
+    not_gadget = (state.prj_kind != _GADGET_SPINNER).unsqueeze(-1)  # (N,P,1)
+    dmg_by_charge = torch.zeros(N, E, E, device=device)
+    dmg_by_charge.scatter_add_(1, owner_exp_e, torch.where(not_gadget, dmg_by_unit, torch.zeros_like(dmg_by_unit)))
+
     # (4) box collision over (N,P,B)
     box_pos_b = state.box_pos.unsqueeze(1)  # (N,1,B,2)
     box_hit_r = state.prj_radius.unsqueeze(-1) + BOX_RADIUS  # (N,P,1)->(N,P,B)
@@ -653,11 +744,14 @@ def step_projectiles(state, bank, params, cfg):
     # A hazard is stationary, so raw_new_pos IS its own position; det_pos therefore already holds
     # the right point for both cases.
     ent_dist = geo.safe_norm(det_pos.unsqueeze(2) - state.ent_pos.unsqueeze(1), dim=-1)  # (N,P,E)
-    # D4: a hazard never damages its owner. Artillery detonations still can (a Grom can blow
-    # himself up), which is pre-existing behavior this step deliberately leaves alone -- hence the
-    # exclusion is conditioned on being a hazard rather than applied to every blast.
+    # D4: a hazard never damages its owner, and neither does the gadget spinner (Step G2.3, S11:
+    # a spinner thrown at an enemy standing on Mortis lands at his own feet). Artillery detonations
+    # still can (a Grom can blow himself up), which is pre-existing behavior both steps
+    # deliberately leave alone -- hence the exclusion is by hazard CLASS and by spinner KIND rather
+    # than applied to every blast.
     entity_idx_e = torch.arange(E, device=device).view(1, 1, E)
-    hazard_owner_ok = ~is_hazard.unsqueeze(-1) | (state.prj_owner.unsqueeze(-1) != entity_idx_e)
+    no_self = is_hazard | (state.prj_kind == _GADGET_SPINNER)
+    owner_ok = ~no_self.unsqueeze(-1) | (state.prj_owner.unsqueeze(-1) != entity_idx_e)
     # `prj_aoe > 0` is what makes "this shell does no damage where it lands" expressible in YAML
     # as `aoe_radius: 0` (Spike). Without it a zero-radius blast still catches anything at
     # EXACTLY the landing point, since `ent_dist <= 0` is true at coincidence -- and that is a
@@ -667,10 +761,13 @@ def step_projectiles(state, bank, params, cfg):
     has_blast = (state.prj_aoe > 0).unsqueeze(-1)
     ent_in_aoe = (
         (ent_dist <= state.prj_aoe.unsqueeze(-1)) & has_blast & state.ent_alive.unsqueeze(1)
-        & blast.unsqueeze(-1) & hazard_owner_ok
+        & blast.unsqueeze(-1) & owner_ok
     )
     dmg_by_aoe = torch.where(ent_in_aoe, state.prj_damage.unsqueeze(-1), torch.zeros_like(ent_dist))
     dmg_by.scatter_add_(1, owner_exp_e, dmg_by_aoe)
+    # The blast is the spinner's only damage path, so this is the mask that actually does the
+    # G2.4 work; see the parallel accumulator's note at the unit-hit scatter above.
+    dmg_by_charge.scatter_add_(1, owner_exp_e, torch.where(not_gadget, dmg_by_aoe, torch.zeros_like(dmg_by_aoe)))
 
     box_dist = geo.safe_norm(det_pos.unsqueeze(2) - state.box_pos.unsqueeze(1), dim=-1)  # (N,P,B)
     box_in_aoe = (
@@ -727,4 +824,5 @@ def step_projectiles(state, bank, params, cfg):
     heal_ent.scatter_add_(1, state.prj_owner, heal_amount)
 
     dmg_ent = dmg_by.sum(dim=1)
-    return dmg_ent, dmg_by, dmg_box, heal_ent
+    charge_hit = dmg_by_charge > 0
+    return dmg_ent, dmg_by, dmg_box, heal_ent, charge_hit

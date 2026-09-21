@@ -37,6 +37,17 @@ doesn't scale or move with the map -- green when firing is legal, grey otherwise
 boolean is `alive & ammo>=1 & cooldown<=0 & dash_t<=0`, it already IS "greys out during dash and
 while reloading" in one gate, per the plan's acceptance bullet -- no separate dash/reload cases
 needed.
+
+**`g` throws the gadget** (SIM_OVERHAUL_PLAN.md Step G3): attack-column value 3. The column holds
+ONE value per tick, so when `g` and space are both held the gadget wins only while
+`action_mask["attack"][:, 3]` says it is legal and space gets the column otherwise. A human's tap
+of `g` spans several 20 Hz ticks; without that fall-through every tick after the throw would send
+a masked (no-op) 3 and eat the dash the player is also holding. The title shows the gadget's
+state (`READY` or the seconds left on its 18 s cooldown).
+
+**The window owns its keyboard.** `connect_input` disconnects matplotlib's default key handler
+from the figure before wiring this module's own: `g` is matplotlib's grid toggle, `s` its save
+dialog, `l`/`k` its log-scale switches -- see that method for what each one did to a live game.
 """
 import argparse
 import sys
@@ -74,6 +85,9 @@ _MOVE_KEYS = {
     "d": (1.0, 0.0), "right": (1.0, 0.0),
 }
 _FIRE_KEYS = {" ", "space"}
+_GADGET_KEYS = {"g"}
+# `action[:, 1]` values, as `core/hero.decode_action` reads them (2 = super has no key here).
+_ATTACK_NONE, _ATTACK_FIRE, _ATTACK_GADGET = 0, 1, 3
 _QUIT_KEYS = {"q", "escape"}
 
 _INDICATOR_READY = "#2ecc40"
@@ -117,7 +131,9 @@ class ManualPlaySession:
         fire_ok = bool(mask["attack"][0, 1])
         dash_t = float(self.env.state.ent_dash_t[0, 0])
         dash_str = f"ACTIVE({dash_t:.2f}s)" if dash_t > 0 else "-"
-        extra = f"  |  fire={'READY' if fire_ok else 'blocked'}  dash={dash_str}"
+        gadget_cd = float(self.env.state.ent_gadget_cd[0, 0])
+        gadget_str = "READY" if bool(mask["attack"][0, 3]) else f"{gadget_cd:.1f}s"
+        extra = f"  |  fire={'READY' if fire_ok else 'blocked'}  dash={dash_str}  gadget={gadget_str}"
         self.viewer.title.set_text(self.viewer.title.get_text() + extra)
 
         self.indicator.set_facecolor(_INDICATOR_READY if fire_ok else _INDICATOR_BLOCKED)
@@ -135,7 +151,9 @@ class ManualPlaySession:
         `bin_from_dir(dir, n_move_bins) + 1` otherwise; action[:,1] is raw fire intent (still
         subject to `action_mask`'s legality gate once it reaches `env.step`, same as any other
         action source -- this module never pre-filters it, matching decode_action's own "illegal
-        fire is a silent no-op" contract)."""
+        fire is a silent no-op" contract). The one exception is ARBITRATION between two held
+        buttons: `g` (gadget, value 3) takes the column from space only while the gadget is
+        legal -- see the module docstring."""
         dx, dy = self._held_direction()
         if dx == 0.0 and dy == 0.0:
             move_bin = torch.zeros(1, dtype=torch.int64, device=self.env.device)
@@ -143,9 +161,12 @@ class ManualPlaySession:
             direction = torch.tensor([[dx, dy]], dtype=torch.float32, device=self.env.device)
             move_bin = geo.bin_from_dir(direction, self.cfg.n_move_bins) + 1  # (1,), already squeezed
 
-        fire = torch.tensor(
-            [1 if self._held_keys & _FIRE_KEYS else 0], dtype=torch.int64, device=self.env.device,
-        )
+        attack = _ATTACK_FIRE if self._held_keys & _FIRE_KEYS else _ATTACK_NONE
+        if self._held_keys & _GADGET_KEYS:
+            mask = hero.action_mask(self.env.state, self.env.params, self.env.cfg)
+            if attack == _ATTACK_NONE or bool(mask["attack"][0, 3]):
+                attack = _ATTACK_GADGET
+        fire = torch.tensor([attack], dtype=torch.int64, device=self.env.device)
         return torch.stack([move_bin, fire], dim=1)
 
     def on_key_press(self, event) -> None:
@@ -176,17 +197,38 @@ class ManualPlaySession:
             plt.close(self.viewer.fig)
         return artists
 
-    def run(self) -> None:
-        print(f"matplotlib backend: {matplotlib.get_backend()}")
-        print("WASD/arrows move, space or left-click fires, q/Esc quits.")
-        fig = self.viewer.fig
-        self.anim = FuncAnimation(
-            fig, self.tick, interval=1000.0 / self.fps, blit=True, cache_frame_data=False,
-        )
+    def connect_input(self, fig) -> None:
+        """Wires the four handlers to `fig`, after taking the keyboard away from matplotlib.
+
+        Every pyplot figure is born with matplotlib's own `key_press_handler` connected, and its
+        default keymap overlaps this module's controls. Measured against a toolbar-carrying
+        canvas: `g` (the gadget, Step G3) cycles the axes grid state and forces a full redraw
+        under the blitted animation whenever the cursor is over the map -- which is where it is,
+        since left-click fires; `s` (move down) opens the toolbar's save dialog; `left`/`right`
+        walk the toolbar's view history; `q` closes the figure behind `tick`'s back; and a stray
+        `k` or `l` flips an axis to log scale -- `l` raises OverflowError inside the next draw,
+        because the view's y limits include 0. A game window owns its keyboard, so the default
+        handler is disconnected -- for THIS figure only, not by editing the process-wide
+        `rcParams` keymaps. `q`/Esc still quit through `on_key_press`. `key_press_handler_id` is
+        None under the experimental `toolmanager` toolbar, which routes keys its own way:
+        nothing to disconnect there."""
+        manager = getattr(fig.canvas, "manager", None)
+        default_keys = getattr(manager, "key_press_handler_id", None)
+        if default_keys is not None:
+            fig.canvas.mpl_disconnect(default_keys)
         fig.canvas.mpl_connect("key_press_event", self.on_key_press)
         fig.canvas.mpl_connect("key_release_event", self.on_key_release)
         fig.canvas.mpl_connect("button_press_event", self.on_button_press)
         fig.canvas.mpl_connect("button_release_event", self.on_button_release)
+
+    def run(self) -> None:
+        print(f"matplotlib backend: {matplotlib.get_backend()}")
+        print("WASD/arrows move, space or left-click fires, g throws the gadget, q/Esc quits.")
+        fig = self.viewer.fig
+        self.anim = FuncAnimation(
+            fig, self.tick, interval=1000.0 / self.fps, blit=True, cache_frame_data=False,
+        )
+        self.connect_input(fig)
         plt.show()
 
 

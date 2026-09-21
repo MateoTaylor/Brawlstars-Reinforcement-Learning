@@ -173,13 +173,22 @@ def _tile_lut(unknown_tile: Tile) -> np.ndarray:
     terrain class, with one extra row standing in for UNKNOWN.
 
     Built by reading `brawl_sim.constants`' own tables rather than restating them, which is the
-    one part of `CONVENTIONS.md` that does bind this package: if the simulator ever decides a
-    fence stops a bullet, this follows without an edit.
+    one part of `CONVENTIONS.md` that does bind this package: if the simulator ever changes a
+    tile's physics, this follows without an edit.
+
+    One row is overridden. FENCE is not a sim tile any more (2026-09; no map carries one), so
+    no policy ever trains on its column combination `blocks_unit & ~blocks_projectile &
+    ~is_water`. The classifier can still predict it. The row it gets is WATER's: the one
+    trained-on combination with a fence's physics (stops a body, passes a shot). Mapping it to
+    WALL would tell the agent a fence stops bullets.
     """
     tiles = [*CLASSES, unknown_tile]
-    return np.array(
+    lut = np.array(
         [[int(TILE_BLOCKS_UNIT[t]), int(TILE_BLOCKS_PROJ[t]),
           int(TILE_IS_BUSH[t]), int(TILE_IS_WATER[t])] for t in tiles], np.uint8)
+    if Tile.FENCE in CLASSES:
+        lut[CLASSES.index(Tile.FENCE)] = lut[CLASSES.index(Tile.WATER)]
+    return lut
 
 
 @dataclass(frozen=True)

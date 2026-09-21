@@ -49,6 +49,16 @@ def test_allocate_shapes_and_dtypes():
     assert state.ent_dash_hits.shape == (N, E, E) and state.ent_dash_hits.dtype == torch.bool
     assert state.ent_death_step.dtype == torch.int32
     assert state.ent_kills.dtype == torch.int32
+    assert state.ent_gadget_cd.shape == (N, E) and state.ent_gadget_cd.dtype == torch.float32
+
+    # observation history rings (Phase H), K = cfg.history_frames deep
+    K = cfg.history_frames
+    assert state.hist_valid.shape == (N, K) and state.hist_valid.dtype == torch.bool
+    assert state.hist_action.shape == (N, K, 2) and state.hist_action.dtype == torch.int64
+    assert state.hist_hp.shape == (N, K) and state.hist_ammo.shape == (N, K)
+    assert state.hist_pos.shape == (N, K, 2) and state.hist_pos.dtype == torch.float32
+    assert state.hist_enemy_pos.shape == (N, K, E, 2)
+    assert state.hist_enemy_seen.shape == (N, K, E) and state.hist_enemy_seen.dtype == torch.bool
 
     assert state.prj_pos.shape == (N, P, 2)
     assert state.prj_owner.dtype == torch.int64
@@ -223,6 +233,20 @@ def test_check_invariants_catches_dash_t_over_duration():
     kind0_dash_duration = params.dash_duration[0, 0].item()
     state.ent_dash_t[0, 0] = kind0_dash_duration + 10.0
     with pytest.raises(ValueError):
+        check_invariants(state, cfg, params)
+
+
+def test_check_invariants_catches_a_gadget_cooldown_outside_its_range():
+    """Step G1.4: ent_gadget_cd is a countdown that only hero.tick_timers (clamped at 0) and the
+    gadget fire path (set to the kind's gadget_cooldown) write, so a fresh state -- all 0, i.e.
+    ready -- passes, and either bound failing means a third writer exists."""
+    cfg, state, params = _valid_state_and_params()
+    check_invariants(state, cfg, params)  # all-zero cooldowns are "ready", not an error
+    state.ent_gadget_cd[0, 0] = -0.05
+    with pytest.raises(ValueError, match="ent_gadget_cd"):
+        check_invariants(state, cfg, params)
+    state.ent_gadget_cd[0, 0] = params.gadget_cooldown[0, 0].item() + 10.0
+    with pytest.raises(ValueError, match="ent_gadget_cd"):
         check_invariants(state, cfg, params)
 
 

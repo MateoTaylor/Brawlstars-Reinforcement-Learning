@@ -29,7 +29,7 @@ def _run_tick(state, bank, params, cfg, gen):
                              state.ent_kind, damage, params, cfg)
 
     hero.tick_timers(state, params, cfg)
-    dmg_ent, _dmg_by, _dmg_box, _heal = projectiles.step_projectiles(state, bank, params, cfg)
+    dmg_ent, _dmg_by, _dmg_box, _heal, _charge = projectiles.step_projectiles(state, bank, params, cfg)
     attacker = torch.ones_like(state.ent_last_hit_by)
     combat.apply_damage(state, dmg_ent, int(DeathCause.COMBAT), attacker, params, cfg)
     state.step_count += 1  # see tests/test_sniper.py::_run_tick

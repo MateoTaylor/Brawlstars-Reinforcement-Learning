@@ -15,8 +15,8 @@ term here exists to make the credit assignment tractable, and every weight lives
 to 0.0) once a policy is competent, without touching this file.
 
 **Every weight below is priced per SIM TICK, not per decision, and stays that way when
-`action_repeat` changes.** The delta terms (damage, kills, cubes) read `info` fields `env.py`
-already summed over the decision's sub-ticks; the two rate terms read `info["alive_ticks"]` /
+`action_repeat` changes.** The delta terms (damage, kills, cubes, attacks in reach) read `info`
+fields `env.py` already summed over the decision's sub-ticks; the two rate terms read `info["alive_ticks"]` /
 `info["in_zone_ticks"]`, which count sub-ticks rather than firing once per call. So total
 episode return -- the thing PPO actually optimizes -- is invariant to `action_repeat`, and
 retuning the decision rate does not silently rescale the reward out from under a tuned config.
@@ -57,6 +57,7 @@ _HERO = 0
 TERM_NAMES = (
     "damage_dealt", "damage_taken", "hp_healed", "kill", "cube_pickup",
     "survive_per_step", "in_zone_per_step", "win_bonus", "death_penalty", "rank_bonus",
+    "attack_in_reach",
 )
 
 
@@ -137,6 +138,17 @@ class ShapedReward:
         if w.rank_bonus != 0.0:
             places_above_last = torch.clamp(cfg.n_entities - 1 - rank, min=0)
             self._add(reward, "rank_bonus", done * places_above_last, w.rank_bonus)
+
+        # ---- shaping on the hero's own attack (SIM_OVERHAUL_PLAN.md §9 R2, 2026-09-21) ----
+        if w.attack_in_reach != 0.0:
+            # A count, like `kill`: attacks and supers the hero made while an enemy it could see
+            # stood inside its uncharged dash reach -- the cadence audit's utilization criterion,
+            # which A1 measured at 0.339 (core/events.py, env.py's attack phase). At most one per
+            # decision. Blunt on purpose: a dash AWAY from that enemy and a miss are paid too. Ammo
+            # and cooldown bound it at one per legal attack; at the shipped 0.05, a whole 150 s
+            # episode of in-reach attacks is worth about 3 (some 55 at Mortis's 2.85 s sustained
+            # rate, plus at most one super per five landed hits), against 10 for a win.
+            self._add(reward, "attack_in_reach", info["attack_in_reach_tick"], w.attack_in_reach)
 
         if w.scale != 1.0:
             reward.mul_(w.scale)

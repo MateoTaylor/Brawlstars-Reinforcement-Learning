@@ -77,7 +77,7 @@ def _run(state, bank, params, cfg, ticks=200):
     for i in range(ticks):
         if not bool(state.prj_alive.any()):
             break
-        dmg_ent, _, _, _ = proj.step_projectiles(state, bank, params, cfg)
+        dmg_ent, _, _, _, _ = proj.step_projectiles(state, bank, params, cfg)
         total += float(dmg_ent[0, 0])
         still_flying = bool((state.prj_class[0][state.prj_alive[0]] == int(ProjClass.ARTILLERY)).any())
         if detonated_at < 0 and not still_flying:

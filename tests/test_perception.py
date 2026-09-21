@@ -149,7 +149,7 @@ def test_target_los_matches_the_raw_los_column_it_replaced():
         # rows whose exclusion this test exists to check.
         state.ent_alive.copy_(torch.rand(6, cfg.n_entities) > 0.3)
         vis = perception.bot_visibility(state, perception.visibility(state, bank, params, cfg), cfg)
-        perception.select_target(state, vis, cfg)
+        perception.select_target(state, vis, params, cfg)
 
         got = perception.target_los(state, bank, cfg)
         full = perception.raw_los(state, bank, cfg)
@@ -254,12 +254,12 @@ def test_select_target_drops_a_target_that_walks_out_of_sight():
     state.ent_pos[0, 1] = torch.tensor([20.0, 20.0])
     state.ent_pos[0, 0] = torch.tensor([25.0, 20.0])  # well within sight
     vis = perception.bot_visibility(state, perception.visibility(state, bank, params, cfg), cfg)
-    perception.select_target(state, vis, cfg)
+    perception.select_target(state, vis, params, cfg)
     assert state.ent_target[0, 1].item() == 0
 
     state.ent_pos[0, 0] = torch.tensor([20.0 + cfg.bots_sight_tiles + 5.0, 20.0])
     vis = perception.bot_visibility(state, perception.visibility(state, bank, params, cfg), cfg)
-    perception.select_target(state, vis, cfg)
+    perception.select_target(state, vis, params, cfg)
     assert state.ent_target[0, 1].item() == -1  # dropped, not held
 
 
@@ -285,7 +285,7 @@ def test_select_target_picks_nearest_visible():
     state.ent_pos[0, 2] = torch.tensor([15.0, 10.0])  # farther
 
     vis = perception.visibility(state, bank, params, cfg)
-    perception.select_target(state, vis, cfg)
+    perception.select_target(state, vis, params, cfg)
     assert state.ent_target[0, 0].item() == 1
 
 
@@ -299,7 +299,7 @@ def test_select_target_is_sticky_no_oscillation_between_equidistant():
     state.ent_pos[0, 2] = torch.tensor([8.0, 10.0])   # exactly equidistant
 
     vis = perception.visibility(state, bank, params, cfg)
-    perception.select_target(state, vis, cfg)
+    perception.select_target(state, vis, params, cfg)
     first_pick = state.ent_target[0, 0].item()
     assert first_pick in (1, 2)
 
@@ -307,7 +307,7 @@ def test_select_target_is_sticky_no_oscillation_between_equidistant():
     # non-sticky implementation could flip-flop between argmin ties; this must not.
     for _ in range(20):
         vis = perception.visibility(state, bank, params, cfg)
-        perception.select_target(state, vis, cfg)
+        perception.select_target(state, vis, params, cfg)
         assert state.ent_target[0, 0].item() == first_pick
 
 
@@ -321,12 +321,12 @@ def test_select_target_switches_when_current_dies():
     state.ent_pos[0, 2] = torch.tensor([15.0, 10.0])
 
     vis = perception.visibility(state, bank, params, cfg)
-    perception.select_target(state, vis, cfg)
+    perception.select_target(state, vis, params, cfg)
     assert state.ent_target[0, 0].item() == 1
 
     state.ent_alive[0, 1] = False
     vis = perception.visibility(state, bank, params, cfg)
-    perception.select_target(state, vis, cfg)
+    perception.select_target(state, vis, params, cfg)
     assert state.ent_target[0, 0].item() == 2
 
 
@@ -339,7 +339,7 @@ def test_select_target_no_candidate_gives_negative_one():
         state.ent_alive[0, e] = False
 
     vis = perception.visibility(state, bank, params, cfg)
-    perception.select_target(state, vis, cfg)
+    perception.select_target(state, vis, params, cfg)
     assert state.ent_target[0, 0].item() == -1
 
 
@@ -635,7 +635,7 @@ def test_batched_smoke():
 
     vis = perception.visibility(state, bank, params, cfg)
     los = perception.raw_los(state, bank, cfg)
-    perception.select_target(state, vis, cfg)
+    perception.select_target(state, vis, params, cfg)
     threat = perception.incoming_threat(state, params, cfg)
 
     assert vis.shape == (4, cfg.n_entities, cfg.n_entities)
@@ -643,3 +643,116 @@ def test_batched_smoke():
     assert state.ent_target.shape == (4, cfg.n_entities)
     assert threat.shape == (4, cfg.n_entities, 2)
     assert not torch.any(torch.isnan(threat))
+
+
+# ---- select_target: hero focus (SIM_OVERHAUL_PLAN.md Step B2) ---------------------------------
+#
+# Every case pins a literal target slot for a bot observer (slot 1) on a 40x40 map with THREE
+# entities, so no zero-initialized extra entity sits at (0,0) inside the 14-tile bot sight limit.
+# The observer's kind is BOT_SNIPER; the case sets that kind's hero_focus column by hand instead of
+# reading the shipped 0.5 back, so a test cannot pass by construction. Positions are literal:
+# observer at (20,20), hero and the other bot due east/west of it.
+
+from tests.bot_fixtures import cfg_and_params as _bot_cfg_and_params
+from tests.bot_fixtures import fresh_state as _bot_fresh_state
+
+
+def _focus_scene(hero_focus, hero_x, bot_x):
+    """Observer bot 1 at (20,20), hero (slot 0) at (hero_x, 20), bot 2 at (bot_x, 20), on a
+    flat 40x40 map. Returns (state, vis, params, cfg) with vis = bot_visibility(...)."""
+    cfg, params, _gen = _bot_cfg_and_params(n_enemies=2, map_h=40, map_w=40)
+    params.hero_focus[:, int(Kind.BOT_SNIPER)] = hero_focus
+    state = _bot_fresh_state(cfg, params)
+    bank = _FakeBank(_grid(40, 40))
+    state.ent_pos[0, 1] = torch.tensor([20.0, 20.0])
+    state.ent_pos[0, 0] = torch.tensor([hero_x, 20.0])
+    state.ent_pos[0, 2] = torch.tensor([bot_x, 20.0])
+    vis = perception.bot_visibility(state, perception.visibility(state, bank, params, cfg), cfg)
+    return state, vis, params, cfg, bank
+
+
+def test_hero_focus_half_picks_a_hero_at_7_over_a_bot_at_4():
+    """3.5 (= 7 * (1 - 0.5)) < 4, so the discounted hero wins the nearest pick."""
+    state, vis, params, cfg, _bank = _focus_scene(0.5, hero_x=27.0, bot_x=16.0)
+    perception.select_target(state, vis, params, cfg)
+    assert state.ent_target[0, 1].item() == 0
+
+
+def test_hero_focus_half_keeps_the_bot_when_the_hero_is_at_9():
+    """4.5 (= 9 * (1 - 0.5)) > 4, so the plain-nearest bot is kept."""
+    state, vis, params, cfg, _bank = _focus_scene(0.5, hero_x=29.0, bot_x=16.0)
+    perception.select_target(state, vis, params, cfg)
+    assert state.ent_target[0, 1].item() == 2
+
+
+def test_hero_focus_overrides_stickiness_the_tick_the_hero_appears_at_a_winning_distance():
+    """A bot locked onto another bot turns on the hero the moment the hero is in view AND wins the
+    discounted comparison -- otherwise "favour the hero" would only apply to idle bots."""
+    # Hero 20 tiles out: beyond bots_sight_tiles (14), so the only candidate is bot 2 at 4 tiles.
+    state, vis, params, cfg, bank = _focus_scene(0.5, hero_x=40.0, bot_x=16.0)
+    perception.select_target(state, vis, params, cfg)
+    assert state.ent_target[0, 1].item() == 2  # sticky target acquired
+
+    # Hero steps into view at 7 tiles (3.5 discounted < 4): the sticky bot target is dropped.
+    state.ent_pos[0, 0] = torch.tensor([27.0, 20.0])
+    vis = perception.bot_visibility(state, perception.visibility(state, bank, params, cfg), cfg)
+    perception.select_target(state, vis, params, cfg)
+    assert state.ent_target[0, 1].item() == 0
+
+    # And a hero that reappears at a LOSING distance (9 -> 4.5 > 4) does not break the lock.
+    state.ent_target[0, 1] = 2
+    state.ent_pos[0, 0] = torch.tensor([29.0, 20.0])
+    vis = perception.bot_visibility(state, perception.visibility(state, bank, params, cfg), cfg)
+    perception.select_target(state, vis, params, cfg)
+    assert state.ent_target[0, 1].item() == 2
+
+
+def test_hero_focus_one_chooses_the_hero_whenever_it_is_visible():
+    """(1 - 1.0) = 0: the hero's effective distance is 0, so it wins against a bot 1 tile away
+    even from 13 tiles -- but NOT once it leaves the 14-tile sight limit."""
+    state, vis, params, cfg, bank = _focus_scene(1.0, hero_x=33.0, bot_x=21.0)
+    perception.select_target(state, vis, params, cfg)
+    assert state.ent_target[0, 1].item() == 0
+
+    state.ent_pos[0, 0] = torch.tensor([35.0, 20.0])  # 15 tiles: out of sight, not a candidate
+    vis = perception.bot_visibility(state, perception.visibility(state, bank, params, cfg), cfg)
+    perception.select_target(state, vis, params, cfg)
+    assert state.ent_target[0, 1].item() == 2
+
+
+def test_hero_focus_zero_is_the_plain_sticky_nearest_rule():
+    """With focus 0 nothing prefers the hero: a bot locked onto another bot at 4 tiles keeps it
+    even when the hero walks up to 2 tiles (today's stickiness, bit-for-bit), and an idle bot
+    picks the plain nearest (bot at 4 over hero at 7)."""
+    state, vis, params, cfg, bank = _focus_scene(0.0, hero_x=40.0, bot_x=16.0)
+    perception.select_target(state, vis, params, cfg)
+    assert state.ent_target[0, 1].item() == 2
+
+    state.ent_pos[0, 0] = torch.tensor([22.0, 20.0])  # hero at 2 tiles, nearer than the lock
+    vis = perception.bot_visibility(state, perception.visibility(state, bank, params, cfg), cfg)
+    perception.select_target(state, vis, params, cfg)
+    assert state.ent_target[0, 1].item() == 2  # sticky, no hero preference
+
+    state.ent_target[0, 1] = -1
+    state.ent_pos[0, 0] = torch.tensor([27.0, 20.0])  # hero at 7, bot at 4
+    vis = perception.bot_visibility(state, perception.visibility(state, bank, params, cfg), cfg)
+    perception.select_target(state, vis, params, cfg)
+    assert state.ent_target[0, 1].item() == 2
+
+
+def test_hero_focus_never_makes_a_concealed_hero_a_candidate():
+    """Sight is unchanged by focus: a hero in a bush outside bush_reveal_radius is invisible to
+    the bot no matter how strong the focus, so the bot keeps the other bot."""
+    cfg, params, _gen = _bot_cfg_and_params(n_enemies=2, map_h=40, map_w=40)
+    params.hero_focus[:, int(Kind.BOT_SNIPER)] = 1.0
+    state = _bot_fresh_state(cfg, params)
+    tiles = _grid(40, 40)
+    tiles[20, 27] = Tile.BUSH
+    bank = _FakeBank(tiles)
+    state.ent_pos[0, 1] = torch.tensor([20.0, 20.0])
+    state.ent_pos[0, 0] = torch.tensor([27.5, 20.5])  # in the bush, 7.5 tiles out
+    state.ent_pos[0, 2] = torch.tensor([16.0, 20.0])
+    vis = perception.bot_visibility(state, perception.visibility(state, bank, params, cfg), cfg)
+    assert not bool(vis[0, 1, 0])
+    perception.select_target(state, vis, params, cfg)
+    assert state.ent_target[0, 1].item() == 2

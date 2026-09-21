@@ -86,6 +86,10 @@ _MOSAIC_SCALE = 12           # ...and in mosaic mode, where the source is 48 px/
 # well under a tile of camera motion, and step-4 odometry was measured within 0.4 tiles of step-1
 # over a 22-tile walk.
 _MARGIN_TILES = 3
+# The layouts that put a picture of the screen in the frame, and therefore the ones a detector,
+# an HP reader or a cropped `map_extent` can be asked for. Named once because five separate gates
+# test for it and a sixth layout would otherwise have to find all five.
+_RAW_PANEL_LAYOUTS = ("side-by-side", "stacked")
 
 
 def tile_lut() -> np.ndarray:
@@ -286,6 +290,43 @@ def _label(img: np.ndarray, text: str) -> np.ndarray:
     return img
 
 
+_STACK_GAP_PX = 6      # separator between the stacked panels, the same one 'view' uses
+
+
+def _stacked(source_bgr: np.ndarray, canvas: np.ndarray,
+             width: int | None = None) -> np.ndarray:
+    """Source frame on top, reconstruction below, matched in WIDTH.
+
+    The vertical twin of `_side_by_side`, and it exists for one reason: a 9x16 frame has height to
+    spare and no width at all, so a horizontal pair has to be shrunk to a third of the screen
+    before it fits. Stacked, both panels keep the video's full width.
+
+    `width` is the output width both panels are matched to, defaulting to the source panel's own.
+    The map is resized with INTER_NEAREST because it is tile art -- a cell is a flat block of
+    colour and nearest keeps its edges square, where an interpolating filter bevels every one of
+    them and the 21x13 policy window turns to mush at the scale factor a stacked layout needs.
+    """
+    src = cv2.cvtColor(source_bgr, cv2.COLOR_BGR2RGB)
+    w = int(src.shape[1] if width is None else width)
+    if w < 1:
+        raise ValueError(f"stacked width must be positive, got {width!r}")
+    w += w % 2
+
+    def fit(img, interp):
+        # Rounded UP to even, both panels, so their sum is even whatever the width and extent are.
+        # `VideoSink` forces the stream even and then zero-pads every frame that is not (see
+        # `VideoSink.write`), so an odd composite is not an error -- it is a black row along the
+        # bottom of the whole video and no message anywhere. One pixel of aspect here is invisible;
+        # that row is not.
+        h = max(2, int(round(img.shape[0] * w / img.shape[1])))
+        return cv2.resize(img, (w, h + h % 2), interpolation=interp)
+
+    top = fit(src, cv2.INTER_AREA if w <= src.shape[1] else cv2.INTER_CUBIC)
+    bottom = fit(canvas, cv2.INTER_NEAREST)
+    gap = np.zeros((_STACK_GAP_PX, w, 3), np.uint8)
+    return np.vstack([top, gap, bottom])
+
+
 def _side_by_side(source_bgr: np.ndarray, canvas: np.ndarray) -> np.ndarray:
     """Source frame left, reconstruction right, matched in height.
 
@@ -441,7 +482,8 @@ def render(source, plan: RectifyPlan, track: Track, path, *, classifier=None, de
            anchor_frac: float | None = None, map_extent: str = "full",
            cfg: VisionConfig | None = None, layout: str = "map", out_fps: float = 12.0,
            cv_fps: float | None = None, scale: int | None = None, progress=None,
-           view_w: int = 21, view_h: int = 13) -> RenderReport:
+           view_w: int = 21, view_h: int = 13,
+           out_width: int | None = None, label: bool = True) -> RenderReport:
     """Pass two. Consume `source` again, render `layout` at `out_fps`, write to `path`.
 
     `track` is used only to size the canvas. Odometry is recomputed here rather than replayed: the
@@ -505,6 +547,11 @@ def render(source, plan: RectifyPlan, track: Track, path, *, classifier=None, de
     are on the ground, and each goes through its own measured anchor (`project.LOOT_ANCHOR_FRAC`,
     the same one the deployed loot map uses), so their markers are real positions.
 
+    **`label` writes the mode, clip time and frame index into the top-left corner.** On by
+    default, because every diagnostic use of this function wants to know which frame it is looking
+    at. Off for footage going somewhere a person watches: there it is debug text burned into the
+    deliverable, and it lands on the raw panel over the game's own HUD.
+
     **`map_extent` decides how much accumulated map the `side-by-side` right panel shows.**
     `full` (the default, and the old behaviour) is the whole explored map with the current
     frame's footprint outlined. `view` crops it to exactly the tiles this frame covers, so the
@@ -536,11 +583,20 @@ def render(source, plan: RectifyPlan, track: Track, path, *, classifier=None, de
     """
     cfg = cfg or VisionConfig()
     mode = "mosaic" if classifier is None else "map"
-    if layout not in ("map", "side-by-side", "view"):
-        raise ValueError(f"unknown layout {layout!r} -- use 'map', 'side-by-side' or 'view'")
+    if layout not in ("map", "side-by-side", "stacked", "view"):
+        raise ValueError(
+            f"unknown layout {layout!r} -- use 'map', 'side-by-side', 'stacked' or 'view'")
+    if out_width is not None and layout != "stacked":
+        # The other layouts derive their size from the panels themselves ('side-by-side' from the
+        # map's height, 'view' from the tile scale), so a width here would be read as an output
+        # size and silently do nothing.
+        raise ValueError(
+            f"out_width only applies to --layout stacked, which matches its panels on width. "
+            f"Got layout {layout!r}"
+        )
     if layout == "view" and classifier is None:
         raise ValueError("the 'view' layout renders the classified map, so it needs a classifier")
-    if detector is not None and layout not in ("side-by-side", "view"):
+    if detector is not None and layout not in _RAW_PANEL_LAYOUTS + ("view",):
         # 'map' is the artifact -- the reconstruction alone, no annotation. Boxes need the raw
         # frame ('side-by-side') and markers need a panel in tile space ('view', or the map panel
         # beside the raw frame). Refusing beats silently dropping them.
@@ -563,7 +619,7 @@ def render(source, plan: RectifyPlan, track: Track, path, *, classifier=None, de
     # `detector or projectiles`, because the two are independent: --projectiles with no --detect
     # is a normal way to run this, and a message naming the wrong model sends you to fix the
     # wrong flag.
-    if projectiles is not None and layout not in ("side-by-side", "view"):
+    if projectiles is not None and layout not in _RAW_PANEL_LAYOUTS + ("view",):
         raise ValueError(
             f"a projectile detector needs a layout with somewhere to draw: 'side-by-side' (boxes "
             f"on the raw frame, markers on the map with projectiles_on_map) or 'view' (markers "
@@ -585,7 +641,7 @@ def render(source, plan: RectifyPlan, track: Track, path, *, classifier=None, de
     if map_extent not in ("full", "view", "policy"):
         raise ValueError(
             f"unknown map_extent {map_extent!r} -- use 'full', 'view' or 'policy'")
-    if map_extent != "full" and layout != "side-by-side":
+    if map_extent != "full" and layout not in _RAW_PANEL_LAYOUTS:
         # 'map' is the artifact and 'view' is ALREADY the footprint crop, so cropping there is
         # either meaningless or a second way to spell what the layout already does. Refusing beats
         # accepting an argument that quietly does nothing.
@@ -602,7 +658,7 @@ def render(source, plan: RectifyPlan, track: Track, path, *, classifier=None, de
         # The reader only ever looks inside a detection box. Without one it has nothing to read
         # and would silently annotate nothing at all.
         raise ValueError("health reading needs a detector -- it reads HP inside detection boxes")
-    if health is not None and layout != "side-by-side":
+    if health is not None and layout not in _RAW_PANEL_LAYOUTS:
         raise ValueError(
             f"health reading annotates the RAW frame, which only 'side-by-side' shows. Got "
             f"layout {layout!r}"
@@ -771,7 +827,7 @@ def render(source, plan: RectifyPlan, track: Track, path, *, classifier=None, de
                                  _held_origin(plan, r.position_tiles, cv_position), vscale,
                                  footprint_tiles=PROJECTILE_FOOTPRINT_TILES)
                 canvas = np.hstack([left, np.zeros((left.shape[0], 6, 3), np.uint8), right])
-            elif layout == "side-by-side":
+            elif layout in _RAW_PANEL_LAYOUTS:
                 # `mscale`, not `scale`, once the panel is cropped. A 21x13 policy window at 14
                 # px/tile is a 294 px-wide panel, and `_side_by_side` matches the RAW frame to the
                 # canvas height -- so a small right panel silently shrinks the left one to match
@@ -858,8 +914,10 @@ def render(source, plan: RectifyPlan, track: Track, path, *, classifier=None, de
                                                             draw_markers)
                     draw_markers(canvas, pplaced, marker_origin, mscale,
                                  footprint_tiles=PROJECTILE_FOOTPRINT_TILES)
-                canvas = _side_by_side(source_frame, canvas)
-            _label(canvas, f"{mode}  t={frame.t:6.2f}s  frame {frame.index}")
+                canvas = (_stacked(source_frame, canvas, out_width) if layout == "stacked"
+                          else _side_by_side(source_frame, canvas))
+            if label:
+                _label(canvas, f"{mode}  t={frame.t:6.2f}s  frame {frame.index}")
             if sink is None:
                 report.size = (canvas.shape[1], canvas.shape[0])
                 sink = VideoSink(path, report.size, fps=out_fps).__enter__()

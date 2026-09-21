@@ -41,17 +41,30 @@ def strafe(pos: torch.Tensor, target_pos: torch.Tensor, sign) -> torch.Tensor:
     return perp * s
 
 
-def maintain_range(pos: torch.Tensor, target_pos: torch.Tensor, desired, deadband) -> torch.Tensor:
+def maintain_range(pos: torch.Tensor, target_pos: torch.Tensor, desired, deadband,
+                   max_dist=None) -> torch.Tensor:
     """(N,E,2). Seeks (unnormalized diff toward target) when dist > desired+deadband, flees
     (negated diff) when dist < desired-deadband, zero inside the deadband. desired/deadband
     are python scalars or (N,E) tensors -- dist is deliberately kept (N,E) (no keepdim) so the
     too_far/too_close comparisons broadcast against them elementwise; keepdim's (N,E,1) would
     instead broadcast against an (N,E) desired as if E were a *second* entity axis, silently
     comparing the wrong pairs whenever E happens to also be a valid broadcast target (this bit
-    a real caller -- see BRAWL_SIM_BUILD_PLAN.md Step 17's note)."""
+    a real caller -- see BRAWL_SIM_BUILD_PLAN.md Step 17's note).
+
+    `max_dist` (optional, scalar or (N,E)) also seeks whenever dist > max_dist, so the seek edge
+    becomes min(desired + deadband, max_dist) and the flee edge is untouched. The seek edge, not
+    `desired`, is where an approaching entity stops: inside the deadband this term is zero, the
+    caller's strafe is all that is left, and an orbit only ever drifts outward. bots/personality.py
+    passes each bot's fire reach (operator, 2026-09-21); before that an easy KITE Brock walking in
+    parked at 11.0 tiles with an 8.0-tile rocket. Where both edges hold at once (only possible if
+    desired - deadband > max_dist) seeking wins and the entity jitters on max_dist, so a caller
+    keeps desired <= max_dist -- bots/policy.targeting caps desired at the same reach."""
     diff = target_pos - pos
     dist = geo.safe_norm(diff, dim=-1)
-    too_far = (dist > (desired + deadband)).unsqueeze(-1)
+    too_far = dist > (desired + deadband)
+    if max_dist is not None:
+        too_far = too_far | (dist > max_dist)
+    too_far = too_far.unsqueeze(-1)
     too_close = (dist < (desired - deadband)).unsqueeze(-1)
     return torch.where(too_far, diff, torch.where(too_close, -diff, torch.zeros_like(diff)))
 

@@ -19,7 +19,7 @@ Run layout:
       logs/events.*     TensorBoard, if the `tensorboard` package is installed
       logs/eval_<tier>/ per-difficulty event files -- overlaid on one eval/win_rate chart
       checkpoints/      periodic model .zip + VecNormalize .pkl
-      best_model.zip    best mean stationary-eval win rate so far
+      best_model.zip    best mean stationary-eval win rate so far (training maps; never the holdout)
       final_model.zip   + final_vecnormalize.pkl
 
 View progress with `tensorboard --logdir runs`, or read `logs/progress.csv` directly
@@ -32,7 +32,9 @@ Four scalar groups answer four different questions, all in the same log:
                  TensorBoard, "how is training going" at a glance
   rollout/       SB3's own ep_rew_mean / ep_len_mean
   curriculum/    the curriculum's OWN decision variable -- resets to empty on every stage change
-  eval/*         stationary -- fixed difficulty, fixed seed, comparable ACROSS THE WHOLE RUN
+  eval/*         stationary -- fixed difficulty, fixed seed, comparable ACROSS THE WHOLE RUN.
+                 Measured on the maps the run TRAINS on; eval/holdout_* is the same measurement
+                 on `eval.holdout_maps`, which it never trains on. The gap is map overfitting.
 """
 import argparse
 import shutil
@@ -56,7 +58,7 @@ from brawl_sim.training.callbacks import (
     CurriculumCallback, TierEvalCallback, TrainingMonitorCallback, VecNormalizeCheckpoint,
 )
 from brawl_sim.training.config import deep_merge, load_train_config, parse_overrides
-from brawl_sim.training.evaluation import TierEvaluator
+from brawl_sim.training.evaluation import build_evaluators
 
 DEFAULT_TRAIN_CONFIG = REPO_ROOT / "configs" / "train.yaml"
 
@@ -73,7 +75,10 @@ _SMOKE = {
     "ppo": {"n_steps": 64, "batch_size": 128, "n_epochs": 2},
     "curriculum": {"window_episodes": 8, "min_episodes_at_stage": 8,
                    "max_timesteps_at_stage": 2048},
-    "eval": {"every_timesteps": 4096, "episodes_per_tier": 2},
+    # No holdout eval: debug_tiny's world is 20x20 and `blank` is the only map that size, so the
+    # 60x60 holdout maps configs/train.yaml names cannot load here. The holdout path has its own
+    # tests in tests/test_training.py, on a 60x60 world.
+    "eval": {"every_timesteps": 4096, "episodes_per_tier": 2, "holdout_maps": []},
 }
 _SMOKE_PRESET = REPO_ROOT / "configs" / "presets" / "debug_tiny.yaml"
 
@@ -138,6 +143,10 @@ def _banner(tcfg, parts, run_dir: Path) -> None:
         print(f"  eval           every {tcfg.eval.every_timesteps:,} steps | "
               f"{tcfg.eval.episodes_per_tier} matches x {len(tiers)} tiers "
               f"({', '.join(tiers)}) | seed {tcfg.eval.seed}")
+        # env_cfg is the TRAINING env's resolved config, and the first evaluator loads the same one.
+        print(f"  eval maps      {len(env_cfg.map_names)} training maps"
+              + (f" + holdout {', '.join(tcfg.eval.holdout_maps)} (never trained on; a second "
+                 f"rollout per eval)" if tcfg.eval.has_holdout else " | no holdout maps"))
     else:
         print("  eval           DISABLED (no stationary win-rate signal will be logged)")
     if parts["curriculum"] is None:
@@ -168,6 +177,10 @@ def main(argv=None) -> int:
     # Built BEFORE the run directory exists, so a config the builder refuses (e.g.
     # builder.check_reward_is_observable) does not leave an empty run behind to be mistaken for one.
     model, venv, parts = build_run(tcfg)
+    # The evaluators too, for the same reason: they need only `tcfg`, and they are where a second
+    # (holdout) eval env can still fail -- out of VRAM, or a map the config checks cannot vouch for.
+    # (training-map evaluator, holdout evaluator or None) -- see evaluation.build_evaluators.
+    evaluators = build_evaluators(tcfg, verbose=tcfg.run.verbose) if tcfg.eval.enabled else ()
 
     run_dir = _make_run_dir(tcfg, args.out_dir, stamp=not (args.no_stamp or args.smoke))
     (run_dir / "train.yaml").write_text(yaml.safe_dump(tcfg.raw, sort_keys=False))
@@ -199,13 +212,11 @@ def main(argv=None) -> int:
         print(f"[train] run.info_mode={tcfg.run.info_mode!r}: no per-episode outcome data, so "
               "train/win_rate and friends will not be logged. Use 'episode' or 'full' to get them.")
 
-    evaluator = None
-    if tcfg.eval.enabled:
-        evaluator = TierEvaluator(tcfg, verbose=tcfg.run.verbose)
+    if evaluators:
         callbacks.append(TierEvalCallback(
-            evaluator, tcfg.eval.every_timesteps, run_dir / "logs",
+            evaluators[0], tcfg.eval.every_timesteps, run_dir / "logs",
             at_start=tcfg.eval.at_start, best_model_path=run_dir / "best_model.zip",
-            verbose=tcfg.run.verbose,
+            verbose=tcfg.run.verbose, holdout_evaluator=evaluators[1],
         ))
     if curriculum is not None:
         callbacks.append(CurriculumCallback(
@@ -244,8 +255,9 @@ def main(argv=None) -> int:
     if tcfg.normalize.enabled:
         venv.save(str(run_dir / "final_vecnormalize.pkl"))
     venv.close()
-    if evaluator is not None:
-        evaluator.close()
+    for evaluator in evaluators:
+        if evaluator is not None:
+            evaluator.close()
 
     steps = model.num_timesteps
     print(f"\n[done{' (interrupted)' if interrupted else ''}] {steps:,} timesteps in "

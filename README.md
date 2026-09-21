@@ -81,7 +81,7 @@ python scripts/sb3_smoke.py               # proves the SB3 plumbing connects (no
 clone doesn't have them. They are the field-by-field reference for what the sim observes
 (`docs/OBSERVATION.md`, everything) and what a policy actually receives (`docs/AGENT_OBS.md`).
 
-**Play it yourself** — WASD to move, space to fire, at the real 20 Hz. The human feel-check for
+**Play it yourself** — WASD to move, space to fire, `g` to throw the gadget, at the real 20 Hz. The human feel-check for
 Mortis's dash, and the fastest way to understand what the bots do:
 
 ```bash

@@ -14,7 +14,7 @@ import numpy as np
 import torch
 
 from ..constants import (
-    CHAR_TO_TILE,
+    MAP_CHAR_TO_TILE,
     TILE_BLOCKS_PROJ,
     TILE_BLOCKS_UNIT,
     TILE_IS_BUSH,
@@ -49,9 +49,9 @@ def load_map_csv(path, cfg) -> np.ndarray:
         if len(row) != w:
             raise ValueError(f"{path}: row {y} has {len(row)} columns, expected {w}")
         for x, ch in enumerate(row):
-            if ch not in CHAR_TO_TILE:
+            if ch not in MAP_CHAR_TO_TILE:
                 raise ValueError(f"{path}: unknown tile character {ch!r} at row {y}, col {x}")
-            tiles[y, x] = int(CHAR_TO_TILE[ch])
+            tiles[y, x] = int(MAP_CHAR_TO_TILE[ch])
     return tiles
 
 

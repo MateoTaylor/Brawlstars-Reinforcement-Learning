@@ -42,6 +42,19 @@ def test_record_rollout_is_deterministic_for_a_fixed_seed():
         assert np.array_equal(a[name], b[name]), f"{name} differs across identical seeds"
 
 
+def test_the_random_policy_draws_the_whole_attack_column_so_a_recording_shows_the_gadget():
+    """SIM_OVERHAUL Step G3.3: the random policy draws attack values 0..3, not the old 0/1. The
+    gadget starts every episode charged, so the first 3 drawn throws a spinner (projectile kind 7,
+    a literal: `Proj.GADGET_SPINNER`), and only the hero (entity 0) has a gadget. 100 ticks is 20
+    decisions -- a draw that never hits 3 in 20 is a 0.3 % event, and the seed is fixed anyway.
+    A binary `randint(0, 2)` draw never throws one and fails here."""
+    frames = record_rollout.record_rollout(_cfg(), steps=100, seed=0, action_seed=0)
+    spinner = frames["prj_alive"] & (frames["prj_kind"] == 7)
+    assert spinner.any(), "no gadget spinner in 100 ticks of random play"
+    assert set(frames["prj_owner"][spinner].tolist()) == {0}
+    assert spinner.sum(axis=1).max() == 1          # 18 s cooldown: never two in the air
+
+
 def test_record_rollout_rejects_non_positive_steps():
     cfg = _cfg()
     try:

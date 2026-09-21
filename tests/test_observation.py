@@ -93,9 +93,10 @@ def test_shapes_match_expected():
     assert obs["world"].shape == (n_envs, 12, cfg.map_h, cfg.map_w)
 
     assert obs["action_mask"]["move"].shape == (n_envs, cfg.n_move_bins + 1)
-    # Width comes from cfg.action_nvec, not a literal: Step D2 widened the attack dim to 3
-    # (0 = nothing, 1 = attack, 2 = super).
+    # Step D2 widened the attack dim to 3 (0 = nothing, 1 = attack, 2 = super) and Step G3 to 4
+    # (3 = gadget). Checked against cfg AND a literal: the cfg comparison alone cannot fail.
     assert obs["action_mask"]["attack"].shape == (n_envs, cfg.action_nvec[1])
+    assert obs["action_mask"]["attack"].shape == (n_envs, 4)
 
     assert obs["meta"]["map_h"].shape == (n_envs,)
     assert torch.all(obs["meta"]["map_h"] == cfg.map_h)

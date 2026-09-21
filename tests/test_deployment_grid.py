@@ -348,10 +348,10 @@ def test_terrain_lands_in_the_cell_its_world_position_says():
 
 
 def test_the_lookup_table_is_the_simulators_and_not_a_restatement():
-    """A fence blocks movement but not shots, and only WALL stops a projectile. If
-    `brawl_sim.constants` ever changes its mind, this should follow it, not contradict it."""
+    """Only WALL stops a projectile, and bush is passable. If `brawl_sim.constants` ever changes
+    its mind, this should follow it, not contradict it. The one deliberate exception is FENCE,
+    pinned by the test below."""
     occ = _occupancy()
-    _put(occ, 10, 6, Tile.FENCE)
     _put(occ, 11, 6, Tile.WALL)
     _put(occ, 12, 6, Tile.BUSH)
     b = _builder(occ)
@@ -359,9 +359,23 @@ def test_the_lookup_table_is_the_simulators_and_not_a_restatement():
     unit = grid[b.spec.channels.index("blocks_unit")]
     proj = grid[b.spec.channels.index("blocks_projectile")]
     bush = grid[b.spec.channels.index("is_bush")]
-    assert (unit[6, 10], proj[6, 10]) == (1, 0)          # fence
     assert (unit[6, 11], proj[6, 11]) == (1, 1)          # wall
     assert (unit[6, 12], proj[6, 12], bush[6, 12]) == (0, 0, 1)
+
+
+def test_a_predicted_fence_reads_as_water():
+    """Fences are not a sim tile (2026-09), so no policy trains on `blocks_unit &
+    ~blocks_projectile & ~is_water`. The classifier can still predict one; it gets WATER's row,
+    the trained-on combination with a fence's physics (stops a body, passes a shot)."""
+    occ = _occupancy()
+    _put(occ, 10, 6, Tile.FENCE)
+    _put(occ, 11, 6, Tile.WATER)
+    b = _builder(occ)
+    grid = b.build((10.5, 6.5))
+    rows = [grid[b.spec.channels.index(c)] for c in ("blocks_unit", "blocks_projectile", "is_bush", "is_water")]
+    fence = tuple(int(r[6, 10]) for r in rows)
+    water = tuple(int(r[6, 11]) for r in rows)
+    assert fence == water == (1, 0, 0, 1)
 
 
 # ---------------------------------------------------------------------------

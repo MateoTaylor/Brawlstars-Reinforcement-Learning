@@ -71,10 +71,12 @@ def test_observation_spec_and_action_spec_properties():
     env = _tiny_env(n_envs=8)
     spec = env.observation_spec
     assert "hero.pos" in spec
-    # (move bins + idle, attack). The attack dim is 3-valued as of Step D2:
-    # 0 = nothing, 1 = attack, 2 = super. Derived from cfg so it tracks n_move_bins.
+    # (move bins + idle, attack). The attack dim is 4-valued: 0 = nothing, 1 = attack,
+    # 2 = super (Step D2), 3 = gadget (SIM_OVERHAUL Step G3). Pinned as a literal on the spec
+    # itself -- comparing the spec to cfg.action_nvec alone is the property compared to itself.
     assert env.action_spec == {"nvec": env.cfg.action_nvec}
-    assert env.cfg.action_nvec == (17, 3)
+    assert env.action_spec == {"nvec": (17, 4)}
+    assert env.cfg.action_nvec == (17, 4)
 
 
 def test_snapshot_is_cpu_numpy():
@@ -472,3 +474,61 @@ def test_batched_smoke_default_config():
         obs, reward, terminated, truncated, info = env.step(_random_action(16, gen))
         _assert_finite(obs)
         _assert_finite(reward)
+
+
+# ---- super charge vs the gadget (Step G2.4) ------------------------------------------------
+
+def _one_enemy_duel(enemy_at):
+    """A per-tick tiny env with bot 2 dead, the hero at (10,10), bot 1 at `enemy_at` at its full
+    HP, and the hero's super at 0. Returns (env, bot 1's HP before anything happens): the tests
+    pin the DELTA, because the tick clamps HP to the kind's effective max, so an inflated HP set
+    here would silently be undone (a 100000 became Shelly's 7800 before the hit landed)."""
+    env = _tiny_env(n_envs=1, overrides=_PER_TICK)
+    env.reset()
+    st = env.state
+    st.ent_super_charge.fill_(0)
+    st.ent_alive[0, 2] = False
+    st.ent_pos[0, 0] = torch.tensor([10.0, 10.0])
+    st.ent_pos[0, 1] = torch.tensor(enemy_at)
+    return env, st.ent_hp[0, 1].item()
+
+
+def test_a_gadget_only_hit_deals_damage_but_does_not_charge_the_super():
+    """S12 through the real tick: the spinner's 2000 lands in `ent_damage_dealt`, and the hero's
+    super charge stays where it was. No action fires a gadget before Step G3, so the spinner is
+    spawned into the env's state by hand and the env is stepped idle until it lands."""
+    from brawl_sim.core import projectiles, stats
+
+    env, hp_before = _one_enemy_duel([11.5, 10.0])
+    st, params, cfg = env.state, env.params, env.cfg
+
+    fire = torch.zeros(1, cfg.n_entities, dtype=torch.bool)
+    fire[0, 0] = True
+    direction = torch.zeros(1, cfg.n_entities, 2)
+    direction[0, 0] = torch.tensor([1.0, 0.0])
+    travel = torch.zeros(1, cfg.n_entities)
+    travel[0, 0] = 1.5
+    damage = stats.effective_gadget_damage(st.ent_kind, st.ent_cubes, params)
+    projectiles.spawn_gadget(st, fire, st.ent_pos.clone(), direction, travel, damage, params, cfg)
+
+    for _ in range(5):  # 4 ticks of flight, one to spare
+        env.step(_idle_action(1))
+
+    assert hp_before - st.ent_hp[0, 1].item() == 2000.0
+    assert st.ent_damage_dealt[0, 0].item() == 2000.0
+    assert int(st.ent_super_charge[0, 0]) == 0
+
+
+def test_a_dash_hit_still_charges_the_super():
+    """The other half of G2.4's pin: nothing about the dash path changed. Move bin 1 is +x
+    (geo.dir_from_bin(0)), straight into the enemy 0.3 tiles east."""
+    env, hp_before = _one_enemy_duel([10.3, 10.0])
+    st = env.state
+    st.ent_ammo[0, 0] = 3.0
+    st.ent_attack_cd[0, 0] = 0.0
+    st.ent_dash_t[0, 0] = 0.0
+
+    env.step(torch.tensor([[1, 1]], dtype=torch.int64))
+
+    assert hp_before - st.ent_hp[0, 1].item() == 2000.0  # one dash hit at base_damage 2000
+    assert int(st.ent_super_charge[0, 0]) == 1

@@ -11,6 +11,10 @@ class Tile(IntEnum):
     WALL = 1
     BUSH = 2
     WATER = 3
+    # Not a sim tile since 2026-09: fences are rare enough in Solo Showdown that no map carries
+    # one, and the map CSV vocabulary (MAP_CHAR_TO_TILE below) refuses the character. The member
+    # stays because brawl_vision.terrain.labeling.CLASSES, its label files and the trained
+    # terrain classifier all index it, and a 4-class retrain would buy nothing.
     FENCE = 4
     SPAWN = 5
     BOX = 6
@@ -102,6 +106,13 @@ class Proj(IntEnum):
     # would leave the policy unable to tell an 880-per-pellet volley from a 600-per-pellet one
     # except by regressing on the continuous `damage` field.
     BULL_SLUG = 6
+    # Mortis's gadget (SIM_OVERHAUL_PLAN.md Phase G): a spinner that flies up to `gadget_range`
+    # toward the nearest revealed enemy, lands after `gadget_flight_seconds`, and deals
+    # `gadget_damage` in `gadget_radius`. ARTILLERY-class in PROJ_CLASS_OF -- it hurts nothing in
+    # flight and resolves at its landing point, which is exactly the shell mechanic -- but its own
+    # `Proj` because it is its own THREAT: a 2000-damage burst that arrives in 0.2 s is not a
+    # Grom shell, and kind_onehot is the only categorical weapon signal the agent gets.
+    GADGET_SPINNER = 7
 
 
 class ProjClass(IntEnum):
@@ -178,11 +189,12 @@ PROJ_CLASS_OF = (
     ProjClass.PROJECTILE,   # SUPER_BOLT   (spawn_supers writes PROJECTILE directly; kept in sync)
     ProjClass.ARTILLERY,    # SPIKE_SHELL
     ProjClass.PROJECTILE,   # BULL_SLUG
+    ProjClass.ARTILLERY,    # GADGET_SPINNER (no damage in flight; a burst where it lands)
 )
 
 N_TILES = 7
 N_KINDS = 8
-N_PROJ_KINDS = 7
+N_PROJ_KINDS = 8
 N_PROJ_CLASSES = 3
 N_AIM_MODELS = 3
 BOT_KINDS = (1, 2, 3, 4, 5, 6, 7)
@@ -212,7 +224,8 @@ def _bool_table(true_tiles: tuple[Tile, ...]) -> torch.Tensor:
 
 # FLOOR / SPAWN / BOX pass units and projectiles. WALL blocks both. BUSH passes both
 # (occupant hiding is a perception-layer concern in bots/perception.py, not a tile block).
-# WATER and FENCE block units only; both pass projectiles.
+# WATER and FENCE block units only; both pass projectiles. (FENCE never appears in a map any
+# more, but its row is what brawl_vision's scorer and brawl_deployment's class table read.)
 #
 # There is no tile-level vision table. The camera is fixed bird's-eye, so no tile ever
 # blocks sight, not even WALL. Bush-hiding is the only thing that hides an entity, and
@@ -227,7 +240,8 @@ TILE_IS_WATER = _bool_table((Tile.WATER,))
 TILE_IS_SPAWN = _bool_table((Tile.SPAWN,))
 TILE_IS_BOX_SPAWN = _bool_table((Tile.BOX,))
 
-# Matches the Step 5 map CSV legend exactly.
+# The complete tile alphabet, one character per Tile. This is what brawl_vision's label files
+# and terrain classes are written in (they carry `f`), so it keeps every member.
 CHAR_TO_TILE = {
     ".": Tile.FLOOR,
     "#": Tile.WALL,
@@ -238,3 +252,8 @@ CHAR_TO_TILE = {
     "X": Tile.BOX,
 }
 TILE_TO_CHAR = {tile: char for char, tile in CHAR_TO_TILE.items()}
+
+# The map CSV vocabulary: what maps/loader.load_map_csv accepts. The alphabet minus FENCE --
+# see the Tile.FENCE comment. A CSV carrying `f` fails to load rather than silently becoming
+# a wall or a floor.
+MAP_CHAR_TO_TILE = {char: tile for char, tile in CHAR_TO_TILE.items() if tile is not Tile.FENCE}

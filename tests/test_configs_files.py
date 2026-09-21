@@ -9,12 +9,14 @@ import torch
 import yaml
 
 from brawl_sim.config import (
+    KIND_YAML_NAMES,
     build_params,
     load_config,
     load_randomization,
     apply_randomization,
     validate,
 )
+from brawl_sim.constants import Kind
 
 CONFIGS = Path(__file__).resolve().parent.parent / "configs"
 PRESETS = CONFIGS / "presets"
@@ -61,6 +63,42 @@ def test_single_archetype_preset_pins_sniper():
     cfg, _ = _build_and_validate(overrides=overrides)
     assert cfg.randomize_enemy_types is False
     assert cfg.fixed_enemy_types == ("sniper",) * cfg.n_enemies
+
+
+def test_every_shipped_bot_kind_authors_both_difficulty_axes():
+    """SIM_OVERHAUL_PLAN.md Phase B (Step B1). `validate()` reads 0 as neutral for `hero_focus`
+    and `aggression` so that partial specs keep loading, which means a shipped bot block that
+    FORGETS one loads without complaint and then never scales with the curriculum's tier table:
+    a tier multiplier on a 0 base is 0. So the shipped file must author both on every bot, and
+    this reads them off the BUILT tensors rather than the YAML dict so a misspelled key
+    (`agression:`) fails here too. The hero block authors neither -- nothing reads them for it."""
+    _, params = _build_and_validate()
+    for k, name in enumerate(KIND_YAML_NAMES):
+        if k == int(Kind.HERO_MORTIS):
+            assert float(params.aggression[:, k].max()) == 0, "the hero block authors no aggression"
+            assert float(params.hero_focus[:, k].max()) == 0, "the hero block authors no hero_focus"
+            continue
+        assert float(params.aggression[:, k].min()) > 0, f"{name}: aggression missing or 0"
+        assert 0 < float(params.hero_focus[:, k].min()) <= float(params.hero_focus[:, k].max()) <= 1, (
+            f"{name}: hero_focus missing, 0, or outside (0, 1]"
+        )
+
+
+def test_the_shipped_hero_authors_the_gadget_as_specified_and_no_bot_has_one():
+    """SIM_OVERHAUL_PLAN.md Phase G (Step G1.3), the operator's numbers: an 18 s cooldown, a
+    spinner that flies up to 2 tiles in 0.2 s and deals 2000 in a 1-tile radius. Pinned off the
+    built tensors so a renamed or misspelled key fails here rather than as a gadget that never
+    fires. `gadget_cooldown: 0` on every bot is what "no gadget" means."""
+    _, params = _build_and_validate()
+    h = int(Kind.HERO_MORTIS)
+    assert float(params.gadget_cooldown[0, h]) == 18.0
+    assert float(params.gadget_range[0, h]) == 2.0
+    assert abs(float(params.gadget_flight_seconds[0, h]) - 0.2) < 1e-6
+    assert float(params.gadget_damage[0, h]) == 2000.0
+    assert float(params.gadget_radius[0, h]) == 1.0
+    for k, name in enumerate(KIND_YAML_NAMES):
+        if k != h:
+            assert float(params.gadget_cooldown[:, k].max()) == 0, f"{name} must not have a gadget"
 
 
 def test_randomization_file_ships_fully_commented():

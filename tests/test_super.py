@@ -108,7 +108,7 @@ def test_action_mask_exposes_super_only_when_charged():
     state.ent_dash_t[:, 0] = 0.0
 
     mask = hero.action_mask(state, params, cfg)["attack"]
-    assert mask.shape == (1, 3)
+    assert mask.shape == (1, 4)   # [no-fire, attack, super, gadget] since SIM_OVERHAUL Step G3
     assert bool(mask[0, 0]) and bool(mask[0, 1]) and not bool(mask[0, 2])
 
     state.ent_super_charge[0, 0] = int(params.super_charge_hits[0, _HERO])
@@ -142,11 +142,11 @@ def test_decode_action_maps_two_to_super_and_one_to_attack():
     state.ent_ammo[:, 0] = 3.0
     state.ent_super_charge[0, 0] = int(params.super_charge_hits[0, _HERO])
 
-    _mv, fire, sup = hero.decode_action(torch.tensor([[0, 1]]), state, params, cfg)
+    _mv, fire, sup, _gadget = hero.decode_action(torch.tensor([[0, 1]]), state, params, cfg)
     assert bool(fire[0]) and not bool(sup[0])
-    _mv, fire, sup = hero.decode_action(torch.tensor([[0, 2]]), state, params, cfg)
+    _mv, fire, sup, _gadget = hero.decode_action(torch.tensor([[0, 2]]), state, params, cfg)
     assert not bool(fire[0]) and bool(sup[0])
-    _mv, fire, sup = hero.decode_action(torch.tensor([[0, 0]]), state, params, cfg)
+    _mv, fire, sup, _gadget = hero.decode_action(torch.tensor([[0, 0]]), state, params, cfg)
     assert not bool(fire[0]) and not bool(sup[0])
 
 
@@ -154,7 +154,7 @@ def test_an_uncharged_super_request_is_a_silent_no_op():
     cfg, params = _cfg_and_params()
     state = _state(cfg, params)
     state.ent_super_charge.fill_(0)
-    _mv, _fire, sup = hero.decode_action(torch.tensor([[0, 2]]), state, params, cfg)
+    _mv, _fire, sup, _gadget = hero.decode_action(torch.tensor([[0, 2]]), state, params, cfg)
     assert not bool(sup[0])
 
 
@@ -200,7 +200,7 @@ def test_bolt_pierces_units_and_walls_and_heals_per_player_hit():
     total = torch.zeros(1, cfg.n_entities)
     healed = 0.0
     for _ in range(80):
-        dmg_ent, _dmg_by, _dmg_box, heal_ent = proj.step_projectiles(state, bank, params, cfg)
+        dmg_ent, _dmg_by, _dmg_box, heal_ent, _charge = proj.step_projectiles(state, bank, params, cfg)
         total += dmg_ent
         healed += float(heal_ent[0, 0])
         if not bool(state.prj_alive.any()):
@@ -231,7 +231,7 @@ def test_bolt_never_damages_the_same_victim_twice():
 
     total = 0.0
     for _ in range(200):
-        dmg_ent, _b, _bx, _h = proj.step_projectiles(state, bank, params, cfg)
+        dmg_ent, _b, _bx, _h, _c = proj.step_projectiles(state, bank, params, cfg)
         total += float(dmg_ent[0, 1])
         if not bool(state.prj_alive.any()):
             break
@@ -256,7 +256,7 @@ def test_hit_memory_is_cleared_when_a_slot_is_reused():
         _fire_super(cfg, params, state)
         got = 0.0
         for _ in range(80):
-            dmg_ent, _b, _bx, _h = proj.step_projectiles(state, bank, params, cfg)
+            dmg_ent, _b, _bx, _h, _c = proj.step_projectiles(state, bank, params, cfg)
             got += float(dmg_ent[0, 1])
             if not bool(state.prj_alive.any()):
                 break

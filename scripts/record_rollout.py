@@ -86,7 +86,10 @@ def record_rollout(cfg, steps: int, seed: int = 0, device: str = "cpu", action_s
     try:
         while len(frames) < steps:
             move = torch.randint(0, env.cfg.n_move_bins + 1, (1,), generator=gen, device=device)
-            fire = torch.randint(0, 2, (1,), generator=gen, device=device)
+            # The whole attack column (0 none, 1 attack, 2 super, 3 gadget -- Step G3), so a random
+            # recording shows the super bolt and the gadget spinner too. Illegal picks are silent
+            # no-ops (`hero.decode_action`), so drawing them unmasked is safe.
+            fire = torch.randint(0, env.cfg.action_nvec[1], (1,), generator=gen, device=device)
             env.step(torch.stack([move, fire], dim=1))
     finally:
         env.tick_hook = None

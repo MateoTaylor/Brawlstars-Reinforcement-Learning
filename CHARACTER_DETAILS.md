@@ -59,6 +59,16 @@ config alone.
   damage**, and **heals Mortis 1800 per player hit**. Charged by landing **5 hits on other
   players** — box hits never charge it. Masked out of the action space until ready; the agent sees
   `hero.super_ready` and `hero.super_charge_frac`.
+- **Gadget** (SIM_OVERHAUL_PLAN.md Phase G, operator spec 2026-09): a third value on the attack
+  column with its own **18 s cooldown, which starts fully charged**. On use a spinner flies **up to
+  2 tiles toward the nearest revealed enemy** (along Mortis's facing when none is visible), lands
+  after **0.2 s**, and deals **2000 damage in a 1-tile radius** to every enemy and box inside.
+  Rules: no self-damage; boxes take the damage; it charges no super; using it breaks concealment
+  like any attack but **does not reset the long-dash timer**. Nothing in flight can be hit or
+  blocked (it is an ARTILLERY-class projectile, `Proj.GADGET_SPINNER`). Masked out of the action
+  space while cooling; the agent sees `hero.gadget_ready` and `hero.gadget_charge_frac`. Config:
+  `gadget_cooldown 18.0`, `gadget_range 2.0`, `gadget_flight_seconds 0.2`, `gadget_damage 2000`,
+  `gadget_radius 1.0`; `gadget_cooldown: 0` on every other kind means "no gadget".
 
 ### 2. Brock — `bot_sniper` (was Nani)
 

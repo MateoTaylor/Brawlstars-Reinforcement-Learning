@@ -43,6 +43,26 @@ _FLOAT_TARGETS = (
     ("move_speed", ("move_speed",)),
     ("hp", ("base_hp",)),
     ("damage", ("base_damage",)),
+    # Unclamped on purpose: bots/personality.py clamps each of aggression's READS itself (retreat
+    # threshold, KITE hold scale). A 0 MULTIPLIER cannot happen -- DifficultyTier refuses
+    # `aggression: 0`, because core/stats.aggression_of reads a 0 as the neutral 1.0 and the tier
+    # would silently play like `hard`. A 0 BASE (a kind whose brawlers.yaml omits the key) can:
+    # it stays 0 under any multiplier and is read as that same neutral 1.0, which is what "unset"
+    # means -- pinned by tests/test_training.py::test_manager_clamps_hero_focus_to_one.
+    ("aggression", ("aggression",)),
+)
+
+# (tier multiplier field, SimParams attribute) for per-kind values that are FRACTIONS in [0, 1]:
+# the product is clamped back into that range after scaling, because past 1.0 each of them stops
+# meaning "more of the same" and becomes a different behaviour.
+#   lead_target_fraction > 1  over-leads: aims PAST where the target will be.
+#   hero_focus > 1            `perception.select_target` scales the hero's distance by
+#                             (1 - focus), so it goes NEGATIVE and argmin picks the hero from any
+#                             range, ahead of a bot standing on top of the observer. 1.0 already
+#                             means "the hero whenever visible"; there is nothing above it.
+_UNIT_TARGETS = (
+    ("lead_target", "lead_target_fraction"),
+    ("hero_focus", "hero_focus"),
 )
 
 
@@ -94,14 +114,15 @@ class TierApplier:
                 current = getattr(params, attr)
                 setattr(params, attr, torch.where(write, current * mult, current))
 
-        # lead_target_fraction is a FRACTION: scaling it freely could push a tier past 1.0, which
-        # would mean over-leading the target (aiming past where it will be) rather than "leading
-        # perfectly", so it clamps rather than saturating into a different behavior.
-        mult = self._multiplier("lead_target", tier_idx, ones)
-        lead = params.lead_target_fraction
-        params.lead_target_fraction = torch.where(
-            write, torch.clamp(lead * mult, min=0.0, max=1.0), lead
-        )
+        # Fractions: scaling one freely could push a tier past 1.0 (elite's 1.5 x a 0.9 lead, or
+        # 1.7 x a 0.7 hero_focus), so they clamp rather than saturating into a different
+        # behaviour -- see _UNIT_TARGETS for what "past 1.0" would mean for each.
+        for tier_field, attr in _UNIT_TARGETS:
+            mult = self._multiplier(tier_field, tier_idx, ones)
+            current = getattr(params, attr)
+            setattr(params, attr, torch.where(
+                write, torch.clamp(current * mult, min=0.0, max=1.0), current
+            ))
 
         # decision_period is in TICKS (int64) -- round after scaling, and floor at 1: a period of
         # 0 would mean "re-decide zero times per tick", which the archetype policies read as a
@@ -291,7 +312,7 @@ class CurriculumManager(TierApplier):
 
 def _build_tables(tiers: tuple[DifficultyTier, ...], device) -> dict:
     """{tier field: (T,) float32 tensor}, one row per tier, in `tier_names` order."""
-    fields = [f for f, _ in _FLOAT_TARGETS] + ["lead_target", "decision_period"]
+    fields = [f for f, _ in _FLOAT_TARGETS] + [f for f, _ in _UNIT_TARGETS] + ["decision_period"]
     return {
         name: torch.tensor([getattr(t, name) for t in tiers], dtype=torch.float32, device=device)
         for name in fields

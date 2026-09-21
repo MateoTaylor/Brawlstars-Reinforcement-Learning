@@ -289,6 +289,82 @@ def test_side_by_side_matches_heights_and_keeps_both():
     assert out.shape[1] == 80 + 120
 
 
+def test_stacked_matches_widths_and_keeps_both():
+    """The vertical twin: panels matched on WIDTH, both present, source on top."""
+    src = np.zeros((100, 200, 3), np.uint8)
+    canvas = np.full((60, 80, 3), 255, np.uint8)
+    out = ev._stacked(src, canvas)
+    assert out.shape[1] == 200, "the panels should be matched to the source width"
+    # 200-wide source keeps its 100 rows; the 80x60 canvas scaled to 200 wide is 150 rows.
+    assert out.shape[0] == 100 + ev._STACK_GAP_PX + 150
+    assert out[0].max() == 0, "the source panel is on top"
+    assert out[-1].min() == 255, "the map panel is below it"
+
+
+def test_stacked_width_sets_the_whole_output_width():
+    """`--width` is the short-form knob: it has to drive BOTH panels, or the vstack fails."""
+    src = np.zeros((1126, 2002, 3), np.uint8)
+    canvas = np.full((728, 1176, 3), 255, np.uint8)
+    out = ev._stacked(src, canvas, width=1080)
+    assert out.shape[1] == 1080
+    # 1126 * 1080/2002 = 607 rows of footage and 728 * 1080/1176 = 669 of map, each rounded up
+    # to even so the composite cannot land odd.
+    assert out.shape[0] == 608 + ev._STACK_GAP_PX + 670
+
+
+def test_stacked_keeps_map_cells_square_edged():
+    """The map panel is tile art, so it must be resized with NEAREST. An interpolating filter
+    bevels every cell edge, and at the scale factor a stacked layout needs that is the difference
+    between readable tiles and mush."""
+    canvas = np.zeros((4, 4, 3), np.uint8)
+    canvas[:2, :2] = 255                                   # one hard quadrant boundary
+    out = ev._stacked(np.zeros((4, 40, 3), np.uint8), canvas, width=40)
+    tiles = out[-40:]                                      # the map panel, 40x40
+    assert set(np.unique(tiles)) <= {0, 255}, "interpolation introduced intermediate values"
+
+
+def test_the_stacked_composite_is_always_even_sided():
+    """`VideoSink` forces the stream even and then zero-pads whatever it is handed, so an odd
+    composite is not an error -- it is a black row along the bottom of the whole video, silently.
+    Every width and map extent has to come out even here, not just the one the last render used."""
+    src = np.zeros((1126, 2002, 3), np.uint8)
+    panels = {"policy@28": (728, 1176), "view@28": (1064, 1680), "view@18": (684, 1080),
+              "full": (513, 903)}
+    for width in (None, 1080, 1081, 1092, 1176, 2002):
+        for name, (ch, cw) in panels.items():
+            out = ev._stacked(src, np.zeros((ch, cw, 3), np.uint8), width=width)
+            assert out.shape[0] % 2 == 0, f"odd height at width={width} extent={name}"
+            assert out.shape[1] % 2 == 0, f"odd width at width={width} extent={name}"
+
+
+def test_the_frame_stamp_can_be_turned_off():
+    """It is a diagnostic. Rendering it into footage someone watches burns debug text into the
+    deliverable, so the switch has to exist -- and default to on for every other caller."""
+    import inspect
+    sig = inspect.signature(ev.render)
+    assert sig.parameters["label"].default is True
+
+
+def test_a_width_without_the_stacked_layout_is_refused():
+    """It would read as an output size and silently do nothing on every other layout."""
+    plan = FakePlan()
+    with pytest.raises(ValueError, match="out_width"):
+        ev.render(iter([]), plan, _track([(0.0, 0.0)]), "x.mp4", classifier=None,
+                  layout="side-by-side", out_width=1080)
+
+
+def test_the_stacked_layout_accepts_what_side_by_side_does():
+    """It is the same panels on the other axis, so every gate that admits one must admit the
+    other -- a cropped map_extent above all, which is what a short-form render actually wants."""
+    plan = FakePlan()
+    for kwargs in ({"map_extent": "policy"}, {"map_extent": "view"}):
+        with pytest.raises(ValueError, match="classifier"):
+            # Reaching the classifier check means the layout gate let it through; the layout
+            # itself is never the complaint.
+            ev.render(iter([]), plan, _track([(0.0, 0.0)]), "x.mp4", classifier=None,
+                      layout="stacked", **kwargs)
+
+
 def test_the_view_crop_takes_the_tiles_the_frame_actually_covers():
     """The `view` layout only means anything if the map panel shows the SAME world as the frame
     panel. Put a known class at a known world cell, put the camera somewhere non-trivial, and check

@@ -3,10 +3,12 @@ import torch
 from brawl_sim.constants import (
     BOT_KINDS,
     CHAR_TO_TILE,
+    MAP_CHAR_TO_TILE,
     N_KINDS,
     N_PROJ_CLASSES,
     N_PROJ_KINDS,
     N_TILES,
+    PROJ_CLASS_OF,
     TILE_BLOCKS_PROJ,
     TILE_BLOCKS_UNIT,
     TILE_IS_BOX_SPAWN,
@@ -39,10 +41,20 @@ def test_enum_values():
     assert (Kind.BOT_MELEE, Kind.BOT_RIFLE) == (3, 4)
     assert (Proj.NONE, Proj.SNIPER_BOLT, Proj.ARTILLERY_SHELL, Proj.RIFLE_ARROW) == (0, 1, 2, 3)
     assert Proj.SUPER_BOLT == 4
+    assert (Proj.SPIKE_SHELL, Proj.BULL_SLUG, Proj.GADGET_SPINNER) == (5, 6, 7)
     assert (ProjClass.PROJECTILE, ProjClass.ARTILLERY, ProjClass.HAZARD) == (0, 1, 2)
     assert (DeathCause.ALIVE, DeathCause.COMBAT, DeathCause.ZONE) == (0, 1, 2)
-    assert (N_TILES, N_KINDS, N_PROJ_KINDS, N_PROJ_CLASSES) == (7, 8, 7, 3)
+    assert (N_TILES, N_KINDS, N_PROJ_KINDS, N_PROJ_CLASSES) == (7, 8, 8, 3)
     assert BOT_KINDS == (1, 2, 3, 4, 5, 6, 7)
+
+
+def test_every_projectile_kind_has_a_class_row_and_the_spinner_is_artillery():
+    """`PROJ_CLASS_OF` is indexed by `Proj`, so a member added without a row would index past
+    the table's end at spawn time (or, worse, read the wrong row if one were inserted mid-table).
+    The gadget spinner (Phase G) is ARTILLERY on purpose: nothing in flight, a burst on landing."""
+    assert len(PROJ_CLASS_OF) == len(Proj)
+    assert PROJ_CLASS_OF[Proj.GADGET_SPINNER] is ProjClass.ARTILLERY
+    assert PROJ_CLASS_OF[Proj.NONE] is ProjClass.PROJECTILE
 
 
 def test_enum_widths_match_their_enums():
@@ -107,3 +119,11 @@ def test_char_tile_roundtrip():
     # every tile used by the Step 5 map CSV legend is covered
     for tile in (Tile.FLOOR, Tile.WALL, Tile.BUSH, Tile.WATER, Tile.FENCE, Tile.SPAWN, Tile.BOX):
         assert tile in TILE_TO_CHAR
+
+
+def test_map_vocabulary_is_the_alphabet_without_fence():
+    """Fences are not a sim tile (2026-09). The full alphabet keeps `f` for brawl_vision's label
+    files and terrain classes; the map CSV vocabulary the loader reads does not."""
+    assert set(MAP_CHAR_TO_TILE) == set(CHAR_TO_TILE) - {"f"}
+    assert Tile.FENCE not in MAP_CHAR_TO_TILE.values()
+    assert all(MAP_CHAR_TO_TILE[c] is CHAR_TO_TILE[c] for c in MAP_CHAR_TO_TILE)

@@ -30,7 +30,7 @@ def _run_tick(state, bank, params, cfg, gen, hero_moves=False, hero_fires=False)
                              state.ent_kind, damage, params, cfg)
 
     hero.tick_timers(state, params, cfg)
-    dmg_ent, _dmg_by, _dmg_box, _heal = projectiles.step_projectiles(state, bank, params, cfg)
+    dmg_ent, _dmg_by, _dmg_box, _heal, _charge = projectiles.step_projectiles(state, bank, params, cfg)
     attacker = torch.ones_like(state.ent_last_hit_by)  # only entity 1 ever fires here
     combat.apply_damage(state, dmg_ent, int(DeathCause.COMBAT), attacker, params, cfg)
     # Section 4 phase 15. Not optional: all_bot_intents' decision-period gate is

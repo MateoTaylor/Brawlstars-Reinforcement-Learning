@@ -296,8 +296,8 @@ def test_derived_properties():
     cfg = EnvConfig(n_enemies=6, n_move_bins=16, max_ray_tiles=24.0, los_step_tiles=0.5,
                      action_latency_seconds=0.001, dt=0.05)
     assert cfg.n_entities == 7
-    # 3-valued attack dim as of Step D2: 0 = nothing, 1 = attack, 2 = super.
-    assert cfg.action_nvec == (17, 3)
+    # 4-valued attack dim: 0 = nothing, 1 = attack, 2 = super (Step D2), 3 = gadget (Step G3).
+    assert cfg.action_nvec == (17, 4)
     assert cfg.ray_steps == 48
     assert cfg.action_latency_ticks == 0
     assert cfg.latency_buf_len == 1
@@ -477,6 +477,103 @@ def test_validate_passes_on_default(config_dir):
     validate(cfg, params)  # must not raise
 
 
+# ---- the two difficulty axes (SIM_OVERHAUL_PLAN.md Phase B, Step B1) ---------------------------
+
+def _params_from(cfg, spec):
+    gen = torch.Generator(device="cpu")
+    gen.manual_seed(7)
+    return build_params(cfg, n_envs=4, device="cpu", gen=gen, spec=spec)
+
+
+def test_validate_reads_a_missing_aggression_and_hero_focus_as_neutral(config_dir):
+    """Neither axis is authored in this file's BRAWLERS_YAML, so both resolve to 0, and validate
+    must ACCEPT that: 0 is "no hero preference" and "aggression as authored" (read as 1.0 where
+    it divides), not an error. Requiring them would fail every partial spec in the test suite. The
+    shipped file is pinned separately to author both (tests/test_configs_files.py)."""
+    cfg = load_config(config_dir / "default.yaml")
+    spec = merged_spec()
+    assert "aggression" not in spec["bot_melee"] and "hero_focus" not in spec["bot_melee"]
+    params = _params_from(cfg, spec)
+    assert torch.all(params.aggression == 0) and torch.all(params.hero_focus == 0)
+    validate(cfg, params)  # must not raise
+
+
+def test_validate_rejects_a_negative_aggression_naming_the_kind(config_dir):
+    """aggression DIVIDES the retreat threshold (Step B3), so a negative value would turn "retreat
+    below x% HP" into "charge below x% HP" -- and it names the kind, since seven blocks share the
+    key."""
+    cfg = load_config(config_dir / "default.yaml")
+    spec = merged_spec()
+    spec["bot_melee"]["aggression"] = -0.5
+    with pytest.raises(ValueError, match="bot_melee: aggression"):
+        validate(cfg, _params_from(cfg, spec))
+
+
+@pytest.mark.parametrize("bad", [-0.1, 1.5])
+def test_validate_rejects_a_hero_focus_outside_the_unit_interval(config_dir, bad):
+    """hero_focus discounts the hero's distance by (1 - hero_focus) (Step B2): above 1 the
+    distance goes negative and the hero wins the nearest-target argmin from anywhere, below 0 it
+    is inflated and the bot avoids the hero."""
+    cfg = load_config(config_dir / "default.yaml")
+    spec = merged_spec()
+    spec["bot_sniper"]["hero_focus"] = bad
+    with pytest.raises(ValueError, match="bot_sniper: hero_focus"):
+        validate(cfg, _params_from(cfg, spec))
+
+
+def test_validate_accepts_both_difficulty_axes_at_their_extremes(config_dir):
+    cfg = load_config(config_dir / "default.yaml")
+    spec = merged_spec()
+    spec["bot_sniper"]["hero_focus"] = 1.0
+    spec["bot_sniper"]["aggression"] = 2.5
+    spec["bot_rifle"]["hero_focus"] = 0.0
+    spec["bot_rifle"]["aggression"] = 0.0
+    params = _params_from(cfg, spec)
+    validate(cfg, params)  # must not raise
+    assert float(params.hero_focus[0, 1]) == 1.0 and float(params.aggression[0, 1]) == 2.5
+
+
+# ---- the gadget's per-kind numbers (SIM_OVERHAUL_PLAN.md Phase G, Step G1) --------------------
+
+_GADGET = {"gadget_cooldown": 18.0, "gadget_range": 2.0, "gadget_flight_seconds": 0.2,
+           "gadget_damage": 2000.0, "gadget_radius": 1.0}
+
+
+def test_build_params_loads_the_gadget_for_a_kind_that_authors_it_and_zero_for_the_rest(config_dir):
+    """Per-kind like the super: `gadget_cooldown: 0` IS "no gadget", so a bot block that never
+    mentions the field resolves to a kind without one, and the hero's five numbers land in the
+    hero column only."""
+    cfg = load_config(config_dir / "default.yaml")
+    spec = merged_spec()
+    spec["hero_mortis"].update(_GADGET)
+    params = _params_from(cfg, spec)
+    validate(cfg, params)  # must not raise
+    for field, value in _GADGET.items():
+        column = getattr(params, field)
+        assert torch.all(column[:, 0] == value), field                  # hero_mortis
+        assert torch.all(column[:, 1:5] == 0), f"{field} leaked into a bot column"
+
+
+def test_validate_rejects_a_gadget_cooldown_with_no_geometry(config_dir):
+    """A cooldown with a 0 radius (or range, or flight time) loads without complaint and ships a
+    button whose spinner hits nothing. The message names the kind and the missing field."""
+    cfg = load_config(config_dir / "default.yaml")
+    spec = merged_spec()
+    spec["hero_mortis"].update({**_GADGET, "gadget_radius": 0.0})
+    with pytest.raises(ValueError, match="hero_mortis: gadget_cooldown is set but gadget_radius"):
+        validate(cfg, _params_from(cfg, spec))
+
+
+def test_validate_allows_a_gadget_with_zero_damage_but_not_a_negative_cooldown(config_dir):
+    cfg = load_config(config_dir / "default.yaml")
+    spec = merged_spec()
+    spec["hero_mortis"].update({**_GADGET, "gadget_damage": 0.0})
+    validate(cfg, _params_from(cfg, spec))  # a utility gadget is a legitimate authoring
+    spec["hero_mortis"].update({**_GADGET, "gadget_cooldown": -1.0})
+    with pytest.raises(ValueError, match="hero_mortis: gadget_cooldown must be >= 0"):
+        validate(cfg, _params_from(cfg, spec))
+
+
 def test_validate_view_larger_than_map():
     cfg = EnvConfig(map_h=10, map_w=10, view_h=20, view_w=40)
     with pytest.raises(ValueError):
@@ -499,6 +596,22 @@ def test_validate_action_latency_negative():
     cfg = EnvConfig(action_latency_seconds=-0.1)
     with pytest.raises(ValueError):
         validate(cfg, _dummy_params(cfg))
+
+
+def test_history_config_loads_from_the_observation_block_and_rejects_zero(config_dir):
+    """SIM_OVERHAUL_PLAN.md Phase H (Step H1.1). Both knobs are structural (they size the
+    `hist_*` rings and the H2 observation), so they are EnvConfig fields under `observation:`.
+    This file's DEFAULT_YAML omits them, which must mean the defaults, not an error."""
+    cfg = load_config(config_dir / "default.yaml")
+    assert (cfg.history_frames, cfg.history_radius_tiles) == (3, 4)
+    cfg = load_config(config_dir / "default.yaml",
+                      overrides={"observation": {"history_frames": 2, "history_radius_tiles": 6}})
+    assert (cfg.history_frames, cfg.history_radius_tiles) == (2, 6)
+    validate(cfg, _dummy_params(cfg))  # must not raise
+    for bad in ({"history_frames": 0}, {"history_radius_tiles": 0}):
+        cfg = EnvConfig(**bad)
+        with pytest.raises(ValueError, match=next(iter(bad))):
+            validate(cfg, _dummy_params(cfg))
 
 
 def test_build_params_rejects_a_config_using_a_renamed_key(config_dir):

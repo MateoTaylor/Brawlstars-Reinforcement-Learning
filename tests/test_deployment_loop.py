@@ -1256,3 +1256,170 @@ def test_vision_stack_build_hands_the_detector_pool_settings_to_both_sessions(mo
     loop_mod.VisionStack.build()
     assert seen["_Det"] == {"cpu_threads": None, "spin": True}, "a script running alone keeps the library defaults"
 
+
+
+# -- attack-cadence telemetry (SIM_OVERHAUL_STEPS.md Step A2.1 / A2.2) -------------------------
+#
+# The four columns `scripts/audit_attack_cadence.py --telemetry` reads, plus the two the audit's
+# own definitions turned out to need (the shadow's idle timer for long-dash waiting, and the ammo
+# error behind a resync). Numbers are literals: the reach is 2.67 + 0.70 + 0.40 from
+# configs/brawlers.yaml (hero_mortis) and configs/default.yaml (entities.unit_radius), and the
+# test would be worthless if it re-added them.
+
+def test_dash_reach_is_the_audits_radius_from_the_configs(loop):
+    from brawl_deployment.loop import dash_reach_tiles
+
+    assert loop.reach_tiles == pytest.approx(3.77)
+    assert dash_reach_tiles(loop.shadow.p) == pytest.approx(3.77)
+
+
+def test_a_decision_with_a_legal_attack_and_an_enemy_two_tiles_away_records_both(loop):
+    """A2.2's acceptance: `attack_legal & 0b10` and `enemy_in_reach` on the decision row.
+
+    The SECOND decision: `EntityTracker` confirms a track on its second sighting, and the column
+    follows the tracks the policy was handed, so an enemy is "in reach" from the decision after
+    it first appears -- one decision later than the sim's `vis`, and the same lag the observation
+    itself has."""
+    loop.vision.entities.detections = [_Detection("player", HERO_PX),
+                                       _Detection("enemy", (HERO_PX[0] + 2 * 48, HERO_PX[1]))]
+    _play(loop, loop.decision_every + 1)
+    first, row = _decisions(loop)
+    assert first.enemy_in_reach is False, "one sighting is not yet a track"
+    assert row.attack_legal & 0b10, "a fresh shadow has a full clip and no cooldown"
+    assert row.attack_legal & 0b01, "no-fire is always legal"
+    assert not row.attack_legal & 0b100, "no super charge at match start"
+    assert row.enemy_in_reach is True
+    assert row.attack_cd_shadow == 0.0
+    assert row.attack_idle_t_shadow == 0.0
+    assert row.resync is False and row.resync_error == 0.0
+
+
+def test_an_enemy_past_the_dash_reach_is_not_in_reach(loop):
+    loop.vision.entities.detections = [_Detection("player", HERO_PX),
+                                       _Detection("enemy", (HERO_PX[0] + 4 * 48, HERO_PX[1]))]
+    _play(loop, loop.decision_every + 1)
+    row = _decisions(loop)[1]
+    assert row.enemy_in_reach is False      # 4.0 tiles > 3.77, and the track is confirmed
+    assert row.attack_legal & 0b10
+
+
+def test_the_columns_are_the_shadows_state_the_policy_was_handed(loop):
+    """After a dash the next decision (0.25 s later) has 0.15 s of cooldown left in the shadow
+    (plan section 1.1's walk: the cooldown is set on the sub-tick after the decision)
+    and the attack column is illegal: the bitmask and the timer on that row must agree with each
+    other and with what `policy.act` received. The shadow spends REAL elapsed time and the fixture
+    ticks back to back, so the decision period is advanced by hand."""
+    loop.policy.decision = Decision(move_bin=3, attack=ATTACK_FIRE, legal=(True, True, False))
+    _play(loop, 1)
+    first = _decisions(loop)[0]
+    assert first.attack == ATTACK_FIRE and first.attack_legal & 0b10
+    loop.shadow.advance(0.25)                # five sub-ticks: the dash runs, 0.15 s of cooldown left
+    for _ in range(loop.decision_every):
+        loop.tick()
+    second = _decisions(loop)[1]
+    assert second.attack_legal == 0b001, "0.35 s cooldown, 0.25 s later: only no-fire is legal"
+    assert second.attack_cd_shadow == pytest.approx(0.15, abs=1e-6)
+    assert second.attack == ATTACK_NONE, "the shadow refused the pick, and the row says what was sent"
+    # The dash zeroed the long-dash timer on sub-tick 1; the four sub-ticks after it count up.
+    assert second.attack_idle_t_shadow == pytest.approx(0.20, abs=1e-6)
+
+
+def test_a_resync_lands_on_the_row_with_the_ammo_error_that_tripped_it(loop, monkeypatch):
+    """`resync` is a fact about the shadow (it reseeds `attack_cd` to a full cooldown, so the
+    mask on the same row is the post-resync one), and `resync_error` is CV minus shadow: +3.0
+    here, a full clip the game kept while the shadow had spent it."""
+    from brawl_deployment.loop import TickRow
+
+    _play(loop, 2)
+    _force_desync(loop, monkeypatch, ammo=3.0)
+    row = TickRow(index=0, t=0.0, grab_ms=0.0)
+    loop._read_own_bars(loop.capture.image, [_Detection("player", HERO_PX)], row)
+    assert row.resync is True
+    assert row.resync_error == 3.0
+    assert float(loop.shadow.attack_cd) == pytest.approx(0.35)
+
+
+def test_a_telemetry_record_without_the_cadence_columns_still_loads():
+    """Old `--telemetry` CSVs predate Step A2. Missing columns take the field defaults; the
+    required positional fields still have to be there."""
+    from brawl_deployment.loop import TickRow
+
+    old = {"index": "7", "t": "0.35", "grab_ms": "1.5", "phase": "playing", "tick_ms": "40.0",
+           "odometry": "ok", "warmup": "False", "decision": "True", "move_bin": "3",
+           "attack": "1", "n_detections": "2", "ammo_cv": "2.0", "ammo_shadow": "2.0",
+           "lattice": "locked", "phase_x": "0.1", "phase_y": "-0.2", "note": ""}
+    row = TickRow.from_record(old)
+    assert (row.index, row.t, row.decision, row.move_bin, row.attack) == (7, 0.35, True, 3, 1)
+    assert row.warmup is False
+    assert (row.attack_legal, row.attack_cd_shadow, row.attack_idle_t_shadow) == (-1, -1.0, -1.0)
+    assert row.enemy_in_reach is False and row.resync is False and row.resync_error == 0.0
+    with pytest.raises(KeyError):
+        TickRow.from_record({"t": "0.0", "grab_ms": "0.0"})
+    # A stringly "False" is False, not truthy text.
+    assert TickRow.from_record(dict(old, enemy_in_reach="False", resync="True")).resync is True
+    assert TickRow.from_record(dict(old, enemy_in_reach="False")).enemy_in_reach is False
+
+
+def test_write_csv_and_read_telemetry_csv_round_trip_the_cadence_columns(loop, tmp_path):
+    from brawl_deployment.loop import read_telemetry_csv
+
+    loop.vision.entities.detections = [_Detection("player", HERO_PX),
+                                       _Detection("enemy", (HERO_PX[0] + 2 * 48, HERO_PX[1]))]
+    _play(loop, 4)
+    path = tmp_path / "run.csv"
+    loop.write_csv(path)
+    back = read_telemetry_csv(path)
+    assert [r.index for r in back] == [r.index for r in loop.telemetry]
+    decisions = [r for r in back if r.decision]
+    assert len(decisions) == 2
+    assert decisions[1].attack_legal == 0b011 and decisions[1].enemy_in_reach is True
+    assert decisions[1].attack_cd_shadow == 0.0
+    held = [r for r in back if not r.decision]
+    assert all(r.attack_legal == -1 and r.enemy_in_reach is False for r in held)
+
+
+# -- Step A2 review: the audit's `ammo` and the reach's brawler kind ------------------------------
+
+def test_the_shadows_clip_is_recorded_even_when_the_frame_has_no_hero_box(loop):
+    """`ammo_shadow` is what `scripts/audit_attack_cadence.py --telemetry` reads as the row's
+    ammo, next to `attack_legal`. The shadow has a clip whether or not the detector found the
+    hero this frame, so the column is written before the hero-box early return -- a `-1.0`
+    sentinel beside a valid mask would reach the audit as a clip size (Step A2 review)."""
+    from brawl_deployment.loop import TickRow
+
+    _play(loop, 2)
+    row = TickRow(index=0, t=0.0, grab_ms=0.0)
+    loop._read_own_bars(loop.capture.image, [], row)     # no `player` box at all
+    assert row.ammo_shadow == 3.0, "a fresh shadow's full clip, not the sentinel"
+    assert row.ammo_cv == -1.0, "and no CV read to put beside it"
+    assert row.resync is False
+
+
+def test_a_decision_taken_while_the_hero_track_coasts_carries_the_shadows_ammo(loop):
+    """The reviewer's probe: `EntityTracker` keeps the hero track for up to three misses, so a
+    decision can proceed on a frame with no `player` box. The cadence columns on that row are
+    valid and its `ammo_shadow` must be the shadow's clip, not `-1.0`. (The real `HealthTracker`
+    emits no hero reading on such a frame and the loop skips with "no hero hp" first; this
+    fixture's health fake keeps reading, which is exactly what lets the row be exercised.)"""
+    _play(loop, 1)                                        # first decision: hero seen, track made
+    loop.vision.entities.detections = []                  # the box drops; the track coasts
+    for _ in range(loop.decision_every):
+        loop.tick()
+    first, second = _decisions(loop)
+    assert second.attack_legal == 0b011 and second.note == ""
+    assert second.ammo_shadow == 3.0
+    assert second.ammo_cv == -1.0
+
+
+def test_the_reach_and_the_shadow_share_one_brawler_kind(loop):
+    """`ShadowParams` does not record which brawlers.yaml block it came from, so the loop names
+    the kind once (`HERO_KIND`) and hands it to both `ShadowParams.load` and `dash_reach_tiles`;
+    a second default in either would let `dash_distance` and `dash_radius` come from two
+    brawlers. Numbers are Mortis's, as literals."""
+    from brawl_deployment.loop import HERO_KIND, dash_reach_tiles
+
+    assert HERO_KIND == "hero_mortis"
+    assert float(loop.shadow.p.dash_distance) == pytest.approx(2.67)
+    assert dash_reach_tiles(loop.shadow.p, kind=HERO_KIND) == pytest.approx(3.77)
+    with pytest.raises(KeyError, match="hero_nobody"):
+        dash_reach_tiles(loop.shadow.p, kind="hero_nobody")

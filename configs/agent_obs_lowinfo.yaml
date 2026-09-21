@@ -19,7 +19,7 @@
 #                   there, where it is, how fast it is closing and how much HP it has left, but
 #                   not whether it is a sniper or a Bull.
 #
-#   projectiles  -- everything but the kinematics dropped: kind_onehot (7), class_onehot (3),
+#   projectiles  -- everything but the kinematics dropped: kind_onehot (8), class_onehot (3),
 #                   damage, aoe, threatens_hero. A projectile is reduced to a moving dot.
 #
 # The non-obvious drops in that second list, spelled out because re-adding one by reflex would

@@ -60,6 +60,18 @@ run:
       # override is scoped to TRAINING, where nothing reads it. Turn it back on here if you add an
       # agent_obs group that consumes `world`.
       include_world_grid: false
+    world:
+      # THE TRAINING ROTATION: configs/default.yaml's sixteen maps minus the two in
+      # `eval.holdout_maps` below (SIM_OVERHAUL_PLAN.md Step M4, 2026-09-18). A list in an
+      # override REPLACES the base list, it is not merged into it, so this is the whole rotation:
+      # a map added to default.yaml does not train until it is also added here.
+      # default.yaml keeps all sixteen because it is the SIM's list (tests/test_maps.py, the tools);
+      # only what a run trains on is decided here. `python scripts/train.py` refuses to start if a
+      # holdout map is also in this list. Everything under `eval/` except `eval/holdout_*` is
+      # measured on exactly these fourteen.
+      maps: [open, bushy, skull_creek, feast_or_famine, scorched_stone, island_invasion,
+             broken_wall, stone_fort, twin_ponds, cross_creek, narrow_pass,
+             dry_gulch, thorn_field, reed_marsh]
 
   info_mode: episode            # minimal | episode | full. "episode" is the MINIMUM the
                                 # curriculum needs -- it is what carries info["outcome"].
@@ -141,6 +153,13 @@ reward:
   cube_pickup: 0.5              # x power cubes the hero collected this tick -- see above
   survive_per_step: 0.0       # flat, every tick the hero is alive
   in_zone_per_step: -0.05       # flat, every tick the hero is outside the safe rect
+  # ADDED 2026-09-21 (SIM_OVERHAUL_PLAN.md §9 R2, operator-approved). x attacks and supers the hero
+  # made while an enemy it can see stood inside its uncharged dash reach (2.67 + 0.70 + 0.40 = 3.77
+  # tiles) -- the cadence audit's utilization criterion, which A1 measured at 0.339. At most one
+  # per decision. Small on purpose: a twelfth of the 0.6 a landed 2000 hit pays, 1/60 of a kill, and
+  # about 3 over a whole episode of attacking in reach, against 10 for a win. It also pays a dash
+  # away from that enemy, and a miss; 0 turns it off.
+  attack_in_reach: 0.05
   scale: 1.0                    # multiplies the whole sum; a global volume knob
 
 # Stationary evaluation. Periodically plays a small, FIXED set of matches against each difficulty
@@ -155,7 +174,9 @@ reward:
 # TensorBoard chart, `eval/win_rate`, with a line per tier (written to logs/eval_<tier>/).
 # `best_model.zip` is saved whenever the mean win rate across tiers improves.
 #
-# Cost: one rollout of `len(tiers) * episodes_per_tier` envs, ALL RUN IN PARALLEL, bounded by
+# Cost PER EVALUATOR -- and with `eval.holdout_maps` set (it is, below) there are TWO, so every
+# figure in this block is paid twice; see the COST note on holdout_maps. One evaluator is
+# one rollout of `len(tiers) * episodes_per_tier` envs, ALL RUN IN PARALLEL, bounded by
 # sim.max_episode_steps ticks (3000) -- that tick cap does NOT scale with episodes_per_tier, since
 # raising it only widens the batch, not the number of sequential rounds. This env is built ONCE
 # and held in VRAM for the whole run (TierEvaluator is eager, not rebuilt per eval) -- a permanent
@@ -172,16 +193,42 @@ reward:
 # especially early on before episodes end quickly.
 eval:
   enabled: true
-  every_timesteps: 5_000_000      # decisions; = the pre-action_repeat 15M sim ticks. Each eval
-                                  # takes ~6-10 min wall-clock at episodes_per_tier=1000
-                                  # (measured), so this keeps cumulative eval overhead to roughly
-                                  # an hour. The eval rollout itself is now bounded by
-                                  # cfg.max_agent_steps (600) rather than 3000 step() calls.
+  every_timesteps: 5_000_000      # decisions; = the pre-action_repeat 15M sim ticks. ONE eval
+                                  # rollout took ~6-10 min wall-clock at 4 tiers x
+                                  # episodes_per_tier=1000 (measured before the holdout eval
+                                  # existed). That is no longer this file's
+                                  # cost: it now runs 6 tiers x 300, TWICE per eval (training
+                                  # maps, then holdout_maps below), ~92 times over 450M
+                                  # decisions. NOT re-measured; time the at_start eval of the
+                                  # next run and size every_timesteps / episodes_per_tier from
+                                  # that. Each rollout is bounded by cfg.max_agent_steps (600)
+                                  # decisions rather than 3000 step() calls.
   episodes_per_tier: 300
   tiers: []                     # empty = every tier under curriculum.tiers below
   deterministic: true           # argmax actions; lower variance, the usual choice for eval
   seed: 999983                  # unrelated to run.seed, so eval scenarios aren't ones seen in training
   at_start: true                # one eval before training starts, as the baseline
+  # MAP-OVERFITTING EVAL (SIM_OVERHAUL_PLAN.md Step M4). Maps the run NEVER trains on: they are
+  # absent from `run.env_overrides.world.maps` above, and the config is refused if one is not.
+  # One standard point-symmetric map and one water_border map (families: brawl_sim/maps/README.md).
+  # A second evaluator, identical to the first (same tiers, episodes_per_tier, seed, pinned bots)
+  # except that its map bank holds ONLY these, runs right after it at every eval and logs
+  #   eval/holdout_win_rate_<tier>, eval/holdout_win_rate (mean over tiers; mirrors
+  #   eval/win_rate_mean), eval/holdout_gap (= win_rate_mean - holdout_win_rate),
+  #   and tag eval/holdout_win_rate in each logs/eval_<tier>/ (one overlaid chart, a line per tier
+  #   PLUS the run's own line on the same tag, which is the mean; eval/win_rate's mean is the
+  #   separate eval/win_rate_mean chart).
+  # Read the gap's TREND from the at_start row onward, not its sign: two maps are not exactly as
+  # hard as the other fourteen, so an untrained policy already shows a small non-zero gap. A gap
+  # that widens while eval/win_rate_mean climbs is the policy memorizing maps.
+  # `best_model.zip` is still picked on the TRAINING-map mean alone -- choosing the checkpoint by
+  # its holdout score would fit the choice to these two maps and spend the holdout.
+  # COST: eval wall-clock roughly DOUBLES (a second rollout of len(tiers) * episodes_per_tier envs
+  # per eval, ~92 evals over this file's 450M decisions), and a second eval env of that size is
+  # held in VRAM for the whole run (see the memory note above; NOT re-measured with two eval envs
+  # at 6 tiers x 300). Set to [] or null to switch the holdout eval off; a `--set
+  # run.env_overrides=...` that changes world.maps must keep these two out of it.
+  holdout_maps: [split_river, hollow_ring]
 
 # ---------------------------------------------------------------------------------------------
 # Difficulty curriculum.
@@ -205,8 +252,8 @@ eval:
 # its own elite. One stage (hard_lean) cleared in 28 decisions, entirely on episodes started under
 # the stage before it. That is why the skip rule above exists. What changed:
 #   - the walk starts where the old one's fourth stage was ({medium 0.3, hard 0.7})
-#   - `veteran` is the OLD elite verbatim, so its eval column compares with that run's elite
-#   - `expert` and the new `elite` step up to 2x HP, 1.75x damage, and near-perfect aim and leading
+#   - `veteran` was the OLD elite verbatim, `expert` and `elite` stepped up to 2x HP, 1.75x damage
+#     (both superseded 2026-09-18: the tier CONTENTS were retuned, see the note above `tiers:`)
 #   - gates are 0.35 on a 2000-episode window; no stage may hold the run past 75M decisions
 curriculum:
   enabled: true
@@ -225,17 +272,28 @@ curriculum:
   #   move_speed      x move_speed
   #   hp              x base_hp
   #   damage          x base_damage
+  #   aggression      x aggression (base 1.0 on every bot)     (HIGHER = retreats at lower HP, a
+  #                                                             KITE holds closer, a CAMPER fires
+  #                                                             on sight from 1.25 up). Must be > 0.
+  #   hero_focus      x hero_focus (base 0.5), clamped to [0,1] (HIGHER = prefers the hero: he is
+  #                                                             picked when his distance x
+  #                                                             (1 - focus) beats the nearest bot's)
   #
-  # Listed weakest to strongest (tests/test_training.py holds every knob to that order). `easy`,
-  # `medium` and `hard` are unchanged from earlier runs, so their eval columns still compare;
-  # `easy` is in no stage and is kept only as that yardstick. `move_speed` stays 1.0 at every tier
-  # above hard on purpose: Mortis (2.73 tiles/s) is only 6-14% faster than the ranged bots
-  # (2.40-2.57) and Edgar already matches him, so a faster bot could kite him forever. That would
-  # make a matchup unwinnable rather than hard.
+  # Listed weakest to strongest (tests/test_training.py holds every knob to that order).
+  # RETUNED 2026-09-18 (SIM_OVERHAUL_PLAN.md Step B4): HP and damage are capped at 1.5x, and what
+  # separates the tiers is now accuracy, aggression and how hard the bots favor the hero. Below
+  # hard those fall faster than HP/damage (an easy bot is a bad shot that runs away, not a paper
+  # bot); above hard they keep climbing while HP/damage plateau. `hard` is still "brawlers.yaml as
+  # authored", but brawlers.yaml itself now authors hero_focus 0.5, so NO tier's eval column
+  # compares with a run from before this date. `easy` is in no stage and is kept only as the
+  # bottom yardstick. `move_speed` stays 1.0 at every tier above hard on purpose: Mortis
+  # (2.73 tiles/s) is only 6-14% faster than the ranged bots (2.40-2.57) and Edgar already matches
+  # him, so a faster bot could kite him forever. That would make a matchup unwinnable rather than
+  # hard.
   #
-  # The elite `hp: 2.0` takes the largest possible normalized `entities.hp` (a bull at 16 cubes)
-  # to 1.32. That is past the 1.0 that obs_select's _NORM_HP_SCALE aims for. It is left that way
-  # because the deployed checkpoints share that constant, and nothing clips the value.
+  # The elite `hp: 1.5` takes the largest possible normalized `entities.hp` (a 10000-HP Bull or
+  # Buzz at 16 cubes: 10000 x 1.5 + 16 x 400 = 21400) to 1.07. That is just past the 1.0 that
+  # obs_select's _NORM_HP_SCALE (20000) aims for, and nothing clips the value.
   tiers:
     easy:
       aim_noise: 3.0
@@ -245,14 +303,18 @@ curriculum:
       move_speed: 0.90
       hp: 0.75
       damage: 0.70
+      aggression: 0.6           # HUNTER/KITE retreat below 58% HP (0.35 / 0.6), not 35%
+      hero_focus: 0.0           # -> 0.00: no preference, the hero is just another target
     medium:
       aim_noise: 1.8
       reaction_delay: 1.6
       lead_target: 0.60
       decision_period: 1.5
       move_speed: 0.95
-      hp: 1.0
+      hp: 0.90
       damage: 0.85
+      aggression: 0.8
+      hero_focus: 0.4           # -> 0.20
     hard:                       # brawlers.yaml exactly as authored -- the reference bot
       aim_noise: 1.0
       reaction_delay: 1.0
@@ -261,30 +323,38 @@ curriculum:
       move_speed: 1.0
       hp: 1.0
       damage: 1.0
-    veteran:                    # the pre-2026-09-13 `elite`, verbatim
+      aggression: 1.0
+      hero_focus: 1.0           # -> 0.50: the hero at 7 tiles beats a bot at 4
+    veteran:
       aim_noise: 0.6
       reaction_delay: 0.6
       lead_target: 1.0
       decision_period: 1.0
       move_speed: 1.0
-      hp: 1.25
-      damage: 1.20
-    expert:                     # about halfway from veteran to elite on every knob
+      hp: 1.15
+      damage: 1.15
+      aggression: 1.2
+      hero_focus: 1.3           # -> 0.65
+    expert:
       aim_noise: 0.4
       reaction_delay: 0.45
       lead_target: 1.25
       decision_period: 0.75     # 4-tick deciders re-decide every 3; 2-tick ones stay at 2
       move_speed: 1.0
-      hp: 1.6
-      damage: 1.45
-    elite:                      # operator spec: 2x health, 1.75x damage, very good aim
-      aim_noise: 0.25           # Brock's rocket bearing sd 0.06 -> 0.015 rad (0.9 deg)
-      reaction_delay: 0.35
+      hp: 1.30
+      damage: 1.30
+      aggression: 1.4           # past 1.25: an unseen CAMPER fires on sight from here up
+      hero_focus: 1.5           # -> 0.75
+    elite:                      # operator spec (S1): 1.5x health and damage, the rest is skill
+      aim_noise: 0.20           # Brock's rocket bearing sd 0.06 -> 0.012 rad (0.7 deg)
+      reaction_delay: 0.30
       lead_target: 1.5          # clamps at 1.0: every leading bot leads fully, Grom to 0.9
       decision_period: 0.5      # re-decides twice as often
       move_speed: 1.0
-      hp: 2.0
-      damage: 1.75
+      hp: 1.50
+      damage: 1.50
+      aggression: 1.7           # retreats below 21% HP (0.35 / 1.7)
+      hero_focus: 1.7           # -> 0.85: the hero at 13 tiles still beats a bot at 2
 
   # Walked in order. `tier_weights` need not sum to 1 -- they are normalized. Each stage's mixture
   # is at least as strong as the one before it at every tier boundary, which the tests check.

@@ -13,6 +13,18 @@ def gather_kind(param_nk: torch.Tensor, kind_ne: torch.Tensor) -> torch.Tensor:
     return param_nk.gather(1, kind_ne)
 
 
+def aggression_of(kind: torch.Tensor, params) -> torch.Tensor:
+    """(N,E) f32 `params.aggression` gathered per entity, with 0 read as 1.0.
+
+    The ONE place that read happens (SIM_OVERHAUL_PLAN.md Step B3). B1 left a missing
+    `aggression` key resolving to 0 so hand-built partial specs still validate, and every consumer
+    DIVIDES by this value (the HUNTER/KITE retreat threshold, the KITE hold distance) or compares
+    it against 1.25 (the CAMPER fire veto) -- so 0 has to mean "the bot as authored", never "divide
+    by zero" or "maximally timid". validate() already rejects negatives, hence `> 0` not `!= 0`."""
+    a = gather_kind(params.aggression, kind)
+    return torch.where(a > 0, a, torch.ones_like(a))
+
+
 def is_hero(kind: torch.Tensor) -> torch.Tensor:
     return kind == _HERO_KIND
 
@@ -39,6 +51,19 @@ def effective_max_hp(kind: torch.Tensor, cubes: torch.Tensor, params) -> torch.T
 
 def effective_damage(kind: torch.Tensor, cubes: torch.Tensor, params) -> torch.Tensor:
     base = gather_kind(params.base_damage, kind)
+    bonus = 1.0 + params.cube_damage_bonus.unsqueeze(-1) * cubes.to(base.dtype)
+    mult = torch.where(is_hero(kind), torch.ones_like(base), params.enemy_damage_mult.unsqueeze(-1))
+    return base * bonus * mult
+
+
+def effective_gadget_damage(kind: torch.Tensor, cubes: torch.Tensor, params) -> torch.Tensor:
+    """`effective_damage` on `gadget_damage` instead of `base_damage` (SIM_OVERHAUL_PLAN.md
+    Step G2 / A-G1): the SAME cube bonus and the same enemy multiplier, so a cube-stacked Mortis's
+    spinner grows at exactly the rate his attack does (2000 -> 2600 at 3 cubes, like 2000 -> 2600
+    for the attack). Kept as its own function rather than scaling `effective_damage` by
+    `gadget_damage / base_damage`, which divides by zero for any kind whose `base_damage` is 0.
+    A kind with no gadget (`gadget_damage: 0`, every bot today) resolves to 0."""
+    base = gather_kind(params.gadget_damage, kind)
     bonus = 1.0 + params.cube_damage_bonus.unsqueeze(-1) * cubes.to(base.dtype)
     mult = torch.where(is_hero(kind), torch.ones_like(base), params.enemy_damage_mult.unsqueeze(-1))
     return base * bonus * mult

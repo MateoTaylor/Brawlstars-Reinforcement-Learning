@@ -89,9 +89,27 @@
 #   base_hp, base_damage, move_speed, attack_range, max_ammo, reload_seconds, attack_cooldown
 #   desired_range_fraction   <- the fraction of its own range a KITE bot of this kind holds.
 #                               `validate()` REJECTS a kind with an attack_range and no fraction:
-#                               0 would make a kite charge to point blank.
+#                               0 would make a kite charge to point blank. Neither the tier-scaled
+#                               hold nor the point a kiter walks in to passes its fire reach
+#                               (fire_range_fraction x attack_range; bots/policy.targeting).
 #   aim_model                <- DIRECT | LEAD | LOB. Defaults to DIRECT (no lead, no noise), which
 #                               is the SAFE default, not the good one -- say what you mean.
+#
+# Authored on every bot (SIM_OVERHAUL_PLAN.md Phase B: the two difficulty axes). Both are per-kind
+# BASES that the curriculum multiplies per tier -- the `aggression` and `hero_focus` columns of the
+# tier table in configs/train.yaml (brawl_sim/training/config.TIER_FIELDS, Step B4) -- so a block
+# that leaves one out does not fail to load, it just never scales: a multiplier on 0 is 0.
+# tests/test_configs_files.py pins that every bot block below authors both.
+#   hero_focus               <- 0..1. How strongly the bot prefers the hero as a target while the
+#                               hero is in view: the hero's distance is discounted by
+#                               (1 - hero_focus) before the nearest-target pick
+#                               (bots/perception.select_target, Step B2). 0 = no preference,
+#                               1 = the hero whenever it is seen. `validate()` rejects anything
+#                               outside [0, 1].
+#   aggression               <- 1.0 = the bot as authored. Divides the retreat HP threshold and the
+#                               KITE hold distance, and lets a CAMPER fire on sight at >= 1.25
+#                               (bots/personality.py and bots/policy.py, Step B3). 0 is read as
+#                               1.0; `validate()` rejects a negative value.
 #
 # Optional, all of which mean "off" at 0 / unset:
 #   fire_needs_los                     require a physical line before firing (straight shots)
@@ -159,6 +177,18 @@ hero_mortis:                        # Undertaker / mortis -- characters.csv, Und
   super_heal: 1800                  # per PLAYER hit; boxes heal nothing and never charge it
   super_proj_speed: 12.0            # not specified; fast enough to read as a committed strike
   super_radius: 0.70                # "same radius as his normal attack" = dash_radius
+  # --- Gadget (SIM_OVERHAUL_PLAN.md Phase G, operator spec 2026-09). A third value on the attack
+  # column with its own cooldown, which STARTS CHARGED (state.ent_gadget_cd is 0 = ready, and 0 is
+  # what a reset leaves). On use a Proj.GADGET_SPINNER flies up to `gadget_range` toward the
+  # nearest revealed enemy (along Mortis's facing when none is visible), lands after
+  # `gadget_flight_seconds`, and deals `gadget_damage` to every enemy AND box within
+  # `gadget_radius`. No self-damage, charges no super, does not reset the long-dash timer.
+  # `gadget_cooldown: 0` on every OTHER kind is what means "no gadget" -- see core/hero.gadget_ready.
+  gadget_cooldown: 18.0
+  gadget_range: 2.0
+  gadget_flight_seconds: 0.2
+  gadget_damage: 2000
+  gadget_radius: 1.0
 
 bot_sniper:                         # grounded in BROCK (was Nani) -- see CHARACTER_DETAILS.md
   base_hp: 6000                     # B1 (was 5000)
@@ -203,6 +233,10 @@ bot_sniper:                         # grounded in BROCK (was Nani) -- see CHARAC
   fire_needs_los: true
   aim_model: LEAD
   desired_range_fraction: 0.85     # was policy.RANGE_FRACTION_BY_KIND[1]
+  # --- difficulty axes (Phase B). Bases for the per-tier `hero_focus` / `aggression` multipliers
+  # in configs/train.yaml; the glossary at the top of this file says what each drives.
+  hero_focus: 0.5
+  aggression: 1.0
   aim_noise_std_rad: 0.06
   reaction_delay: 0.15
   lead_target_fraction: 0.9
@@ -269,6 +303,10 @@ bot_artillery:                      # grounded in GROM (was Dynamike) -- see CHA
   fire_needs_los: false
   aim_model: LOB
   desired_range_fraction: 0.7      # was policy.RANGE_FRACTION_BY_KIND[2]
+  # --- difficulty axes (Phase B). Bases for the per-tier `hero_focus` / `aggression` multipliers
+  # in configs/train.yaml; the glossary at the top of this file says what each drives.
+  hero_focus: 0.5
+  aggression: 1.0
   aim_noise_tiles: 0.8
   reaction_delay: 0.25
   lead_target_fraction: 0.6
@@ -314,6 +352,10 @@ bot_melee:                          # grounded in BUZZ (was El Primo) -- see CHA
   fire_needs_los: false
   aim_model: DIRECT
   desired_range_fraction: 0.5      # was policy.RANGE_FRACTION_BY_KIND[3]
+  # --- difficulty axes (Phase B). Bases for the per-tier `hero_focus` / `aggression` multipliers
+  # in configs/train.yaml; the glossary at the top of this file says what each drives.
+  hero_focus: 0.5
+  aggression: 1.0
   aim_noise_std_rad: 0.10
   reaction_delay: 0.10
   lead_target_fraction: 0.0
@@ -352,6 +394,10 @@ bot_rifle:                          # grounded in SHELLY (was Bo) -- see CHARACT
   fire_lateral_hold_range_fraction: 0.6
   aim_model: LEAD
   desired_range_fraction: 0.75     # was policy.RANGE_FRACTION_BY_KIND[4]
+  # --- difficulty axes (Phase B). Bases for the per-tier `hero_focus` / `aggression` multipliers
+  # in configs/train.yaml; the glossary at the top of this file says what each drives.
+  hero_focus: 0.5
+  aggression: 1.0
   aim_noise_std_rad: 0.08
   reaction_delay: 0.20
   lead_target_fraction: 0.7
@@ -398,6 +444,10 @@ bot_edgar:                          # EDGAR -- named for the brawler, not a role
   fire_needs_los: false
   aim_model: DIRECT
   desired_range_fraction: 0.5
+  # --- difficulty axes (Phase B). Bases for the per-tier `hero_focus` / `aggression` multipliers
+  # in configs/train.yaml; the glossary at the top of this file says what each drives.
+  hero_focus: 0.5
+  aggression: 1.0
   aim_noise_std_rad: 0.10
   reaction_delay: 0.10
   lead_target_fraction: 0.0
@@ -474,6 +524,10 @@ bot_spike:                          # SPIKE -- named for the brawler, not a role
   fire_needs_los: true
   aim_model: LOB
   desired_range_fraction: 0.75
+  # --- difficulty axes (Phase B). Bases for the per-tier `hero_focus` / `aggression` multipliers
+  # in configs/train.yaml; the glossary at the top of this file says what each drives.
+  hero_focus: 0.5
+  aggression: 1.0
   # Non-zero for a LOB kind is not optional decoration. With no positional noise a bot aims at a
   # stationary target's exact position, the shell lands on it bit for bit, and the ring of shards
   # spawns just outside the one body it was aimed at -- the shot that should hurt most does
@@ -526,6 +580,10 @@ bot_bull:                           # BULL -- named for the brawler, not a role 
   # brawler fighting at the edge of its reach with the weakest per-pellet spread it has; 0.6 puts
   # him at 4.2 tiles, where enough of the fan connects to justify the health he is spending.
   desired_range_fraction: 0.6
+  # --- difficulty axes (Phase B). Bases for the per-tier `hero_focus` / `aggression` multipliers
+  # in configs/train.yaml; the glossary at the top of this file says what each drives.
+  hero_focus: 0.5
+  aggression: 1.0
   aim_noise_std_rad: 0.08
   reaction_delay: 0.20
   lead_target_fraction: 0.7

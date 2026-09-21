@@ -15,6 +15,7 @@ from brawl_sim.bots import perception, personality, policy
 from brawl_sim.bots.personality import Mode
 from brawl_sim.constants import Kind, Person, Tile
 from brawl_sim.core import geometry as geo
+from brawl_sim.core import stats
 
 
 def _move(state, bank, params, cfg, gen):
@@ -154,13 +155,13 @@ def test_camper_does_not_fire_until_something_can_see_it():
     _vis, tgt = build_targeting(state, bank, params, cfg)
     assert bool(tgt.has_enemy[0, 1])          # it has a target
     assert not bool(tgt.seen_by_other[0, 1])  # but nobody can see it
-    assert not bool(personality.fire_allowed(state, tgt, cfg)[0, 1])
+    assert not bool(personality.fire_allowed(state, tgt, stats.aggression_of(state.ent_kind, params), cfg)[0, 1])
 
     # Step inside the reveal radius and the camper is exposed -- and opens fire.
     state.ent_pos[0, 0] = torch.tensor([13.5 - (bush_reveal - 0.5), 10.5])
     _vis, tgt = build_targeting(state, bank, params, cfg)
     assert bool(tgt.seen_by_other[0, 1])
-    assert bool(personality.fire_allowed(state, tgt, cfg)[0, 1])
+    assert bool(personality.fire_allowed(state, tgt, stats.aggression_of(state.ent_kind, params), cfg)[0, 1])
 
 
 def test_camper_fires_back_at_a_spotter_that_is_not_its_own_target():
@@ -179,7 +180,7 @@ def test_camper_fires_back_at_a_spotter_that_is_not_its_own_target():
 
     _vis, tgt = build_targeting(state, bank, params, cfg)
     assert bool(tgt.seen_by_other[0, 1])
-    assert bool(personality.fire_allowed(state, tgt, cfg)[0, 1])
+    assert bool(personality.fire_allowed(state, tgt, stats.aggression_of(state.ent_kind, params), cfg)[0, 1])
 
 
 def test_camper_abandons_its_bush_when_the_zone_closes_to_two_tiles():
@@ -368,7 +369,7 @@ def test_trapper_fires_freely_unlike_a_camper():
 
     _vis, tgt = build_targeting(state, bank, params, cfg)
     assert not bool(tgt.seen_by_other[0, 1])
-    assert bool(personality.fire_allowed(state, tgt, cfg)[0, 1])  # shoots anyway
+    assert bool(personality.fire_allowed(state, tgt, stats.aggression_of(state.ent_kind, params), cfg)[0, 1])  # shoots anyway
 
 
 def test_trapper_drifts_to_a_different_bush_when_idle():
@@ -634,3 +635,178 @@ def test_a_camper_never_shoots_a_box():
         state.box_pos[0, 0] = torch.tensor([14.5, 10.5])
         _vis, tgt = build_targeting(state, bank, params, cfg)
         assert bool(tgt.is_box[0, 1]) is expected, person
+
+
+# =============================================================================================
+# aggression (SIM_OVERHAUL_PLAN.md Step B3): three consumers, every threshold pinned as a literal
+# =============================================================================================
+
+def _hunter_at_hp_fraction(hp_fraction, aggression, person=Person.HUNTER):
+    """The retreat scene from test_hunter_retreats_at_low_hp with the sniper kind's `aggression`
+    column set by hand and the bot's HP at a literal fraction of max."""
+    cfg, params, gen = cfg_and_params(n_enemies=1)
+    params.aggression[:, int(Kind.BOT_SNIPER)] = aggression
+    state = fresh_state(cfg, params, person=person)
+    bank = FakeBank(grid(20, 20))
+    state.ent_pos[0, 0] = torch.tensor([8.0, 10.0])
+    state.ent_pos[0, 1] = torch.tensor([12.0, 10.0])
+    state.ent_hp[0, 1] = hp_fraction * state.ent_max_hp[0, 1]
+    return _mode_of(state, bank, params, cfg, gen)
+
+
+def test_hunter_at_25_percent_hp_closes_at_aggression_1_7_and_retreats_at_1_0():
+    """B3.1: threshold = clamp(0.35 / a, 0.05, 0.90). At a = 1.7 that is 0.206, so 25% HP is
+    above it (CLOSE); at a = 1.0 it is the plain 0.35 (RETREAT)."""
+    assert _hunter_at_hp_fraction(0.25, 1.7) is Mode.CLOSE
+    assert _hunter_at_hp_fraction(0.25, 1.0) is Mode.RETREAT
+
+
+def test_aggression_zero_is_read_as_one_for_the_retreat_threshold():
+    """A partial spec without the key resolves to 0 (B1); the helper reads it as 1.0, so the
+    threshold is 0.35: 25% retreats, 40% closes -- identical to a = 1.0."""
+    assert _hunter_at_hp_fraction(0.25, 0.0) is Mode.RETREAT
+    assert _hunter_at_hp_fraction(0.40, 0.0) is Mode.CLOSE
+    assert _hunter_at_hp_fraction(0.40, 1.0) is Mode.CLOSE
+
+
+def test_timid_hunter_retreats_earlier():
+    """a = 0.6 -> 0.35 / 0.6 = 0.583: 50% HP retreats, where a = 1.0 would still close."""
+    assert _hunter_at_hp_fraction(0.50, 0.6) is Mode.RETREAT
+    assert _hunter_at_hp_fraction(0.50, 1.0) is Mode.CLOSE
+    assert _hunter_at_hp_fraction(0.60, 0.6) is Mode.CLOSE
+
+
+def test_retreat_threshold_is_clamped_to_5_and_90_percent():
+    """a = 10 would give 0.035 but the floor is 0.05: 4% retreats, 6% closes. a = 0.1 would give
+    3.5 but the ceiling is 0.90: 89% retreats, 91% closes."""
+    assert _hunter_at_hp_fraction(0.04, 10.0) is Mode.RETREAT
+    assert _hunter_at_hp_fraction(0.06, 10.0) is Mode.CLOSE
+    assert _hunter_at_hp_fraction(0.89, 0.1) is Mode.RETREAT
+    assert _hunter_at_hp_fraction(0.91, 0.1) is Mode.CLOSE
+
+
+def test_kite_shares_the_scaled_retreat_threshold():
+    """KITE retreats on the same rule as HUNTER: 25% HP holds range at a = 1.7, retreats at 1.0."""
+    assert _hunter_at_hp_fraction(0.25, 1.7, person=Person.KITE) is Mode.HOLD_RANGE
+    assert _hunter_at_hp_fraction(0.25, 1.0, person=Person.KITE) is Mode.RETREAT
+
+
+def test_rush_still_never_retreats_whatever_the_aggression():
+    """Aggression only moves the threshold for the two personalities that HAVE one."""
+    assert _hunter_at_hp_fraction(0.05, 0.1, person=Person.RUSH) is Mode.CLOSE
+
+
+def _unseen_camper_scene():
+    """The first half of test_camper_does_not_fire_until_something_can_see_it: camper in the
+    bush, hero outside bush_reveal_radius, so the camper has a target but nobody can see it."""
+    cfg, params, gen = cfg_and_params(n_enemies=1)
+    state = fresh_state(cfg, params, person=Person.CAMPER)
+    bank = FakeBank(_one_bush_grid())
+    bush_reveal = params.bush_reveal_radius[0].item()
+    state.ent_pos[0, 1] = BUSH_E.clone()
+    state.ent_pos[0, 0] = torch.tensor([13.5 - (bush_reveal + 2.0), 10.5])
+    _vis, tgt = build_targeting(state, bank, params, cfg)
+    assert bool(tgt.has_enemy[0, 1])
+    assert not bool(tgt.seen_by_other[0, 1])
+    return state, tgt, params, cfg
+
+
+def test_unseen_camper_fires_at_aggression_1_5_and_holds_at_1_0():
+    """B3.3: the veto is `~seen_by_other & a < 1.25`. Literal (N,E) aggression tensors, so the
+    pin does not go through the helper."""
+    state, tgt, _params, cfg = _unseen_camper_scene()
+    shape = state.ent_person.shape
+    assert bool(personality.fire_allowed(state, tgt, torch.full(shape, 1.5), cfg)[0, 1])
+    assert not bool(personality.fire_allowed(state, tgt, torch.full(shape, 1.0), cfg)[0, 1])
+
+
+def test_camper_fire_on_sight_boundary_is_inclusive_at_1_25():
+    state, tgt, _params, cfg = _unseen_camper_scene()
+    shape = state.ent_person.shape
+    assert bool(personality.fire_allowed(state, tgt, torch.full(shape, 1.25), cfg)[0, 1])
+    assert not bool(personality.fire_allowed(state, tgt, torch.full(shape, 1.24), cfg)[0, 1])
+
+
+def test_camper_veto_reads_a_missing_aggression_as_one_through_the_helper():
+    """params.aggression = 0 for the kind (a partial spec) must behave as 1.0: still silent."""
+    state, tgt, params, cfg = _unseen_camper_scene()
+    params.aggression[:, int(Kind.BOT_SNIPER)] = 0.0
+    a = stats.aggression_of(state.ent_kind, params)
+    assert a[0, 1].item() == 1.0
+    assert not bool(personality.fire_allowed(state, tgt, a, cfg)[0, 1])
+    params.aggression[:, int(Kind.BOT_SNIPER)] = 1.5
+    a = stats.aggression_of(state.ent_kind, params)
+    assert a[0, 1].item() == 1.5
+    assert bool(personality.fire_allowed(state, tgt, a, cfg)[0, 1])
+
+
+def test_aggression_does_not_lift_the_camper_veto_for_a_non_camper_or_a_seen_camper():
+    """The only thing aggression changes in fire_allowed is the UNSEEN camper; everyone else was
+    already allowed to fire and stays that way at any aggression."""
+    cfg, params, gen = cfg_and_params(n_enemies=1)
+    state = fresh_state(cfg, params, person=Person.CAMPER)
+    bank = FakeBank(_one_bush_grid())
+    bush_reveal = params.bush_reveal_radius[0].item()
+    state.ent_pos[0, 1] = BUSH_E.clone()
+    state.ent_pos[0, 0] = torch.tensor([13.5 - (bush_reveal - 0.5), 10.5])  # inside reveal radius
+    _vis, tgt = build_targeting(state, bank, params, cfg)
+    assert bool(tgt.seen_by_other[0, 1])
+    shape = state.ent_person.shape
+    assert bool(personality.fire_allowed(state, tgt, torch.full(shape, 0.5), cfg)[0, 1])
+    state.ent_person.fill_(int(Person.TRAPPER))
+    assert bool(personality.fire_allowed(state, tgt, torch.full(shape, 0.5), cfg)[0, 1])
+
+
+def test_kite_holds_closer_at_high_aggression_and_farther_at_low():
+    """B3.2 through the movement layer, with RANGE_DEADBAND 1.5 and the far edge capped at Brock's
+    8.0-tile reach. Brock (attack_range 8.0, desired_range_fraction 0.85) holds 6.8 tiles at
+    a = 1.0 (band 5.3 to 8.0). At a = 1.7 the multiplier clamps to 0.6 (4.08, band 2.58 to 5.58),
+    so a bot standing at 6.0 is too far out and closes in (west). At a = 1.0 the same bot orbits.
+    At a = 0.6 it clamps to 1.4 (9.52, capped to 8.0, band 6.5 to 8.0), so it is too close and
+    backs off (east)."""
+    for aggression, want_sign in ((1.7, -1.0), (1.0, 0.0), (0.6, 1.0)):
+        cfg, params, gen = cfg_and_params(n_enemies=1, map_h=40, map_w=40)
+        params.aggression[:, int(Kind.BOT_SNIPER)] = aggression
+        state = fresh_state(cfg, params, person=Person.KITE)
+        bank = FakeBank(grid(40, 40))
+        state.ent_pos[0, 0] = torch.tensor([5.0, 20.0])
+        state.ent_pos[0, 1] = torch.tensor([5.0 + 6.0, 20.0])
+        move, mode = _move(state, bank, params, cfg, gen)
+        assert Mode(int(mode[0, 1])) is Mode.HOLD_RANGE
+        if want_sign == 0.0:
+            assert abs(move[0, 1, 0].item()) < 1e-6, aggression   # strafe only: no radial part
+        else:
+            assert move[0, 1, 0].item() * want_sign > 0, aggression
+
+
+def test_kite_walks_in_to_its_own_fire_reach_rather_than_parking_outside_it():
+    """The far edge of the KITE band, not its centre, is where an approaching kiter stops: inside
+    the band only strafe is left, and an orbit only drifts outward. Uncapped, that edge was hold +
+    1.5, i.e. 8.3 tiles for a hard Brock with an 8.0-tile rocket and 11.02 for an easy one, so a
+    kiter walking in parked where it could never fire (operator, 2026-09-21: cap it at the range).
+    Capped at the fire reach, a Brock at 8.2 tiles closes at every tier from easy to hard and at
+    7.9 orbits. Shelly's reach is her 0.9 fire fraction of 8.0, so at hard she closes from 7.4,
+    which sat inside her old 4.5 to 7.5 band, and orbits at 7.1."""
+    cases = (
+        (Kind.BOT_SNIPER, 0.6, 8.2, -1.0),
+        (Kind.BOT_SNIPER, 0.8, 8.2, -1.0),
+        (Kind.BOT_SNIPER, 1.0, 8.2, -1.0),
+        (Kind.BOT_SNIPER, 0.6, 7.9, 0.0),
+        (Kind.BOT_SNIPER, 1.0, 7.9, 0.0),
+        (Kind.BOT_RIFLE, 1.0, 7.4, -1.0),
+        (Kind.BOT_RIFLE, 1.0, 7.1, 0.0),
+    )
+    for kind, aggression, dist, want_sign in cases:
+        cfg, params, gen = cfg_and_params(n_enemies=1, map_h=40, map_w=40)
+        params.aggression[:, int(kind)] = aggression
+        state = fresh_state(cfg, params, enemy_kind=kind, person=Person.KITE)
+        bank = FakeBank(grid(40, 40))
+        state.ent_pos[0, 0] = torch.tensor([5.0, 20.0])
+        state.ent_pos[0, 1] = torch.tensor([5.0 + dist, 20.0])
+        move, mode = _move(state, bank, params, cfg, gen)
+        case = (kind.name, aggression, dist)
+        assert Mode(int(mode[0, 1])) is Mode.HOLD_RANGE, case
+        if want_sign == 0.0:
+            assert abs(move[0, 1, 0].item()) < 1e-6, case
+        else:
+            assert move[0, 1, 0].item() * want_sign > 0, case

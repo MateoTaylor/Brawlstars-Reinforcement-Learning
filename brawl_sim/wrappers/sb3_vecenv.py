@@ -261,7 +261,9 @@ class BrawlSB3VecEnv(VecEnv):
     # ---- action masking (sb3_contrib.MaskablePPO) --------------------------------------
 
     def action_masks(self) -> np.ndarray:
-        """(num_envs, 19) bool = [move_mask (17), attack_mask (2)] -- what MaskablePPO expects.
+        """(num_envs, 21) bool = [move_mask (17), attack_mask (4: no-fire, attack, super, gadget)]
+        -- what MaskablePPO expects: `sum(cfg.action_nvec)` wide, sliced per dimension. The widths
+        come from the obs, never from a literal here, so Step G3's 3 -> 4 needed no code change.
         Reads the LAST obs this wrapper produced (reset() or step_wait()); action_masks() is
         always called by MaskablePPO right after an obs, before the matching action, so this is
         never stale in normal use."""

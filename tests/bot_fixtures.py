@@ -104,6 +104,6 @@ def build_targeting(state, bank, params, cfg):
     differently-shaped LOS than the real dispatcher does would be testing a code path that no
     longer exists."""
     vis = perception.bot_visibility(state, perception.visibility(state, bank, params, cfg), cfg)
-    perception.select_target(state, vis, cfg)
+    perception.select_target(state, vis, params, cfg)
     los = perception.target_los(state, bank, cfg)
     return vis, policy.targeting(state, vis, los, bank, params, cfg)

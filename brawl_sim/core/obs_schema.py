@@ -145,8 +145,8 @@ _ROWS: tuple[tuple, ...] = (
 
     # ---- projectiles: all P slots ---------------------------------------------------
     ("projectiles.alive", ("N", "P"), "bool", "bool", None, "Whether this slot holds a live projectile.", False, None),
-    ("projectiles.kind", ("N", "P"), "int64", "enum", (0, 6), "brawl_sim.constants.Proj value.", False, None),
-    ("projectiles.kind_onehot", ("N", "P", 7), "uint8", "onehot", (0, 1), "One-hot of kind, N_PROJ_KINDS=7 wide.", False, None),
+    ("projectiles.kind", ("N", "P"), "int64", "enum", (0, 7), "brawl_sim.constants.Proj value.", False, None),
+    ("projectiles.kind_onehot", ("N", "P", 8), "uint8", "onehot", (0, 1), "One-hot of kind, N_PROJ_KINDS=8 wide.", False, None),
     ("projectiles.pos", ("N", "P", 2), "float32", "tiles", None, "World position.", False, None),
     ("projectiles.pos_norm", ("N", "P", 2), "float32", "fraction", (0.0, 1.0), "pos / (map_w, map_h).", False, None),
     ("projectiles.vel", ("N", "P", 2), "float32", "tiles/s", None, "Velocity.", False, None),
@@ -214,7 +214,7 @@ _ROWS: tuple[tuple, ...] = (
 
     # ---- action_mask -----------------------------------------------------------------------
     ("action_mask.move", ("N", "MOVE"), "bool", "bool", None, "Legal move bins (idle + n_move_bins directions); always all-True today.", False, None),
-    ("action_mask.attack", ("N", 3), "bool", "bool", None, "[no-fire, attack, super] legal for the hero this tick.", False, None),
+    ("action_mask.attack", ("N", 4), "bool", "bool", None, "[no-fire, attack, super, gadget] legal for the hero this tick.", False, None),
 
     # ---- meta ------------------------------------------------------------------------------
     ("meta.map_id", ("N",), "int64", "index", (0, None), "Index into cfg.map_names for this env.", False, None),

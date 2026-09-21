@@ -121,6 +121,105 @@ def test_right_click_does_not_fire():
     assert int(session.action_tensor()[0, 1]) == 0
 
 
+# ---- gadget: `g` is attack-column value 3 (SIM_OVERHAUL Step G3) ---------------------------------
+
+def test_g_sets_the_gadget_value_and_release_clears_it():
+    session, env, cfg = _session()
+    session.on_key_press(_FakeKeyEvent("g"))
+    assert session.action_tensor().tolist() == [[0, 3]]
+    session.on_key_release(_FakeKeyEvent("G"))          # case-insensitive, like every other key
+    assert session.action_tensor().tolist() == [[0, 0]]
+
+
+def test_g_alone_is_sent_raw_even_while_the_gadget_is_on_cooldown():
+    """Not pre-filtered: a masked 3 is a silent no-op inside `env.step`, same contract as fire."""
+    session, env, cfg = _session()
+    env.state.ent_gadget_cd[0, 0] = 9.0
+    session.on_key_press(_FakeKeyEvent("g"))
+    assert int(session.action_tensor()[0, 1]) == 3
+
+
+def test_g_with_space_takes_the_column_only_while_the_gadget_is_legal():
+    """One column, one value. A tap of `g` spans several 20 Hz ticks; after the throw the gadget
+    is masked for 18 s, and those ticks must go back to the dash the player is also holding."""
+    session, env, cfg = _session()
+    session.on_key_press(_FakeKeyEvent(" "))
+    session.on_key_press(_FakeKeyEvent("g"))
+    assert int(session.action_tensor()[0, 1]) == 3
+
+    env.state.ent_gadget_cd[0, 0] = 17.0
+    assert int(session.action_tensor()[0, 1]) == 1
+
+
+def test_pressing_g_throws_a_spinner_and_the_title_counts_the_cooldown_down():
+    session, env, cfg = _session()
+    assert "gadget=READY" in session.viewer.title.get_text()
+
+    # The spinner's 4 ticks of flight fit inside the one 5-tick decision, so it is already gone
+    # when `tick()` returns: count it per SUB-tick instead. Projectile kind 7 is
+    # `Proj.GADGET_SPINNER`, as a literal. Without this the test passed on an env that started
+    # the cooldown and threw nothing (Step G3 review).
+    spinners, owners = [], set()
+
+    def _count(e):
+        live = e.state.prj_alive[0] & (e.state.prj_kind[0] == 7)
+        spinners.append(int(live.sum()))
+        owners.update(e.state.prj_owner[0][live].tolist())
+
+    env.tick_hook = _count
+    session.on_key_press(_FakeKeyEvent("g"))
+    session.tick()
+    env.tick_hook = None
+
+    assert spinners == [1, 1, 1, 0, 0]          # in flight after sub-ticks 1-3, detonated on the 4th
+    assert owners == {0}                         # the hero's, not a bot's
+    state = env.state
+    # 18.0 s set on the first sub-tick, four more sub-ticks (action_repeat 5) of 0.05 s after it.
+    assert abs(float(state.ent_gadget_cd[0, 0]) - 17.8) < 1e-4
+    assert "gadget=17.8s" in session.viewer.title.get_text()
+
+
+def test_the_game_window_takes_its_keys_away_from_matplotlibs_default_keymap():
+    """Every pyplot figure is born with matplotlib's own key handler connected, and `g` is its
+    grid toggle (two `ax.grid` calls and a full redraw while the cursor is over the axes -- which
+    it is, since left-click fires) and `s` its save dialog. `connect_input` disconnects it. Real
+    `KeyEvent`s through the canvas, not `on_key_press` called by hand: the collision lives in
+    what ELSE is connected to the figure, which a direct call cannot see (Step G3 review)."""
+    from matplotlib.backend_bases import KeyEvent
+
+    session, env, cfg = _session()
+    fig, ax = session.viewer.fig, session.viewer.ax
+    fig.canvas.draw()
+    x, y = ax.transAxes.transform((0.5, 0.5))           # a cursor in the middle of the map
+
+    grid_calls, saves = [], []
+    ax.grid = lambda *args, **kwargs: grid_calls.append(kwargs)
+
+    class _Toolbar:                                      # Agg has none; every GUI backend does
+        def save_figure(self, *args):
+            saves.append(1)
+
+    def press(key, toolbar=None):
+        fig.canvas.toolbar = toolbar
+        KeyEvent("key_press_event", fig.canvas, key, x, y)._process()
+        fig.canvas.toolbar = None
+
+    # Control: before the session takes the keyboard matplotlib's defaults DO fire, so the
+    # unchanged counts below are the disconnect's doing and not a dead observable.
+    press("g")
+    press("s", toolbar=_Toolbar())
+    assert [call["axis"] for call in grid_calls] == ["x", "y"]
+    assert saves == [1]
+    assert session._held_keys == set()
+
+    session.connect_input(fig)
+    press("g")
+    press("s", toolbar=_Toolbar())
+    assert len(grid_calls) == 2 and saves == [1], "matplotlib still handles the game's keys"
+    assert session._held_keys == {"g", "s"}
+    assert session.action_tensor().tolist() == [[5, 3]]  # bin 5 is straight down (+y); 3 the gadget
+
+
 # ---- quit ----------------------------------------------------------------------------------------
 
 def test_q_key_requests_quit():

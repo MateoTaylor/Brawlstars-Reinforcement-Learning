@@ -45,7 +45,7 @@ UNLABELLED = "?"
 # Recordings captured on the emulator (BlueStacks + Nulls Brawl), by name prefix. Their buttons sit
 # where `config.EMULATOR_HUD_MASK_PATH` says; every other recording is a phone's. All of them, and
 # only they, are 1920x1080, which `test_vision_classifier` checks against the recordings on disk.
-EMULATOR_CLIP_PREFIXES = ("bluestacks-", "9-10_new", "edited_day14_broll")
+EMULATOR_CLIP_PREFIXES = ("bluestacks-", "9-10_new", "edited_day14_broll", "2maps_dataset")
 
 # Share of a cell that must be real world, clear of the HUD, before it can be labelled. The same
 # bar `OccupancyMap` sets for a vote, so a label is only ever asked of a cell the map can fill.

@@ -80,7 +80,7 @@ def _damage_at(kind, dist, lateral=0.0, origin=(10.0, 20.0)):
     for _ in range(150):
         if not bool(state.prj_alive.any()):
             break
-        dmg_ent, _, _, _ = proj.step_projectiles(state, bank, params, cfg)
+        dmg_ent, _, _, _, _ = proj.step_projectiles(state, bank, params, cfg)
         total += float(dmg_ent[0, 0])
     return total
 

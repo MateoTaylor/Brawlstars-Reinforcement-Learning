@@ -8,7 +8,7 @@ from pathlib import Path
 
 import pytest
 
-from brawl_sim.constants import CHAR_TO_TILE, Tile
+from brawl_sim.constants import MAP_CHAR_TO_TILE, Tile
 
 MAPS_DIR = Path(__file__).resolve().parent.parent / "brawl_sim" / "maps" / "csv"
 
@@ -16,12 +16,22 @@ DIMENSIONS = {
     "blank": (20, 20), "open": (60, 60), "bushy": (60, 60), "walled": (60, 60),
     "skull_creek": (60, 60), "feast_or_famine": (60, 60),
     "scorched_stone": (60, 60), "island_invasion": (60, 60),
+    # The ten generated maps (SIM_OVERHAUL_PLAN.md Step M3; brawl_sim/maps/README.md has the
+    # seed table). brawl_sim/maps/generate.py only makes 60x60 grids.
+    "broken_wall": (60, 60), "stone_fort": (60, 60), "twin_ponds": (60, 60),
+    "cross_creek": (60, 60), "split_river": (60, 60), "narrow_pass": (60, 60),
+    "dry_gulch": (60, 60), "thorn_field": (60, 60), "reed_marsh": (60, 60),
+    "hollow_ring": (60, 60),
 }
 ALL_MAPS = list(DIMENSIONS)
+GENERATED_MAPS = [
+    "broken_wall", "stone_fort", "twin_ponds", "cross_creek", "split_river", "narrow_pass",
+    "dry_gulch", "thorn_field", "reed_marsh", "hollow_ring",
+]
 MIN_SPAWN = {name: 12 for name in DIMENSIONS} | {"blank": 8}
 MIN_BOX = {name: 16 for name in DIMENSIONS} | {"blank": 8}
 
-UNIT_BLOCKING = {Tile.WALL, Tile.WATER, Tile.FENCE}
+UNIT_BLOCKING = {Tile.WALL, Tile.WATER}
 
 
 def _read_grid(name: str) -> list[list[str]]:
@@ -35,7 +45,7 @@ def _connected_components(grid: list[list[str]]) -> list[list[tuple[int, int]]]:
     comps = []
     for y in range(h):
         for x in range(w):
-            tile = CHAR_TO_TILE[grid[y][x]]
+            tile = MAP_CHAR_TO_TILE[grid[y][x]]
             if tile in UNIT_BLOCKING or seen[y][x]:
                 continue
             comp = []
@@ -47,7 +57,7 @@ def _connected_components(grid: list[list[str]]) -> list[list[tuple[int, int]]]:
                 for dy, dx in ((1, 0), (-1, 0), (0, 1), (0, -1)):
                     ny, nx = cy + dy, cx + dx
                     if 0 <= ny < h and 0 <= nx < w and not seen[ny][nx]:
-                        if CHAR_TO_TILE[grid[ny][nx]] not in UNIT_BLOCKING:
+                        if MAP_CHAR_TO_TILE[grid[ny][nx]] not in UNIT_BLOCKING:
                             seen[ny][nx] = True
                             dq.append((ny, nx))
             comps.append(comp)
@@ -67,7 +77,7 @@ def test_every_character_is_known(name):
     grid = _read_grid(name)
     for row in grid:
         for ch in row:
-            assert ch in CHAR_TO_TILE, f"{name}.csv has unknown character {ch!r}"
+            assert ch in MAP_CHAR_TO_TILE, f"{name}.csv has unknown character {ch!r}"
 
 
 @pytest.mark.parametrize("name", ALL_MAPS)
@@ -105,7 +115,24 @@ def test_bushy_density_is_roughly_a_quarter():
     assert 0.15 <= fraction <= 0.35, f"bushy.csv bush fraction {fraction:.2f} is not ~25%"
 
 
-def test_walled_has_water_and_fences():
+def test_walled_has_water():
     grid = _read_grid("walled")
     assert sum(row.count("~") for row in grid) > 0
-    assert sum(row.count("f") for row in grid) > 0
+
+
+@pytest.mark.parametrize("name", GENERATED_MAPS)
+def test_generated_map_has_exactly_sixteen_spawns(name):
+    """The generator places `N_SPAWNS = 16` markers (plan Step M2 item 3) -- a hand edit that
+    drops or duplicates one would still pass the >= 12 minimum above, so the exact count is
+    pinned here. The literal 16 is deliberate: reading `generate.N_SPAWNS` would let the test
+    follow a changed constant."""
+    grid = _read_grid(name)
+    assert sum(row.count("S") for row in grid) == 16
+
+
+@pytest.mark.parametrize("name", ALL_MAPS)
+def test_no_map_contains_fences(name):
+    """Fences are not a sim tile (2026-09). `test_every_character_is_known` already refuses `f`
+    through the vocabulary; this one says so by name, so a reintroduced fence fails readably."""
+    grid = _read_grid(name)
+    assert sum(row.count("f") for row in grid) == 0, f"{name}.csv carries a fence cell"

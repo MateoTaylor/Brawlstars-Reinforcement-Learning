@@ -23,6 +23,12 @@ reason: healing (out-of-combat regen in `combat.apply_regen`, super lifesteal in
 diff, so `env.py` collects what those two calls report applying and passes it down. Absent, it
 is zeros.
 
+`attack_in_reach_tick` is caller-supplied too: whether the hero's attack had an enemy in reach is
+known only inside `env.py`'s attack phase, which holds the attack gates and the tick's fair
+visibility. `env.py` counts it over the decision's live sub-ticks and passes the (N,) count down;
+absent, it is zeros. It is the one input of training/reward.py's `attack_in_reach` term
+(SIM_OVERHAUL_PLAN.md §9 R2).
+
 `shots_fired_tick` / `dash_hits_tick` are best-effort, NOT exact, given the signature this step
 specifies -- see their own comments below for exactly what they miss and why. Flagged here as a
 forward pointer: if reward shaping in a later phase needs a true miss-inclusive fire-attempt
@@ -130,7 +136,7 @@ def advance_decision_tally(tally: dict, state, cfg) -> dict:
 def compute_info(
     state, dmg_by: torch.Tensor, newly_dead: torch.Tensor, newly_broken: torch.Tensor,
     cubes_gained: torch.Tensor, cfg, decision: dict | None = None,
-    hp_healed: torch.Tensor | None = None,
+    hp_healed: torch.Tensor | None = None, attacks_in_reach: torch.Tensor | None = None,
 ) -> dict:
     """(N,)/(N,E)/(N,E,E) device tensors, one dict of THIS DECISION's events -- see module
     docstring for the `dmg_by` contract and the shots_fired_tick/dash_hits_tick caveat.
@@ -144,11 +150,17 @@ def compute_info(
     `hp_healed` is the (N,E) HP restored over the same sub-ticks -- regen plus super lifesteal,
     as actually applied (see `combat.apply_heal`/`apply_regen`). Unlike damage there is no
     matrix to project it out of and nothing in `SimState` records it, so it can only come from
-    the caller; left at `None` it is zeros, which is what every pre-existing call site means."""
+    the caller; left at `None` it is zeros, which is what every pre-existing call site means.
+
+    `attacks_in_reach` is the (N,) int32 count of the hero's attacks and supers made with a
+    visible enemy inside its uncharged dash reach over the same sub-ticks (see `env.py`'s attack
+    phase). Same contract: only the caller can know it, and `None` is zeros."""
     if decision is None:
         decision = new_decision_tally(state, cfg)
     if hp_healed is None:
         hp_healed = torch.zeros_like(dmg_by[:, :, 0])
+    if attacks_in_reach is None:
+        attacks_in_reach = torch.zeros_like(decision["n_ticks"])
     terminated, truncated = decision["terminated"], decision["truncated"]
 
     damage_dealt_tick = dmg_by.sum(dim=2)  # (N,E): per attacker, this tick
@@ -203,6 +215,8 @@ def compute_info(
         "boxes_broken_tick": boxes_broken_tick,
         "shots_fired_tick": shots_fired_tick,
         "dash_hits_tick": dash_hits_tick,
+        # (N,) int32, the HERO's alone -- what training/reward.py's `attack_in_reach` term pays.
+        "attack_in_reach_tick": attacks_in_reach,
         "hero_rank": decision["hero_rank"],
         "terminated": terminated,
         "truncated": truncated,

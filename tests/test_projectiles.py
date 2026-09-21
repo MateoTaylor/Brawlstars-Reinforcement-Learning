@@ -1,5 +1,6 @@
 from pathlib import Path
 
+import pytest
 import torch
 import yaml
 
@@ -389,7 +390,7 @@ def test_unit_collision_deals_damage_and_kills_projectile():
     for _ in range(50):
         if not torch.any(state.prj_alive):
             break
-        dmg_ent, dmg_by, dmg_box, _heal = proj.step_projectiles(state, bank, params, cfg)
+        dmg_ent, dmg_by, dmg_box, _heal, _charge = proj.step_projectiles(state, bank, params, cfg)
         total_dmg += dmg_ent
 
     assert total_dmg[0, 0].item() > 0.0
@@ -412,7 +413,7 @@ def test_projectile_never_hits_its_own_owner():
     for _ in range(50):
         if not torch.any(state.prj_alive):
             break
-        dmg_ent, dmg_by, dmg_box, _heal = proj.step_projectiles(state, bank, params, cfg)
+        dmg_ent, dmg_by, dmg_box, _heal, _charge = proj.step_projectiles(state, bank, params, cfg)
         total_dmg += dmg_ent
     assert total_dmg[0, owner].item() == 0.0
 
@@ -436,7 +437,7 @@ def test_earliest_t_wins_hits_closer_target_not_farther():
     for _ in range(50):
         if not torch.any(state.prj_alive):
             break
-        dmg_ent, dmg_by, dmg_box, _heal = proj.step_projectiles(state, bank, params, cfg)
+        dmg_ent, dmg_by, dmg_box, _heal, _charge = proj.step_projectiles(state, bank, params, cfg)
         total_dmg += dmg_ent
 
     assert total_dmg[0, 0].item() > 0.0
@@ -460,7 +461,7 @@ def test_box_collision_deals_damage_and_kills_projectile():
     for _ in range(50):
         if not torch.any(state.prj_alive):
             break
-        _, _, dmg_box, _ = proj.step_projectiles(state, bank, params, cfg)
+        _, _, dmg_box, _, _ = proj.step_projectiles(state, bank, params, cfg)
         total_box_dmg += dmg_box[0, 0].item()
 
     assert total_box_dmg > 0.0
@@ -521,7 +522,7 @@ def test_artillery_shell_lands_past_wall_and_damages_unit_behind_it():
     for _ in range(200):
         if not torch.any(state.prj_alive):
             break
-        dmg_ent, _, _, _ = proj.step_projectiles(state, bank, params, cfg)
+        dmg_ent, _, _, _, _ = proj.step_projectiles(state, bank, params, cfg)
         total_dmg += dmg_ent
 
     assert total_dmg[0, 0].item() > 0.0  # damaged despite the wall in between
@@ -651,7 +652,7 @@ def test_shard_deals_half_damage_two_tiles_off_the_landing_point():
     for _ in range(100):
         if not torch.any(state.prj_alive):
             break
-        dmg_ent, _, _, _ = proj.step_projectiles(state, bank, params, cfg)
+        dmg_ent, _, _, _, _ = proj.step_projectiles(state, bank, params, cfg)
         total += dmg_ent[0, 0].item()
 
     fraction = params.split_damage_fraction[0, int(Kind.BOT_ARTILLERY)].item()
@@ -672,7 +673,7 @@ def test_direct_hit_is_not_also_hit_by_its_own_shards():
     for _ in range(100):
         if not torch.any(state.prj_alive):
             break
-        dmg_ent, _, _, _ = proj.step_projectiles(state, bank, params, cfg)
+        dmg_ent, _, _, _, _ = proj.step_projectiles(state, bank, params, cfg)
         total += dmg_ent[0, 0].item()
 
     assert abs(total - full_damage) < 1e-3
@@ -692,7 +693,7 @@ def test_shards_are_stopped_by_walls():
     for _ in range(100):
         if not torch.any(state.prj_alive):
             break
-        dmg_ent, _, _, _ = proj.step_projectiles(state, bank, params, cfg)
+        dmg_ent, _, _, _, _ = proj.step_projectiles(state, bank, params, cfg)
         total += dmg_ent[0, 0].item()
 
     assert total == 0.0  # the shell arcs over walls; its shards do not
@@ -764,7 +765,7 @@ def _fire_rocket_and_settle(cfg, params, tiles, hero_at, shooter_at=(5.0, 15.0),
     total = torch.zeros(1, cfg.n_entities)
     events = []
     for i in range(ticks):
-        dmg_ent, _, _, _ = proj.step_projectiles(state, bank, params, cfg)
+        dmg_ent, _, _, _, _ = proj.step_projectiles(state, bank, params, cfg)
         if float(dmg_ent[0].abs().sum()) > 0:
             events.append(((i + 1) * cfg.dt, dmg_ent[0].clone()))
         total += dmg_ent
@@ -820,7 +821,7 @@ def test_hazard_never_damages_its_own_owner():
         if bool(live.any()):
             j = int(torch.nonzero(live)[0])
             state2.ent_pos[0, 1] = state2.prj_pos[0, j].clone()   # owner stands in his own sphere
-        dmg_ent, _, _, _ = proj.step_projectiles(state2, bank, params, cfg)
+        dmg_ent, _, _, _, _ = proj.step_projectiles(state2, bank, params, cfg)
         owner_damage += float(dmg_ent[0, 1])
         if not torch.any(state2.prj_alive):
             break
@@ -854,7 +855,7 @@ def test_two_hazards_stack():
 
     per_tick = []
     for _ in range(120):
-        dmg_ent, _, _, _ = proj.step_projectiles(state, bank, params, cfg)
+        dmg_ent, _, _, _, _ = proj.step_projectiles(state, bank, params, cfg)
         if float(dmg_ent[0, 0]) > 0:
             per_tick.append(float(dmg_ent[0, 0]))
         if not torch.any(state.prj_alive):
@@ -906,3 +907,164 @@ def test_a_kind_without_on_hit_area_leaves_nothing():
         )
         if not torch.any(state.prj_alive):
             break
+
+
+# ---- gadget spinner (Step G2.2 / G2.3 / G2.4) ----------------------------------------------
+
+def _spawn_spinner(state, cfg, params, origin, direction, travel, owner=0):
+    """One gadget spinner from `owner` at `origin`, flying `travel` tiles along `direction`."""
+    fire_mask = torch.zeros(1, cfg.n_entities, dtype=torch.bool)
+    fire_mask[0, owner] = True
+    origins = state.ent_pos.clone()
+    origins[0, owner] = torch.tensor(origin)
+    dirs = torch.zeros(1, cfg.n_entities, 2)
+    dirs[0, owner] = torch.tensor(direction)
+    travels = torch.zeros(1, cfg.n_entities)
+    travels[0, owner] = travel
+    damage = stats.effective_gadget_damage(state.ent_kind, state.ent_cubes, params)
+    proj.spawn_gadget(state, fire_mask, origins, dirs, travels, damage, params, cfg)
+    return damage[0, owner].item()
+
+
+def test_spawn_gadget_writes_one_fully_defined_artillery_slot():
+    cfg, params = _cfg_and_params(map_h=20, map_w=20)
+    state = _fresh_state(cfg)
+    state.ent_pos[0, 0] = torch.tensor([5.0, 5.0])
+
+    _spawn_spinner(state, cfg, params, [5.0, 5.0], [0.0, 1.0], 1.5)
+
+    alive = state.prj_alive[0]
+    assert int(alive.sum()) == 1
+    s = int(alive.nonzero()[0, 0])
+    assert state.prj_pos[0, s].tolist() == [5.0, 5.0]
+    assert state.prj_target[0, s].tolist() == pytest.approx([5.0, 6.5], abs=1e-6)
+    # travel / gadget_flight_seconds = 1.5 / 0.2 = 7.5, times the 1.0001 landing overshoot
+    # (projectiles._LANDING_OVERSHOOT) that makes the landing tick deterministic. Pinned tight so
+    # the overshoot is a tested property, not something a loose tolerance happens to admit.
+    assert state.prj_vel[0, s].tolist() == pytest.approx([0.0, 7.50075], abs=1e-5)
+    assert state.prj_dist_left[0, s].item() == pytest.approx(1.5, abs=1e-5)
+    assert state.prj_damage[0, s].item() == 2000.0
+    assert state.prj_radius[0, s].item() == 0.0
+    assert state.prj_aoe[0, s].item() == 1.0
+    assert state.prj_age[0, s].item() == 0.0
+    assert int(state.prj_owner[0, s]) == 0
+    assert int(state.prj_kind[0, s]) == int(Proj.GADGET_SPINNER) == 7
+    assert int(state.prj_class[0, s]) == int(ProjClass.ARTILLERY)
+    assert not bool(state.prj_pierce[0, s])
+
+
+def test_spawn_gadget_with_zero_travel_still_writes_a_slot_that_detonates_on_tick_one():
+    cfg, params = _cfg_and_params(map_h=20, map_w=20)
+    state = _fresh_state(cfg)
+    bank = _bank_from_grid(_grid(20, 20))
+    state.ent_max_hp.fill_(1e9)
+    state.ent_hp.fill_(1e9)
+    state.ent_pos[0, 0] = torch.tensor([5.0, 5.0])
+    state.ent_pos[0, 1] = torch.tensor([5.3, 5.0])  # standing on the hero: 0.3 < the 1.0 radius
+
+    _spawn_spinner(state, cfg, params, [5.0, 5.0], [1.0, 0.0], 0.0)
+    assert int(state.prj_alive.sum()) == 1
+    assert state.prj_vel[0].abs().max().item() == 0.0
+
+    dmg_ent, _, _, _, _ = proj.step_projectiles(state, bank, params, cfg)
+
+    assert int(state.prj_alive.sum()) == 0  # detonated in place on its first tick
+    assert dmg_ent[0, 1].item() == 2000.0
+
+
+def test_spinner_blast_at_the_owners_feet_deals_0_to_the_owner():
+    """S11: no self-damage, by KIND -- compare the Grom test right below."""
+    cfg, params = _cfg_and_params(map_h=20, map_w=20)
+    state = _fresh_state(cfg)
+    bank = _bank_from_grid(_grid(20, 20))
+    state.ent_max_hp.fill_(1e9)
+    state.ent_hp.fill_(1e9)
+    state.ent_pos[0, 0] = torch.tensor([5.0, 5.0])
+    state.ent_pos[0, 1] = torch.tensor([5.5, 5.0])
+
+    _spawn_spinner(state, cfg, params, [5.0, 5.0], [1.0, 0.0], 0.0)
+    dmg_ent, dmg_by, _, _, _ = proj.step_projectiles(state, bank, params, cfg)
+
+    assert dmg_ent[0, 0].item() == 0.0     # the owner, standing on the landing point
+    assert dmg_ent[0, 1].item() == 2000.0  # the enemy 0.5 tiles away
+    assert dmg_by[0, 0, 0].item() == 0.0
+
+
+def test_grom_shell_at_the_owners_feet_still_hits_the_owner():
+    """D4 is unchanged by G2.3: artillery self-detonation is decided per kind, and Grom is not
+    the spinner. 2080 is BOT_ARTILLERY base_damage at 0 cubes and enemy_damage_mult 1.0."""
+    cfg, params = _cfg_and_params(map_h=20, map_w=20)
+    state = _fresh_state(cfg)
+    bank = _bank_from_grid(_grid(20, 20))
+    state.ent_max_hp.fill_(1e9)
+    state.ent_hp.fill_(1e9)
+    state.ent_pos[0, 1] = torch.tensor([5.0, 5.0])
+    state.ent_pos[0, 0] = torch.tensor([15.0, 15.0])  # hero well clear of it
+
+    _spawn_shell(state, cfg, params, [5.0, 5.0], [5.0, 5.0], owner=1)
+    dmg_ent, dmg_by, _, _, charge_hit = proj.step_projectiles(state, bank, params, cfg)
+
+    assert dmg_ent[0, 1].item() == 2080.0
+    assert dmg_by[0, 1, 1].item() == 2080.0
+    assert bool(charge_hit[0, 1, 1])  # and it even charges: nothing about D4 changed
+
+
+def test_charge_hit_excludes_the_spinner_but_keeps_artillery():
+    """G2.4 / S12: `charge_hit` is `dmg_by > 0` minus the gadget. Two blasts in the air: the
+    spinner on bot 1 (damage yes, charge no) and a Grom shell on the hero (both yes). Bot 1 stands
+    2.0 tiles from the hero on the diagonal: at the spinner's max range, outside Grom's 0.6-tile
+    blast, and off the axes his 1.2-tile shards fly along, so his shell charges exactly once."""
+    cfg, params = _cfg_and_params(map_h=20, map_w=20)
+    state = _fresh_state(cfg)
+    bank = _bank_from_grid(_grid(20, 20))
+    state.ent_max_hp.fill_(1e9)
+    state.ent_hp.fill_(1e9)
+    state.ent_pos[0, 0] = torch.tensor([5.0, 5.0])
+    state.ent_pos[0, 1] = torch.tensor([5.0 + 1.41421356, 5.0 + 1.41421356])
+    state.ent_pos[0, 2] = torch.tensor([12.0, 12.0])  # Grom, far from both blasts
+
+    _spawn_spinner(state, cfg, params, [5.0, 5.0], [0.70710678, 0.70710678], 2.0)  # on bot 1
+    _spawn_shell(state, cfg, params, [12.0, 12.0], [5.0, 5.0], owner=2)          # on the hero
+    seen = torch.zeros(cfg.n_entities, cfg.n_entities)
+    charged = torch.zeros(cfg.n_entities, cfg.n_entities, dtype=torch.bool)
+    for _ in range(80):  # spinner lands on tick 4, Grom's on tick 25, his shards expire after
+        _dmg_ent, dmg_by, _, _, charge_hit = proj.step_projectiles(state, bank, params, cfg)
+        seen += dmg_by[0]
+        charged |= charge_hit[0]
+        if not bool(state.prj_alive.any()):
+            break
+
+    assert seen[0, 1].item() == 2000.0
+    assert not bool(charged[0, 1])   # the spinner charged nothing
+    assert seen[2, 0].item() == 2080.0
+    assert bool(charged[2, 0])       # the Grom shell charged as always
+    assert int(charged.sum()) == 1
+
+
+def test_charge_hit_keeps_an_ordinary_volley():
+    """A Brock rocket (BOT_SNIPER, base_damage 2320) into the hero: damage and charge agree."""
+    cfg, params = _cfg_and_params(map_h=20, map_w=20)
+    state = _fresh_state(cfg)
+    bank = _bank_from_grid(_grid(20, 20))
+    state.ent_max_hp.fill_(1e9)
+    state.ent_hp.fill_(1e9)
+    state.ent_pos[0, 0] = torch.tensor([8.0, 5.0])
+    state.ent_pos[0, 1] = torch.tensor([5.0, 5.0])
+
+    fire_mask = torch.zeros(1, cfg.n_entities, dtype=torch.bool)
+    fire_mask[0, 1] = True
+    aim_dir = torch.zeros(1, cfg.n_entities, 2)
+    aim_dir[0, 1] = torch.tensor([1.0, 0.0])
+    damage = stats.effective_damage(state.ent_kind, state.ent_cubes, params)
+    proj.spawn_volley(state, fire_mask, state.ent_pos.clone(), aim_dir, state.ent_pos.clone(),
+                      state.ent_kind, damage, params, cfg)
+
+    hit_dmg, hit_charge = 0.0, False
+    for _ in range(40):
+        _, dmg_by, _, _, charge_hit = proj.step_projectiles(state, bank, params, cfg)
+        if dmg_by[0, 1, 0].item() > 0:
+            hit_dmg, hit_charge = dmg_by[0, 1, 0].item(), bool(charge_hit[0, 1, 0])
+            break
+
+    assert hit_dmg == 2320.0
+    assert hit_charge

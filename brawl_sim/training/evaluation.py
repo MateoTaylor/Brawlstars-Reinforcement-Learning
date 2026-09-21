@@ -22,7 +22,19 @@ the ones training happened to see.
 starts another episode and would otherwise be over-represented (short episodes = deaths, so
 counting every finish would bias the win rate DOWN). Each slot contributes exactly one episode;
 the rollout runs until every slot has finished once, bounded by `max_episode_steps`.
+
+**Which maps (SIM_OVERHAUL M4).** By default the eval env is built from `run.env_config` +
+`run.env_overrides`, i.e. the SAME resolved `world.maps` the training env draws from -- so every
+`eval/*` number is a TRAINING-MAP number. With configs/train.yaml that is the fourteen maps its
+`run.env_overrides.world.maps` lists, not configs/default.yaml's sixteen. `TierEvaluator(tcfg,
+maps=...)` builds the holdout twin instead: identical in every other respect (tiers, episode
+count, seed, reward, spec), but its map bank holds ONLY the named maps. `build_evaluators`
+returns the pair a run needs. Training-map win rate minus holdout win rate is the map-overfitting
+measurement; it is only meaningful because `validate_train_config` guarantees the two map sets
+are disjoint.
 """
+from dataclasses import replace
+
 import numpy as np
 import torch
 
@@ -30,7 +42,7 @@ from ..config import load_config
 from ..core import obs_select
 from ..env import BrawlVecEnv
 from ..wrappers.sb3_vecenv import BrawlSB3VecEnv
-from .config import TrainConfig
+from .config import TrainConfig, deep_merge, holdout_env_overrides
 from .curriculum import FixedTierHook
 from .reward import ShapedReward
 
@@ -45,11 +57,28 @@ class TierEvaluator:
     `episodes_per_tier=32` over 4 tiers that's 128 envs held for the life of the run, which costs
     well under the VRAM headroom `benchmark.py` measured, and rebuilding it every 500k steps
     would re-pay map-bank construction and buffer allocation for nothing.
+
+    `maps=None` evaluates on the run's own (training) maps. `maps=("a", "b")` replaces the env's
+    `world.maps` with exactly those, drawn uniformly -- the holdout evaluator. Everything else is
+    built from the same `tcfg`, so the two evaluators differ in the map bank and nothing else.
     """
 
-    def __init__(self, tcfg: TrainConfig, tiers=None, device=None, verbose: int = 0) -> None:
+    def __init__(self, tcfg: TrainConfig, tiers=None, device=None, verbose: int = 0,
+                 maps=None) -> None:
         from .builder import build_spec, _resolve   # local: avoid a circular import at module load
 
+        if maps:
+            # Patched into `run.env_overrides` rather than into the EnvConfig alone, because the
+            # env is built from TWO views of that dict (`load_config` and `build_spec` below) and
+            # they must agree. `replace`, not `with_overrides`: this derived config is by
+            # construction one validate_train_config refuses (its world.maps ARE the holdout).
+            # `deep_merge` copies every dict it descends into, so the run's own config is not
+            # written to.
+            tcfg = replace(tcfg, run=replace(tcfg.run, env_overrides=deep_merge(
+                tcfg.run.env_overrides or {}, holdout_env_overrides(maps))))
+        # Stored AFTER the patch: `self.tcfg` is the config THIS evaluator's env was built from,
+        # so it agrees with `self.env_cfg` / `self.map_names` and with `build_spec(self.tcfg)`.
+        # For the holdout twin that is the derived config, not the run's.
         self.tcfg = tcfg
         self.verbose = verbose
         self.tier_names = tuple(tiers or tcfg.eval.tiers or tcfg.curriculum.tiers)
@@ -63,6 +92,7 @@ class TierEvaluator:
         device = device or tcfg.run.device
         env_cfg = load_config(_resolve(tcfg.run.env_config), overrides=tcfg.run.env_overrides or None)
         self.env_cfg = env_cfg
+        self.map_names = env_cfg.map_names   # what this evaluator's bank holds, for the banner/log
         # DECISIONS, not sim ticks: `evaluate`'s loop drives `venv.step()`, and one of those
         # covers `action_repeat` ticks. Using max_episode_steps here would spin the eval rollout
         # action_repeat times longer than any episode can possibly last.
@@ -145,6 +175,27 @@ class TierEvaluator:
 
     def close(self) -> None:
         self.venv.close()
+
+
+def build_evaluators(tcfg: TrainConfig, device=None, verbose: int = 0):
+    """`(training_map_evaluator, holdout_evaluator_or_None)` for a run.
+
+    The second is built only when `eval.holdout_maps` names something, and is the first one's
+    twin on those maps (see the module docstring). It costs what the first costs: a second env of
+    `len(tiers) * episodes_per_tier` slots held for the life of the run, and a second rollout per
+    evaluation, so eval wall-clock roughly doubles."""
+    evaluator = TierEvaluator(tcfg, device=device, verbose=verbose)
+    holdout = None
+    if tcfg.eval.has_holdout:
+        holdout = TierEvaluator(tcfg, device=device, verbose=verbose, maps=tcfg.eval.holdout_maps)
+    return evaluator, holdout
+
+
+def mean_win_rate(results: dict) -> float:
+    """Unweighted mean of the per-tier win rates -- `eval/win_rate_mean` and
+    `eval/holdout_win_rate` are both this, over their own evaluator's results."""
+    win_rates = [r["win_rate"] for r in results.values()]
+    return float(sum(win_rates) / len(win_rates)) if win_rates else 0.0
 
 
 def summary_line(results: dict) -> str:

@@ -41,6 +41,11 @@ PERSON_SHORT_NAMES = ("rush", "camper", "hunter", "trapper", "kite")
 _KNOWN_MAP_NAMES = (
     "blank", "open", "bushy", "walled", "skull_creek", "feast_or_famine",
     "scorched_stone", "island_invasion",
+    # The ten generated maps (SIM_OVERHAUL_PLAN.md Step M3, 2026-09-18); seeds and families in
+    # brawl_sim/maps/README.md. A new CSV under brawl_sim/maps/csv/ must be listed here before
+    # world.maps / fixed_map may name it.
+    "broken_wall", "stone_fort", "twin_ponds", "cross_creek", "split_river", "narrow_pass",
+    "dry_gulch", "thorn_field", "reed_marsh", "hollow_ring",
 )
 
 # A RandomizationSpec maps a "section.field" dotted key (matching configs/*.yaml section and
@@ -72,6 +77,14 @@ class EnvConfig:
     dash_on_idle: str = "facing"
     obs_include_world_grid: bool = True
     obs_include_privileged: bool = True
+    # --- observation history (SIM_OVERHAUL_PLAN.md Phase H). The sim keeps the last
+    # `history_frames` DECISIONS of the hero's hp, ammo and position, the action it took, and every
+    # entity's position plus whether the hero saw it (core/state `hist_*`, written by
+    # core/history.push at the top of env.step). `history_radius_tiles` is how far around the hero
+    # the H2 grid channels look back. Both are structural -- they size state buffers and the
+    # observation -- so they live here, not in SimParams, and changing them breaks checkpoints.
+    history_frames: int = 3
+    history_radius_tiles: int = 4
     bots_break_boxes: bool = True
     bots_collect_cubes: bool = True
     bots_avoid_zone: bool = True
@@ -115,10 +128,11 @@ class EnvConfig:
 
     @property
     def action_nvec(self) -> tuple[int, int]:
-        """(move bins + idle, attack). The attack dimension is 3-valued as of Step D2:
-        0 = nothing, 1 = attack, 2 = super. Widened rather than joined by a third dimension so the
-        action stays (N,2) -- see core/hero.action_mask."""
-        return (self.n_move_bins + 1, 3)
+        """(move bins + idle, attack). The attack dimension is 4-valued: 0 = nothing, 1 = attack,
+        2 = super (Step D2), 3 = gadget (SIM_OVERHAUL_PLAN.md Step G3, decision S7). Widened
+        rather than joined by a third dimension so the action stays (N,2) -- see
+        core/hero.action_mask."""
+        return (self.n_move_bins + 1, 4)
 
     @property
     def ray_steps(self) -> int:
@@ -227,6 +241,8 @@ _ENV_CONFIG_FIELDS = (
     ("action.dash_on_idle", "dash_on_idle", str),
     ("observation.include_world_grid", "obs_include_world_grid", bool),
     ("observation.include_privileged", "obs_include_privileged", bool),
+    ("observation.history_frames", "history_frames", int),
+    ("observation.history_radius_tiles", "history_radius_tiles", int),
     ("bots.break_boxes", "bots_break_boxes", bool),
     ("bots.collect_cubes", "bots_collect_cubes", bool),
     ("bots.avoid_zone", "bots_avoid_zone", bool),
@@ -435,6 +451,17 @@ PER_KIND_FIELDS = (
     ("super_heal", "super_heal", _F32),
     ("super_proj_speed", "super_proj_speed", _F32),
     ("super_radius", "super_radius", _F32),
+    # GADGET (SIM_OVERHAUL_PLAN.md Phase G). Per-kind exactly like the super: `gadget_cooldown: 0`
+    # means "this kind has no gadget", which is what every bot resolves to today. The five numbers
+    # are the whole mechanic -- a Proj.GADGET_SPINNER (ARTILLERY-class) flies `gadget_range` tiles
+    # toward the nearest revealed enemy, lands after `gadget_flight_seconds`, and deals
+    # `gadget_damage` to everything within `gadget_radius`. The timer is state.ent_gadget_cd (0 =
+    # ready, so a fresh episode starts charged); `validate()` rejects a cooldown with no geometry.
+    ("gadget_cooldown", "gadget_cooldown", _F32),
+    ("gadget_range", "gadget_range", _F32),
+    ("gadget_flight_seconds", "gadget_flight_seconds", _F32),
+    ("gadget_damage", "gadget_damage", _F32),
+    ("gadget_radius", "gadget_radius", _F32),
     # --- FIRE RULE (Step E1). These four numbers plus `aim_model` below are the entirety of what
     # used to be bots/{sniper,artillery,melee,rifle}.py: adding a sixth brawler is now a
     # brawlers.yaml block, not a fifth Python module plus a dispatcher entry. See
@@ -462,9 +489,25 @@ PER_KIND_FIELDS = (
     # Preferred engagement distance as a fraction of this kind's own attack_range -- what the KITE
     # personality holds. Was bots/policy.RANGE_FRACTION_BY_KIND, a Python tuple with an
     # `assert len(...) == N_KINDS` that a sixth brawler would have tripped. Read by
-    # bots/policy.targeting into Targeting.desired_range; the hero's 0 is never read (its movement
-    # comes from decode_action).
+    # bots/policy.targeting into Targeting.desired_range, capped at the kind's fire reach
+    # (fire_range_fraction x attack_range) so no aggression tier holds its target out of range; the
+    # hero's 0 is never read (its movement comes from decode_action).
     ("desired_range_fraction", "desired_range_fraction", _F32),
+    # --- DIFFICULTY AXES (SIM_OVERHAUL_PLAN.md Phase B). Both are per kind so the curriculum can
+    # scale them per (env, kind) exactly like `hp` and `damage`; both are authored on every bot
+    # block in brawlers.yaml because a tier MULTIPLIES them and 0 times anything is 0.
+    #
+    # hero_focus in [0, 1]: how much a bot prefers the hero as a target when the hero is in view.
+    # bots/perception.select_target discounts the hero's distance by (1 - hero_focus) and switches
+    # to the hero, sticky target or not, when the discounted distance wins. 0 is the plain
+    # nearest-visible-target rule (what every bot did before 2026-09). The hero's own value is
+    # never read.
+    ("hero_focus", "hero_focus", _F32),
+    # aggression, 1.0 = the bot as authored: bots/personality.py reads it in exactly three places
+    # (the HUNTER/KITE retreat HP threshold, the KITE hold distance, the CAMPER fire veto). 0 --
+    # what a hand-built partial spec resolves to -- is read as 1.0, so it is neutral like every
+    # other optional field here; a NEGATIVE value is rejected by validate().
+    ("aggression", "aggression", _F32),
 )
 
 # (SimParams attribute, brawlers.yaml leaf key, enum class, default member name) -- one column per
@@ -871,6 +914,15 @@ def validate(cfg: EnvConfig, params: SimParams) -> None:
 
     if cfg.action_latency_seconds < 0:
         raise ValueError(f"action_latency_seconds must be >= 0, got {cfg.action_latency_seconds}")
+    # The history rings (Phase H) are allocated K deep and `history.push` shifts K-1 slots; 0 would
+    # allocate an empty ring and index slot 0 of it. 1 is the legitimate minimum: "just the last
+    # decision". The radius sizes the H2 grid channels, and a 0-tile window sees nothing.
+    if cfg.history_frames < 1:
+        raise ValueError(f"observation.history_frames must be >= 1, got {cfg.history_frames}")
+    if cfg.history_radius_tiles < 1:
+        raise ValueError(
+            f"observation.history_radius_tiles must be >= 1, got {cfg.history_radius_tiles}"
+        )
 
     if cfg.action_repeat < 1:
         raise ValueError(f"action_repeat must be >= 1, got {cfg.action_repeat}")
@@ -996,6 +1048,44 @@ def validate(cfg: EnvConfig, params: SimParams) -> None:
                 f"of this kind would hold range 0 -- it would charge to point blank instead of "
                 f"keeping distance. Set the fraction of attack_range this kind fights at."
             )
+
+        # --- difficulty axes (SIM_OVERHAUL_PLAN.md Phase B). hero_focus is a discount FACTOR on a
+        # distance, so outside [0, 1] it either inflates the hero's distance (a bot that avoids
+        # the hero) or makes it negative (argmin picks the hero at any range, including out of
+        # sight). aggression divides a threshold, so a negative value flips retreat into charge.
+        # 0 is neutral for both (see PER_KIND_FIELDS) and is not rejected: hand-built partial specs
+        # in tests resolve to it. The shipped brawlers.yaml is pinned separately
+        # (tests/test_configs_files.py) to author both on every bot kind.
+        focus_hi = float(params.hero_focus[:, k].max())
+        focus_lo = float(params.hero_focus[:, k].min())
+        if focus_lo < 0 or focus_hi > 1.0:
+            raise ValueError(
+                f"{kind_name}: hero_focus must be in [0, 1] -- it discounts the hero's distance "
+                f"by (1 - hero_focus) in bots/perception.select_target. Got {focus_lo}..{focus_hi}."
+            )
+        if float(params.aggression[:, k].min()) < 0:
+            raise ValueError(
+                f"{kind_name}: aggression must be >= 0 (0 is read as 1.0; a negative value would "
+                f"turn the retreat threshold into a charge threshold). Got "
+                f"{float(params.aggression[:, k].min())}."
+            )
+
+        # --- gadget (SIM_OVERHAUL_PLAN.md Phase G). `gadget_cooldown > 0` is what "this kind has
+        # a gadget" means (core/hero.gadget_ready, Step G2), so a block that sets it and leaves
+        # the geometry at 0 loads fine and ships a button whose spinner reaches nowhere, lands
+        # never, and hurts nothing -- for a whole training run. Damage is deliberately not checked:
+        # 0 is a legitimate "utility" gadget, the geometry is not.
+        if float(params.gadget_cooldown[:, k].min()) < 0:
+            raise ValueError(f"{kind_name}: gadget_cooldown must be >= 0 (0 = no gadget).")
+        if float(params.gadget_cooldown[:, k].max()) > 0:
+            for field in ("gadget_range", "gadget_flight_seconds", "gadget_radius"):
+                if float(getattr(params, field)[:, k].min()) <= 0:
+                    raise ValueError(
+                        f"{kind_name}: gadget_cooldown is set but {field} is 0, so the gadget "
+                        f"would fire a spinner that cannot reach, land or hit anything. Set all "
+                        f"three of gadget_range, gadget_flight_seconds and gadget_radius, or "
+                        f"drop the cooldown."
+                    )
 
         # A projectile with no speed and no fixed flight time never moves and never expires by
         # distance -- it would sit on the shooter forever, holding a slot.

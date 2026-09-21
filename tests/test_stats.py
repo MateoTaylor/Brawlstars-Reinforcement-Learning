@@ -1,6 +1,7 @@
 from pathlib import Path
 from types import SimpleNamespace
 
+import pytest
 import torch
 import yaml
 
@@ -210,3 +211,49 @@ def test_functions_support_n_e_batch():
     ):
         assert out.shape == (n, e)
         assert not torch.any(torch.isnan(out))
+
+
+# ---- effective_gadget_damage (Step G2.5) ---------------------------------------------------
+
+def test_effective_gadget_damage_is_2000_for_the_hero_with_no_cubes():
+    cfg, params = _real_params(n_envs=2)
+    kind = torch.full((2, 1), int(Kind.HERO_MORTIS), dtype=torch.int64)
+    cubes = torch.zeros(2, 1, dtype=torch.int64)
+    assert stats.effective_gadget_damage(kind, cubes, params).tolist() == [[2000.0], [2000.0]]
+
+
+def test_effective_gadget_damage_applies_the_same_cube_bonus_as_the_attack():
+    """+10% per cube (configs/default.yaml `damage_bonus_per_cube: 0.10`); the hero's base_damage
+    and gadget_damage are both 2000, so the two must agree number for number."""
+    cfg, params = _real_params(n_envs=1)
+    kind = torch.full((1, 3), int(Kind.HERO_MORTIS), dtype=torch.int64)
+    cubes = torch.tensor([[3, 10, 16]], dtype=torch.int64)
+    gadget = stats.effective_gadget_damage(kind, cubes, params)
+    attack = stats.effective_damage(kind, cubes, params)
+    assert gadget[0].tolist() == pytest.approx([2600.0, 4000.0, 5200.0], abs=1e-3)
+    assert torch.allclose(gadget, attack)
+
+
+def test_effective_gadget_damage_is_zero_for_a_kind_without_a_gadget():
+    cfg, params = _real_params(n_envs=1)
+    kind = torch.full((1, 2), int(Kind.BOT_SNIPER), dtype=torch.int64)
+    cubes = torch.tensor([[0, 7]], dtype=torch.int64)
+    assert stats.effective_gadget_damage(kind, cubes, params).tolist() == [[0.0, 0.0]]
+
+
+def test_effective_gadget_damage_uses_the_enemy_multiplier_like_the_attack_does():
+    """Synthetic params so a bot with a gadget is expressible: kind 2 has gadget_damage 500, 3
+    cubes at +20% each and enemy_damage_mult 3.0 -> 500 * 1.6 * 3 = 2400; the hero (kind 0)
+    at the same cubes skips the multiplier -> 100 * 1.6 = 160."""
+    gadget_damage = torch.zeros(1, N_KINDS)
+    gadget_damage[0, 0] = 100.0
+    gadget_damage[0, 2] = 500.0
+    params = SimpleNamespace(
+        gadget_damage=gadget_damage,
+        cube_damage_bonus=torch.full((1,), 0.2),
+        enemy_damage_mult=torch.full((1,), 3.0),
+    )
+    kind = torch.tensor([[int(Kind.HERO_MORTIS), 2]], dtype=torch.int64)
+    cubes = torch.tensor([[3, 3]], dtype=torch.int64)
+    out = stats.effective_gadget_damage(kind, cubes, params)
+    assert out[0].tolist() == pytest.approx([160.0, 2400.0], abs=1e-4)

@@ -60,6 +60,12 @@ from brawl_sim.core import obs_select
 from brawl_deployment.perception.assemble import MapFrame, ObservationAssembler
 
 ATTACK_NONE, ATTACK_FIRE, ATTACK_SUPER = 0, 1, 2
+# The sim's attack column is 4 wide since SIM_OVERHAUL Step G3 (`[none, attack, super, gadget]`,
+# `cfg.action_nvec`), and it is the only width that loads: the 3-wide checkpoints trained before it
+# were retired by the operator on 2026-09-21. The shadow reports three legals; the fourth column is
+# held illegal until Step G5 wires the gadget button.
+_SHADOW_ATTACK_WIDTH = 3
+_PRE_GADGET_ATTACK_WIDTH = 3   # only to NAME that refusal in `check_spaces`; nothing loads at it
 
 
 def check_spaces(model, spec, cfg, *, label: str, spec_path="the spec", cfg_path="the config"):
@@ -83,8 +89,13 @@ def check_spaces(model, spec, cfg, *, label: str, spec_path="the spec", cfg_path
             f"edited since the run finished -- a changed spec must be a NEW file."
         )
     nvec = tuple(int(v) for v in getattr(model.action_space, "nvec", ()))
-    if nvec != tuple(cfg.action_nvec):
-        raise ValueError(f"{label} has action space {nvec}, config says {tuple(cfg.action_nvec)}")
+    want = tuple(int(v) for v in cfg.action_nvec)
+    if nvec != want:
+        why = ""
+        if nvec == (want[0], _PRE_GADGET_ATTACK_WIDTH):
+            why = (" It is a pre-gadget checkpoint (before SIM_OVERHAUL Step G3); those were "
+                   "retired on 2026-09-21, so retrain rather than load it.")
+        raise ValueError(f"{label} has action space {nvec}, config says {want}.{why}")
 
 
 @dataclass(frozen=True)
@@ -119,7 +130,10 @@ class DeployedPolicy:
         self.cfg = cfg
         self.deterministic = deterministic
         self._n_move = int(cfg.n_move_bins) + 1
-        self._mask = np.ones((1, self._n_move + 3), dtype=bool)
+        # The sim's own `[move, attack]` layout, `cfg.action_nvec`: `check_spaces` has already
+        # refused any checkpoint whose action space differs from it.
+        self._mask = np.ones((1, self._n_move + int(cfg.action_nvec[1])), dtype=bool)
+        self._mask[0, self._n_move + _SHADOW_ATTACK_WIDTH:] = False  # gadget column: illegal until Step G5 wires the shadow + button
         self._batched: dict = {}
 
     # -- loading --------------------------------------------------------------
@@ -141,7 +155,10 @@ class DeployedPolicy:
         from brawl_sim.training.config import load_train_config
 
         run_dir = Path(run_dir)
-        tcfg = load_train_config(run_dir / "train.yaml")
+        # `check_holdout=False`: `eval.holdout_maps` is checked against the map registry and the
+        # CSVs as they are TODAY, and nothing below reads a map name. Without this, retiring or
+        # renaming a held-out map would make every run that archived it undeployable.
+        tcfg = load_train_config(run_dir / "train.yaml", check_holdout=False)
 
         if tcfg.run.algo != "maskable_ppo":
             raise ValueError(
@@ -181,7 +198,8 @@ class DeployedPolicy:
         """One decision. `obs` is `ObservationAssembler.assemble`'s output; `attack_legal` is
         `ShadowHero.attack_mask()`.
 
-        The mask is `[move (n_move_bins + 1), attack (3)]` flattened, which is what
+        The mask is `[move (n_move_bins + 1), attack (4)]` flattened, with the gadget column
+        held False until Step G5, which is what
         `wrappers/sb3_vecenv.py:action_masks` hands `MaskablePPO` during training. The move half
         is all-True because `core/hero.action_mask` builds it that way and nothing has ever
         narrowed it; the attack half comes from the shadow, which owns the hero's timers and ammo
@@ -197,7 +215,7 @@ class DeployedPolicy:
             # surfaces as NaN logits rather than as an error, so refuse here instead.
             raise ValueError("attack_legal[0] (no-fire) must always be True; an all-illegal "
                              "dimension gives the policy a degenerate distribution, not an error")
-        self._mask[0, self._n_move:] = legal
+        self._mask[0, self._n_move:self._n_move + _SHADOW_ATTACK_WIDTH] = legal
 
         for name, value in obs.items():
             slot = self._batched.get(name)
