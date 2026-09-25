@@ -114,6 +114,9 @@ _ZONE_EPISODE_FIELDS = (
     ("zone_hi", lambda N, E, P, B, U, L, K: (N, 2), F32),
     ("zone_next_t", lambda N, E, P, B, U, L, K: (N,), F32),
     ("zone_step", lambda N, E, P, B, U, L, K: (N,), I32),
+    # Latch behind obs zone.active: gas has been on screen at least once this episode
+    # (core/zone.mark_seen, OBS_PARITY_TASKS.md C5). Reset with the rest of the episode fields.
+    ("zone_seen", lambda N, E, P, B, U, L, K: (N,), BOOL),
     ("map_id", lambda N, E, P, B, U, L, K: (N,), I64),
     ("time", lambda N, E, P, B, U, L, K: (N,), F32),
     ("step_count", lambda N, E, P, B, U, L, K: (N,), I32),
@@ -142,6 +145,17 @@ _HISTORY_FIELDS = (
     ("hist_enemy_seen", lambda N, E, P, B, U, L, K: (N, K, E), BOOL),
 )
 
+# --- tracker-style enemy slots (OBS_PARITY_TASKS.md C8). Written only by core/slots.update, once
+# per DECISION from env._build_observation, and by zero_. Slot k of a `slots: tracked` group is
+# entity `slot_ent[k] - 1`: stored +1 so a zeroed (reset) row means "no slots". The slot count is
+# E - 1 -- the hero holds none -- and the lambda's K is the history depth, hence `E - 1` here.
+_SLOT_FIELDS = (
+    ("slot_ent", lambda N, E, P, B, U, L, K: (N, E - 1), I64),   # entity index + 1 in slot k; 0 = empty
+    ("ent_slot", lambda N, E, P, B, U, L, K: (N, E), I64),       # slot + 1 of entity e; 0 = none
+    ("ent_hits", lambda N, E, P, B, U, L, K: (N, E), I32),       # consecutive decisions seen while unslotted
+    ("ent_misses", lambda N, E, P, B, U, L, K: (N, E), I32),     # consecutive decisions unseen while slotted
+)
+
 # Cached, not part of "state" in the resettable sense -- excluded from zero_ (see below).
 _CACHED_FIELDS = (
     ("env_idx", lambda N, E, P, B, U, L, K: (N,), I64),
@@ -149,7 +163,7 @@ _CACHED_FIELDS = (
 
 _ALL_FIELD_SPECS = (
     _ENTITY_FIELDS + _PROJECTILE_FIELDS + _BOX_PICKUP_FIELDS
-    + _ZONE_EPISODE_FIELDS + _LATENCY_FIELDS + _HISTORY_FIELDS + _CACHED_FIELDS
+    + _ZONE_EPISODE_FIELDS + _LATENCY_FIELDS + _HISTORY_FIELDS + _SLOT_FIELDS + _CACHED_FIELDS
 )
 _RESETTABLE_FIELD_NAMES = tuple(name for name, _, _ in _ALL_FIELD_SPECS if name != "env_idx")
 

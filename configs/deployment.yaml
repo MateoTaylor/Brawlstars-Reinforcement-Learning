@@ -26,7 +26,10 @@ run:
   #
   # This is the DEFAULT run. `scripts/deploy_run.py --run <name> [--checkpoint best|final]` plays a
   # different one for a single invocation, by the name it was trained as, without editing this file.
-  dir: runs/mortis_deploy3_elite-20260913-015933
+  # Repointed 2026-09-22 (SIM_OVERHAUL I5). It named the deploy3 run, which is pre-gadget AND was
+  # deleted, so a live run would have failed on a missing path and the pre-flight test SKIPPED
+  # rather than failing -- see test_deployment_policy.py's dangling-pointer guard.
+  dir: runs/mortis_deploy4-20260921-185945
   checkpoint: best_model.zip
 
 policy:
@@ -38,6 +41,11 @@ policy:
   # its own action distribution adds noise to a decision it already made and makes every failure
   # unreproducible.
   deterministic: true
+  # The dead-bin move mask (brawl_deployment/move_mask.py, design 6.16): a bin that would walk
+  # the hero into a wall on the grid the policy sees is masked, the way an uncharged super is.
+  # MEASURED 2026-09-23 in the sim: wall-pushing decisions 2.2% -> 0.0%, 2 s stalls gone, win
+  # rate unchanged within noise. `false` is the A/B switch, not a tuning.
+  dead_bin_mask: true
 
 compute:                  # design 7.2
   # The emulator is a VM on the same eight cores, and it is what lags when this process burns
@@ -92,10 +100,15 @@ control:
   # button: any tap on the right side of the screen fires so long as it misses the Super and
   # gadget buttons, and the attack stick FLOATS to the touch point exactly like the movement
   # stick. So this is chosen for CLEARANCE -- the same way 4.3 chose the joystick anchor -- and
-  # pointing it at the measured button centre would be a downgrade, not a fix. At 1920x1080 it
-  # sits ~330 px from gadget and ~450 px from super, above the button cluster and inside the
-  # right edge, which also keeps it clear of venue-specific buttons drawn over the attack area
-  # (a green chevron in Training Grounds swallowed 2 of 3 taps at the old anchor).
+  # pointing it at the measured button centre would be a downgrade, not a fix. Since 2026-09-22
+  # there is no measured attack centre to point it at either: the disc the calibration called
+  # `attack` is the GADGET, and the attack stick's own rest circle is deliberately uncalibrated
+  # because it floats to wherever it is touched. At 1920x1080 this point sits ~333 px from the
+  # Super and ~403 px from the gadget, above the button cluster and inside the right edge, which
+  # also keeps it clear of venue-specific buttons drawn over the attack area (a green chevron in
+  # Training Grounds swallowed 2 of 3 taps at the old anchor). Both clearances are unchanged
+  # measurements under corrected names: 333 px was reported as the distance to `gadget`, and the
+  # old "450 px from super" was the distance to a third disc nothing presses.
   #
   # UNVERIFIED IN A REAL MATCH. scripts/deploy_calibrate.py confirms it by tapping once and
   # asserting read_ammo decrements, which is the venue-independent check and the one that would
@@ -108,9 +121,10 @@ control:
   # the policy never trained on.
   #
   # Direction only -- the dash and the super travel a fixed distance -- so this just has to clear
-  # the game's aim deadzone. 75 is ~70% of the movement stick's 110 px ring. The ceiling is the
-  # super button, 81 px above the bottom edge: a radius past that is refused at startup, because
-  # an off-screen point is clamped to the edge and the shot would go the wrong way.
+  # the game's aim deadzone. 75 is ~70% of the movement stick's 110 px ring. The ceiling is still
+  # the super button, but it is now 179 px above the bottom edge rather than 81: the 81 px disc
+  # was never the Super (2026-09-22). A radius past the ceiling is refused at startup, because an
+  # off-screen point is clamped to the edge and the shot would go the wrong way.
   #
   # UNVERIFIED IN A REAL MATCH. The calibration tap job proves the press fires (ammo drops); watch
   # that the dash goes the way the stick was held, too.

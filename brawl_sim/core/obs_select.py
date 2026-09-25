@@ -32,6 +32,16 @@ mask) -- this happens unconditionally, independent of `fair`, since it's slot-pa
 fairness. **This is the one group shape that is NOT index-stable tick to tick** -- unlike every
 other group, a given output row is not "the same real entity" across steps.
 
+**`slots: tracked` (OBS_PARITY_TASKS.md C9) orders an `entities.*` group by the sim's
+tracker-style slots** (`core/slots.py`, read from `full_obs["slots"]["entity"]`): output row k is
+the entity holding slot k, zero while the slot is empty, and the fairness mask is gathered the same
+way. Row identity then follows the live `EntityTracker`'s rule -- a slot is taken on the second
+consecutive sighting, kept through three unseen decisions and reassigned to whichever enemy comes
+next -- instead of "row k is entity k + 1 forever", which no detector can supply. The shape is
+unchanged (`E - 1` rows). Deployment writes the identity permutation (`assemble._put_entities`),
+so its output is slot-ordered already. Only defined for the hero-axis prefix, and never together
+with `max_slots`: the two are both row orders.
+
 **`normalize: true` is a real but intentionally narrow transform**, not full z-scoring. Four
 units are covered, each by one constant chosen the same way -- so that the largest value the sim
 can actually produce lands just inside 1.0, with headroom:
@@ -82,15 +92,19 @@ from . import obs_schema
 
 _MAX_GROUPS = 6  # Hard Constraint 4: each group is a separate device->host transfer (Step 33)
 
-# The 12 `_build_grid` channels (core/observation.py), by name -> index. "enemy_any"/
+# The 12 base `_build_grid` channels (core/observation.py), by name -> index. The grid carries
+# `cfg.history_frames` more after them, "enemy_hist1".."enemy_histK" (Phase H); those depend
+# on cfg, so `channel_index(cfg)` adds them and this table stays the fixed part. "enemy_any"/
 # "enemy_hidden" are deliberately excluded from `fair: true` specs (checked at load time) --
-# only "enemy_revealed" is a legitimate agent-facing channel under fairness gating.
+# only "enemy_revealed" is a legitimate agent-facing channel under fairness gating. The
+# enemy_hist planes are fair: they only ever draw enemies that were revealed to the hero.
 _CHANNEL_INDEX = {
     "blocks_unit": 0, "blocks_projectile": 1, "is_bush": 2, "is_water": 3, "in_zone": 4,
     "enemy_any": 5, "enemy_revealed": 6, "enemy_hidden": 7, "hero": 8, "box": 9,
     "pickup": 10, "projectile": 11,
 }
 _UNFAIR_GRID_CHANNELS = ("enemy_any", "enemy_hidden")
+_HISTORY_CHANNEL_PREFIX = "enemy_hist"
 
 _HERO_AXIS_PREFIX = "entities"  # the only per-entity axis with a hero slot to drop
 _FAIRNESS_MASK_FIELD = {"entities": "entities.revealed_to_hero", "projectiles": "projectiles.in_view"}
@@ -143,6 +157,7 @@ class GroupSpec:
     fields: tuple = ()
     per_entity: bool = False
     max_slots: int | None = None
+    slots: str | None = None                       # None | "tracked": rows ordered by full_obs["slots"] (C9)
     view_channels: tuple | None = None
     channel_idx: tuple | None = None               # resolved view-channel indices, grid groups only
     entity_prefix: str | None = None                # shared dotted prefix of `fields`, per_entity groups only
@@ -203,12 +218,28 @@ def load_agent_spec(path, cfg) -> AgentObsSpec:
                     f"group {name!r}: field {f!r} is under entities.privileged and must NEVER "
                     "be exposed to the agent (this is R04's guardrail)"
                 )
+            if f.startswith("slots."):
+                raise ValueError(
+                    f"group {name!r}: field {f!r} is the slot bookkeeping `slots: tracked` reads "
+                    "(core/slots.py), not an observation"
+                )
             if f not in spec_fields:
                 raise ValueError(f"group {name!r}: unknown field {f!r} (not present in obs_spec(cfg))")
 
         per_entity = bool(g.get("per_entity", False))
         max_slots = g.get("max_slots")
         entity_prefix = _entity_prefix(fields) if per_entity else None
+        slots = g.get("slots")
+        if slots is not None:
+            if slots != "tracked":
+                raise ValueError(f"group {name!r}: slots must be omitted or 'tracked', got {slots!r}")
+            if not per_entity or entity_prefix != _HERO_AXIS_PREFIX:
+                raise ValueError(
+                    f"group {name!r}: slots: tracked is only defined for a per_entity "
+                    f"{_HERO_AXIS_PREFIX}.* group (core/slots.py slots enemies, nothing else)"
+                )
+            if max_slots is not None:
+                raise ValueError(f"group {name!r}: slots: tracked and max_slots are both row orders; pick one")
         if max_slots is not None:
             if not per_entity:
                 raise ValueError(f"group {name!r}: max_slots is only meaningful when per_entity: true")
@@ -236,7 +267,7 @@ def load_agent_spec(path, cfg) -> AgentObsSpec:
 
         groups.append(GroupSpec(
             name=name, dtype=dtype, shape=shape, fields=fields, per_entity=per_entity,
-            max_slots=max_slots, entity_prefix=entity_prefix, norm_scale=norm_scale,
+            max_slots=max_slots, slots=slots, entity_prefix=entity_prefix, norm_scale=norm_scale,
         ))
 
     if len(groups) > _MAX_GROUPS:
@@ -247,10 +278,22 @@ def load_agent_spec(path, cfg) -> AgentObsSpec:
     return AgentObsSpec(fair=fair, groups=tuple(groups), normalize=normalize)
 
 
+def channel_index(cfg) -> dict:
+    """Every `view` channel for this cfg, by name -> index: the 12 of `_CHANNEL_INDEX`, then
+    "enemy_hist1".."enemy_hist{K}" at 12..11+K for K = cfg.history_frames. "enemy_histk" draws
+    the enemies seen k decisions before the current observation (core/observation.py)."""
+    index = dict(_CHANNEL_INDEX)
+    base = len(_CHANNEL_INDEX)
+    for k in range(1, cfg.history_frames + 1):
+        index[f"{_HISTORY_CHANNEL_PREFIX}{k}"] = base + k - 1
+    return index
+
+
 def _load_grid_group(name: str, dtype: str, view_channels, fair: bool, cfg) -> GroupSpec:
+    index = channel_index(cfg)
     for ch in view_channels:
-        if ch not in _CHANNEL_INDEX:
-            raise ValueError(f"group {name!r}: unknown view channel {ch!r}; valid: {sorted(_CHANNEL_INDEX)}")
+        if ch not in index:
+            raise ValueError(f"group {name!r}: unknown view channel {ch!r}; valid: {sorted(index)}")
     if fair:
         forbidden = [ch for ch in view_channels if ch in _UNFAIR_GRID_CHANNELS]
         if forbidden:
@@ -259,7 +302,7 @@ def _load_grid_group(name: str, dtype: str, view_channels, fair: bool, cfg) -> G
                 "already respects visibility -- 'enemy_any'/'enemy_hidden' would leak hidden "
                 "enemy positions to the agent)"
             )
-    channel_idx = tuple(_CHANNEL_INDEX[c] for c in view_channels)
+    channel_idx = tuple(index[c] for c in view_channels)
     shape = (len(view_channels), cfg.view_h, cfg.view_w)
     return GroupSpec(name=name, dtype=dtype, shape=shape, view_channels=tuple(view_channels), channel_idx=channel_idx)
 
@@ -327,8 +370,15 @@ def _ensure_trailing_dim(t: torch.Tensor, per_entity: bool) -> torch.Tensor:
     return t.unsqueeze(-1) if t.dim() < min_dims else t
 
 
+def _flat_columns(t: torch.Tensor) -> torch.Tensor:
+    """(N,) -> (N,1), and (N, d1, d2, ...) -> (N, d1*d2*...) in row-major order: the width
+    `_field_width` counts and the column order `agent_obs_index_map` documents. `hist.move_onehot`
+    (N,K,17) becomes slot 0's 17 columns, then slot 1's, then slot 2's."""
+    return t.unsqueeze(-1) if t.dim() == 1 else t.flatten(1)
+
+
 def _build_flat_group(full_obs: dict, g: GroupSpec) -> torch.Tensor:
-    parts = [_ensure_trailing_dim(_get_field(full_obs, f), per_entity=False).to(torch.float32) for f in g.fields]
+    parts = [_flat_columns(_get_field(full_obs, f)).to(torch.float32) for f in g.fields]
     return torch.cat(parts, dim=-1)
 
 
@@ -342,7 +392,7 @@ def _build_entity_group(full_obs: dict, g: GroupSpec, fair: bool) -> torch.Tenso
         parts.append(t.to(torch.float32))
     out = torch.cat(parts, dim=-1)  # (N, n_slots, W)
 
-    idx = None  # set below only when max_slots selected a K-of-full-axis subset of slots
+    idx = None  # (N,K) row gather, set when max_slots or `slots: tracked` reorders the rows
     if g.max_slots is not None:
         ttc = _get_field(full_obs, f"{g.entity_prefix}.time_to_closest")
         alive = _get_field(full_obs, f"{g.entity_prefix}.alive")
@@ -352,6 +402,11 @@ def _build_entity_group(full_obs: dict, g: GroupSpec, fair: bool) -> torch.Tenso
         out = torch.gather(out, 1, idx_exp)
         slot_alive = torch.gather(alive, 1, idx).to(torch.float32).unsqueeze(-1)
         out = out * slot_alive  # zero-pad slots with fewer than max_slots alive occupants
+    elif g.slots == "tracked":
+        ent = full_obs["slots"]["entity"]                       # (N,K): entity + 1, 0 = empty
+        idx = (ent - 2).clamp(min=0)                            # entity e -> row e - 1 (hero dropped)
+        valid = (ent > 0).to(torch.float32).unsqueeze(-1)
+        out = torch.gather(out, 1, idx.unsqueeze(-1).expand(-1, -1, out.shape[-1])) * valid
 
     if fair:
         mask_field = _FAIRNESS_MASK_FIELD.get(g.entity_prefix)
@@ -359,7 +414,7 @@ def _build_entity_group(full_obs: dict, g: GroupSpec, fair: bool) -> torch.Tenso
             mask = _get_field(full_obs, mask_field)
             if drop_hero:
                 mask = mask[:, 1:]
-            if g.max_slots is not None:
+            if idx is not None:
                 mask = torch.gather(mask, 1, idx)
             out = out * mask.to(torch.float32).unsqueeze(-1)
 

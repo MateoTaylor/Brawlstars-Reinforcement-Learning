@@ -598,6 +598,63 @@ def test_validate_action_latency_negative():
         validate(cfg, _dummy_params(cfg))
 
 
+_SHIPPED = Path(__file__).resolve().parents[1] / "configs"
+_QUAD = ((-14.11, -10.59), (14.77, -10.93), (11.73, 7.45), (-11.55, 7.01))
+
+
+def test_camera_and_slots_load_from_the_yaml_and_default_when_absent(config_dir):
+    """OBS_PARITY_TASKS.md C1. The dataclass defaults ARE the shipped values, so a train.yaml that
+    points at an older default.yaml (no `camera:` block) evaluates under the same camera."""
+    absent = load_config(config_dir / "default.yaml")      # DEFAULT_YAML has no camera/slots block
+    shipped = load_config(_SHIPPED / "default.yaml")
+    for cfg in (absent, shipped):
+        assert cfg.camera_quad == _QUAD
+        assert cfg.camera_clamp_onset == (12.1, 12.8, 8.9, 5.5)
+        assert cfg.camera_edge_flag_tiles == 2.0
+        assert (cfg.slots_promote_hits, cfg.slots_max_misses) == (2, 3)
+    validate(shipped, _dummy_params(shipped))  # the shipped quad passes its own orientation check
+
+
+def test_camera_overrides_deep_merge_onto_the_shipped_yaml():
+    cfg = load_config(_SHIPPED / "default.yaml", overrides={"camera": {"edge_flag_tiles": 1.0}})
+    assert cfg.camera_edge_flag_tiles == 1.0
+    assert cfg.camera_clamp_onset == (12.1, 12.8, 8.9, 5.5) and cfg.camera_quad == _QUAD
+    # One side overridden: the deep merge keeps the yaml's other three.
+    cfg = load_config(_SHIPPED / "default.yaml", overrides={"camera": {"clamp_onset": {"west": 5}}})
+    assert cfg.camera_clamp_onset == (5.0, 12.8, 8.9, 5.5)
+
+
+def test_camera_fragment_naming_only_one_side_raises_naming_the_others(tmp_path):
+    (tmp_path / "frag.yaml").write_text("camera:\n  clamp_onset: {west: 5}\n")
+    with pytest.raises(ValueError, match="east, north, south"):
+        load_config(tmp_path / "frag.yaml")
+    (tmp_path / "frag2.yaml").write_text(
+        "camera:\n  clamp_onset: {west: 5, east: 5, north: 5, south: 5, up: 1}\n")
+    with pytest.raises(ValueError, match="unknown: up"):
+        load_config(tmp_path / "frag2.yaml")
+
+
+def test_camera_quad_needs_four_corners(tmp_path):
+    (tmp_path / "frag.yaml").write_text("camera:\n  quad: [[-1, -1], [1, -1], [1, 1]]\n")
+    with pytest.raises(ValueError, match="4 corners"):
+        load_config(tmp_path / "frag.yaml")
+
+
+@pytest.mark.parametrize("bad, name", [
+    ({"camera_quad": tuple(reversed(_QUAD))}, "camera.quad"),                  # counter-clockwise
+    ({"camera_quad": tuple((x + 30.0, y) for x, y in _QUAD)}, "hero anchor"),  # origin outside
+    ({"camera_quad": ((-1.0, -1.0), (1.0, -1.0), (0.0, 0.5), (1.0, 1.0))}, "convex"),
+    ({"camera_clamp_onset": (-1.0, 12.8, 8.9, 5.5)}, "clamp_onset"),
+    ({"camera_edge_flag_tiles": 0.0}, "edge_flag_tiles"),
+    ({"slots_promote_hits": 0}, "promote_hits"),
+    ({"slots_max_misses": -1}, "max_misses"),
+])
+def test_validate_rejects_a_bad_camera_or_slot_setting(bad, name):
+    cfg = EnvConfig(**bad)
+    with pytest.raises(ValueError, match=name):
+        validate(cfg, _dummy_params(cfg))
+
+
 def test_history_config_loads_from_the_observation_block_and_rejects_zero(config_dir):
     """SIM_OVERHAUL_PLAN.md Phase H (Step H1.1). Both knobs are structural (they size the
     `hist_*` rings and the H2 observation), so they are EnvConfig fields under `observation:`.

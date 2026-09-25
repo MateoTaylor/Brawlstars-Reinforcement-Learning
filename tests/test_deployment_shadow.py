@@ -20,7 +20,7 @@ import yaml
 
 from brawl_sim.config import load_config
 from brawl_sim.env import BrawlVecEnv
-from brawl_deployment.control.buttons import ATTACK_FIRE, ATTACK_NONE, ATTACK_SUPER
+from brawl_deployment.control.buttons import ATTACK_FIRE, ATTACK_GADGET, ATTACK_NONE, ATTACK_SUPER
 from brawl_deployment.perception.shadow import (
     AMMO_TOLERANCE, AMMO_TOLERANCE_UNPAINTED, DESYNC, DESYNC_GRACE_SECONDS, GRACE, NO_READ,
     OK, SUSPECT, ShadowHero, ShadowParams,
@@ -61,8 +61,9 @@ def test_the_params_are_mortis_own_block_not_a_copy_of_it():
     block = yaml.safe_load((CONFIGS / "brawlers.yaml").read_text())["hero_mortis"]
     for name in ("max_ammo", "reload_seconds", "attack_cooldown", "dash_distance",
                  "dash_duration", "long_dash_seconds", "long_dash_multiplier",
-                 "super_charge_hits", "move_speed"):
+                 "super_charge_hits", "move_speed", "gadget_cooldown"):
         assert getattr(p, name) == block[name], name
+    assert p.gadget_cooldown == 18.0          # the plan's 18 s, pinned apart from the file
 
 
 def test_a_randomized_range_refuses_to_load(tmp_path):
@@ -83,6 +84,26 @@ def test_a_brawler_without_a_dash_names_the_field_it_is_missing(tmp_path):
     path.write_text(yaml.safe_dump(spec))
     with pytest.raises(KeyError, match="attack_cooldown"):
         ShadowParams.load("bot_x", path)
+
+
+def test_a_kind_without_a_gadget_loads_as_a_kind_with_no_gadget(tmp_path):
+    """The sim resolves an absent `gadget_cooldown` to 0, which is its "this kind has no gadget",
+    so the shadow does too rather than refusing the kind: never legal, never charging, and `act`
+    refuses the throw, so the loop cannot press a button the kind does not have."""
+    mortis = yaml.safe_load((CONFIGS / "brawlers.yaml").read_text())["hero_mortis"]
+    path = tmp_path / "brawlers.yaml"
+    path.write_text(yaml.safe_dump(
+        {"hero_x": {k: v for k, v in mortis.items() if k != "gadget_cooldown"}}))
+    params = ShadowParams.load("hero_x", path)
+    assert params.gadget_cooldown == 0.0
+
+    shadow = ShadowHero(params)
+    assert shadow.attack_mask() == (True, True, False, False)
+    assert shadow.observe()["gadget_ready"] is False
+    assert shadow.observe()["gadget_charge_frac"] == 0.0
+    assert shadow.act(0, ATTACK_GADGET) == ATTACK_NONE
+    shadow.advance(20.0)
+    assert not shadow.attack_mask()[3] and shadow.gadget_charge_frac == 0.0
 
 
 # ---------------------------------------------------------------------------
@@ -223,6 +244,58 @@ def test_a_super_costs_the_sim_and_the_shadow_the_same_thing():
     for field in ("ammo", "attack_cd", "dash_t", "attack_idle_t"):
         assert s[field] == float(h[field][0]), field
     assert s["ammo"] == 3.0
+
+
+@pytest.mark.parametrize("action_repeat,n_decisions", [(1, 400), (5, 100)])
+def test_the_shadows_gadget_matches_the_sims(action_repeat, n_decisions):
+    """The gadget's parity test (SIM_OVERHAUL Step G5), closed-loop on the shadow's own mask so
+    every throw is one the deployed loop could send. Decision 0 throws. Each time the gadget is
+    legal again it is thrown mid-dash, with a dash started first when none is running, because
+    the gadget's mask is the one with no dash term. Between throws the hero fires at random, so
+    the timers a throw must NOT touch are moving under it.
+
+    400 decisions at 20 Hz and 100 at 4 Hz are 20 s and 25 s, both past one 18 s cooldown, so
+    the timer is compared all the way down and through a second throw."""
+    env = _sim_env(action_repeat)
+    env.reset()
+    shadow = _shadow()
+    shadow.reset(facing=float(env.state.ent_facing[0, 0]))
+    override = torch.zeros(1, env.cfg.n_entities, 2, dtype=torch.int64)
+    override[0, 0, 0] = -1
+
+    rng = Random(1)
+    throws = mid_dash = 0
+    for decision in range(n_decisions):
+        legal = shadow.attack_mask()
+        move = rng.randrange(0, 17)
+        if decision == 0 or (legal[3] and shadow.dash_t > 0):
+            attack = ATTACK_GADGET
+        elif legal[3] and legal[1]:
+            attack = ATTACK_FIRE                 # a dash, so the next decision throws mid-dash
+        elif legal[1] and rng.random() < 0.3:
+            attack = ATTACK_FIRE
+        else:
+            attack = ATTACK_NONE
+        if attack == ATTACK_GADGET:
+            throws += 1
+            mid_dash += bool(shadow.dash_t > 0)
+        assert shadow.act(move, attack) == attack, f"decision {decision}: refused its own pick"
+        obs, _, terminated, truncated, _ = env.step(
+            torch.tensor([[move, attack]], dtype=torch.int64), override)
+        assert not bool(terminated[0]) and not bool(truncated[0]), f"episode ended at {decision}"
+        shadow.advance(action_repeat * env.cfg.dt)
+
+        h, s = obs["hero"], shadow.observe()
+        where = f"decision {decision} (move={move}, attack={attack})"
+        # Exact, like the parity test above: the same float32 operations in the same order.
+        assert s["gadget_ready"] == bool(h["gadget_ready"][0]), where
+        assert s["gadget_charge_frac"] == float(h["gadget_charge_frac"][0]), where
+        # ...and no throw moved the attack's own state.
+        for field in ("ammo", "attack_cd", "dash_t", "attack_idle_t"):
+            assert s[field] == float(h[field][0]), f"{field} at {where}"
+        for flag in ("can_attack", "dashing", "invuln", "long_dash_ready"):
+            assert s[flag] == bool(h[flag][0]), f"{flag} at {where}"
+    assert throws >= 2 and mid_dash >= 1, (throws, mid_dash)
 
 
 def test_the_scripted_run_actually_exercises_a_dash_and_a_long_dash():
@@ -411,7 +484,7 @@ def test_a_dead_hero_cannot_attack_but_its_timers_keep_running():
     shadow.act(1, ATTACK_FIRE)
     shadow.advance(0.05)
     shadow.set_alive(False)
-    assert shadow.attack_mask() == (True, False, False)
+    assert shadow.attack_mask() == (True, False, False, False)   # the gadget reads alive too
     assert not shadow.observe()["can_attack"]
     assert shadow.act(1, ATTACK_FIRE) == ATTACK_NONE
     shadow.advance(5.0)
@@ -443,15 +516,16 @@ def test_a_second_act_before_a_sub_tick_cannot_queue_a_second_attack():
 
 
 def test_an_empty_clip_masks_the_attack_but_not_the_super():
-    """`action_mask`'s super term deliberately omits the ammo test: a super costs charge."""
+    """`action_mask`'s super term deliberately omits the ammo test: a super costs charge. The
+    gadget's never had one."""
     shadow = _shadow()
     for _ in range(3):
         shadow.act(1, ATTACK_FIRE)
         shadow.advance(0.40)
     assert shadow.observe()["ammo"] < 1.0
     shadow.set_super(_super(1.0, True))
-    no_fire, fire, super_ok = shadow.attack_mask()
-    assert not fire and super_ok
+    no_fire, fire, super_ok, gadget = shadow.attack_mask()
+    assert not fire and super_ok and gadget
 
 
 def test_the_mask_is_never_wider_than_the_sims_post_timer_one():
@@ -543,6 +617,123 @@ def test_the_super_mask_still_obeys_the_cooldown_and_the_dash():
     shadow.advance(0.05)
     assert shadow.observe()["super_ready"]
     assert not shadow.attack_mask()[2]
+
+
+# ---------------------------------------------------------------------------
+# the gadget (SIM_OVERHAUL Step G5)
+# ---------------------------------------------------------------------------
+
+def test_the_gadget_is_charged_at_the_gate():
+    """Every sim episode starts with `ent_gadget_cd` at 0, and the fraction reads 1.0 there."""
+    shadow = _shadow()
+    assert shadow.attack_mask() == (True, True, False, True)
+    assert shadow.observe()["gadget_ready"] is True
+    assert shadow.observe()["gadget_charge_frac"] == 1.0
+
+
+def test_a_throw_holds_the_gadget_for_exactly_360_sub_ticks():
+    """`gadget_cooldown: 18.0` at `dt: 0.05`. The throw's own tick writes 18.0, and float32 needs
+    360 decrements to bring that to zero, so the gadget is illegal for 359 more sub-ticks and
+    legal after the 360th. The parity test above checks the same count against the sim."""
+    shadow = _shadow()
+    assert shadow.act(0, ATTACK_GADGET) == ATTACK_GADGET
+    shadow.advance(0.05)
+    assert shadow.gadget_cd == 18.0
+    assert shadow.observe()["gadget_ready"] is False
+    assert shadow.observe()["gadget_charge_frac"] == 0.0
+    for tick in range(359):
+        shadow.advance(0.05)
+        assert not shadow.attack_mask()[3], f"legal {tick + 1} sub-ticks after the throw"
+    shadow.advance(0.05)
+    assert shadow.attack_mask()[3]
+    assert shadow.observe()["gadget_charge_frac"] == 1.0
+
+
+def test_a_throw_lands_on_the_first_sub_tick_of_its_decision():
+    """The throw is sub-tick 1 and the other four count it down: 17.8 s left at the decision's
+    end, and the sim's own post-throw fraction, 0.2 / 18."""
+    shadow = _shadow()
+    shadow.act(0, ATTACK_GADGET)
+    shadow.advance(5 * 0.05)
+    assert shadow.gadget_cd == pytest.approx(17.8, abs=1e-5)
+    assert shadow.observe()["gadget_charge_frac"] == pytest.approx(0.0111111, abs=1e-6)
+
+
+def test_at_the_deployed_4_hz_the_second_throw_is_decision_73():
+    """The figure `tests/test_gadget.py` pins on the sim for a decision-rate mirror. The throw
+    leaves 17.8 s after its own decision and each later one takes 0.25 s, so decision 72 still
+    reads 0.05 s and decision 73, 18.25 s after the first throw, is the earliest second one.
+    Not 18.0: the deployed loop decides at 4 Hz, which is this."""
+    shadow = _shadow()
+    shadow.act(0, ATTACK_GADGET)                 # decision 0
+    shadow.advance(0.25)
+    for decision in range(1, 73):
+        assert not shadow.attack_mask()[3], f"legal at decision {decision}"
+        shadow.advance(0.25)
+    assert shadow.attack_mask()[3]
+
+
+def test_a_throw_is_not_an_attack():
+    """It restarts `gadget_cd` and nothing else (`env._attack_phase`). The clip, the attack
+    cooldown and the long-dash stopwatch stay put, so a throw never costs the long dash; and the
+    canary opens no grace window, because there is no spend for the bar to catch up with."""
+    shadow = _shadow()
+    shadow.advance(5.0)                          # long dash charged, far outside any grace
+    idle = shadow.observe()["attack_idle_t"]
+    shadow.act(3, ATTACK_GADGET)
+    shadow.advance(0.05)
+    s = shadow.observe()
+    assert s["ammo"] == 3.0 and s["attack_cd"] == 0.0 and s["can_attack"]
+    assert s["attack_idle_t"] == pytest.approx(idle + 0.05, abs=1e-6)
+    assert s["long_dash_ready"]
+    assert shadow.check_ammo(_ammo(3.0)).status == OK
+
+
+def test_the_gadget_can_be_thrown_in_the_middle_of_a_dash():
+    """`hero.gadget_ready` has no `dash_t` or `attack_cd` term. The attack and the super are
+    masked for the whole dash; the gadget is not, and throwing it does not cut the dash short."""
+    shadow = _shadow()
+    shadow.act(1, ATTACK_FIRE)
+    shadow.advance(0.05)
+    assert shadow.observe()["dashing"] and shadow.attack_cd > 0
+    assert shadow.attack_mask() == (True, False, False, True)
+    assert shadow.act(1, ATTACK_GADGET) == ATTACK_GADGET
+    shadow.advance(0.05)
+    assert shadow.observe()["gadget_ready"] is False
+    assert shadow.observe()["dashing"]
+
+
+def test_one_decision_is_one_press_whichever_button():
+    """The gadget shares the attack's single pending slot. A second `act` before a sub-tick has
+    run cannot queue a throw behind a queued dash, or a dash behind a queued throw."""
+    shadow = _shadow()
+    assert shadow.act(1, ATTACK_FIRE) == ATTACK_FIRE
+    assert shadow.act(1, ATTACK_GADGET) == ATTACK_NONE
+    shadow.advance(0.05)
+    assert shadow.observe()["gadget_ready"] is True
+
+    shadow = _shadow()
+    assert shadow.act(1, ATTACK_GADGET) == ATTACK_GADGET
+    assert shadow.act(1, ATTACK_FIRE) == ATTACK_NONE
+    shadow.advance(0.05)
+    assert shadow.observe()["ammo"] == 3.0
+
+
+def test_a_dead_hero_cannot_throw_but_its_gadget_timer_keeps_running():
+    """`hero.gadget_ready` reads `alive` and `gadget_charge_frac` does not, and `tick_timers` runs
+    for the dead. So the mask and the flag go False while the fraction keeps climbing."""
+    shadow = _shadow()
+    shadow.act(0, ATTACK_GADGET)
+    shadow.advance(0.05)
+    shadow.set_alive(False)
+    frac = shadow.gadget_charge_frac
+    shadow.advance(1.0)
+    assert shadow.gadget_charge_frac > frac
+    shadow.advance(20.0)
+    assert shadow.gadget_charge_frac == 1.0
+    assert not shadow.attack_mask()[3]
+    assert shadow.observe()["gadget_ready"] is False
+    assert shadow.act(0, ATTACK_GADGET) == ATTACK_NONE
 
 
 # ---------------------------------------------------------------------------
@@ -727,7 +918,7 @@ def test_resync_takes_ammo_from_cv_and_reseeds_everything_else_to_not_ready():
     assert not s["long_dash_ready"] and s["long_dash_frac"] == 0.0
     assert not s["super_ready"] and s["super_charge_frac"] == 0.0
     assert not s["can_attack"]                 # the full cooldown, not zero
-    assert shadow.attack_mask() == (True, False, False)
+    assert shadow.attack_mask() == (True, False, False, True)   # never thrown; resync keeps it
     assert shadow.strikes == 0 and shadow.desyncs == 1
 
 
@@ -753,20 +944,51 @@ def test_a_queued_attack_does_not_survive_a_resync():
     assert shadow.observe()["ammo"] == pytest.approx(3.0)
 
 
+def test_a_queued_throw_does_survive_a_resync():
+    """Unlike the queued dash above. The loop pressed the gadget in the decision that queued
+    it, so dropping the throw here would leave the shadow offering the policy, for a whole
+    cooldown, a gadget the game has already spent."""
+    shadow = _shadow()
+    shadow.act(0, ATTACK_GADGET)
+    shadow.resync()
+    shadow.advance(0.05)
+    assert shadow.gadget_cd == 18.0
+    assert not shadow.attack_mask()[3]
+
+
+def test_resync_leaves_the_gadget_timer_alone():
+    """The canary's evidence is ammo, which says nothing about the gadget. Reseeding the timer to
+    "not ready" would cost up to 18 s of a gadget the game still holds."""
+    shadow = _shadow()
+    shadow.act(0, ATTACK_GADGET)
+    shadow.advance(1.0)
+    before = (shadow.gadget_cd, shadow.gadget_charge_frac)
+    shadow.resync(_ammo(3.0))
+    assert (shadow.gadget_cd, shadow.gadget_charge_frac) == before
+
+    fresh = _shadow()
+    fresh.resync()
+    assert fresh.attack_mask()[3], "a charged gadget stays charged through a resync"
+
+
 # ---------------------------------------------------------------------------
 # the contract with the observation spec
 # ---------------------------------------------------------------------------
 
-# The `self` group fields that come from CV or the wall clock rather than from here -- 6.3's table.
+# The `self` group fields that come from CV or the wall clock rather than from here -- 6.3's table,
+# plus `hero.near_edge`: the tracker's `hero_offset` through `assemble._near_edge` (C7).
 _NOT_SHADOWED = {"hero.pos_norm", "hero.vel", "hero.hp", "hero.in_bush", "hero.in_zone",
-                 "meta.time_frac", "meta.n_enemies_alive"}
+                 "hero.near_edge", "meta.time_frac", "meta.n_enemies_alive"}
 
 
-def test_observe_covers_every_self_field_the_deploy_spec_asks_of_it():
-    """If a field is added to `agent_obs_deploy.yaml`'s `self` group, it either gets a CV supplier
-    (and joins the set above) or it has to come from here. Silently returning neither is how a
-    column of zeros reaches a policy trained to trust it."""
-    spec = yaml.safe_load((CONFIGS / "agent_obs_deploy.yaml").read_text())
+@pytest.mark.parametrize("spec_path", sorted(CONFIGS.glob("agent_obs_deploy*.yaml")),
+                         ids=lambda p: p.name)
+def test_observe_covers_every_self_field_the_deploy_spec_asks_of_it(spec_path):
+    """If a field is added to a deploy spec's `self` group, it either gets a CV supplier (and joins
+    the set above) or it has to come from here. Silently returning neither is how a column of
+    zeros reaches a policy trained to trust it. Every `agent_obs_deploy*.yaml`, so deploy4's
+    gadget pair is covered, and so is whatever the next spec adds."""
+    spec = yaml.safe_load(spec_path.read_text())
     group = next(g for g in spec["groups"] if g["name"] == "self")
     keys = set(_shadow().observe())
     for field in group["fields"]:

@@ -21,10 +21,12 @@ training's, they are training's, by construction.
 
 Two consequences worth stating, because both look like bugs:
 
-* **The `view` grid is built with all 12 sim channels, of which 4 are never filled.** `GridBuilder`
-  produces the 8 the spec asks for; this scatters them into their canonical sim indices
-  (`obs_select._CHANNEL_INDEX`) and leaves `enemy_any`, `enemy_hidden`, `box` and `pickup` as
-  zeros. `_build_grid_group` does an `index_select` over exactly the 8 configured channels, so the
+* **The `view` grid is built with every sim channel, and only the spec's are filled.** The sim's
+  view is the 12 base channels plus one `enemy_hist` plane per history slot, 15 at the default
+  config, and `obs_select.channel_index(cfg)` names them all. `GridBuilder` produces the planes the
+  spec asks for, 8 on deploy; this scatters them into their canonical sim indices and leaves the
+  rest as zeros, on deploy `enemy_any`, `enemy_hidden`, `box`, `pickup` and the three history
+  planes. `_build_grid_group` does an `index_select` over exactly the configured channels, so the
   zeros are **provably unread** rather than fed to anything -- which is the distinction that makes
   this legal under the never-feed-a-constant rule. Building an 8-channel array and splicing it in
   as the finished group would work too, and would quietly stop working the day a spec reorders its
@@ -44,6 +46,16 @@ slot reads `entities.alive = 0` with its other columns zeroed. That is the state
 produces for an empty slot, so it is in-distribution rather than invented; the alternative is a
 made-up HP in a column the policy was trained to trust. It costs at most one decision of latency.
 
+#### The `hist` group: the loop's snapshots, through the sim's own expressions
+
+`DeployLoop` keeps one `DecisionSnapshot` per decision that reached the policy, newest first, and
+hands them over as `history` (SIM_OVERHAUL_STEPS.md H4). `_put_history` lays them out as the rings
+`core/history.py` keeps and then runs `build_obs`'s own `hist` expressions on them,
+`observation._onehot` included. So an empty slot is all zeros, one-hots too, and the displacement
+is the position then minus the position now in float32, exactly as the sim computes it. A snapshot
+records what its own observation was BUILT from rather than a fresh read, plus the action that
+answered it, which is the sim's slot k: the observation k + 1 decisions back and its answer.
+
 #### What this module does NOT decide
 
 It never invents a value for a field it was handed nothing for. Every supplier is an argument, and
@@ -60,12 +72,9 @@ import numpy as np
 import torch
 
 from brawl_sim.core import obs_select
-
-# The canonical 12-channel `view` ordering, borrowed rather than restated. A private name, taken
-# deliberately: the alternative is a copy of the table that goes stale the day a channel is added,
-# and there is no public accessor for it. `_channel_indices` asserts the two agree.
-_CHANNEL_INDEX = obs_select._CHANNEL_INDEX
-_N_VIEW_CHANNELS = 12
+# `build_obs`'s one-hot, borrowed rather than restated: a private name, taken deliberately, because
+# the `hist` group has to be byte-equal to the sim's and a second implementation is how it drifts.
+from brawl_sim.core.observation import _onehot
 
 # `meta.time_frac`'s denominator is the episode length in SECONDS, and it is clamped -- running
 # long is out-of-distribution in a way running short is not, because the sim truncates at 1.0.
@@ -137,6 +146,34 @@ class MapFrame:
                 f"hero.pos_norm is the only field that reads it")
 
 
+@dataclass(frozen=True)
+class DecisionSnapshot:
+    """One decision, as the `hist` group and the `enemy_hist` planes read it back later.
+
+    `DeployLoop` takes one after `ShadowHero.act`, and only for a decision that reached the
+    policy. Every field is what that decision's observation was built from, or the action that
+    answered it, so the loop's slot k is `core/history.py`'s slot k:
+
+    * `move_bin` -- the policy's move bin, which the joystick holds.
+    * `attack` -- the MODELLED attack, `ShadowHero.act`'s return: what was pressed, not what was
+      chosen, which differ when the shadow's mask refused the pick.
+    * `hp` -- the HP numeral the observation was handed. `_decide` skips a decision with no
+      read, so there is never a gap to carry a last good value across.
+    * `ammo_frac` -- `ShadowHero.observe()["ammo_frac"]`, the value the observation used.
+    * `pos` -- the hero's world position, tiles.
+    * `enemies` -- the world position of every enemy track with `seen_now`: the set the
+      `enemy_revealed` plane drew. The sim's `hist_enemy_seen` is alive AND revealed, so a
+      coasted track is left out here exactly as an unrevealed enemy is left out there.
+    """
+
+    move_bin: int
+    attack: int
+    hp: float
+    ammo_frac: float
+    pos: tuple[float, float]
+    enemies: tuple[tuple[float, float], ...]
+
+
 def _require(value, name: str):
     """A supplier that was not passed is an error, never a zero.
 
@@ -180,8 +217,15 @@ class ObservationAssembler:
                                                extent=(float(self.cfg.map_w),
                                                        float(self.cfg.map_h)))
         self.episode_seconds = float(self.cfg.max_episode_steps) * float(self.cfg.dt)
-        self._view = np.zeros((_N_VIEW_CHANNELS, self.cfg.view_h, self.cfg.view_w), np.uint8)
+        # Every `view` channel by name, the enemy_hist planes included. The same table
+        # `load_agent_spec` resolved the spec's grid group through, so the two cannot disagree.
+        self._channel_index = obs_select.channel_index(self.cfg)
+        self._view = np.zeros((len(self._channel_index), self.cfg.view_h, self.cfg.view_w),
+                              np.uint8)
         self._grid_channels = self._channel_indices()
+        # `hero.near_edge` (OBS_PARITY_TASKS.md C7) needs the tracker's `hero_offset`; a spec that
+        # does not read it (deploy4 and earlier) must not have to supply one.
+        self._wants_near_edge = any("hero.near_edge" in g.fields for g in self.spec.groups)
 
     @classmethod
     def from_paths(cls, spec_path, cfg_path, **kw) -> "ObservationAssembler":
@@ -193,7 +237,8 @@ class ObservationAssembler:
         return cls(obs_select.load_agent_spec(spec_path, cfg), cfg, **kw)
 
     def _channel_indices(self) -> tuple[int, ...]:
-        """Where each of `GridBuilder`'s planes belongs in the 12-channel `view`.
+        """Where each of `GridBuilder`'s planes belongs in the sim's `view`: 12 base channels,
+        then the history planes.
 
         Read off the loaded spec rather than off `GridSpec`, so that if the two ever name
         different channel lists this raises here instead of producing a correctly-shaped grid with
@@ -202,16 +247,17 @@ class ObservationAssembler:
         grid = next((g for g in self.spec.groups if g.view_channels is not None), None)
         if grid is None:
             raise ValueError("the deployed spec has no grid group; assemble cannot place a view")
-        return tuple(_CHANNEL_INDEX[ch] for ch in grid.view_channels)
+        return tuple(self._channel_index[ch] for ch in grid.view_channels)
 
     # -- the tick -------------------------------------------------------------
 
     def assemble(self, *, hero_pos, hero_vel, shadow, hero_hp, n_enemies_alive, elapsed_s,
                  hero_in_bush, hero_in_zone, enemies, enemy_hp, enemy_in_bush,
-                 projectiles, zone, grid) -> dict:
+                 projectiles, zone, history, grid, hero_offset=None) -> dict:
         """One decision's observation, as `{group: np.ndarray}` with no leading batch axis.
 
-        Every argument is a supplier's output and none has a default:
+        Every argument is a supplier's output and none has a default, except `hero_offset`,
+        which only a spec that names `hero.near_edge` needs (and then `_require`s):
 
         * `hero_pos`, `hero_vel` -- world tiles and tiles/s, from `TrackerResult.hero`.
         * `shadow` -- `ShadowHero.observe()`.
@@ -225,11 +271,17 @@ class ObservationAssembler:
           because it owns the occupancy map.
         * `projectiles` -- `ProjectileTracker.snapshot(hero_pos)`.
         * `zone` -- `{field: value}` for the spec's zone group, in the sim's own units.
+        * `history` -- the loop's `DecisionSnapshot`s, newest first, at most
+          `cfg.history_frames`, and empty at a match's first decision.
         * `grid` -- `GridBuilder.build(...)`, `(len(spec channels), view_h, view_w)` uint8.
+        * `hero_offset` -- `TrackerResult.hero_offset`, the player box's tiles from its nominal
+          screen anchor; `hero.near_edge` is that offset against the sim config's
+          `camera.edge_flag_tiles`.
         """
         full = {}
         self._put_self(full, hero_pos, hero_vel, shadow, hero_hp, n_enemies_alive, elapsed_s,
-                       hero_in_bush, hero_in_zone)
+                       hero_in_bush, hero_in_zone, hero_offset)
+        self._put_history(full, hero_pos, history)
         self._put_entities(full, hero_pos, hero_vel, enemies, enemy_hp, enemy_in_bush)
         self._put_projectiles(full, projectiles)
         self._put_zone(full, zone)
@@ -250,7 +302,7 @@ class ObservationAssembler:
         return torch.tensor([list(values)], dtype=torch.float32, device=self.device)
 
     def _put_self(self, full, hero_pos, hero_vel, shadow, hero_hp, n_enemies_alive, elapsed_s,
-                  in_bush, in_zone) -> None:
+                  in_bush, in_zone, hero_offset) -> None:
         s = _require(shadow, "shadow.observe()")
         px, py = self.map_frame.pos_norm(_require(hero_pos, "hero_pos"))
         vx, vy = _require(hero_vel, "hero_vel")
@@ -271,10 +323,13 @@ class ObservationAssembler:
             "invuln": self._b(s["invuln"]),
             "in_bush": self._b(_require(in_bush, "hero_in_bush")),
             "in_zone": self._b(_require(in_zone, "hero_in_zone")),
+            "near_edge": self._near_edge(hero_offset),
             "long_dash_ready": self._b(s["long_dash_ready"]),
             "long_dash_frac": self._f(s["long_dash_frac"])[:, 0],
             "super_ready": self._b(s["super_ready"]),
             "super_charge_frac": self._f(s["super_charge_frac"])[:, 0],
+            "gadget_ready": self._b(s["gadget_ready"]),
+            "gadget_charge_frac": self._f(s["gadget_charge_frac"])[:, 0],
         }
         # Clamped, and the clamp is the part that matters: the sim truncates at time_frac == 1, so
         # the column's whole training range is bounded by 1 and a long match would feed it 1.33.
@@ -286,6 +341,53 @@ class ObservationAssembler:
 
     def _b(self, value) -> torch.Tensor:
         return torch.tensor([bool(value)], dtype=torch.bool, device=self.device)
+
+    def _near_edge(self, hero_offset) -> torch.Tensor:
+        """`hero.near_edge` as `core/observation.py` defines it: the camera has stopped following
+        the hero by more than `cfg.camera_edge_flag_tiles` on either axis. Live, that offset is
+        the player box against its nominal screen anchor (`TrackerResult.hero_offset`). Required
+        only when the spec reads the field; otherwise False and unread, the same rule as the hero
+        row in `_put_entities`. The threshold is the sim config's, never a deployment.yaml key."""
+        if not self._wants_near_edge:
+            return self._b(False)
+        ox, oy = _require(hero_offset, "hero_offset")
+        return self._b(max(abs(float(ox)), abs(float(oy))) > float(self.cfg.camera_edge_flag_tiles))
+
+    def _put_history(self, full, hero_pos, history) -> None:
+        """The `hist` group, built the way `build_obs` builds it.
+
+        The snapshots go into `core/history.py`'s ring layout, newest first, with the unused
+        slots left zero and `valid` False, and then the sim's own expressions run on them. An
+        empty slot's action (0, 0) is a real "idle, no attack" and its position (0, 0) would read
+        as a displacement of minus the hero's position, so the mask is load-bearing, not tidy.
+        """
+        history = tuple(_require(history, "history"))
+        k = int(self.cfg.history_frames)
+        if len(history) > k:
+            raise ValueError(f"history holds {len(history)} decisions and the config keeps {k}; "
+                             f"the loop's deque is sized from the same field")
+        valid = torch.zeros((1, k), dtype=torch.bool, device=self.device)
+        action = torch.zeros((1, k, 2), dtype=torch.int64, device=self.device)
+        hp = torch.zeros((1, k), dtype=torch.float32, device=self.device)
+        ammo_frac = torch.zeros((1, k), dtype=torch.float32, device=self.device)
+        pos = torch.zeros((1, k, 2), dtype=torch.float32, device=self.device)
+        for i, snap in enumerate(history):
+            valid[0, i] = True
+            action[0, i] = torch.tensor([int(snap.move_bin), int(snap.attack)], device=self.device)
+            hp[0, i] = float(snap.hp)
+            ammo_frac[0, i] = float(snap.ammo_frac)
+            pos[0, i] = torch.tensor(snap.pos, dtype=torch.float32, device=self.device)
+
+        now = self._f(*_require(hero_pos, "hero_pos"))                 # (1, 2) float32
+        n_move, n_attack = self.cfg.action_nvec
+        full["hist"] = {
+            "valid": valid,
+            "move_onehot": _onehot(action[..., 0], n_move, valid),
+            "attack_onehot": _onehot(action[..., 1], n_attack, valid),
+            "hp": torch.where(valid, hp, 0.0),
+            "ammo_frac": torch.where(valid, ammo_frac, 0.0),
+            "displacement": torch.where(valid.unsqueeze(-1), pos - now.unsqueeze(1), 0.0),
+        }
 
     def _put_entities(self, full, hero_pos, hero_vel, enemies, enemy_hp, enemy_in_bush) -> None:
         """The `entities` axis, hero at index 0 and enemy slot k at index k + 1.
@@ -326,6 +428,14 @@ class ObservationAssembler:
 
         full["entities"] = {"alive": alive, "revealed_to_hero": revealed, "rel_pos": rel_pos,
                             "dist": dist, "rel_vel": rel_vel, "hp": hp, "in_bush": in_bush}
+        # The identity permutation for `slots: tracked` (OBS_PARITY_TASKS.md C9): track k sits at
+        # entities index k + 1 and `slots.entity` stores entity + 1, so obs_select's gather maps
+        # slot k back to row k. The tracker already IS the slot rule the sim reproduces
+        # (core/slots.py), so nothing here reorders. Empty where the row above is: no track, or
+        # no HP committed yet.
+        entity = torch.tensor([[slot + 2 if bool(alive[0, slot + 1]) else 0 for slot in range(e - 1)]],
+                              dtype=torch.int64, device=self.device)
+        full["slots"] = {"entity": entity, "valid": entity > 0}
 
     def _put_projectiles(self, full, snapshot) -> None:
         """All `max_projectiles` slots, of which `obs_select` keeps the nearest K by
@@ -383,9 +493,9 @@ class ObservationAssembler:
         full["zone"] = out
 
     def _put_view(self, full, grid) -> None:
-        """`GridBuilder`'s planes scattered into the 12-channel sim `view`.
+        """`GridBuilder`'s planes scattered into the sim's whole `view`.
 
-        The four unfilled channels are never read: `_build_grid_group` index-selects exactly the
+        The unfilled channels are never read: `_build_grid_group` index-selects exactly the
         spec's own channels. Zeroing the whole array each tick rather than only the filled planes
         costs 3 KB of memset and removes the question of whether a stale plane could survive.
         """

@@ -209,6 +209,21 @@ def gadget_ready(state, params) -> torch.Tensor:
     return state.ent_alive & (state.ent_gadget_cd <= 0) & (cooldown > 0)
 
 
+def gadget_charge_frac(state, params) -> torch.Tensor:
+    """(N,E) f32 in [0,1] -- progress back to a charged gadget, `1 - gadget_cd / gadget_cooldown`:
+    0.0 on the tick it is thrown, 1.0 once the timer has run out, and 0.0 for any kind without a
+    gadget (`gadget_cooldown` 0, which is every bot kind). The observation pairs it with
+    `gadget_ready` for the reason `super_charge_frac` gives (SIM_OVERHAUL_PLAN.md Step G4).
+
+    No `alive` term, like `super_charge_frac`: a dead hero still reads its timer's progress, and
+    only `gadget_ready` goes False. The clamp only makes the declared range exact: `gadget_cd`
+    already stays inside [0, gadget_cooldown], since `tick_timers` floors it at 0, a throw writes
+    exactly `gadget_cooldown`, and `state.check_invariants` checks both ends."""
+    cooldown = stats.gather_kind(params.gadget_cooldown, state.ent_kind)
+    frac = 1.0 - state.ent_gadget_cd / torch.clamp(cooldown, min=_EPS)
+    return torch.where(cooldown > 0, torch.clamp(frac, 0.0, 1.0), torch.zeros_like(frac))
+
+
 def gadget_target(state, vis: torch.Tensor, params, bank, cfg):
     """Where each entity's gadget spinner would fly THIS tick (SIM_OVERHAUL_PLAN.md Step G2,
     substep G2.1). Returns `(dir (N,E,2) f32 unit vectors, travel (N,E) f32 tiles)`. Pure --

@@ -1,0 +1,111 @@
+# DEPLOYABLE agent view, fourth pass -- configs/agent_obs_deploy3.yaml plus the gadget pair in
+# `self`, a new `history` group, and three `enemy_hist` planes at the end of the grid
+# (SIM_OVERHAUL_PLAN.md Phases G and H). `enemies`, `projectiles` and `zone` are byte-identical to
+# the parent's; tests/test_configs_files.py pins that.
+#
+#   python scripts/train.py --set run.agent_obs=configs/agent_obs_deploy4.yaml
+#
+# WHY A SIXTH FILE RATHER THAN AN EDIT
+# ------------------------------------
+# Same reason as the last three. `runs/*/train.yaml` names its spec BY PATH. agent_obs_deploy3.yaml
+# is what every pre-gadget run trained on; widening it would make it mean two different widths
+# depending on when you read it.
+#
+# WHAT CHANGED (2026-09-21)
+# -------------------------
+#   self      + hero.gadget_ready, hero.gadget_charge_frac (Step G4), right after the super pair so
+#             the three ability pairs read together: long dash, super, gadget. `gadget_ready` is
+#             the action mask's gadget column (alive and off cooldown); the fraction runs 0 -> 1
+#             over the 18 s cooldown and reads 1.0 at the match start.
+#   history   NEW (Step H2). The hero's own last three decisions, newest first. Slot k is the
+#             observation k+1 decisions back and the action that answered it:
+#               hist.valid          whether the slot holds a real decision yet
+#               hist.move_onehot    the move bin chosen, 17 wide
+#               hist.attack_onehot  the attack column chosen, 4 wide (0 none, 1 attack, 2 super,
+#                                   3 gadget)
+#               hist.hp             hero HP then, absolute, like hero.hp (cubes move max_hp)
+#               hist.ammo_frac      hero ammo / max ammo then
+#               hist.displacement   hero position then minus now, in tiles
+#             78 floats: valid [0, 3), move [3, 54), attack [54, 66), hp [66, 69), ammo [69, 72),
+#             displacement [72, 78). An empty slot is all zeros, one-hots included, so the first
+#             decisions of a match do not read as three idles.
+#   grid      + enemy_hist1, enemy_hist2, enemy_hist3 after every deploy3 plane, so a deploy3
+#             channel index means the same plane here. Plane k marks the enemies the hero could
+#             see k decisions ago, drawn at the world cell they stood on, in the current window,
+#             inside the 9 x 9 tile block around the hero's tile NOW (`history_radius_tiles: 4`,
+#             Chebyshev on tile indices). `fair` passes them: a plane only ever holds a sighting.
+#
+# Normalization is the existing units' (plan section 5, "Keep it"): hist.hp divides by the HP
+# scale like hero.hp, and hist.displacement by max(map_w, map_h) like entities.rel_pos, so one tile
+# reads 0.017 on the 60-tile map.
+#
+# Six groups is obs_select._MAX_GROUPS: each group is its own device-to-host copy. The next field
+# joins an existing group; a seventh group will not load.
+#
+# ------------------------------------------------------------------------------------------------
+# DEPLOYABLE since Step H4 (2026-09-21) -- what supplies the new fields
+# ------------------------------------------------------------------------------------------------
+# Every new field passes the deploy rule: the live loop supplies it without a new detector.
+#   hero.gadget_ready,       ShadowHero.observe() (Step G5.1). Proprioception, plan S18: charged
+#   hero.gadget_charge_frac  at the match gate, 18 s from each modelled press, the way the shadow
+#                            already owns attack_cd. No CV read of the button.
+#   hist.*                   the assembler's `history` supplier (Step H4.2), from DeployLoop's
+#                            deque of per-decision snapshots (H4.1), each taken after shadow.act:
+#                            the move bin sent, the attack the shadow modelled, the HP numeral
+#                            read, the shadow's ammo before the shot, and the hero's world
+#                            position. A skipped decision takes no snapshot, and the deque empties
+#                            at the match gate and on a new odometry segment.
+#   enemy_hist1..3           GridBuilder (Step H4.3), drawing the enemies each snapshot saw
+#                            (Track.seen_now) with the sim's block rule exactly
+#                            (observation._history_drawn).
+# tests/test_deployment_loop.py and tests/test_deployment_zone.py glob this file and serve it like
+# every other deploy spec; tests/test_deployment_grid.py and tests/test_deployment_assemble.py
+# check it against the sim cell for cell and byte for byte. SIM_OVERHAUL_STEPS.md Step G6 must
+# still land before a live run of a checkpoint that presses the gadget: the gadget is the match
+# gate's anchor.
+#
+# WIDTH CHANGES: self 24 -> 26 floats (the gadget pair is columns 22 and 23), a new 78-float
+# `history` group, grid (10, 13, 21) -> (13, 13, 21). Not a checkpoint swap; train from scratch.
+fair: true
+normalize: true
+groups:
+  - name: self                          # deploy3's, plus the gadget pair after the super pair
+    per_entity: false
+    dtype: float32
+    fields: [hero.pos_norm, hero.vel, hero.facing_vec, hero.hp, hero.ammo_frac,
+             hero.ammo_whole, hero.attack_cd, hero.can_attack, hero.dashing,
+             hero.dash_t, hero.dash_dir, hero.invuln, hero.in_bush, hero.in_zone,
+             hero.long_dash_ready, hero.long_dash_frac,
+             hero.super_ready, hero.super_charge_frac,
+             hero.gadget_ready, hero.gadget_charge_frac,
+             meta.time_frac, meta.n_enemies_alive]
+  - name: enemies                       # slots 1..n_enemies, index-stable, gated by fair
+    per_entity: true
+    dtype: float32
+    # Unchanged from agent_obs_deploy3.yaml. agent_obs_deploy.yaml's header explains every removal:
+    # kind_onehot by lowinfo, cubes/can_attack/dashing as unsuppliable, hp_frac -> hp because cubes
+    # move max_hp.
+    fields: [entities.alive, entities.revealed_to_hero,
+             entities.rel_pos, entities.dist, entities.rel_vel, entities.hp,
+             entities.in_bush]
+  - name: projectiles                   # nearest K by time_to_closest, K = 12 -- NOT index-stable
+    per_entity: true
+    max_slots: 12
+    dtype: float32
+    # Unchanged. A moving dot and nothing more.
+    fields: [projectiles.alive, projectiles.rel_pos, projectiles.vel,
+             projectiles.time_to_closest]
+  - name: zone                          # unchanged from agent_obs_deploy3.yaml
+    per_entity: false
+    dtype: float32
+    fields: [zone.hero_margin_local, zone.active]
+  - name: history                       # NEW: the hero's last three decisions, see the header
+    per_entity: false
+    dtype: float32
+    fields: [hist.valid, hist.move_onehot, hist.attack_onehot, hist.hp, hist.ammo_frac,
+             hist.displacement]
+  - name: grid                          # deploy3's ten planes, then the three history planes
+    dtype: uint8
+    view_channels: [blocks_unit, blocks_projectile, is_bush, is_water, in_zone,
+                    enemy_revealed, hero, box, pickup, projectile,
+                    enemy_hist1, enemy_hist2, enemy_hist3]

@@ -42,7 +42,7 @@ if str(REPO) not in sys.path:
     sys.path.insert(0, str(REPO))
 
 from brawl_deployment.config import load_deployment_config, resolve_run, validate  # noqa: E402
-from brawl_deployment.loop import Controls, DeployLoop, Phase                  # noqa: E402
+from brawl_deployment.loop import DeployLoop, Phase                            # noqa: E402
 
 # `--checkpoint` shorthands: the two files every run's `scripts/train.py` writes.
 CHECKPOINTS = {"best": "best_model.zip", "final": "final_model.zip"}
@@ -149,16 +149,7 @@ def main(argv=None) -> int:
         # then no code path in which a dry run can touch the device, which a boolean cannot promise.
         from brawl_deployment.control.backend import NullBackend
 
-        null = NullBackend()
-        loop.controls = Controls(backend=null,
-                                 joystick=type(loop.controls.joystick)(
-                                     null, loop.controls.joystick.anchor,
-                                     loop.controls.joystick.radius_px,
-                                     n_bins=loop.controls.joystick.n_bins),
-                                 buttons=type(loop.controls.buttons)(
-                                     null, loop.controls.buttons.attack,
-                                     loop.controls.buttons.super_,
-                                     aim_radius_px=loop.controls.buttons.aim_radius_px))
+        loop.controls = loop.controls.with_backend(NullBackend())
         _log("DRY RUN -- decisions are real, touches go nowhere")
 
     _log(f"capture {loop.capture.viewport[0]}x{loop.capture.viewport[1]} from monitor "

@@ -62,6 +62,13 @@ class DeploymentConfig:
     # deployed agent sampling from its own action distribution is adding noise to a decision it
     # already made, and makes every failure unreproducible.
     policy_deterministic: bool = True
+    # The dead-bin move mask (`move_mask.py`, design 6.16): a move bin that the sim's own
+    # collision rule would leave the hero in place on -- walking into a wall on the grid the
+    # policy sees -- is masked the way an uncharged super is. MEASURED in the sim before shipping
+    # (2026-09-23, 96 elite episodes, the deploy4 checkpoint): wall-pushing decisions 2.2% -> 0.0%
+    # on the training maps and 4.4% -> 0.1% on the held-out pair, stalls of 2 s or more gone, win
+    # rate unchanged within noise, ~3% of decisions altered. The off switch is for A/B runs.
+    policy_dead_bin_mask: bool = True
 
     # --- thread pools (§7.2) ----------------------------------------------------------------
     # The emulator is a VM on the same eight cores, and it is what lags when this process burns
@@ -184,6 +191,7 @@ _DEPLOYMENT_CONFIG_FIELDS = (
     ("run.checkpoint", "run_checkpoint", str),
     ("policy.device", "policy_device", str),
     ("policy.deterministic", "policy_deterministic", bool),
+    ("policy.dead_bin_mask", "policy_dead_bin_mask", bool),
     ("compute.torch_threads", "compute_torch_threads", int),
     ("compute.cv2_threads", "compute_cv2_threads", int),
     ("compute.detector_threads", "compute_detector_threads", int),

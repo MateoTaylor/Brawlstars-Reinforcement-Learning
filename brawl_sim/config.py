@@ -62,6 +62,19 @@ class EnvConfig:
     fixed_map: str = "open"
     view_h: int = 20
     view_w: int = 40
+    # The camera model (OBS_PARITY_PLAN.md §2): the ground quad the screen shows, in tiles relative
+    # to the hero's nominal screen anchor, corners TL/TR/BR/BL with y down; how far from each map
+    # edge (west, east, north, south) the game camera stops following the hero; and the
+    # hero-to-camera offset past which `hero.near_edge` is set. Defaults mirror configs/default.yaml.
+    camera_quad: tuple[tuple[float, float], ...] = (
+        (-14.11, -10.59), (14.77, -10.93), (11.73, 7.45), (-11.55, 7.01),
+    )
+    camera_clamp_onset: tuple[float, float, float, float] = (12.1, 12.8, 8.9, 5.5)
+    camera_edge_flag_tiles: float = 2.0
+    # Enemy observation slots, `EntityTracker`'s rule in DECISIONS: sightings before a slot is
+    # granted, unseen decisions before it is released (core/slots.py).
+    slots_promote_hits: int = 2
+    slots_max_misses: int = 3
     n_enemies: int = 6
     randomize_enemy_types: bool = True
     enemy_type_weights: tuple[float, ...] = (1 / 7,) * 7
@@ -217,6 +230,35 @@ def _tuple_transform(x) -> tuple:
     return tuple(x)
 
 
+_ONSET_SIDES = ("west", "east", "north", "south")
+
+
+def _quad_transform(v) -> tuple[tuple[float, float], ...]:
+    """Four `[x, y]` corners, TL/TR/BR/BL. The count is checked here and the orientation in
+    `validate`, so a yaml with the corners in the wrong order fails at load, not by revealing
+    nothing."""
+    corners = list(v) if isinstance(v, (list, tuple)) else None
+    if corners is None or len(corners) != 4 or any(len(c) != 2 for c in corners):
+        raise ValueError(f"camera.quad needs exactly 4 corners of 2 numbers, got {v!r}")
+    return tuple((float(x), float(y)) for x, y in corners)
+
+
+def _onset_transform(d) -> tuple[float, float, float, float]:
+    """`{west, east, north, south}` -> that order. A fragment naming only some sides is refused:
+    a missing side would otherwise read as 0, a camera that never clamps there. (An override on
+    top of default.yaml is deep-merged first, so overriding one side that way is fine.)"""
+    if not isinstance(d, dict):
+        raise ValueError(f"camera.clamp_onset must be a mapping of sides, got {d!r}")
+    missing = [s for s in _ONSET_SIDES if s not in d]
+    unknown = sorted(set(d) - set(_ONSET_SIDES))
+    if missing or unknown:
+        raise ValueError(
+            f"camera.clamp_onset needs exactly the sides {', '.join(_ONSET_SIDES)}; "
+            f"missing: {', '.join(missing) or 'none'}; unknown: {', '.join(unknown) or 'none'}"
+        )
+    return tuple(float(d[s]) for s in _ONSET_SIDES)
+
+
 # (dotted YAML path, EnvConfig field name, type coercion)
 _ENV_CONFIG_FIELDS = (
     ("world.map_h", "map_h", int),
@@ -226,6 +268,11 @@ _ENV_CONFIG_FIELDS = (
     ("world.fixed_map", "fixed_map", str),
     ("view.height", "view_h", int),
     ("view.width", "view_w", int),
+    ("camera.quad", "camera_quad", _quad_transform),
+    ("camera.clamp_onset", "camera_clamp_onset", _onset_transform),
+    ("camera.edge_flag_tiles", "camera_edge_flag_tiles", float),
+    ("slots.promote_hits", "slots_promote_hits", int),
+    ("slots.max_misses", "slots_max_misses", int),
     ("entities.n_enemies", "n_enemies", int),
     ("entities.randomize_enemy_types", "randomize_enemy_types", bool),
     ("entities.enemy_type_weights", "enemy_type_weights", _weights_transform),
@@ -923,6 +970,39 @@ def validate(cfg: EnvConfig, params: SimParams) -> None:
         raise ValueError(
             f"observation.history_radius_tiles must be >= 1, got {cfg.history_radius_tiles}"
         )
+
+    # The camera quad must be convex, wound the way core/camera.in_camera assumes (clockwise on
+    # screen, y down) and contain the hero's anchor at the origin. The predicate is the same edge
+    # cross product `in_camera` evaluates, so a mis-ordered yaml fails HERE with a message instead
+    # of passing every entity through as "off screen".
+    quad = cfg.camera_quad
+    if len(quad) != 4:
+        raise ValueError(f"camera.quad needs 4 corners, got {len(quad)}")
+    for i in range(4):
+        (ax, ay), (bx, by) = quad[i], quad[(i + 1) % 4]
+        (cx, cy) = quad[(i + 2) % 4]
+        ex, ey = bx - ax, by - ay
+        if ex * (cy - by) - ey * (cx - bx) <= 0:
+            raise ValueError(
+                f"camera.quad is not convex and clockwise at corner {i + 1} -> {i + 2}: "
+                f"corners must run TL, TR, BR, BL with y down, got {quad}"
+            )
+        if ex * (0.0 - ay) - ey * (0.0 - ax) <= 0:
+            raise ValueError(
+                f"camera.quad does not contain the hero anchor (origin) on the side of edge "
+                f"{i + 1} -> {i + 2}: {quad}"
+            )
+    if len(cfg.camera_clamp_onset) != 4 or any(o < 0 for o in cfg.camera_clamp_onset):
+        raise ValueError(
+            f"camera.clamp_onset needs four non-negative distances (west, east, north, south), "
+            f"got {cfg.camera_clamp_onset}"
+        )
+    if cfg.camera_edge_flag_tiles <= 0:
+        raise ValueError(f"camera.edge_flag_tiles must be > 0, got {cfg.camera_edge_flag_tiles}")
+    if cfg.slots_promote_hits < 1:
+        raise ValueError(f"slots.promote_hits must be >= 1, got {cfg.slots_promote_hits}")
+    if cfg.slots_max_misses < 0:
+        raise ValueError(f"slots.max_misses must be >= 0, got {cfg.slots_max_misses}")
 
     if cfg.action_repeat < 1:
         raise ValueError(f"action_repeat must be >= 1, got {cfg.action_repeat}")

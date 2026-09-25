@@ -34,10 +34,10 @@ Steps in one wave are independent; a wave starts when its dependencies in earlie
 | 3 | G3, B4, M4 | G3 wires the gadget into the action space and needs G2 |
 | 4 | G4, H2, (A3) | H2's attack one-hot is 4 wide only after G3; A3 is DEFERRED (operator, 2026-09-21), see A2.4 |
 | 5 | I1, G5, H4, (A4) | I1 needs G4 + H2; the deployment mirrors need their sim halves green; A4 is deferred with A3 |
-| 6 | H3, G6, I2 | H3 needs the deploy4 spec; G6 is a live measurement; I2 needs B4 + M4 |
-| 7 | I3, I4, I5 | docs, throughput, the run |
+| 6 | H3, G6, I2 | H3 needs the deploy4 spec; G6 was a live measurement, DEFERRED until training completed (operator, 2026-09-21), DONE 2026-09-22; I2 needs B4 + M4 |
+| 7 | I3, I4, I5 | docs, the suite, the run; I4.2's benchmark is REMOVED (operator, 2026-09-21) |
 
-**Status 2026-09-21: waves 1, 2 and 3 are complete** (each step carries a `DONE` note under its
+**Status 2026-09-21: waves 1 to 5 are complete** (each step carries a `DONE` note under its
 heading with what deviated from the text and why). **The operator settled every open item on
 2026-09-21; do not re-raise any of them:**
 
@@ -51,20 +51,45 @@ heading with what deviated from the text and why). **The operator settled every 
   (G3's amendment) and the operator deletes the old runs.
 - **KITE bots hold no farther than their own fire reach** (B3's amendment, which closes B4's second
   review note).
+- **`scripts/play_manual.py` gets no super key** and no further manual-play controls. Its module
+  docstring records the decision; `g` (G3.3) stays as it is.
+- **G6 and every deployment step wait until training is complete** (2026-09-21): G6.1's live
+  trace, G6.2, and I5's dry run and deploy items. Training needs none of them, because the match
+  gate reads the emulator's screen and the sim has no gate. G6 still lands before any live run
+  of a checkpoint trained on this tree. **Lifted 2026-09-22**: the run is done (I5), and both
+  G6.1's trace and G6.2 landed the same day. G6's own entry carries the numbers.
+- **I4.2's benchmark is removed.** The operator watches `time/fps` during training instead;
+  I4.2's note says what to read it against.
+- **Attack, super and gadget stay one masked four-way choice.** The operator's rule, that
+  choosing one of them rules out the others, holds by construction: `action[:, 1]` carries one
+  value per decision, and
+  `tests/test_hero.py::test_decode_action_yields_at_most_one_of_attack_super_gadget` pins it
+  with all three legal at once. No priority order is needed, since the policy never picks two.
 
-Next is wave 4: G4 and H2. Since G3 the audit's `--run` mode refuses every pre-gadget checkpoint, so
-A1's report (`runs/audit/cadence_mortis_deploy3_elite.md`) cannot be regenerated; A1's table below
-is the record. No checkpoint on disk trains, evaluates, watches or deploys against this tree any
-more (4-wide attack column, sixteen-map default). Two checklist file names were wrong and are
-corrected in place: `tests/test_bots_policy.py` -> `tests/test_bot_dispatch.py`,
-`tests/test_env_step.py` -> `tests/test_env.py`.
+Wave 4 is complete: G4 and H2 are DONE (2026-09-21) and A3 stays deferred. Wave 5 is complete: I1,
+G5 and H4 are DONE (2026-09-21), and A4 stays deferred with A3. Wave 6 is complete: H3 and I2 are
+DONE (2026-09-21), and G6 is DONE (2026-09-22). Wave 7's checklist is DONE too: I4.1 on
+2026-09-21, I4.2 removed, and I3 plus I5's run and cadence audit on 2026-09-22. What is left is the
+live deployment work G6 unblocked -- I5's two unticked boxes and G6.2's trace-replay test -- and
+nothing else in this file. Since I2 a bare `python scripts/train.py` trains deploy4.
+Since H4, deployment serves `configs/agent_obs_deploy4.yaml`, and the two strict xfails that tracked
+its refusal are gone (H4's note). Since G5 the deployed policy presses the gadget, which G6 found is
+NOT the match gate's anchor and never was: all three button names in `control_calibration.json` sat
+one disc off, so a commanded gadget pressed the Super and the gate sat on the Super too. The gate is
+on `hypercharge` now, the one disc nothing presses. Since G3 the audit's `--run` mode refuses every
+pre-gadget checkpoint, so A1's report (`runs/audit/cadence_mortis_deploy3_elite.md`) cannot be
+regenerated; A1's table below is the record. No checkpoint on disk trains, evaluates, watches or
+deploys against this tree any more (4-wide attack column, sixteen-map default). Two checklist file
+names were wrong and are corrected in place: `tests/test_bots_policy.py` ->
+`tests/test_bot_dispatch.py`, `tests/test_env_step.py` -> `tests/test_env.py`.
 
 Cross-phase dependencies that are easy to miss:
 
 - G3 before A3 and before H2 (attack column width 3 -> 4).
 - G2's `charge_hit` return changes `step_projectiles`' tuple; anything else calling it (grep) updates in G2.4.
 - I1 before H3 (the extractor test reads the spec).
-- G6 before any live run with the gadget enabled, including the `control.backend: null` dry run's interpretation.
+- G6 before any live run with the gadget enabled, including the `control.backend: null` dry run's
+  interpretation. DONE 2026-09-22.
 - M3 before M4 (holdout maps must exist) and before I2.
 
 ---
@@ -860,6 +885,32 @@ gadget tap.
 
 ## Step G4 -- observation fields
 
+**DONE 2026-09-21.** `core/hero.py` gains `gadget_charge_frac(state, params)` beside `gadget_ready`:
+`1 - gadget_cd / gadget_cooldown` clamped to [0, 1], 0.0 for a kind without a gadget, and no `alive`
+term, like `super_charge_frac`. `build_obs` emits `hero.gadget_ready` and `hero.gadget_charge_frac`
+right after the long-dash pair, `OBS_SCHEMA` declares both rows in that order, and
+`_HERO_DESCRIBE_FIELDS` gains `gadget_ready`. **Deviation:** the `hero.gadget_ready` field is G3's
+`hero.gadget_ready(state, params)` predicate, as G3's addition said it would be, so it carries the
+`alive` term that the formula below leaves out and always equals `action_mask.attack[:, 3]`. A dead
+hero reads not-ready with its fraction intact. **What the policy sees at `action_repeat: 5`:** the
+first observation after a throw reads 0.2 / 18 = 0.0111, not 0.0, because the throw lands on
+sub-tick 1 and four more sub-ticks count down before the observation is built. It is the same
+decision-boundary offset as G3's 73rd-observation behaviour, which G5.1's note already covers.
+`docs/OBSERVATION.md` is regenerated with both rows (the file is gitignored, so `git diff` shows
+nothing); `docs/AGENT_OBS.md` is unchanged, because no spec selects the fields until I1. Nothing in
+deployment changes: `ObservationAssembler` fills only what its suppliers hand it and then selects by
+spec, so G5.1's shadow must supply both fields before deploy4 selects them. Tests:
+`tests/test_observation.py` +5 (charged at reset; 0.0 / 0.25 / 0.5 / 0.99722 / 1.0 for timers 18 /
+13.5 / 9 / 0.05 / 0; the field equals the mask column across ready, cooling, dead and no-gadget,
+with fractions 1.0 / 0.5 / 1.0 / 0.0; through `env.step` at repeat 1, 0.0 then 0.05 / 18 then ready
+at 1.0; at repeat 5, a timer of 17.8 and 0.0111) and `tests/test_obs_schema.py` +4 (both rows'
+shape, dtype, units and range; the hero rows in `build_obs` order with the gadget pair after the
+long dash; `validate_obs` refuses either field missing; `describe_obs` prints `gadget_ready: T`).
+Six mutants, all killed: the fraction inverted, the no-gadget zeroing dropped, the fraction gated on
+`alive`, the field swapped for the super's flag, the field without `alive`, and the two schema rows
+swapped. Full `-m "not vision"` suite: 2256 passed, 4 skipped (the four retired pre-gadget runs), 85
+vision tests deselected, 20 min.
+
 ### G4.1 Fields
 - Files: `brawl_sim/core/observation.py` (`build_obs` hero block), `brawl_sim/core/obs_schema.py`
   (`OBS_SCHEMA`, `_HERO_DESCRIBE_FIELDS`)
@@ -870,6 +921,82 @@ gadget tap.
 - Done when: green; `scripts/dump_obs_schema.py` regenerates `docs/OBSERVATION.md` with both rows.
 
 ## Step G5 -- deployment: shadow, buttons, policy
+
+**DONE 2026-09-21.** The shadow owns the gadget as proprioception (plan S18):
+`ShadowParams.gadget_cooldown` (Mortis 18.0) and a float32 `gadget_cd`, 0 at `reset()`, decremented
+in phase 2 beside `attack_cd` and restarted by a throw in phase 6. `attack_mask()` returns four
+legals; the fourth is `gadget_ready` alone (alive, a kind with a gadget, off cooldown), outside the
+gate the attack and the super share, so it is legal mid-dash. `observe()` adds `gadget_ready` and
+`gadget_charge_frac`, and `_put_self` maps both. `Buttons` takes a required `gadget` origin and taps
+it: down on the decision tick, up on the next, never a move; its module docstring, which G3 left to
+G5.2, describes the tap and points at G6. The policy's mask is the shadow's four legals verbatim
+(`_SHADOW_ATTACK_WIDTH` is gone), and `act` refuses any other width by name. The loop builds the
+gadget from `cal.button("gadget")`; a decision row carries attack 3 and bit 3 of `attack_legal`, so
+a fresh match's first row reads `0b1011`. Deviations and choices:
+
+1. **A throw is not an attack.** It spends no ammo and moves neither `attack_cd`, `attack_idle_t`
+   nor `_last_attack_at`, so it never costs the long dash and opens no canary grace window, as in
+   `env._attack_phase`. It shares the attack's one pending slot, so one decision is still one press.
+2. **`resync()` also keeps a queued throw**, beyond G5.1's "leaves `gadget_cd` alone". The canary's
+   evidence is ammo, and the loop taps only what `act` modelled, so the shadow's gadget can lag the
+   game's but never lead it; dropping the queued throw would offer the policy, for a whole cooldown,
+   a gadget the game has already spent. The skill file names this as the one exception to "reseed
+   conservatively".
+3. **`gadget_cooldown` is the one `ShadowParams` field with a default, 0.0.** The sim resolves an
+   absent per-kind field to 0 (`config.PER_KIND_FIELDS`), which is its "no gadget": never legal,
+   fraction 0.0, and `act` refuses the throw. Every other missing field still raises.
+4. **`Buttons.gadget` is required**, so a `Buttons` that cannot press the gadget cannot be built by
+   accident. `require_on_screen` only checks that the tap point is on the screen, since a tap needs
+   no room around it, and `aim_point` raises for the gadget.
+5. **Found and fixed: `scripts/deploy_run.py --dry-run` rebuilt `Buttons` positionally**, through
+   `type(loop.controls.buttons)(...)`, which a search for `Buttons(` misses. With `gadget` required,
+   every dry run would have crashed before its first tick. The rebuild moved to
+   `Controls.with_backend(backend)` beside `Controls.build`, carrying every field by name, and the
+   script calls it. Nothing offline reached either path before: one new test covers `with_backend`,
+   and another runs the real `Controls.build` with only ADB faked, where `_shipped_buttons` only
+   copies it.
+6. **`match_state.py`'s second reason for the gadget anchor, that the policy never presses it, no
+   longer holds.** Its module docstring and design §5 carry a dated note pointing at G6; the anchor
+   and the JSON `_comment` stay G6.2's.
+7. **G5.3's dry-run check needs the emulator window**, so it is covered offline by the unchanged
+   `check_spaces` tests (`test_a_checkpoint_with_the_wrong_action_space_is_refused`,
+   `test_a_pre_gadget_checkpoint_is_refused`). The real-checkpoint seam test now passes four legals
+   and the gadget pair, but all four checkpoints on disk are pre-gadget, so it skips until a run
+   trains on this tree.
+8. **Deploy4 is still refused, now by H4 alone.** The assembler raises `KeyError('enemy_hist1')` at
+   construction as before, so both strict xfails stand; the loop test's comment and reason now name
+   only H4.
+9. **The timing is the sim's to the bit**, G3's decision-rate figure included: the throw's own
+   sub-tick writes 18.0, float32 needs 360 decrements to clear it, and at the deployed 4 Hz the
+   earliest second throw is decision 73, 18.25 s after the first.
+
+G5.4, each revision dated: `BRAWL_DEPLOYMENT_DESIGN.md`'s scope paragraph (gadget use left the
+out-of-scope list), §4.3 (`attack ∈ {0, 1, 2, 3}`, nvec `(n_move_bins + 1, 4)`), §4.4 (its heading
+marked, the "not emitted" sentence struck, masking four wide, and a closing gadget paragraph), §5
+(the side effect revised), §6.3's table (a row for the gadget pair), guard 4 (holds as written
+again) and the mask paragraph (`attack (4)`); the skill file's fire semantics, a gadget paragraph in
+place of "never touch the gadget button", and its shadow section. Tests:
+`tests/test_deployment_shadow.py` +16 (parity with the sim, closed-loop on the shadow's own mask at
+1 and 5 sub-ticks per decision with throws mid-dash, exact on the pair and on every attack field a
+throw must not move; charged at the gate; exactly 360 sub-ticks; decision 73 at 4 Hz; the first
+sub-tick; not an attack; legal mid-dash; one pending slot both ways; the dead hero; a kind with no
+gadget; resync keeping the timer and a queued throw; the `observe` coverage test over every deploy
+spec), `tests/test_deployment_control.py` +6 (the bare tap, a tap and a press in flight, release, an
+off-screen gadget, `with_backend`, the real `Controls.build`), `tests/test_deployment_assemble.py`
++1 (deploy4 minus `history` and the `enemy_hist` planes against `build_agent_obs`, throwing first so
+a swapped pair shows) and `tests/test_deployment_loop.py` +1 (a gadget decision is a tap on the
+gadget button, and the next row reads `0b0011`); the loop's fake policy asserts four legals, and the
+policy, calibration and cadence-audit tests take four legals, a gadget origin and bit 3. Twenty-six
+mutants, all killed: no phase-2 decrement, a throw counted as an attack, a throw restarting one
+sub-tick short, resync dropping a queued throw or restarting the timer, a dash, attack-cooldown or
+ammo term in the gadget mask, `gadget_ready` without `alive`, the fraction in float64, `reset`
+leaving it uncharged, a kind without the field refused, `act` never queueing a throw, `observe`
+swapping the pair, `_put_self` swapping the pair or reading the super, the tap on the super's
+button, never lifted or dragged like a press, the on-screen check skipping the gadget, `aim_point`
+accepting it, the policy holding the gadget column False or accepting three legals, `Controls.build`
+wiring the super as the gadget, and `with_backend` dropping the gadget or keeping the live backend.
+The parity test alone killed nine of the fourteen shadow mutants. Full `-m "not vision"` suite: 2313
+passed, 4 skipped, 2 xfailed (deploy4's two), 85 deselected, in 21 min 1 s.
 
 ### G5.1 Shadow
 - Files: `brawl_deployment/perception/shadow.py`, `brawl_deployment/perception/assemble.py`
@@ -884,6 +1011,10 @@ gadget tap.
   the SIM at decision rate sees 18.25 s (G3's note, behaviour 1). Do not report that as a parity
   failure.
 - Done when: pinned.
+- Amended by I1 (2026-09-21): deploy4 selects both fields, so `tests/test_deployment_loop.py`'s
+  decision test runs deploy4 as a strict xfail (`NOT_SERVED_YET`) until G5.1 and H4.1 to H4.3 are
+  all in. The step that lands last deletes the entry, and the strict XPASS says which step that is.
+  A step that changes the exception the case raises restates it there.
 
 ### G5.2 Buttons
 - Files: `brawl_deployment/control/buttons.py`, `brawl_deployment/match_state.py`
@@ -922,9 +1053,15 @@ gadget tap.
   `--` as an em-dash, so anchor any scripted patch on text without dashes.
 - Done when: present.
 
-## Step G6 -- the match gate anchor
+## Step G6 -- the match gate anchor -- DONE 2026-09-22
 
 Gate: G5 done. Must complete before any live run with the gadget enabled.
+
+Deferred 2026-09-21 by the operator: G6.1's trace and G6.2 run after training is complete, with
+I5's dry run and deploy items. Training does not depend on G6, which only gates live runs.
+Unblocked 2026-09-22: the run finished, and both substeps landed the same day. Read G6.2's note
+before anything above it. The trace found that the gate was not on the gadget at all and never
+had been, because all three button names in the calibration were one disc off.
 
 ### G6.1 Probe job
 - Files: `scripts/deploy_calibrate.py` (`--probe-gadget`)
@@ -932,6 +1069,36 @@ Gate: G5 done. Must complete before any live run with the gadget enabled.
   scores every tick for 20 s to `runs/audit/gadget_anchor_trace.json`.
 - Needs: live emulator.
 - Done when: the trace file exists.
+- Progress 2026-09-21: the probe is built; the trace waits on a live match. The command is
+  `python scripts/deploy_calibrate.py --probe-gadget`, run alone, never with `--jobs` or
+  `--write`, and the operator's steps are in the script's docstring. It waits for the gate,
+  scores all three buttons every tick for 2 s, taps the gadget once through `Buttons.press` if
+  the gate still reads in match, scores 20 s more at `loop.tick_hz`, writes the trace and prints
+  KEEP, CHANGE or INCONCLUSIVE. Deviations: the 2 s before the tap are a baseline G6.1 did not
+  ask for; `MatchState` gains a read-only `anchor` property, `(cx, cy, r)` after `refine`, where
+  the plan lists match_state.py for G6.2 only; and each row records every button's mean disc
+  colour, because a tap that never landed would otherwise read as KEEP. A gadget whose colour
+  moves by at most `UNCHANGED_COLOUR` is INCONCLUSIVE, and so is a trace that does not cover the
+  18 s recharge, `GADGET_RECHARGE_S`, which a test pins to brawlers.yaml. The 8.0 in
+  `UNCHANGED_COLOUR` is a first guess, to revise against the first real trace. Ticks where every
+  button is under the threshold at once are the controls leaving the screen, not the gadget, and
+  are not counted against it. A CHANGE names the alternative anchor with the widest margin and
+  says whether the 2-of-3 vote held. `runs/` is gitignored, so G6.2's replay test needs the trace
+  copied under `tests/fixtures/`. Tests: `tests/test_deployment_calibration.py` +16. 21 mutants,
+  all killed.
+- **DONE 2026-09-22.** `runs/audit/gadget_anchor_trace.json`, 264 ticks at 12 Hz in a real
+  match, tap at tick 24, verdict KEEP. It took two runs. The first returned INCONCLUSIVE, and the
+  operator, watching the screen, reported that the gadget press had landed on the Super button.
+  That was correct, and the cause was not the probe: every button name in the calibration had
+  been one disc off since 2026-09-09 (see G6.2).
+- Two defects in the probe itself surfaced from it and are fixed. `_verdict` read "did the tap
+  land?" off the gate anchor's colour, which is only valid while the tapped button and the gate
+  anchor are the same disc; they are now deliberately different, so `TAPPED_ANCHOR` is a separate
+  constant and the probe reports on the button it pressed while gating on the button it watches.
+  The live log line also named the gate as though it were the tap target.
+- `UNCHANGED_COLOUR = 8.0` survived its first real trace, so the guess stands: the thrown gadget
+  moved 224.3 colour levels and the two untouched discs moved 0.0. There is no ambiguity near the
+  threshold to tune against.
 
 ### G6.2 Decide and implement
 - Files: `brawl_deployment/data/control_calibration.json` (`match_gate`),
@@ -948,6 +1115,116 @@ Gate: G5 done. Must complete before any live run with the gadget enabled.
   overhaul change feeding it. Any anchor change moves that margin, so re-measure it here.
 - Done when: the trace-replay test passes and a `control.backend: null` dry run shows no gate exit
   at the first gadget decision.
+- Amended by G5 (2026-09-21): the gadget is live in deployment, so any checkpoint trained on this
+  tree can tap the anchor. `brawl_deployment/match_state.py`'s module docstring and design §5 carry
+  a dated note that the policy presses it; settle both with the `_comment` once the trace decides.
+  The dry run in "Done when" goes through `Controls.with_backend` since G5, gadget included, and
+  `tests/test_deployment_control.py` covers that path.
+- Amended by G6.1 (2026-09-21): a `control.backend: null` dry run sends no touch, so the game's
+  gadget button never changes under it. It proves the loop's own path through a gadget decision,
+  not that the anchor survives a real tap; that evidence is the trace and its replay test.
+- **DONE 2026-09-22, and the verdict is CHANGE for a reason this step did not anticipate: the
+  anchors were mislabelled, not mis-chosen.** Stored `attack` is the gadget (1675.9, 997.0), stored
+  `gadget` is the Super (1559.9, 901.1), and stored `super` is a third disc nothing presses, now
+  `hypercharge` after its icon. No coordinate moved. The rename is the whole fix, and the `_comment`
+  claiming "the one button the policy never presses" was false about the disc it named. Two
+  consequences beyond the gadget: every super the policy has emitted went to `hypercharge`, and the
+  gate was anchored on the real Super, which the policy presses.
+- Bakeoff on `tests/fixtures/vision/bluestacks-example-new.mp4`, 238 sampled frames, measured
+  through `MatchState.update`'s own path at the stored centres and radii, partitioned by the 0.45
+  threshold: `hypercharge` menu max 0.212 / play min 0.968 / median 0.985, `super` 0.083 / 0.675 /
+  0.770, `gadget` 0.336 / 0.454 / 0.978. `hypercharge` is the anchor, 2.1x clear below and 2.2x
+  above. `super` has the cleanest menus but the policy fires it. The gadget's in-match floor is
+  0.454 against a 0.45 threshold with nobody pressing it, so it was never usable, press hazard or
+  no. No vote was added: `MatchState` already had one, and `match_state.py` changed only in its
+  docstring.
+- **The Verify item paid off immediately.** The real-footage gate test,
+  `test_gate_separates_gameplay_from_menus_on_real_footage`, had failed on `gameplay floor 0.675 too
+  close to the threshold` since A2, with no overhaul change feeding it. 0.675 is the Super's own
+  in-match floor on that clip: its face changes as it charges, so its ring score dips, and the gate
+  was sitting on it. Moving the anchor to `hypercharge` fixes it at the root; the test now passes.
+  Its bounds are restated against the threshold (floor > 1.7x, ceiling < 0.70x, ratio > 4.0) and its
+  docstring carries the measured numbers and the reason they moved. This closes the known failure
+  that was not to be re-diagnosed; it did not need diagnosing, it needed the anchor moved off an
+  animating button.
+- The live trace then confirmed the choice and showed the hazard was real on the other disc.
+  `hypercharge` held 0.991 with a floor of 0.991 over the whole 22 s, zero ticks under threshold,
+  zero colour movement, while the real gadget false-exited at +0.58 s and stayed under 0.45 for 60
+  consecutive ticks, 5.0 s, bottoming at 0.164 at +18.4 s as the recharge sweep completed. Renaming
+  the entries without also moving the gate would have built exactly the failure G6 was written to
+  prevent.
+- **Read the trace's two untouched columns carefully; "held" understates and possibly overstates
+  them.** `hypercharge` and `super` are BIT-IDENTICAL across all 264 ticks -- exactly one distinct
+  score and one distinct mean colour each, both equal to that anchor's own `refine_score` -- while
+  the tapped gadget has 111 distinct scores and 9 distinct colours. `probe_gadget` builds a real
+  `MatchState` per button and `record_gadget_trace` calls `update` and `_disc_colour` on every one
+  every tick (there is no caching in `MatchState.update`), and `tick_ms` varies, so the loop did do
+  the work on fresh grabs. Two readings fit and the trace cannot separate them: the capture is
+  lossless and those HUD regions were pixel-for-pixel static for 22 s, which is the strongest form
+  of "did not move" available; or something upstream served a stale ROI for the non-tapped anchors.
+  What argues for the second is that `ring_score_at` samples AT radius r, on the disc edge, where
+  moving world pixels are adjacent -- and on the fixture clip the same anchor's score does vary
+  (play min 0.968, median 0.985). The frames were not retained, so this is not decidable after the
+  fact.
+- **This does not touch the anchor decision, and it does block the replay test.** The choice rests
+  on the bakeoff and on the disc being inert, neither of which cites the trace. But a replay test
+  over a column with one distinct value asserts nothing, so do not write one against this file.
+  Settle it first. `probe_gadget` now records a blake2b digest of each anchor's ROI on every tick
+  (`_roi_digest`, 2026-09-22, +1 test), so the next trace separates the two: identical digests mean
+  identical pixels, and a digest that MOVES under a frozen score is a bug in the scorer. Re-run the
+  probe and build the replay fixture from that trace, not this one.
+- Files: `brawl_deployment/data/control_calibration.json` (three renames, `match_gate.anchor` ->
+  `hypercharge`, both `_comment` blocks rewritten with the bakeoff and the live trace),
+  `scripts/deploy_calibrate.py` (`TAPPED_ANCHOR`, the docstring protocol, the live log line),
+  `configs/deployment.yaml` (two clearance comments, and the aim-radius ceiling is 179 px rather
+  than 81, because the 81 px disc was never the Super), `brawl_deployment/match_state.py` and
+  `brawl_deployment/control/buttons.py` (docstrings), design 5 and the new 5.1, and the
+  deployment skill.
+- Tests: `tests/test_deployment_control.py` +1,
+  `test_the_gate_never_anchors_on_a_button_the_policy_can_press`, which is the standing guard. It
+  cannot catch a fresh mislabelling, because no test can, but it catches what made this one harmful.
+  `tests/test_deployment_calibration.py` is retargeted throughout: the probe fixtures now darken
+  `hypercharge` to close the gate and darken the gadget to exercise the non-gate button path, which
+  before 2026-09-22 could not be expressed at all, since a dark gadget WAS a closed gate.
+- **Still open from "Done when", and neither blocks the anchor.** The trace-replay test is not
+  written: `runs/` is gitignored and the trace has not been copied under `tests/fixtures/`. The
+  `control.backend: null` dry run is in the I5 list at the end of this file. The live trace is
+  stronger evidence than the replay test would have been, since it is the real button under a
+  real throw, but the replay test is what keeps it from regressing.
+- **The anchor's safety is conditional on the roster, confirmed by the operator 2026-09-22.** The
+  third disc is the HYPERCHARGE button, and Mortis has no hypercharge, so it is drawn but inert: it
+  never fills, sweeps or animates. That is stronger than the property the gate was chosen on. Give
+  Mortis a hypercharge and it gains a charge meter that fills during a match, which is exactly what
+  makes the Super unusable here, so re-measure the gate if the brawler or its unlocks change.
+
+### G6.3 The live `--jobs super` check, and the readback defect it exposed
+
+**DONE 2026-09-22.** The one check the rotation post-mortem said was still owed: no run had ever
+discriminated a wrong super point from an uncharged Super, because `job_super` reports both as
+"skipped". Run against a CHARGED Super, on the corrected labels.
+
+- **The corrected mapping is confirmed live.** The press went to `(1559.9, 901.1)`, the disc this
+  file has called `super` since the rename, and the operator watched the Super fire at exactly 90
+  degrees right, which is the commanded `AIM_BEARING`. The names are right and the aimed drag lands.
+- **The job printed FAIL anyway, and the job was wrong.** It slept a flat 0.8 s, took ONE reading
+  and scored it. Deployment observables lag the input by about a second (design 6.8, and the ammo
+  path's own `TROUGH_WINDOW_S`), so 0.8 s sat under the floor. Mortis's super is also a dash, so
+  the hero detector can lose him mid-flight, and `ok = after is not None and not after.ready`
+  scored a lost detection as a failed super.
+- **Fixed by polling rather than guessing.** `SUPER_DRAIN_WINDOW_S = 3.0` at
+  `SUPER_SAMPLE_S = 0.1`; PASS is the first not-ready frame and the latency it arrived at is
+  printed, so the job now MEASURES the lag instead of assuming it. Unreadable frames are counted
+  and skipped, never scored. A timeout still FAILS, and prints the charge trajectory so the next
+  such failure reads itself.
+- Files: `scripts/deploy_calibrate.py` (`job_super`, two new constants).
+- Tests: new `tests/test_deploy_calibrate.py`, four cases on a fake clock and the real
+  `SuperReading` -- a drain at 1.2 s passes (the old code fails it), unreadable frames decide
+  nothing, a track that never drains fails with its trajectory, and an uncharged Super is skipped
+  with no press. That last one pins the hole the rotation hid in as a deliberate property rather
+  than an accident.
+- **The ammo path had already learned this and the super path had not.** `verify_tap` samples a
+  0.9 s window at 50 ms and looks for a trough; `job_super` slept once. One file, two theories of
+  how fast the game answers. If a third verifier is ever added, poll.
 
 ---
 
@@ -1016,6 +1293,70 @@ does not exist; the timing pins are `tests/test_env.py` + `tests/test_action_rep
 
 Depends on G3 (attack one-hot width 4).
 
+**DONE 2026-09-21.** `build_obs` emits a `hist` group right after `hero`: `valid`, `move_onehot`,
+`attack_onehot`, `hp`, `ammo_frac` and `displacement`, each `(N, K, ...)` with K = `history_frames`,
+newest first, every field 0 where `valid` is False. Because H1's push runs at the top of `env.step`,
+slot k of an observation is the observation k+1 decisions back plus the action that answered it, and
+the grid names that slot's plane `enemy_hist{k+1}`. `_build_grid` appends one plane per slot after
+the 12 base channels, scattering past sightings (`hist_enemy_seen`) at their world position into the
+current window. `OBS_SCHEMA` gains the six rows and two dims, `K` = `history_frames` and `C` = 12 +
+`history_frames`, and declares `view`/`world` as `(N, C, ...)`. `obs_select._build_flat_group` now
+flattens any rank row-major (`_flat_columns`); before, the probe showed a rank-3 field raising
+`RuntimeError: Tensors must have same number of dimensions: got 2 and 3`. The six fields flatten to
+78 columns: valid [0, 3), move [3, 54), attack [54, 66), hp [66, 69), ammo [69, 72), displacement
+[72, 78). Deviations and choices:
+
+1. **The planes follow K.** R6 makes `history_frames` a real knob, so the grid has 12 + K channels
+   rather than a fixed 15. `obs_select._CHANNEL_INDEX` keeps the 12 fixed names; the new public
+   `obs_select.channel_index(cfg)` adds `enemy_hist1..K` at 12..11+K, and grid specs resolve through
+   it. `observation._N_BASE_CHANNELS`, obs_schema's `C` and `_CHANNEL_INDEX` each restate the 12,
+   and the tests pin all three.
+2. **The radius is Chebyshev on tile indices:** the enemy's tile then against the hero's tile now,
+   `max(|dx|, |dy|) <= history_radius_tiles`, which is exactly the 9 x 9 block of cells. The text's
+   `chebyshev(hist_enemy_pos - hero.pos)` on raw positions would take a boundary cell or not
+   depending on where inside their tiles the two stood: an enemy at x 14.9 with the hero at x 10.1
+   is on the block's edge but 4.8 away. H4.3 can reproduce a cell rule exactly, and not the other.
+3. **The one-hots are `uint8` with units `onehot`**, like `entities.kind_onehot`. Specs read them as
+   float32 and `normalize` divides `onehot` by 1.0, so nothing downstream sees the difference.
+4. **H2.2's "fix if it does not"**: it did not, and `_flat_columns` is the fix.
+5. **`hist` sits right after `hero`** in `build_obs`, `OBS_SCHEMA` and `dump_obs_schema.py`'s group
+   order. The whole schema is now pinned to `build_obs` order, not only the hero rows.
+6. **Every field is masked by `valid`, and the planes AND `hist_valid` in as well.** For the
+   one-hots and the displacement the mask is load-bearing: an empty slot holds action (0, 0), a real
+   "idle, no attack", and position (0, 0), which would read as a displacement of `-hero.pos`. For hp
+   and ammo it is defensive, since `state.zero_` already leaves 0 there.
+7. **The one-hots are a comparison with an arange**, not `F.one_hot`, so the mask folds into the
+   same expression and no index can raise.
+8. **Deployment is untouched.** The assembler still builds a 12-channel view, which is right for
+   every shipped spec: none selects `hist.*` or `enemy_hist*` before I1, and one that does fails
+   loudly (`KeyError` in `assemble._channel_indices`) until H4.2 and H4.3 land. The one deployment
+   file edited is a docstring: `tests/test_deployment_grid.py`'s `_sim_view` said 12 channels.
+
+`displacement` normalizes like every other `tiles` field, by `max(map_w, map_h)`, so one tile reads
+0.017 on the 60-tile default map. `docs/OBSERVATION.md` is regenerated (gitignored);
+`docs/AGENT_OBS.md` is byte-identical. The CUDA sync test (`test_native_step_is_sync_free_on_cuda`)
+is green. Tests: `tests/test_observation.py` +11 (empty history at reset in the declared shapes;
+every field 0 in the empty middle slot of `[T, F, T]`; three `env.step`s at repeat 5, each slot 0
+equal to the previous observation's hp, ammo fraction and position minus the current one; an enemy
+seen two decisions back at (10.2, 10.7) lands only in `enemy_hist2` at view (4, 5) and world (10,
+10); a hidden sighting and a sighting in an empty slot draw nothing; the block keeps two tiles 4
+away that stand 4.4 and 4.8 away and drops two tiles 5 away inside the view; the radius counts from
+the hero's tile now, not then; after one idle step `enemy_hist1` equals the previous
+`enemy_revealed` plane cut to the block; K 1 and 4 give 13 and 16 channels),
+`tests/test_obs_schema.py` +7 (the six rows as declared; the whole schema in `build_obs` order; K
+and C at 3, 1 and 4, with `validate_obs`; `validate_obs` refuses each `hist` field missing; the docs
+put `hist` between `hero` and `entities` and define K and C) and `tests/test_obs_select.py` +6 (78
+wide with the column map above; row-major on a hand-built package; the normalize vector, 1.0 x 66,
+20000 x 3, 1.0 x 3, 20 x 6 on debug_tiny; nothing before the first step and slot 0 after it on a
+real env; `channel_index` at K 3 and 1; a grid spec selecting (6, 12, 14) and refusing
+`enemy_hist4`). The five 12-channel shape assertions, three in `tests/test_observation.py` and two
+in `tests/test_obs_schema.py`, read 15. Seventeen mutants, all killed: the one-hots, displacement,
+hp or ammo fraction unmasked, the displacement's sign flipped, the radius on raw positions, from the
+hero then, or strict `<`, the planes without `hist_valid`, without `hist_enemy_seen`, in reverse
+slot order or drawing current positions, a column-major flatten, the pre-H2 flatten, `channel_index`
+off by one, `C` fixed at 15, and two schema rows swapped. Full `-m "not vision"` suite: 2280 passed,
+4 skipped, 85 deselected, in 20 min 17 s.
+
 ### H2.1 Float fields
 - Files: `brawl_sim/core/observation.py` (`build_obs`), `brawl_sim/core/obs_schema.py`
 - Do: `hist.valid (N,K) bool`, `hist.move_onehot (N,K,17)`, `hist.attack_onehot (N,K,4)`, `hist.hp
@@ -1047,6 +1388,18 @@ Depends on G3 (attack one-hot width 4).
 
 Depends on I1.
 
+**DONE 2026-09-21.** `tests/test_sb3_features.py` pins both deploy specs, not only the one the
+next run trains. `DEPLOY_WIDTHS` writes out each one's CNN `in_channels`, MLP `in_features` and
+per-group float widths as literals, never read back from the spec, and
+`test_a_deploy_spec_builds_the_extractor_at_its_pinned_widths` builds `BrawlFeaturesExtractor`
+from each at the default config and runs a batch through it. Deploy4: 13 channels and 262
+floats, the sum of `self` 26, `enemies` 81, `projectiles` 72, `zone` 5 and `history` 78.
+Deploy3: 10 and 182. No extractor change. Deploy3 is there for more than the record: deploy4's
+grid is 13 x 13 x 21, so an extractor that took its channel count from the view-height axis
+would still build 13 channels for it, and only deploy3's 10 tell the two axes apart. Tests: +2,
+the one test over both specs. Two mutants, both killed: the channel count read from the
+view-height axis, and the last float group dropped from the MLP.
+
 ### H3.1 Test
 - Files: `tests/test_sb3_features.py`
 - Do: build `BrawlFeaturesExtractor` from `configs/agent_obs_deploy4.yaml`; assert the CNN's
@@ -1054,8 +1407,99 @@ Depends on I1.
   change expected.
 - Verify: the file.
 - Done when: pinned.
+- Amended by I1 (2026-09-21): measured on deploy4 with no extractor change: CNN `in_channels` 13,
+  MLP `in_features` 262, the sum of `self` 26, `enemies` 81, `projectiles` 72, `zone` 5 and
+  `history` 78, and 384 features out. Deploy3 gives 10 and 182. Pin the float width, not the plan
+  table's field counts (I1's note, deviation 1).
 
 ## Step H4 -- deployment mirror
+
+**DONE 2026-09-21.** `DeployLoop` keeps a `deque(maxlen=history_frames)` of `DecisionSnapshot`s, a
+frozen dataclass in `assemble.py`: the move bin, the modelled attack, the hero HP read, the shadow's
+`ammo_frac`, the hero's world position, and the world positions of the enemies seen that decision.
+It pushes one per decision, newest first, right after `shadow.act`, and empties at the match gate.
+`ObservationAssembler.assemble` takes a required `history`; `_put_history` writes the snapshots into
+`core/history.py`'s ring layout and runs the sim's own expressions on them, `observation._onehot`
+included. `GridSpec` gains `history_frames` and `history_radius_tiles`, `history_slots` maps
+`enemy_hist{k}` to snapshot k - 1, and `GridBuilder.build(..., enemy_history=...)` draws each past
+sighting inside the sim's block: tile floors, Chebyshev, `<= history_radius_tiles`, the enemy's tile
+then against the hero's tile now. `assemble._N_VIEW_CHANNELS` and `_CHANNEL_INDEX` are gone, and the
+view is `obs_select.channel_index(cfg)`'s 15 channels. Deploy4 is served: the zone file's
+`ASSEMBLER_NOT_BUILT_YET` and the loop file's `NOT_SERVED_YET` are deleted with their machinery, and
+both files run every deploy spec plainly. Deviations and choices:
+
+1. **`enemies` holds only the tracks seen that decision**, not "every tracked enemy" as H4.1 says.
+   The sim's `hist_enemy_seen` is alive AND revealed, which on this side is `Track.seen_now`, the
+   set `enemy_revealed` draws. A coasted track is the tracker's prediction: it keeps its slot and
+   stays out of the snapshot.
+2. **The ring also empties on a new odometry segment.** A snapshot's position is in its segment's
+   world frame, a new segment has no defined offset to the old one, and the tracker drops its tracks
+   for the same reason. The check runs where the snapshots are read. A new segment's first decision
+   is the tracker's reset tick and is skipped, so the one after reads `valid = [0,0,0]`.
+3. **A skipped decision pushes nothing.** `valid` stays a prefix, as it always is in the sim, and
+   the next decision's first slot is the last one that reached the policy, two windows back.
+4. **No "last good" HP carry.** `_decide` skips a tick with no hero HP read before it assembles
+   anything, so every snapshot holds a real read and the carry has nothing to carry.
+5. **`ammo_frac` is what the decision's observation read, before its own shot.** The sim pushes the
+   ring at the top of `env.step`, so `hist_ammo` is the clip the previous observation was built
+   from. The loop reads `shadow.observe()` once per decision for both. `ShadowHero.act` only queues
+   the shot, so a second read after it would agree today; the test pins the contract through the
+   next observation instead, with the shot spent in between.
+6. **The attack is the one the shadow modelled.** The sim records the requested action, and under
+   its mask a requested attack always fires. Here the policy can pick an attack the shadow refuses,
+   and the snapshot holds what was pressed.
+7. **The loop hands `enemy_history` to `GridBuilder.build`**, not `_put_view` as H4.3's Files line
+   says. The assembler receives a built grid, so the loop is the one caller holding both the builder
+   and the snapshots.
+8. **A missing history is never a default.** `enemy_history=None` raises for a spec with history
+   planes, since an empty plane claims nobody was seen; a spec without them ignores the argument.
+   More snapshots than `history_frames` raise in both the grid and the assembler.
+9. **`history` is a required assembler keyword for every spec**, deploy3's included, and the `hist`
+   group is always built; `obs_select` drops it for a spec that does not select it.
+   `tests/test_deployment_policy.py`'s seam test passes `history=()`.
+10. **`GridSpec` gained two required fields**, which `load` reads from the config's raw
+    `observation` block, so every spec agrees with the sim's `history_frames: 3` and
+    `history_radius_tiles: 4`.
+11. **Two private names are borrowed from the sim**, `observation._onehot` and
+    `obs_select._HISTORY_CHANNEL_PREFIX`, rather than defined a second time.
+12. **Snapshot positions are plain floats**, converted from the tracker's numpy scalars, so a
+    snapshot compares and logs exactly.
+13. **The deque's `maxlen` is the loop's `sim.history_frames`**, the field the assembler and the
+    grid check against.
+14. **The grid parity run's coverage comment was re-measured.** The sim's random stream had moved
+    since it was written: `box` 30, `pickup` 33, `enemy_revealed` 37, `in_zone` 14 and `projectile`
+    21 of forty decisions, and deploy4's three history planes 16, 14 and 12. Design §6.2 carries the
+    same numbers.
+
+Docs: `BRAWL_DEPLOYMENT_DESIGN.md` §6.2 (the parity run covers deploy4, and a dated paragraph on the
+history planes) and §6.3 (a dated `history` subsection with a table of the six fields and their
+sources); the skill file's history section; `configs/agent_obs_deploy4.yaml`'s supplier section,
+which now says deployable since H4 and still names G6. Tests: `tests/test_deployment_grid.py` +15
+(deploy4 in the `from_agent_spec` and parity cases, and the yaml test pins `history_frames` 3 and
+`history_radius_tiles` 4; deploy4's spec is deploy3's ten planes then one per history frame; a plane
+the config does not keep is refused four ways; the plane count is the config's; a past enemy lands
+where the sim's `_scatter_count` puts it, from hand-written rings with a garbage slot and a dead
+enemy; plane k is k decisions ago; the block's edges on both axes; the block follows the hero while
+the sighting stays; two in one cell count two; a `None`, empty and over-long history; a grid without
+the planes ignores them), `tests/test_deployment_assemble.py` +7 (synthetic snapshots byte-equal to
+`build_obs` and `obs_select` at zero to three valid slots, with the one-hots and floats pinned as
+literals at three; an over-long history refused; `history` among the required suppliers; the view
+scatter over deploy4's 15 channels; and G5's deploy4 test now assembles the whole spec over six live
+steps, history byte-equal and `valid` checked per step) and `tests/test_deployment_loop.py` +8
+(H4.1's verify through the real assembler, newest first by a different HP at each decision; the
+modelled attack; the ammo before the shot; the world position as (x, y); a new match; a new segment;
+a skipped decision; only `seen_now` enemies, down to the planes). The zone round trip and the loop's
+decision test run deploy4 plainly. Twenty-three mutants, all killed: in the grid, the block's `<=`
+as `<`, the block on raw distance, a Euclidean block, the hero's tile rounded, no block at all, the
+planes read oldest first, `None` defaulting to empty, no over-length refusal, and the channel check
+admitting any `enemy_hist` name; in the assembler, `valid` all true, the displacement's sign
+flipped, the displacement unmasked, the slots filled oldest first, the position read (y, x), and no
+over-length refusal; in the loop, the chosen attack recorded instead of the modelled one, no clear
+on a new segment, no clear at the gate, `append` for `appendleft`, coasted enemies kept, every plane
+drawn from this decision's sightings, the position stored (y, x), and each snapshot's HP copied from
+the one before. Two needed a test first: `append` until the H4.1 test read a different HP at each
+decision, and the stored (y, x) until a test put the hero at world (3, 1). Full `-m "not vision"`
+suite: 2345 passed, 4 skipped, 85 deselected, no xfails, in 20 min 29 s.
 
 ### H4.1 Snapshots
 - Files: `brawl_deployment/loop.py` (`DeployLoop`)
@@ -1074,6 +1518,9 @@ Depends on I1.
 - Verify: `tests/test_deployment_assemble.py` -- three synthetic snapshots produce the same vector
   `build_obs` + `obs_select` produce for the same numbers (build both, compare).
 - Done when: byte-equal.
+- Amended by H2 (2026-09-21): an empty slot is all zeros, one-hots included; `hist.hp` is the
+  absolute HP (`normalize` divides by 20000); `displacement` is the position then minus the
+  position now, in tiles. The column map is H2's note.
 
 ### H4.3 Grid
 - Files: `brawl_deployment/perception/grid.py` (`GridBuilder.build(..., enemy_history)`),
@@ -1082,6 +1529,22 @@ Depends on I1.
 - Verify: `tests/test_deployment_grid.py` -- a past enemy at map (x, y) lands in the same cell the
   sim's `_scatter_count` puts it.
 - Done when: pinned.
+- Amended by H2 (2026-09-21): the sim's view has `12 + history_frames` channels and the plane
+  names come from `obs_select.channel_index(cfg)`. So H4.3 also moves `assemble._N_VIEW_CHANNELS
+  = 12` and `assemble._CHANNEL_INDEX` onto `channel_index(cfg)`, widens
+  `tests/test_deployment_assemble.py`'s `unfilled = set(range(12)) - ...` check (the enemy_hist
+  planes become filled ones), and gives `GridBuilder` the sim's block exactly: tile indices,
+  Chebyshev, `<= history_radius_tiles`, the enemy's tile then against the hero's tile now
+  (`observation._history_drawn`).
+- Amended by I1 (2026-09-21): once `_CHANNEL_INDEX` moves, the assembler builds for deploy4.
+  `tests/test_deployment_zone.py`'s round trip builds it and calls only `_put_zone`, so H4.3 deletes
+  its `ASSEMBLER_NOT_BUILT_YET` entry; the strict XPASS says so. `tests/test_deployment_loop.py`'s
+  decision case then fails later, on the first field the loop cannot yet supply, and that need not
+  be a `KeyError`: `assemble._require` raises `ValueError`. Restate `NOT_SERVED_YET`'s exception in
+  the same change, or delete the entry if the case passes (G5.1's amendment).
+- Amended by G5 (2026-09-21): G5.1 is in and the shadow supplies `self`'s gadget pair, so H4 is the
+  last step the loop's deploy4 case waits on. The test's comment and xfail reason already name only
+  H4.
 
 ---
 
@@ -1332,6 +1795,66 @@ holdout map after a run archived it, deployment, watch and the audit still load 
 
 Depends on G4 and H2.
 
+**DONE 2026-09-21.** `configs/agent_obs_deploy4.yaml` is deploy3 plus the gadget pair in `self`, a
+`history` group with H2's six `hist.*` fields, and `enemy_hist1`, `enemy_hist2` and `enemy_hist3`
+after deploy3's ten grid planes. `obs_select.load_agent_spec` loads it with six groups, which is
+`obs_select._MAX_GROUPS`, so the next field joins an existing group. The widths the policy sees:
+`self` 26, `enemies` (9, 9), `projectiles` (12, 6), `zone` 5, `history` 78, `grid` (13, 13, 21). A
+probe built `BrawlFeaturesExtractor` on it with no code change: CNN `in_channels` 13 and MLP
+`in_features` 262, the sum of 26, 81, 72, 5 and 78, with 384 features out; deploy3 gives 10 and 182.
+Deviations and choices:
+
+1. **The plan's widths count fields.** I1.1's "(22 floats)" is 22 fields: `pos_norm`, `vel`,
+   `facing_vec` and `dash_dir` are two floats each, so `self` is 26 floats (deploy3: 20 fields, 24
+   floats). The plan table's `enemies` 9 x 7 and `zone` 2 count fields too, and its `projectiles` 5
+   per slot matches neither the group's 4 fields nor its 6 floats. The load test pins the float
+   widths above.
+2. **The gadget pair sits right after the super pair**, at columns 22 and 23, not at the end, so the
+   three ability pairs read together: long dash, super, gadget. `meta.time_frac` and
+   `meta.n_enemies_alive` move to 24 and 25, which costs nothing because deploy4 trains from
+   scratch.
+3. **`history` is the fifth group, before `grid`**, in the plan table's order; I1.1's "sixth group"
+   counts groups. The load test pins the order, and nothing else does: the history-before-zone
+   mutant survived every other test.
+4. **The header says "a sixth file"**, not the plan's "fifth": agent_obs, lowinfo, deploy, deploy2
+   and deploy3 come first, and deploy3's own header already says fifth.
+5. **Deployment refuses deploy4 today, and the two tests that glob `configs/agent_obs_deploy*.yaml`
+   run it as a strict xfail.** The glob picked deploy4 up the day it landed, and both cases raised
+   `KeyError('enemy_hist1')` from `ObservationAssembler._channel_indices` at construction;
+   `GridSpec.load` refuses the file too, with `ValueError: unknown grid channel 'enemy_hist1'`.
+   `tests/test_deployment_zone.py`'s round trip (`ASSEMBLER_NOT_BUILT_YET`) waits only on H4.3,
+   because it builds the assembler and calls nothing but `_put_zone`.
+   `tests/test_deployment_loop.py`'s decision test (`NOT_SERVED_YET`) waits on G5.1 and H4.1 to
+   H4.3. Each is `xfail(strict=True, raises=KeyError)`, so the marker turns red the day its case
+   passes and any other failure stays a failure. The zone file's estimator test passes for deploy4
+   as it stands. G5.1 and H4.3 carry the hand-off.
+6. **`docs/AGENT_OBS.md` is byte-identical after regenerating.** `scripts/dump_obs_schema.py`
+   renders only `configs/agent_obs.yaml` (`AGENT_OBS_YAML`); the `--spec` flag is I3.1's.
+
+The header, in deploy3's style: why a sixth file (runs name their spec by path), what changed, with
+H2's column map and the empty-slot rule, the normalization under the plan's "Keep it" (one tile of
+`hist.displacement` reads 0.017 on the 60-tile map), the six-group cap, the deployment supplier of
+every new field (G5.1's proprioceptive shadow per plan S18, H4.2 from H4.1's deque, H4.3 with
+`observation._history_drawn`), the measured refusal, and the width changes as a train-from-scratch.
+Tests: `tests/test_configs_files.py` +8. Deploy4 joins `DEPLOY_SPECS`, which runs it through the six
+per-spec rules (the lowinfo type masking, the live-loop fields, absolute hp, no unnormalized large
+field, train.yaml's cube-pickup reward through `check_reward_is_observable`, no cube counts), and
+the pickups table says it sees pickups. `test_deploy4_agent_obs_yaml_loads_as_a_real_agent_spec`
+pins `fair` and `normalize`, the six group names in order at `_MAX_GROUPS`, every shape, the history
+column map against H2's, the gadget pair at columns 22 and 23, and the grid's channel indices 0 to
+4, 6 and 8 to 14. `test_deploy4_differs_from_deploy3_by_exactly_the_history_and_gadget_additions`
+compares both directions: `history` is the only new group and none is lost; `enemies`, `projectiles`
+and `zone` are equal; `self` is deploy3's plus exactly the gadget pair, right after
+`hero.super_charge_frac`; `grid` is deploy3's planes plus the three history planes at the end;
+`history` is exactly H2's six fields. The two deployment files gain the two xfails and one passing
+case, the zone estimator's. Sixteen mutants, all killed: the gadget pair after `meta`, its fraction
+dropped, `gadget_ready` twice, `hero.hp_frac` back, a cube count in `self`, `history` before `zone`,
+`history` without `hist.valid`, `hist.hp` and `hist.ammo_frac` swapped, `enemies` without `in_bush`,
+`enemy_hist3` dropped, `enemy_hist1` and `enemy_hist2` swapped, the pickup plane dropped, `fair:
+false`, the pickups table without deploy4, the zone xfail on `ValueError`, and the loop xfail over
+deploy3 too (a strict XPASS). Full `-m "not vision"` suite: 2289 passed, 4 skipped, 2 xfailed
+(deploy4's two), 85 deselected, in 20 min 19 s.
+
 ### I1.1 The spec
 - Files: `configs/agent_obs_deploy4.yaml` (new)
 - Do: copy deploy3; `self` += `hero.gadget_ready`, `hero.gadget_charge_frac` (22 floats);
@@ -1353,6 +1876,56 @@ Depends on G4 and H2.
 
 Depends on B4, M4.
 
+**DONE 2026-09-21.** `run.agent_obs` is `configs/agent_obs_deploy4.yaml`, so a bare
+`python scripts/train.py` trains the deployable spec. The comment above it said the reverse, that
+full information is the default and a deploy spec is picked with `--set`; it now lists the other
+specs by `--set`. The tiers, maps, holdout pair and rewards were already final (the hand-off
+below). Deviations and choices:
+
+1. **`gadgets_used` is an eval metric, not an env event.** Nothing in the sim state counts
+   throws, so `TierEvaluator.evaluate` counts the ones it sends, by the sim's own rule: attack
+   value 3 where the attack mask allows it, at most once per decision, only in a slot's first
+   episode, and counted before the step so that a slot's last decision still belongs to it. The
+   mask is the one the policy was given. The sim re-derives its own after ticking the timers,
+   and the two differ only on the tick before a charge completes, where a `maskable_ppo` policy
+   cannot press, so for the run's algo the count is exact. It is the fifth of
+   `evaluation.METRICS`: progress.csv gains `eval/gadgets_used_<tier>`, throws per episode on the
+   training maps, and each tier's writer draws `eval/gadgets_used` on the overlaid chart, as it
+   does `eval/win_rate`.
+2. **The eval cost is measured** and replaces train.yaml's three "not re-measured" notes. RTX
+   5070 Ti, 6 tiers x 300, untrained policy: 49.3 s per training-map rollout and 49.4 s per
+   holdout one, each ~200 decisions at ~245 ms. A rollout stops at 600 decisions, so one eval is
+   ~100 s now and up to ~5 min once the policy survives to the time cap, which is ~2.5 h to
+   ~7.5 h over the run's ~92 evals. Peak allocated VRAM is 1.14GB for 4096 training envs and the
+   model, and 1.24GB with both eval envs; the ~2.95GB the file quoted was 4 tiers x 1000.
+3. **SB3 transposed deploy4's grid for any view under 13 cells a side**, fixed outside I2's file.
+   SB3 takes a rank-3 uint8 Box on [0, 255] for an image, calls it channels-last unless the first
+   axis is the smallest, and then wraps the env in `VecTransposeImage`. Deploy4's 13 x 13 x 21
+   grid is channels-first only on that tie, so the real run was safe by luck, but debug_tiny's
+   13 x 10 x 14 trained on 14 x 13 x 10, view columns for channels, `train.py --smoke` included.
+   `builder.no_image_transpose` puts the env behind SB3's own opt-out,
+   `VecTransposeImage(skip=True)`, and `build_model` and both of `scripts/train.py`'s `_resume`
+   hand-offs go through it: the load, and the VecNormalize `set_env`. `scripts/sb3_smoke.py`
+   still hands SB3 the bare env. Its `agent_obs.yaml` grid has 10 channels, which SB3 keeps at
+   both configs, so only deploy4 on debug_tiny would trip it there.
+
+Tests: `tests/test_training.py` +5, `tests/test_configs_files.py` +1.
+`test_evaluator_counts_the_gadgets_a_real_rollout_throws` runs the real env: an idle policy
+throws 0 per episode and one that presses on its first decision throws 1, where a count keyed to
+the super's column would read 0 for both, since the super starts uncharged.
+`test_evaluator_counts_a_gadget_only_where_legal_and_only_in_the_first_episode` scripts four
+slots' legality and dones, and `test_eval_callback_means_and_gap_are_per_evaluator` checks the
+CSV column and the overlaid chart by value.
+`test_the_model_sees_the_grid_channels_first_as_the_env_builds_it` and
+`test_a_resumed_model_keeps_the_grid_channels_first` build and resume a debug_tiny run, and
+`test_the_shipped_run_trains_deploy4_at_its_pinned_input_widths` builds the extractor through
+train.yaml's own env config and overrides: 13 channels, 262 floats. Eleven mutants, all killed:
+the gadget count without the first-episode gate, without the mask, on the super's mask column,
+on the super's action value, and after the step's dones; `gadgets_used` dropped from `METRICS`;
+the overlay dropped; `build_model` and each `_resume` hand-off given the bare env; and train.yaml
+back on deploy3. Full `-m "not vision"` suite after wave 6's code, H3, I2 and G6.1's probe:
+2369 passed, 4 skipped, no xfails, 85 deselected, in 19 min 14 s.
+
 Hand-off from wave 3: the tiers block (B4), `run.env_overrides.world.maps` (fourteen) and
 `eval.holdout_maps` with their comments (M4) are already in the file and final, and so is the
 reward block's `attack_in_reach: 0.05` (R2); I2 only switches `run.agent_obs` and adds the optional
@@ -1366,8 +1939,12 @@ event. Leave the eval-cost comments alone except to replace
   event for the eval log.
 - Verify: `tests/test_training.py`; `check_reward_is_observable` passes for deploy4.
 - Done when: green.
+- Amended by I1 (2026-09-21): the second check already runs.
+  `test_the_shipped_cube_pickup_reward_builds_only_with_a_spec_that_sees_cubes` in
+  `tests/test_configs_files.py` puts the real train.yaml reward through `check_reward_is_observable`
+  with deploy4, which the pickups table marks as seeing pickups.
 
-## Step I3 -- docs, schema, graph
+## Step I3 -- docs, schema, graph -- DONE 2026-09-22
 
 ### I3.1 Regenerate and record
 - Files: `docs/OBSERVATION.md`, `docs/AGENT_OBS.md`, `BRAWL_DEPLOYMENT_DESIGN.md` §9/§10,
@@ -1385,7 +1962,31 @@ event. Leave the eval-cost comments alone except to replace
   them, and mention the `.preset.yaml` sidecar in the `--save ... --no-view` workflow.
   (`docs/OBSERVATION.md` matched `dump_obs_schema.render()` exactly on 2026-09-21; only G4's and
   H2's new rows are missing.)
-- Done when: the docs match the schema and the graph is current.
+- **DONE 2026-09-22.**
+- **`dump_obs_schema.py` grew `--spec`.** It rendered `configs/agent_obs.yaml` and nothing else, so
+  rendering the spec that actually trains would have overwritten the full-information doc. `--spec`
+  names the output after the spec it was given, so `agent_obs_deploy4.yaml` produces
+  `docs/AGENT_OBS_DEPLOY4.md`. `docs/OBSERVATION.md` is rendered from `OBS_SCHEMA` itself and is
+  rewritten either way, so its content does not depend on the flag.
+- **"The docs match the schema" was checked by REGENERATING, not by reading.** All three docs
+  re-render byte-identical on 2026-09-22, and `graphify update .` ran the same day.
+- Tests: `tests/test_obs_schema.py` +2, `test_render_is_deterministic` and
+  `test_render_covers_every_schema_field`. The second is the load-bearing one: a field added to
+  `OBS_SCHEMA` and forgotten in the renderer now fails here instead of shipping a short doc.
+- **`CHARACTER_DETAILS.md` was a correction, not an addition.** Gadgets sat under "Still
+  unimplemented" next to Star Powers and Hypercharges. Phase G implemented Mortis's, so gadgets
+  moved OUT of that list, with `gadget_cooldown: 0` named as the "this kind has no gadget"
+  sentinel -- the same shape as `super_charge_hits: 0` in the bullet directly below it.
+- `brawl_sim/maps/README.md`: "What actually trains" now states the sixteen-versus-FOURTEEN split,
+  names `split_river` and `hollow_ring` as eval-only holdouts, and says a new map needs a
+  `train.yaml` entry as well as a sim entry.
+- **`TRAINING.md` needed no change, which is a finding rather than an omission.** Every item on the
+  carried-forward list was already written by B4 and M4 on 2026-09-18 and is in the last commit,
+  not the working tree: the ladder paragraph and its nine-column table (:73-88), the "no tier's
+  eval column is comparable with any run before 2026-09-18" warning (:99), the three holdout
+  metrics plus the `eval/*` = fourteen-training-maps statement (:157-163), best_model chosen on
+  the training maps only (:152-155), and the `.preset.yaml` sidecar (:194). Checked line by line.
+- **Done when: SATISFIED.**
 
 ## Step I4 -- test suite and throughput
 
@@ -1395,28 +1996,64 @@ event. Leave the eval-cost comments alone except to replace
   {0, 1}, so the all-presets smoke battery never throws a gadget or a super. Draw
   `randint(0, env.cfg.action_nvec[1])`, as `scripts/record_rollout.py` does, and run it.
 - Done when: green.
+- DONE 2026-09-21. `_random_action` draws `randint(0, env.cfg.action_nvec[1])` with
+  `record_rollout`'s comment, and `tests/test_smoke_test.py` pins both columns against literals
+  (+1 test; 4 mutants, all killed). `scripts/smoke_test.py` passed all four config variants
+  (default, debug_tiny, no_zone, single_archetype; 500 decisions each at 8 envs on CPU with
+  `debug_checks` on). The full `-m "not vision"` suite ran after wave 6's code (I2's note:
+  2369 passed, no xfails); only the smoke script and its new test changed since.
 
-### I4.2 Benchmark
-- Files: `scripts/benchmark.py`
-- Do: run at `n_envs=4096` before and after (the "before" is the tree at plan time; record both).
-  Budget: <= 3% step-time regression. If the history push shows up, store enemies as int16 tile
-  coordinates instead of f32 positions.
-- Needs: GPU free (check for a running `scripts/train.py`).
-- Also (G3's review): `scripts/benchmark.py` (:101, :107) draws attack from {0, 1} too, so no
-  spinner is ever in flight; widen it before the "after" number. `hero.gadget_target` runs one
-  terrain march per entity every tick whether anyone throws or not; this is where its cost shows.
-- Done when: both numbers are recorded in the run notes.
+### I4.2 Benchmark (removed)
+- Removed 2026-09-21 by the operator, who watches `time/fps` during training instead, so there
+  is no before/after number and no 3% budget. SB3's `time/fps` is decisions over wall clock
+  since `learn()` began, eval pauses included. The last run (`mortis_deploy3_elite`, 4096 envs)
+  logged 8,560 at its midpoint; its ~90 evals cost ~50 s each, 8% of its 15.5 h. This config
+  adds the holdout rollout to every eval, which alone puts the same sim at ~7,900 mid-run, and
+  the first row reads low because the start-of-run eval sits inside it. Lower than ~7,900 is
+  the new sim work or deploy4's larger observation. The suspects, from the plan's Step I4: the
+  per-entity march in `hero.gadget_target` every tick (G2), two (N,E) gathers per tick (B2,
+  B3), the history push (H1: store enemies as int16 tile coordinates) and three grid scatters
+  per observation (H2).
+- Outcome 2026-09-22: the run logged ~6,900 against this note's ~7,900, with an iteration
+  median of 63.0 s against the last run's 56.0 s. So the doubled eval was ~8% of it and the
+  new sim work plus deploy4 about 12% per decision. The operator accepted it; I5 has the rest.
+- `scripts/benchmark.py` (:101, :107) still draws attack from {0, 1}, so no spinner is ever in
+  flight. Widen it as I4.1 widened `smoke_test.py` before using it again.
 
 ## Step I5 -- the run checklist
 
-- [ ] A1.5 audit numbers recorded (baseline before the change; A2.4 is deferred, so there is no
-      deploy-side baseline).
+- [x] A1.5 audit numbers recorded (baseline before the change; A2.4 is deferred, so there is no
+      deploy-side baseline). A1's DONE note (2026-09-18) holds them.
+- [x] Train: DONE 2026-09-22, `runs/mortis_deploy4-20260921-185945`, 450M decisions in 18.15 h
+      at ~6,900 fps (I4.2's note). Eval on the training maps 0.530 mean over the six tiers,
+      best 0.549, elite 0.240; holdout 0.368 with a 0.162 gap; `gadgets_used` 1.6 on elite to
+      1.9 on easy, so the policy does press the button. Every curriculum stage force-advanced
+      on its timestep budget at a 0.24 to 0.32 win rate and never through the 0.35 gate, which
+      is B4's harder ladder showing up exactly where this checklist predicted it.
+- [x] Sim cadence audit (`--run`) on the new `best_model.zip`: DONE 2026-09-22,
+      `runs/audit/cadence_mortis_deploy4.md`, 200 episodes against elite, 677 fights. R2's
+      `attack_in_reach` bought both numbers it was taken for: utilization 0.511 against A1's
+      0.339, long-dash waiting 0.042 against 0.114. Phasing loss rose to 0.107 from 0.081,
+      which is the 0.35 s cooldown against 0.25 s decisions biting more often now that the
+      policy attacks more; that is A3's structural cap, still deferred. The interval mode is
+      still 10 ticks and tighter, 383 of 871 intervals against A1's 141 of 454. Ammo at the
+      first attack 2.37 against 2.41.
+
+- [x] Repoint `configs/deployment.yaml` at the new run: DONE 2026-09-22. It still named
+      `runs/mortis_deploy3_elite-20260913-015933`, which is pre-gadget AND had been deleted, so a
+      live run would have died on a missing path before reaching anything interesting. The
+      pre-flight check that exists to catch this -- `test_deployment_policy.py -k real_checkpoint`
+      -- SKIPPED instead of failing, because "this machine does not have the artifact" and "the
+      config names a run that does not exist" were one branch. They are separate now, and only
+      `DEPLOYED_RUN` is held to the strict one; the other parameters are historical constants and
+      a machine without them is just a machine. The deploy4 checkpoint now loads and decides from
+      a real assembled observation offline, which is as far as the suite can take it.
+
+After training is complete (operator, 2026-09-21). G6 landed 2026-09-22, so both items are
+live:
+
 - [ ] `control.backend: null` dry run against the new spec: no gate exit at the first gadget
       decision (G6), `history` and `self` assembled without `_require` errors (H4, G5), telemetry
       rows carry A2.1's fields.
-- [ ] Train. The first stage's win rate starts lower than the last run's (harder `hard`); the gate
-      is unchanged at 0.35.
-- [ ] Sim cadence audit (`--run`) on the new `best_model.zip`: utilization against A1's 0.339 is
-      what R2's `attack_in_reach` bought; the long-dash share against A1's 0.114.
 - [ ] Deploy `best_model.zip`; rerun the cadence audit on the resulting telemetry and compare with
       the baseline.

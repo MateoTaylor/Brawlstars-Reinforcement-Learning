@@ -1,9 +1,10 @@
 """Bot targeting and the observation's visibility annotations. See BRAWL_SIM_BUILD_PLAN.md
-Step 15 / Notice 4: bush-hiding is the only thing that ever hides an entity -- terrain never
-blocks sight, since the camera is fixed bird's-eye. visibility() (bush-only) drives BOTH bot
-targeting and the hero's revealed_* observation flags; raw_los() (walls-only, via
-terrain.line_of_sight) is a separate, purely physical query used for fire-gating and
-obs["visibility"]["los"], never for targeting.
+Step 15 / Notice 4: bush-hiding is the only thing that ever CONCEALS an entity -- terrain never
+blocks sight. visibility() (bush-only, whole-map) drives bot targeting and combat; the hero's
+revealed_* observation flags are narrower, `core/camera.hero_view` = this matrix's hero row AND
+the camera window, because the deployed detector only reports what is on screen
+(OBS_PARITY_PLAN.md §2). raw_los() (walls-only, via terrain.line_of_sight) is a separate, purely
+physical query used for fire-gating and obs["visibility"]["los"], never for targeting.
 
 `bush_scan` (the tile search three of the five bot personalities need, Step 41) lives here
 rather than in the sniper archetype, where its loop-per-probe ancestor `_nearest_bush` lived:
@@ -61,8 +62,9 @@ def bot_visibility(state, vis: torch.Tensor, cfg) -> torch.Tensor:
     within `cfg.bots_sight_tiles`.
 
     **`visibility()` has no range limit at all**, by design: it answers "is this entity concealed",
-    and concealment is a property of bushes, not of distance (the camera is a fixed bird's-eye
-    view, so the hero's observation legitimately covers the whole map). Feeding that same matrix
+    and concealment is a property of bushes, not of distance. It stays whole-map because bots and
+    combat read it; the hero's observation is narrowed separately, by `core/camera.hero_view`
+    (concealment AND the camera window), and bots by `sight_tiles` here. Feeding that same matrix
     straight into bot targeting, which is what happened before Step 41, gave every bot perfect
     sight across a 60x60 map. Measured consequences on `bushy`:
       - 84.3% of live bot-ticks had an enemy locked, at a mean range of 22.7 tiles -- roughly three

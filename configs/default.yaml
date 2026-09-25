@@ -53,6 +53,31 @@ world:
 # number stale.
 view:  {height: 13, width: 21}
 
+# The camera as the sim models it (OBS_PARITY_PLAN.md §2). `quad` is the ground the screen
+# actually shows: a trapezoid in tiles relative to the hero's nominal screen anchor (the viewport
+# centre + (0.09, 0.80) tiles, see the `view` comment), corners TL, TR, BR, BL with y down. The
+# sim reveals enemies inside it and nothing outside it, because that is all the deployed YOLO can
+# ever see; `tests/test_sim_camera.py` re-derives the corners from the shipped homography so a
+# recalibration fails there instead of leaving these stale.
+# `clamp_onset` is how far from each map edge the game's camera stops following the hero (it
+# clamps at the map boundary, so near an edge the hero drifts off-centre on screen). Geometry
+# defaults: the quad's half-extent on that side minus ~2 tiles of visible off-map ground, until
+# `scripts/probes/edge_probe.py` measures them from footage. `edge_flag_tiles` is the hero-to-camera
+# offset past which `hero.near_edge` is set; the deployed side thresholds the tracked hero box's
+# distance from the screen centre at the same number, read from this file.
+camera:
+  quad: [[-14.11, -10.59], [14.77, -10.93], [11.73, 7.45], [-11.55, 7.01]]
+  clamp_onset: {west: 12.1, east: 12.8, north: 8.9, south: 5.5}
+  edge_flag_tiles: 2.0
+
+# Enemy observation slots behave like the deployed `EntityTracker`'s: an enemy needs
+# `promote_hits` sightings to get a slot, keeps it through `max_misses` unseen decisions, and slots
+# are re-used lowest-free-first, so identities shift the way they do live. Both are counted in
+# DECISIONS -- the tracker updates once per decision, not per perception tick (OBS_PARITY_TASKS.md C8).
+slots:
+  promote_hits: 2
+  max_misses: 3
+
 sim:
   dt: 0.05                         # SIM tick = 20 Hz, the rate the world updates at
   max_episode_steps: 3000          # SIM TICKS, i.e. 150s of game time -- NOT agent steps

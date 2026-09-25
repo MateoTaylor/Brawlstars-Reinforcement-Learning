@@ -186,6 +186,111 @@ def test_cells_outside_the_true_footprint_are_skipped(plan):
 
 
 # ---------------------------------------------------------------------------
+# the one-wide-gap rule
+# ---------------------------------------------------------------------------
+
+def _interior(plan, m):
+    """(row, col) of a cell the footprint gate admits together with its four neighbours, in the
+    frame's own indices: where a pinch can be laid without touching a gate."""
+    allow = m._footprint(plan)
+    rows, cols = allow.shape
+    for r in range(2, rows - 2):
+        for c in range(2, cols - 2):
+            if allow[r - 1:r + 2, c - 1:c + 2].all():
+                return r, c
+    raise AssertionError("no cell of the plan's footprint has an admitted 3x3 neighbourhood")
+
+
+def _pinched(plan, m, klass=Tile.WALL):
+    """All FLOOR, with `klass` either side of one interior cell: a frame claiming a passage one
+    tile wide. Returns the grid and the (row, col) of the pinched cell."""
+    r, c = _interior(plan, m)
+    cells = _cells(plan)
+    cells[r, c - 1] = cells[r, c + 1] = CLASS_INDEX[klass]
+    return cells, (r, c)
+
+
+def _map_cell(m, plan, rc):
+    """Map indices of frame cell `rc` deposited at the origin."""
+    ox, oy = m.origin
+    return rc[0] + int(round(plan.origin_tile[1])) - oy, rc[1] + int(round(plan.origin_tile[0])) - ox
+
+
+def test_a_frame_claiming_a_one_wide_gap_votes_at_the_rule_weight(plan):
+    """The rule's whole mechanism: the pinched cell and both flanks get a fraction of a vote,
+    every other cell a whole one, and the frame reports how many cells it touched."""
+    cfg = VisionConfig(occupancy_gap_rule_weight=0.25)
+    m = _map(cfg)
+    cells, (r, c) = _pinched(plan, m)
+    res = m.update(cells, _odo(), plan, cfg=cfg)
+    assert res.gap_weighted == 3
+    mr, mc = _map_cell(m, plan, (r, c))
+    total = m.votes.sum(axis=2)
+    assert total[mr, mc] == pytest.approx(0.25)
+    assert total[mr, mc - 1] == pytest.approx(0.25) and total[mr, mc + 1] == pytest.approx(0.25)
+    assert total[mr - 1, mc] == pytest.approx(1.0) and total[mr, mc + 2] == pytest.approx(1.0)
+    assert m.confidence()[mr, mc] == pytest.approx(1.0), "a fractional vote is still 100% agreed"
+
+
+def test_views_making_no_impossible_claim_decide_a_disputed_cell(plan):
+    """A two-wide corridor whose far wall the classifier over-extends by a row from most views:
+    the majority of frames say WALL at the corridor's second cell -- and claim a one-wide gap by
+    doing so. Under the rule, the minority of views that see the corridor whole win the cell."""
+    m = _map()
+    cells_pinched, (r, c) = _pinched(plan, m)          # WALL at c-1 and c+1, FLOOR at c
+    cells_open = cells_pinched.copy()
+    cells_open[r, c + 1] = CLASS_INDEX[Tile.FLOOR]     # c and c+1 both floor: a two-wide gap
+    mr, mc = _map_cell(m, plan, (r, c))
+
+    off = VisionConfig(occupancy_gap_rule_weight=1.0)
+    on = VisionConfig(occupancy_gap_rule_weight=0.1)
+    for cfg in (off, on):
+        m = _map(cfg)
+        for _ in range(5):
+            m.update(cells_pinched, _odo(), plan, cfg=cfg)
+        for _ in range(2):
+            m.update(cells_open, _odo(), plan, cfg=cfg)
+        want = Tile.WALL if cfg is off else Tile.FLOOR
+        assert m.best()[mr, mc + 1] == CLASS_INDEX[want], (
+            f"with the rule {'off' if cfg is off else 'on'} the disputed flank should be {want.name}")
+        assert m.best()[mr, mc] == CLASS_INDEX[Tile.FLOOR], "the pinched cell was floor in every view"
+
+
+def test_the_rule_never_flips_a_cell_every_view_agrees_on(plan):
+    """Symmetry: all three cells of a pinch are scaled alike, so unanimous views keep their
+    argmax at any weight -- and the cells are still observed, never left UNKNOWN (which the
+    deploy grid would read as FLOOR)."""
+    cells, (r, c) = _pinched(plan, _map())
+    maps = {}
+    for w in (1.0, 0.1, 0.01):
+        cfg = VisionConfig(occupancy_gap_rule_weight=w)
+        maps[w] = _map(cfg)
+        for _ in range(4):
+            maps[w].update(cells, _odo(), plan, cfg=cfg)
+    for w in (0.1, 0.01):
+        assert (maps[w].best() == maps[1.0].best()).all()
+        assert (maps[w].observed == maps[1.0].observed).all()
+    mr, mc = _map_cell(maps[1.0], plan, (r, c))
+    assert maps[0.01].best()[mr, mc - 1] == CLASS_INDEX[Tile.WALL]
+    assert maps[0.01].best()[mr, mc] == CLASS_INDEX[Tile.FLOOR]
+
+
+def test_a_flank_the_frame_may_not_vote_on_does_not_pinch(plan):
+    """The rule's notion of known is the deposit's: an occluded blocker (a crate, a brawler) is
+    not evidence of a passage, so the cells beside it vote in full."""
+    cfg = VisionConfig(occupancy_gap_rule_weight=0.1)
+    m = _map(cfg)
+    cells, (r, c) = _pinched(plan, m)
+    occluded = np.zeros(cells.shape, bool)
+    occluded[r, c + 1] = True
+    res = m.update(cells, _odo(), plan, occluded=occluded, cfg=cfg)
+    assert res.gap_weighted == 0
+    mr, mc = _map_cell(m, plan, (r, c))
+    assert m.votes.sum(axis=2)[mr, mc] == pytest.approx(1.0)
+    assert m.votes.sum(axis=2)[mr, mc + 1] == 0, "the occluded flank itself never voted"
+
+
+# ---------------------------------------------------------------------------
 # position, and the rounding that must not compound
 # ---------------------------------------------------------------------------
 

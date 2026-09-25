@@ -84,6 +84,35 @@ in. The offline tools pass Phase F's own, whose whole tiles sit at an arbitrary 
 from the game's. The deploy loop passes a world moved onto the game's lattice from crate sightings
 (`brawl_deployment/perception/lattice.py`), and changes `segment` whenever it moves it.
 
+**The one-wide-gap rule weights votes (since 2026-09-22).** Brawl Stars maps never contain a
+walkable passage one tile wide, so a frame classifying a FLOOR or BUSH cell with unit-blocking
+cells on both sides of it (along either axis) is claiming something the map cannot hold. Such a
+frame still votes on those three cells, but at `occupancy_gap_rule_weight` instead of 1
+(`terrain/gaps.py` marks them; `allow` is its notion of known, so nothing under the HUD, gas, a
+box or the footprint's edge takes part). The rule is symmetric on purpose: scaling all three cells
+alike means a cell every view agrees on keeps its argmax whatever the weight, so the rule can only
+change cells the views disagree on, and there it lets the views making no impossible claim win.
+`DepositResult.gap_weighted` counts the cells it touched on a frame. Votes are float32 for it.
+
+Measured with `scripts/vision_score_map.py --gap-weight ...` (same protocol as above; "gaps" is
+the number of one-wide passages the built maps still show over the scored cells, and the labels
+themselves show 23 / 41 / 77 in the same windows, mostly sprite overhang -- see gaps.py):
+
+                              held out, 2 unseen maps      6 graveyard maps        54 older labels
+                              (heldout.pt, n=698)          (terrain.pt, n=2451)    (09-14 weights, n=3922)
+    weight                    F1     P      5-cls  gaps    F1     R      gaps      F1     R      gaps
+    1.0  (off)                0.896  0.935  0.922  16      0.952  0.961  55        0.945  0.939  76
+    0.5                       0.903  0.945  0.927  11      0.952  0.960  45        0.945  0.937  63
+    0.2                       0.905  0.950  0.929  12      0.952  0.958  40        0.944  0.935  57
+    0.1  (shipped)            0.905  0.951  0.930  11      0.951  0.957  37        0.944  0.935  55
+    0.03                      0.904  0.951  0.929   9      0.950  0.956  36        0.943  0.934  54
+
+On maps the classifier never trained on, the rule is worth +0.009 F1, all of it precision: a
+phantom wall row that narrows a corridor is exactly a one-wide claim, and the views that see the
+corridor whole now win. On the classifier's own maps it is neutral (F1 -0.001, ~10 cells of
+recall), and those cells are where it disagrees with the labels' overhang rows rather than with
+the game. 0.1 sits on the plateau of every column; below it nothing more is gained.
+
 **Never-observed cells stay UNKNOWN, and that is correct fog-of-war, not a gap to fill.** Whatever
 consumes this map must treat UNKNOWN as its own state: a policy that believes unexplored ground is
 walkable will walk into walls.
@@ -102,6 +131,7 @@ from brawl_sim.constants import TILE_TO_CHAR
 
 from ..camera import RectifyPlan
 from ..config import VisionConfig
+from .gaps import one_wide_gaps
 from .labeling import CLASSES
 
 # A never-observed cell. Deliberately NOT an eighth `brawl_sim.constants.Tile` member: `N_TILES`
@@ -127,6 +157,7 @@ class DepositResult:
     out_of_bounds: int
     status: str                 # "ok" | "uncertain" | "lost" | "reset"
     segment: int
+    gap_weighted: int = 0       # cells whose vote this frame was scaled by the one-wide-gap rule
 
 
 @dataclass
@@ -142,7 +173,9 @@ class OccupancyMap:
 
     def __post_init__(self):
         if self.votes is None:
-            self.votes = np.zeros((self.height, self.width, self.n_classes), np.int32)
+            # float, not int, since 2026-09-22: a vote cast under the one-wide-gap rule is a
+            # fraction of one (`update`). Whole votes stay exact in float32 to 2**24.
+            self.votes = np.zeros((self.height, self.width, self.n_classes), np.float32)
         if self.locked is None:
             self.locked = np.zeros((self.height, self.width), bool)
 
@@ -177,7 +210,9 @@ class OccupancyMap:
         """Winning class's share of each cell's votes; 0 where unobserved."""
         total = self.votes.sum(axis=2)
         with np.errstate(invalid="ignore", divide="ignore"):
-            return np.where(total > 0, self.votes.max(axis=2) / np.maximum(total, 1), 0.0)
+            # Divide by the total itself, not max(total, 1): under the one-wide-gap rule a
+            # cell's votes can sum to less than one, and its winner's share is still a share.
+            return np.where(total > 0, self.votes.max(axis=2) / total, 0.0)
 
     def to_chars(self) -> np.ndarray:
         """(h, w) of map-CSV legend characters, `?` where UNKNOWN -- the form a hand-verified
@@ -260,16 +295,23 @@ class OccupancyMap:
         if not target.any():
             return DepositResult(0, 0, 0, skipped_gas, oob, "ok", self.segment)
 
-        # Every cell in view votes, locked or not: see "No cell is ever frozen" above.
+        # Every cell in view votes, locked or not: see "No cell is ever frozen" above. A vote
+        # is worth 1, except on the cells with which this frame claims a one-wide passage: those
+        # count `occupancy_gap_rule_weight`, so the views that make no such claim decide them.
+        # `allow` is the rule's notion of known -- exactly the cells about to be trusted with a
+        # vote -- so a blocker under a crate, the HUD or the footprint's edge never pinches.
         rr, cc = np.where(target)
         before = self.votes[dst][rr, cc].argmax(axis=1)
         classes = cells[sub][target].astype(np.int64)
-        np.add.at(self.votes[dst], (rr, cc, classes), 1)
+        weight = np.ones(cells.shape, np.float32)
+        pinched = one_wide_gaps(cells, allow)
+        weight[pinched] = cfg.occupancy_gap_rule_weight
+        np.add.at(self.votes[dst], (rr, cc, classes), weight[sub][target])
 
         # Only cells this frame touched can lock or release: nothing else got a new vote.
         v = self.votes[dst][rr, cc]
         total = v.sum(axis=1)
-        share = v.max(axis=1) / np.maximum(total, 1)
+        share = v.max(axis=1) / np.maximum(total, np.finfo(np.float32).tiny)
         was = self.locked[dst][rr, cc]
         # A lock holds until another class has the most votes, not until the share dips under
         # lock_ratio -- so `released_now` counts overturned cells rather than threshold flicker.
@@ -278,7 +320,7 @@ class OccupancyMap:
         self.locked[dst][rr[released], cc[released]] = False
         self.locked[dst][rr[newly], cc[newly]] = True
         return DepositResult(int(target.sum()), int(newly.sum()), int(released.sum()), skipped_gas,
-                             oob, "ok", self.segment)
+                             oob, "ok", self.segment, int(pinched[sub][target].sum()))
 
     # -- helpers -------------------------------------------------------------
 

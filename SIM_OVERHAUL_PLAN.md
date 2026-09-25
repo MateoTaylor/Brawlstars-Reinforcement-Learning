@@ -647,6 +647,10 @@ script's dry run still refuses a spec/checkpoint mismatch.
 the loop's first live dry run (`control.backend: null`) after Phase G shows no gate exit at the
 first gadget decision.
 
+**Deferred 2026-09-21** (the operator): G6 runs after the training run, with every other
+deployment step, and still lands before any live run of the new checkpoint. Training does not
+need it: the gate reads the emulator's screen, and the sim has no gate.
+
 ---
 
 # 5. Phase H -- three frames of local history
@@ -908,9 +912,11 @@ than editing resolved items; `CHARACTER_DETAILS.md` gadget block (G1).
 
 - `pytest tests/ -x -q -n auto` -- the full suite is ~13 min, 95% of it `brawl_sim`; the vision
   files can be run alone in 11 s and should be untouched by everything here except M1.
-- `scripts/benchmark.py` at `n_envs=4096` before and after: the additions are one (N,E) march per
-  tick (G2), two (N,E) gathers per tick (B2/B3), the per-decision history push (H1) and three
-  scatters per observation (H2). **Budget: <= 3% step-time regression.** If the history push shows
+- `scripts/benchmark.py` at `n_envs=4096` before and after: **removed 2026-09-21** by the
+  operator, who watches training's `time/fps` instead (SIM_OVERHAUL_STEPS.md I4.2 has what to
+  read it against). Kept as the list of suspects if it drops: the additions are one (N,E) march
+  per tick (G2), two (N,E) gathers per tick (B2/B3), the per-decision history push (H1) and
+  three scatters per observation (H2). The removed budget was <= 3%. If the history push shows
   up, the (N,K,E,2) ring is the suspect -- store enemies at (N,K,E) x int16 tile coordinates instead.
 - Check for a running `scripts/train.py` before any GPU job (the GPU is shared).
 
@@ -923,6 +929,9 @@ than editing resolved items; `CHARACTER_DETAILS.md` gadget block (G1).
 3. Train. The first stage's win rate will start lower than the last run's (harder `hard`); the gate
    is unchanged at 0.35, so the walk self-paces.
 4. Deploy `best_model.zip`; re-run the cadence audit on the resulting telemetry and compare to A1/A2.
+
+**Reordered 2026-09-21** (the operator): 3 runs first. 2 and 4 wait until training is complete
+and G6 has landed; SIM_OVERHAUL_STEPS.md I5 is the live checklist.
 
 ---
 

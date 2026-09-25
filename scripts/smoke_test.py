@@ -63,7 +63,10 @@ def config_variants() -> list:
 
 def _random_action(env: BrawlVecEnv) -> torch.Tensor:
     move = torch.randint(0, env.cfg.n_move_bins + 1, (env.n_envs,), device=env.device)
-    fire = torch.randint(0, 2, (env.n_envs,), device=env.device)
+    # The whole attack column (0 none, 1 attack, 2 super, 3 gadget -- SIM_OVERHAUL Step G3), so the
+    # battery's invariant checks see supers and spinners in flight too, as `record_rollout` does.
+    # Illegal picks are silent no-ops (`hero.decode_action`), so drawing them unmasked is safe.
+    fire = torch.randint(0, env.cfg.action_nvec[1], (env.n_envs,), device=env.device)
     return torch.stack([move, fire], dim=1)
 
 

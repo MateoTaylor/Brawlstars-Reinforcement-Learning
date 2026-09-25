@@ -40,8 +40,9 @@ numbers, after four separate faults (§9.12). Sibling of
 
 **Scope.** One agent, one BlueStacks instance, Nulls Brawl friendly battles against bots.
 Capture the screen, perceive, decide, inject touch input, detect when the match ends and stop.
-**Out of scope for the MVP:** queueing matches, menu navigation, brawler selection, gadget use,
-multi-instance, any form of parallelism.
+**Out of scope for the MVP:** queueing matches, menu navigation, brawler selection,
+multi-instance, any form of parallelism. Gadget use was on this list until 2026-09-21, when
+SIM_OVERHAUL Step G5 brought it in (§4.4).
 
 ---
 
@@ -352,8 +353,10 @@ at the bottom-left rest anchor is a direct "did my contact drop" signal, reusing
 
 ### 4.3 Bin → screen offset
 
-The agent's action is `(move, attack)` where `move ∈ [0, 16]` and `attack ∈ {0, 1, 2}`
-(`brawl_sim/config.py:108` → `action_nvec = (n_move_bins + 1, 3)`).
+The agent's action is `(move, attack)` where `move ∈ [0, 16]` and `attack ∈ {0, 1, 2, 3}`
+(`brawl_sim/config.py:130` → `action_nvec = (n_move_bins + 1, 4)`). **Revised 2026-09-21:**
+this read `{0, 1, 2}` and `3` until SIM_OVERHAUL Step G3 added the gadget as attack value 3,
+which deployment presses since Step G5 (§4.4).
 
 From `hero.decode_action` and `geometry.dir_from_bin`:
 
@@ -405,7 +408,7 @@ that the reachable circle clears the bottom UI strip. And bin 2 landing *down*-r
 up-right is **the no-y-flip convention confirmed empirically**, not just derived. Had the negation
 been there, this is the measurement that would have caught it.
 
-### 4.4 Buttons — REVISED 2026-09-15: aimed drags, not taps
+### 4.4 Buttons — REVISED 2026-09-15: aimed drags, not taps; 2026-09-21: the gadget is the one tap
 
 Attack and super are **aimed drags**. This section used to say they were binary taps needing no
 aim, and that was wrong for this policy: a bare tap auto-aims in the real game, sending Mortis at
@@ -415,8 +418,10 @@ move direction too. So each press works the attack stick the way the movement st
 contact goes down on the origin, drags `control.aim_radius_px` (75 px) along
 `ShadowHero.attack_bearing`, and lifts. The lift fires. `attack == 1` presses from the attack
 clearance point (§6.8: the attack stick floats), and `attack == 2` from the super button's centre.
-**Gadgets are not emitted** (the policy has no gadget action) and their button is never touched.
-The action space is unchanged. The aim is the choice the policy already made with its move bin.
+~~**Gadgets are not emitted** (the policy has no gadget action) and their button is never
+touched.~~ **Struck 2026-09-21:** since SIM_OVERHAUL Step G5 the gadget is emitted, as a bare
+tap; see the last paragraph of this section. The drags left the action space unchanged. The aim
+is the choice the policy already made with its move bin.
 
 One step per perception tick: down, drag, lift. Two events in one device write can land in
 one game frame, and a down merged with its drag is a zero-length drag, which the game reads as a
@@ -432,7 +437,23 @@ mirroring `env._held`, which zeroes the fire column on sub-ticks 2..K.
 
 Action masking must be applied at inference the same way `MaskablePPO` saw it in training: if
 super is not charged, bin 2 is masked out. `hero.action_mask` is the sim-side reference; the
-deployed equivalent reads super readiness off the HUD (§6.3).
+deployed equivalent reads super readiness off the HUD (§6.3). Since 2026-09-21 the mask is
+four wide: bin 3, the gadget, is masked for the 18 s cooldown after each throw, read from the
+shadow's own timer rather than the HUD (§6.3's table).
+
+**The gadget is the one bare tap (added 2026-09-21, SIM_OVERHAUL Step G5).** `attack == 3` goes
+down on the calibrated gadget centre, `Calibration.button("gadget")`, and lifts on the next
+tick with no drag: two ticks where a press takes three. A tap is right for the gadget for the
+same reason it was wrong for the other two. The game aims a gadget at the nearest enemy by
+itself, which is exactly what the sim's `hero.gadget_target` does (SIM_OVERHAUL_PLAN.md S10), so
+there is no bearing to carry: `Buttons.aim_point` refuses the gadget, and `Controls.build` checks
+only that the tap point is on screen. One decision is still one press. The gadget shares the
+attack's single pending slot in the shadow and its contact slot in `Buttons`, and a press still
+in flight is finished first. **The gadget is not the match gate's anchor, and never was** (§5.1,
+corrected 2026-09-22). The gate sits on `hypercharge`, the one disc in the cluster that nothing
+presses. Step G6 confirmed that live on 2026-09-22 and measured why the separation is load-bearing
+rather than tidy: after one throw the gadget's own ring score sits under threshold
+for 5.0 s.
 
 ### 4.5 Calibration — BUILT 2026-09-08, see §6.14
 
@@ -575,7 +596,7 @@ instant "Defeated" appears, and on the results screen.
 1920×1080 @ 30 fps, BlueStacks fullscreen, Mortis, sampled every 5th frame):
 
 ```
-                        attack anchor      gadget anchor
+                        the GADGET disc    the SUPER disc
   pre-match / loading   0.000 - 0.198      0.001 - 0.078
   gameplay              0.582 - 0.593      0.776 - 0.823
   post-match            0.000 - 0.198      0.001 - 0.078
@@ -583,33 +604,156 @@ instant "Defeated" appears, and on the results screen.
 GAMEPLAY_THRESHOLD = 0.45  (unchanged; sits cleanly inside both gaps)
 ```
 
-**Anchor the live gate on the GADGET (skull) button, not the attack button.** Both separate
-cleanly, but the gadget's margin is far better balanced: 5.8× below threshold and 1.8× above,
-against attack's 2.3×/1.3×. The attack button reads lower here than in the iOS footage
-(0.585 vs 0.649–0.790) because Nulls Brawl draws a bright filled disc where the iOS layout drew a
-dark annulus, and `ring_score_at` is measuring radial gradient either way. Still well clear of
-0.45, just with less headroom than the gadget.
+Those two columns were headed `attack anchor` and `gadget anchor` until 2026-09-22, and **both
+names were wrong**: the left column is the GADGET, the right column is the SUPER. Not one number
+in the table moved. The rotation changed which disc owns a name, never a measurement. §5.1 is the
+account.
 
-Convenient side effect: the gadget button is the one the policy never presses, so nothing the
-agent does can perturb its own in-match signal.
+The old text explained the left column's 0.585 as the attack button reading lower here than in
+the iOS footage (0.649 to 0.790), and blamed Nulls Brawl drawing a bright filled disc where the
+iOS layout drew a dark annulus. The disc-versus-annulus point is real and still governs every
+score in this section. The comparison it was attached to is not: the left column is not an attack
+button, so there is no iOS counterpart for it to read lower than.
+
+**The two tables in this section disagree, and only the second reproduces.** Scoring the same
+clip today at the 2026-09-08 radii: the Super's row comes back exactly, 0.082 menu max and 0.677
+play min against today's 0.083 and 0.675, because its stored radius barely moved (33.2 to 33.3).
+The gadget's row does not come back at all — at r=35.1 it never crosses 0.45 on any frame of the
+clip, so it has no gameplay range to report; its stored radius is 30.2. Whatever produced
+`0.582 - 0.593` was not this code path at this calibration. Read the first table as history and
+the numbers below as the claim. A ring-score table is worth only the code path it was measured
+through.
+
+**Anchor the live gate on `hypercharge`, the third disc at (1463, 998).** It is the only one of the
+three the policy never touches, which is the property a gate needs and the property this section had
+been claiming for whichever disc happened to be called `gadget`. Re-measured on the same clip on
+2026-09-22 through `MatchState.update`'s own path, stored centres and radii, 238 samples, scores
+partitioned by the 0.45 threshold the way `test_deployment_control.py` partitions them:
+
+```
+  disc          menu max   play min   play median
+  hypercharge     0.212      0.968       0.985
+  super           0.083      0.675       0.770
+  gadget          0.336      0.454       0.978
+```
+
+`hypercharge` clears the threshold by 2.1x below and 2.2x above, and is the anchor. `super` has the
+cleanest menus but the policy fires it, and its face changes as it charges: that 0.675 is the
+exact number `test_gate_separates_gameplay_from_menus_on_real_footage` failed on for two weeks
+while the gate sat on this disc, which is not a coincidence and is now fixed at its root. The
+gadget's in-match floor is 0.454 against a 0.45 threshold with nobody pressing it, so it was
+never usable, press hazard or no.
+
+Confirmed live the same day in a real match with the gadget thrown: `hypercharge` held 0.991 with a
+floor of 0.991 across 264 ticks and never moved a colour level (§5.1). Note that it held those
+values BIT-IDENTICALLY, one distinct score for the whole trace, as did `super`, while the tapped
+gadget varied across 111 -- either a lossless capture of a static region or a stale ROI, and the
+trace cannot tell which (STEPS G6.2). The anchor does not rest on it either way.
+
+**The guarantee is inertness, and it is conditional on the roster.** Mortis has no hypercharge,
+so this button is drawn and never fills, sweeps or animates. That is stronger than "the policy
+never presses it", which is all the gate was originally chosen on. It is also contingent: give
+Mortis a hypercharge and the disc gains a charge meter that fills during a match, which is
+exactly what disqualifies the Super here. Re-measure this gate if the brawler or its unlocks
+change.
 
 **One constant blocks auto-calibration: `RADIUS_PX = (40, 115)`.** `calibrate_buttons` returns
-**zero anchors** on this footage — not a scoring failure but a search-range one. The measured
-radii are attack ≈ 35, gadget ≈ 33, super ≈ 46, so the two best buttons are never proposed to
-`HoughCircles` in the first place. Re-running the identical search at `minRadius=20` finds them
-and they score 0.587 and 0.818 against `MIN_CALIBRATION_SCORE = 0.60`. Lowering the bound to ~25
-fixes it.
+**zero anchors** on this footage — not a scoring failure but a search-range one. The measured radii
+run 30 to 35, so the buttons are never proposed to `HoughCircles` in the first place. Re-running
+the identical search at `minRadius=20` finds them and they score 0.587 and 0.818 against
+`MIN_CALIBRATION_SCORE = 0.60`. Lowering the bound to ~25 fixes it.
+
+That search first reported the radii as 35, 33 and 46, and the 46 is worth keeping as a warning.
+`hypercharge` is drawn as a bright disc inside a dark navy ring, so Hough can lock the ring instead
+of the disc. Re-fitting it from scratch on 2026-09-22 reproduced 46.3, and at 46.3 it never opens
+the gate at all, while the stored 34.4 gives an in-match median of 0.985. A radius is only ever
+advisory (see `match_state.refine`); one from a fresh Hough fit on a new source is not even that.
 
 That said — **the HUD is fixed for this project, so runtime calibration is unnecessary.** Measure
 the anchors once, store them in `brawl_deployment/data/control_calibration.json`, and skip Hough
-entirely in the loop. Per-frame cost is then three `ring_score_at` evaluations. Measured anchors,
-1920×1080:
+entirely in the loop. Per-frame cost is then three `ring_score_at` evaluations. Stored anchors,
+1920x1080 device pixels, refined against a live capture:
 
 ```
-attack  (1676.5,  999.5)  r 35.1
-gadget  (1560.5,  901.5)  r 33.2      <- in-match gate anchor
-super   (1462.5, 1000.5)  r 46.5
+gadget       (1675.9,  997.0)  r 30.2
+super        (1559.9,  901.1)  r 33.3
+hypercharge  (1463.0,  998.0)  r 34.4      <- in-match gate anchor
 ```
+
+There is no `attack` entry, deliberately: the attack is an AREA, not a button (§6.8), so
+`configs/deployment.yaml` carries `attack_tap` on the settings side and there is nothing here to
+calibrate. The `attack` that used to head this block was the gadget.
+
+### 5.1 The labels were rotated by one disc — CORRECTED 2026-09-22
+
+Three discs sit in the bottom-right cluster. From 2026-09-08 until 2026-09-22 every name in
+`control_calibration.json`, and every name in this section, sat one disc away from the button it
+claimed to be:
+
+```
+  stored name       real button   device centre       what it looks like
+  attack       ->   GADGET        (1675.9,  997.0)    bottom right, bright green
+  gadget       ->   SUPER         (1559.9,  901.1)    up and left, blue skull
+  super        ->   HYPERCHARGE   (1463.0,  998.0)    bottom left, a bat icon; Mortis has none
+```
+
+The operator named all three off a live frame rather than letting me infer them from icons,
+which is how the rotation was found and is the only way a name here can be established.
+
+**Every coordinate in the file was correct.** Only the names lied, which is precisely why the
+rotation survived for two weeks: a coordinate can be re-measured by a script, and a name cannot.
+Three safeguards looked straight at these buttons and none of them could see it.
+
+- `fit_buttons(median, expected)` is a REFINER. It searches near each stored centre, so the most
+  it can ever confirm is that something round is still there.
+- `job_tap` validates the attack, but `Controls.build` takes the attack point from
+  `deployment.yaml`'s `attack_tap`, not from this table. The table's `attack` was never pressed.
+- `job_super` reports "skipped" rather than failing when the Super is uncharged. A wrong point
+  and an uncharged Super produce identical output.
+
+The `gadget` entry, meanwhile, was pressed by nothing at all until Step G5 landed on 2026-09-21.
+Its first press was also its first test.
+
+**What it cost.** Two things beyond the gadget, both silent.
+
+- **Every super the policy emitted went to the `hypercharge` disc**, because `Controls.build` reads
+  `button("super")` and that entry held (1463, 998). Whether any of them fired a super is still
+  unknown: `job_super` skips rather than fails on an uncharged Super, so no run has ever
+  discriminated. `scripts/deploy_calibrate.py --jobs super` against a charged Super is the check,
+  and it is outstanding.
+- **The match gate was anchored on the real Super button**, which the policy does press. The one
+  gate this doc described as immune to the agent was on the button most exposed to it.
+- **A test failed for two weeks and this was the cause.**
+  `test_gate_separates_gameplay_from_menus_on_real_footage` reported `gameplay floor 0.675 too
+  close to the threshold` from Step A2 onward, with no overhaul change feeding it, and it was
+  logged as a known failure rather than diagnosed. 0.675 is the Super's own in-match floor on
+  that clip: its face changes as it charges, so its ring score dips mid-match, and the gate was
+  watching it. Moving the anchor to `hypercharge` fixes it and the test passes. A mislabelled anchor
+  does not announce itself; it presents as a threshold that needs loosening.
+
+**How it was found.** Not by a test. The operator watched a `--probe-gadget` run and said the
+gadget press had landed on the Super. The probe itself returned INCONCLUSIVE, for a second
+structural reason worth recording: `_verdict` read "did the tap land?" off the gate anchor's
+colour, which is only valid while the tapped button and the gate anchor are the same disc. They
+are now deliberately different, so `TAPPED_ANCHOR` is a separate constant from the gate name.
+
+**And Step G6 was right about the wrong disc.** G6 asked whether an agent that presses its own
+gate anchor can still gate. The configuration it feared, gate on the gadget, never existed. But
+the live trace measured that hazard on the real gadget and it is severe: after one throw the
+gadget's ring score fell under 0.45 for 60 consecutive ticks, 5.0 s, bottoming at 0.164 as the
+recharge sweep completed, with 224 levels of colour movement. An agent gated on its own gadget
+would stop dead for five seconds after every throw. Renaming the three entries without also
+moving the gate would have built exactly that. `runs/audit/gadget_anchor_trace.json` holds all
+264 ticks; `match_gate._comment` in the calibration file carries the summary.
+
+**The correction changed no coordinate.** It renamed three entries, moved the gate to `hypercharge`,
+and re-pointed two clearance comments in `configs/deployment.yaml`. The old margin argument
+reproduces exactly on the disc that actually has that margin, which is the evidence that the
+measurements themselves were always sound.
+
+`tests/test_deployment_control.py::test_the_gate_never_anchors_on_a_button_the_policy_can_press`
+is the standing guard. It cannot catch a fresh mislabelling, because no test can. It does catch
+the specific thing that made this one harmful.
 
 **Offline → live adaptation.** `scan_gameplay` walks a whole recording and takes the longest
 gap-filled run; live has no future frames. The adaptation:
@@ -830,7 +974,7 @@ tracks §6.1 already produces, and its entire contract is **placement** — putt
 where `brawl_sim/core/observation.py:_build_grid` puts it. So that function is what checks it:
 `tests/test_deployment_grid.py` runs a live `BrawlVecEnv` on `island_invasion`, hands `GridBuilder`
 a perfect-perception view of that env's own world, and asserts every plane (eight for deploy, ten
-for deploy3) equals the corresponding channel of the sim's own grid, every cell, every decision,
+for deploy3, thirteen for deploy4) equals the corresponding channel of the sim's own grid, every cell, every decision,
 for forty decisions. 40 tests, all passing.
 
 "Perfect perception" is the INPUT, not the thing under test — the occupancy map is seeded from the
@@ -846,7 +990,9 @@ agree for the wrong reason:
   (Mortis's own attack is a dash and spawns no projectile), and the crates beside the hero are
   broken on the first step so the `pickup` plane has cubes in it. Measured coverage on the seed
   (10 since the cube scatter shifted the sim's random stream): terrain and `hero` non-empty on
-  40/40 decisions, `box` 28, `pickup` 33, `enemy_revealed` 32, `in_zone` 14, `projectile` 14 — asserted, so a regression to one lucky cell fails.
+  40/40 decisions, `box` 30, `pickup` 33, `enemy_revealed` 37, `in_zone` 14, `projectile` 21 as
+  re-measured 2026-09-21, and deploy4's `enemy_hist1`, `enemy_hist2` and `enemy_hist3` 16, 14
+  and 12 — asserted, so a regression to one lucky cell fails.
 - **The gas seeding is cumulative**, which makes the run a live check of the monotonicity
   assumption below rather than a restatement of it.
 
@@ -871,6 +1017,16 @@ gassed would read back as clear. The deposit uses `ZoneMask.cells` rather than `
 because `zone.py` says those answer different questions — `at_least` exists for the occupancy
 map's *abstain* path where over-flagging is free, `cells` answers "is this cell in the zone" for
 the agent. The cost is that a false positive is permanent.
+
+**The `enemy_hist{k}` planes of deploy4 are past sightings, not past tracks.** Added 2026-09-21,
+SIM_OVERHAUL Step H4. Plane k draws the enemies seen k decisions ago, from the loop's snapshots,
+at the world cell each one stood in. "Seen" is `seen_now`, the set `enemy_revealed` draws,
+because the sim's `hist_enemy_seen` is alive AND revealed: a coasted track is a prediction and is
+never recorded. A sighting is drawn only inside the block the sim's `_history_drawn` keeps,
+`history_radius_tiles` around the hero's tile NOW by Chebyshev distance on tile floors. So the
+block is whole cells, it follows the hero, and the sighting stays where it was seen. A spec with
+these planes that is handed no history raises: an empty plane claims nobody was seen, so it is
+never a default. §6.3 has the snapshots themselves.
 
 #### The one real decision: what an unobserved cell reads as, and why it is FLOOR
 
@@ -971,6 +1127,7 @@ issue, using the same `configs/brawlers.yaml` params the sim loads. Re-auditing 
 | `hero.facing_vec` | **shadow** | Set by our own `move_dir` / `dash_dir`. Never needed sprite orientation. |
 | `hero.dashing`, `dash_t`, `dash_dir` | **shadow** | Dash is triggered by our own attack; `dash_duration` is a kit constant. |
 | `hero.long_dash_ready`, `long_dash_frac` | **shadow** | Stopwatch since our last attack vs `long_dash_seconds`. |
+| `hero.gadget_ready`, `gadget_charge_frac` | **shadow** | Added 2026-09-21, SIM_OVERHAUL Step G5. Countdown from `gadget_cooldown` (18 s), charged at the gate and restarted by our own throw. Proprioception by design (SIM_OVERHAUL_PLAN.md S18), so no reader is built, and a canary resync leaves it alone: the ammo it compares says nothing about the gadget. |
 | `hero.invuln` | **shadow** | `-= dt` countdown, seeded by a DASH — not, as this row said before it was built, at spawn. `core/spawn.py` writes pos, hp, ammo, facing and alive and nothing else; `ent_invuln_t` has exactly one writer, `start_dash`, and `obs_schema` says so itself: "invuln_t > 0 (dash i-frames)". |
 | `meta.time_frac` | wall clock | Seconds since the gate went true ÷ 150, **clamped to [0, 1]**. §9.6. |
 
@@ -1196,6 +1353,36 @@ one — and only while the hero is alive, because the game stops counting you th
 letting the call site guess, since the error it prevents is a plausible integer either way.
 
 `meta.time_frac` is the one field in this group with neither a reader nor a shadow, and it needs neither: §9 item 6 resolved it to **wall-clock seconds since the gate went true ÷ 150, clamped to [0, 1]**. `loop.py` owns it, because `loop.py` owns the gate.
+
+#### The `history` group of deploy4, BUILT 2026-09-21
+
+SIM_OVERHAUL Step H4. `configs/agent_obs_deploy4.yaml` adds a 78-float `history` group: the last
+three decisions, newest first, laid out the way the sim's `core/history.py` rings hold them. It
+needs no new reader. Every column is either our own action or a number the decision already
+assembled, which is why it sits with the proprioception fields:
+
+| Field | Source | How |
+|---|---|---|
+| `hist.valid` | loop | One flag per slot, always a prefix. The ring empties at the gate and on a new odometry segment, because a snapshot's position is in its own segment's world frame. |
+| `hist.move_onehot` | loop | The move bin the decision sent. |
+| `hist.attack_onehot` | shadow | The attack `ShadowHero.act` MODELLED, which is what was pressed. The sim records the requested action, and under the sim's mask the two never differ. |
+| `hist.hp` | CV | The numeral the decision's observation was built from. |
+| `hist.ammo_frac` | shadow | What the decision's observation read, before its own shot lands: the sim pushes the ring at the top of `env.step`. |
+| `hist.displacement` | CV | The world position then minus the world position now, normalized as the sim normalizes tiles. |
+
+Three rules the tests pin, each implied by the sim rather than stated by it:
+
+- **A snapshot is taken after `shadow.act` and holds only what that decision saw.** The attack is
+  the modelled one. Everything else is what the observation was assembled from, read once.
+- **A skipped decision pushes nothing.** No hero HP read means no decision and no snapshot, so the
+  next decision's first slot is two windows back and `valid` stays a prefix. The sim never holds
+  an invalid slot in front of a valid one.
+- **The loop hands the grid its history.** The assembler receives a built grid, so the loop passes
+  the snapshots' sightings to `GridBuilder.build`, and §6.2 has how they are drawn.
+
+`tests/test_deployment_assemble.py` checks the group byte for byte against `build_obs` and
+`obs_select`, from synthetic snapshots with zero to three valid slots and over a live six-step
+run. `tests/test_deployment_loop.py` checks the snapshots through the real loop.
 
 ---
 
@@ -1638,7 +1825,9 @@ Four guards, in order:
    spec or env config edited after the run finished — the failure the add-a-file rule exists to
    prevent.
 4. **Action nvec ≠ `cfg.action_nvec` → refuse.** Catches a pre-super checkpoint, whose observation
-   still matches.
+   still matches. *2026-09-21:* this holds as written again. SIM_OVERHAUL Step G3 first also
+   accepted the pre-gadget `(n_move_bins + 1, 3)`; its 2026-09-21 amendment retired that, and
+   a pre-gadget checkpoint is now refused with a message that names it as one.
 
 Guards 1 and 2 fire **before** `MaskablePPO.load`, which is what makes the whole set testable from
 a temp directory holding nothing but a `train.yaml` — `runs/` is gitignored, so a test that needed
@@ -1646,9 +1835,11 @@ the 44 MB checkpoint could not run on a clean checkout.
 
 **The mask is the shadow's, not a second copy.** `act(obs, attack_legal)` takes
 `ShadowHero.attack_mask()` verbatim and concatenates it after an all-True move half, giving the
-`[move (17), attack (3)]` layout `wrappers/sb3_vecenv.py:action_masks` produced on every training
-step. The formula (`alive & cd <= 0 & dash_t <= 0`, plus ammo for attack and charge for super)
-lives in the shadow, which owns the timers it reads. One extra check: an all-False attack column
+`[move (17), attack (4)]` layout `wrappers/sb3_vecenv.py:action_masks` produces on every training
+step (`attack (3)` until 2026-09-21; the fourth column is the gadget, SIM_OVERHAUL Step G5). The
+formula (`alive & cd <= 0 & dash_t <= 0`, plus ammo for attack and charge for super; the
+gadget's `alive & gadget_cd <= 0` sits outside that gate) lives in the shadow, which owns the
+timers it reads. One extra check: an all-False attack column
 is **rejected**, because `hero.action_mask` makes no-fire unconditionally legal and MaskablePPO's
 response to a degenerate categorical is NaN logits rather than an exception.
 
@@ -1773,8 +1964,9 @@ instead: **odometry is the wrong instrument in a non-scrolling venue**, and a ze
 fault. Anything that tests odometry needs a real match.
 
 **3. ⚠ THE ATTACK TAP LANDED ON A VENUE-SPECIFIC BUTTON — and the fix is to stop aiming at the
-button at all.** The `super` and `gadget` anchors land correctly, but `attack` at viewport
-(1748, 1042) lands on a **green chevron button that exists only in this venue**, drawn on top of
+button at all.** The two calibrated anchors land on real discs, though not on the buttons they
+were named after (§5.1). `attack` at viewport (1748, 1042) lands on a **green chevron button
+that exists only in this venue**, drawn on top of
 the real attack area. Taps there were unreliable: 2 of 3 consumed no ammo, and **the super
 discharged without ever being commanded**. Nothing raised — the tap "succeeded" every time.
 
@@ -2478,6 +2670,76 @@ pause, which is out of scope (result 2).
   41 s — but it needs nobody to record anything. Point the script at the CSVs as they pile up.
 - **A clip recorded for this.** Mortis, in a friendly battle, emptying and refilling the magazine
   repeatedly for two minutes, is worth more than all 14 fixtures put together for this one number.
+
+### 6.16 `move_mask.py` — the dead-bin move mask — BUILT 2026-09-23
+
+**What happened.** `2026-09-23 20-20-47.mp4`, 22–32 s: the hero walks into the wall east of
+him for ten seconds. Replaying the clip through the live perception path put the map in the
+clear — the cell east of the hero held 161–163 WALL votes with no dissent, and the policy's own
+`blocks_unit` plane showed it — and the deploy4 checkpoint still chose bin 1 (east) on 40 of 45
+decisions, at 0.77 probability on the exact observation it was handed. No edit to `self`, `zone`,
+`hist` or an enemy slot flips that choice; only the terrain planes and `time_frac` move it, and
+not the way a local-navigation reaction would (mirroring the terrain sends it north-east, a lone
+wall slab sends it *away* from the slab). The sim has the same habit: at the elite tier the
+checkpoint spends 2.2% of its decisions pushing into a wall on its 14 training maps and 4.4% on
+the two held-out ones, stalls ≥ 2 s in a third of its episodes, with single stalls of 69
+decisions. `core/hero.action_mask` builds the move half all-True, so training never told the
+policy a bin was pointless, and the deployed argmax holds one for as long as the observation
+stands still.
+
+**The fix, deployment side.** A move bin is DEAD when `core/terrain.resolve_move` — x step alone,
+then y from where x landed, each through `circle_blocked` at `unit_radius` — would leave the hero
+where it is. `legal_move_bins` is that rule in numpy on the `blocks_unit` plane the grid hands
+the policy, and `DeployedPolicy.act` ANDs it into the move half of the mask, so a dead bin is
+masked the way an uncharged super is. `tests/test_deployment_move_mask.py` holds the port against
+`resolve_move` itself on random planes. Two branches have no sim counterpart: a footprint the map
+already blocks shrinks (halving, up to four times) until it is free, because the game lets a
+brawler press nearer to a wall than `unit_radius` and the map is an estimate; and a hero whose
+*centre* reads blocked keeps every bin, because a wall drawn under the hero is a map error and
+pinning him to idle on it is worse than letting the policy push. UNKNOWN cells read as floor, so
+the mask never invents a wall.
+
+**Measured** in the sim before shipping — 96 elite episodes per cell, the deploy4 checkpoint,
+deterministic as deployed, the mask computed from the agent's own grid plane:
+
+| maps     | mask | wall-push decisions | stalls ≥ 2 s / episode | longest stall | win  |
+|----------|------|---------------------|------------------------|---------------|------|
+| training | off  | 0.022               | 0.30                   | 69 decisions  | 0.26 |
+| training | on   | 0.000               | 0.00                   | 1             | 0.25 |
+| holdout  | off  | 0.044               | 0.38                   | 67            | 0.12 |
+| holdout  | on   | 0.001               | 0.00                   | 1             | 0.10 |
+
+Win rates move within noise (SE ≈ 4.5 pp), the stalls are gone, and about 3% of decisions
+change. `policy.dead_bin_mask: false` turns it off for an A/B run; `TickRow.move_legal` records
+the bitmask the policy was handed, `-1` when it was not.
+
+**Re-measured 2026-09-24** under the camera-limited sim (OBS_PARITY_TASKS.md Status block, the
+same 96-episode protocol as `scripts/probes/wall_push_measure.py`, one definition change: a
+wall-push is any chosen bin that `resolve_move` leaves in place, not only "wall cell 0.75 tiles
+ahead"). Mask off 0.056 / 0.065 of decisions (training / holdout), mask on 0.036 / 0.031; every
+wall-push on free ground is gone with the mask on, and the remainder is the sim's own dash wedge
+(a dash lands the body inside a wall face, all 16 bins then fail `resolve_move` until the next
+dash; 100 % of onsets follow a dash), which the mask cannot see and this table's 0.000 did not
+count. Win rates unchanged (0.20 / 0.17 off, 0.20 / 0.15 on). Sim fix pending the lead's
+decision; deploy5 trains on the current physics.
+
+**What it is not.** The habit is a training artefact and wants a training-side fix, on three
+findings from the same replay:
+
+1. `entities.revealed_to_hero` has no range limit in the sim — `bots/perception.visibility` is
+   whole-map with bush-only concealment; `sight_tiles: 14` gates the bots only — so the policy saw
+   at least one enemy on 95–97% of its sim decisions and none at all for the whole stuck window
+   live, where the camera is the limit. Limiting the hero's reveal to `in_view` (the camera
+   window) would make the sim observation the one the deployment can supply.
+2. The east preference on that frame was not a reaction to the wall, and the run's own log has a
+   0.53 → 0.37 training-to-holdout win-rate gap (elite 0.24 → 0.16): 14 fixed maps are being
+   memorised as routes. Procedural or augmented maps (the generator's seeds, mirroring) is the
+   ordinary answer.
+3. Adopting the same dead-bin rule in `core/hero.action_mask` would make training and
+   deployment agree on what a move bin can do, and stop the policy learning that a wall-push is
+   a way to stand still.
+
+None of the three is built; the mask is what stops the stall today.
 
 ---
 
@@ -3382,6 +3644,58 @@ stopped agent is recoverable by hand; an agent mashing inputs into a menu is not
 
     ```
     .venv/Scripts/python.exe scripts/train.py --set run.name=mortis_deploy3 --set run.agent_obs=configs/agent_obs_deploy3.yaml
+    ```
+
+19. **BUILT 2026-09-24 — `agent_obs_deploy5.yaml`: the sim hero sees the screen, not a
+    hero-centred rectangle.** The observation-parity audit (`OBS_PARITY_PLAN.md` rev 3; chunks
+    C1–C11 of `OBS_PARITY_TASKS.md`) went through every place the sim hero got information the
+    deployed loop could not have, and closed the ones the operator decided on. Four changes, two
+    of them columns.
+
+    **The camera window and clamp** (C1–C4). `hero_view` is now the camera's ground quad,
+    measured from footage, around the CLAMPED camera. `camera.quad` in `configs/default.yaml` is
+    the hero-relative trapezoid and `camera.clamp_onset` is where the camera stops following the
+    hero on each side (west 12.1, east 12.8, north 8.9, south 5.5 tiles from the map edge; on an
+    axis narrower than its two onsets the camera pins to the middle). Every `*.in_view`,
+    `entities.revealed_to_hero`, the grid's enemy planes, the history planes and the projectile
+    fairness mask read through it (`brawl_sim/core/camera.py`); the 13 × 21 grid crop itself
+    stays hero-centred. The top-K projectile ranking still counts off-screen projectiles, by
+    decision: noise in the same direction as the detector's misses.
+
+    **`hero.near_edge`** (C6, C7). One bool after `hero.in_zone`: the camera has stopped
+    following the hero, `|hero − cam| > camera.edge_flag_tiles` (2.0) on either axis. It is the
+    only thing on screen that says "map edge"; the operator's test for it is that the hero must
+    not waste time trying to run off the map. Live, `EntityTracker` measures the player box's
+    tile position against its nominal anchor (the viewport centre plus `HERO_ANCHOR_TILES`,
+    through the same rectify plan as every detection, so `origin_tile` cancels) and reports it as
+    `TrackerResult.hero_offset`. The assembler thresholds it only when the spec names the field,
+    and the loop logs `hero_offset_x/y` and `near_edge` per decision.
+
+    **Tracked slots** (C8, C9). The sim's enemy rows follow the tracker's slot rule instead of
+    entity index: two consecutive sightings to take the lowest free slot, held through three
+    unseen decisions, retired on the fourth, both counted in DECISIONS because the tracker updates
+    once per decision (`brawl_sim/core/slots.py`; `slots:` in `configs/default.yaml`).
+    `slots: tracked` on a spec's `entities.*` group orders the rows by that table (`obs_select`);
+    the assembler, which already writes track k to row k, reports the identity permutation. The
+    rule was fitted to the tracker decision by decision (`tests/test_deployment_tracker.py`). Not
+    modelled: the assembler's HP-commit delay, and which of two enemies takes a slot when both
+    qualify at once with fewer free slots than candidates.
+
+    **`zone.active` as a latch** (C5). 0 until gas has been on screen at least once in the
+    episode, then 1 for the rest of it, which is what `ZoneEstimator.active` means live. It used
+    to read 1 from the first decision whenever the zone was enabled. No column changed, only its
+    meaning.
+
+    **The spec.** `configs/agent_obs_deploy5.yaml` is deploy4 plus `hero.near_edge` and
+    `slots: tracked`: `self` 26 → 27 floats, the extractor 262 → 263, every other group
+    byte-identical (`tests/test_configs_files.py` pins both directions). `configs/train.yaml` and
+    `configs/deployment.yaml` stay on deploy4 until a deploy5 run exists (C12). Phase 2, timing
+    the zone schedule from the game, is Z1–Z4 of the same file.
+
+    The run:
+
+    ```
+    .venv/Scripts/python.exe scripts/train.py --set run.name=mortis_deploy5 --set run.agent_obs=configs/agent_obs_deploy5.yaml
     ```
 
 ---

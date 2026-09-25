@@ -28,17 +28,20 @@ run:
   algo: maskable_ppo            # maskable_ppo (uses action_masks) | ppo
 
   env_config: configs/default.yaml
-  # Full information by default. The deployable views are selected per run and never by default:
-  #   --set run.agent_obs=configs/agent_obs_deploy3.yaml   <- the next run: deploy2 plus crates
-  #                                                           and cubes on the grid. Needs a
-  #                                                           crate/cube detector before it can
-  #                                                           DEPLOY -- see that file's header
+  # The deployable spec is the DEFAULT since SIM_OVERHAUL_PLAN.md Step I2 (2026-09-21). Before
+  # that, full information was the default and every deploy spec was picked with --set; the next
+  # run is the one meant to deploy, so a bare `python scripts/train.py` now trains it.
+  # agent_obs_deploy4.yaml is deploy3 plus the gadget pair, the `history` group and three
+  # `enemy_hist` grid planes, and brawl_deployment supplies every field of it (Step H4).
+  # The others, by --set:
+  #   --set run.agent_obs=configs/agent_obs.yaml           <- full information; cannot deploy
+  #   --set run.agent_obs=configs/agent_obs_deploy3.yaml   <- the 2026-09-11 run's spec
   #   --set run.agent_obs=configs/agent_obs_deploy2.yaml   <- the zone rebuild, never trained
   #   --set run.agent_obs=configs/agent_obs_deploy.yaml    <- kept so the 2026-09-07 Mortis run
   #                                                           (the deployed one) reproduces
   # deploy and deploy2 cannot see cubes, so they also need `--set reward.cube_pickup=0` (below).
   # Each is a different observation width, so none of them is a checkpoint swap.
-  agent_obs: configs/agent_obs.yaml
+  agent_obs: configs/agent_obs_deploy4.yaml
   randomization: null           # e.g. configs/randomization.yaml -- per-env stat jitter, applied
                                 # on top of (and independently of) the curriculum below
   # Nested dict deep-merged onto env_config, e.g.
@@ -114,7 +117,7 @@ policy:
     pi: [384, 384]
     vf: [384, 384]
 
-# VecNormalize. Observation normalization is OFF by default because configs/agent_obs.yaml
+# VecNormalize. Observation normalization is OFF by default because every configs/agent_obs*.yaml
 # already sets `normalize: true` (obs_select scales fields into sane ranges on-device, before
 # the host transfer). Reward normalization is ON: shaped-reward magnitudes shift every time the
 # curriculum advances, and a running return-scale keeps PPO's value loss well conditioned.
@@ -180,10 +183,11 @@ reward:
 # sim.max_episode_steps ticks (3000) -- that tick cap does NOT scale with episodes_per_tier, since
 # raising it only widens the batch, not the number of sequential rounds. This env is built ONCE
 # and held in VRAM for the whole run (TierEvaluator is eager, not rebuilt per eval) -- a permanent
-# memory cost, not just a slower periodic eval. Measured on an RTX 5070 Ti (17.1GB): 4096 training
-# envs alone = 1.47GB; adding 4000 eval envs (episodes_per_tier=1000 x 4 tiers) brings the combined
-# peak to ~2.95GB -- comfortable headroom. At n=1000/tier the win-rate standard error is ~1.6pp
-# (vs ~8.8pp at the old n=32).
+# memory cost, not just a slower periodic eval. Re-measured 2026-09-21 on an RTX 5070 Ti (17.1GB)
+# as torch's peak ALLOCATED memory, never nvidia-smi: 4096 training envs and the model = 1.14GB,
+# and one eval on each of the two evaluators (6 tiers x 300 = 1800 envs each) lifts the peak to
+# 1.24GB -- comfortable headroom. (The ~2.95GB once quoted here was 4 tiers x 1000 eval envs.)
+# At n=300/tier the win-rate standard error is at most ~2.9pp (vs ~8.8pp at the old n=32).
 #
 # Worth knowing: `every_timesteps` counts SB3 timesteps, which advance by n_envs (4096) per
 # DECISION -- so 3_000_000 training timesteps is only ~732 decisions (~3660 sim ticks) of training
@@ -193,16 +197,16 @@ reward:
 # especially early on before episodes end quickly.
 eval:
   enabled: true
-  every_timesteps: 5_000_000      # decisions; = the pre-action_repeat 15M sim ticks. ONE eval
-                                  # rollout took ~6-10 min wall-clock at 4 tiers x
-                                  # episodes_per_tier=1000 (measured before the holdout eval
-                                  # existed). That is no longer this file's
-                                  # cost: it now runs 6 tiers x 300, TWICE per eval (training
-                                  # maps, then holdout_maps below), ~92 times over 450M
-                                  # decisions. NOT re-measured; time the at_start eval of the
-                                  # next run and size every_timesteps / episodes_per_tier from
-                                  # that. Each rollout is bounded by cfg.max_agent_steps (600)
-                                  # decisions rather than 3000 step() calls.
+  every_timesteps: 5_000_000      # decisions; = the pre-action_repeat 15M sim ticks. An eval
+                                  # is TWO rollouts, training maps then holdout_maps below.
+                                  # MEASURED 2026-09-21, RTX 5070 Ti, 6 tiers x 300 (1800 envs
+                                  # per rollout), untrained policy: 49.3 s and 49.4 s, each
+                                  # done in ~200 decisions at ~245 ms per decision. A rollout
+                                  # ends when its longest first episode does, bounded by
+                                  # cfg.max_agent_steps (600) decisions, so ~147 s at most.
+                                  # One eval: ~100 s now, up to ~5 min once the policy
+                                  # survives to the time cap. ~92 evals over 450M decisions:
+                                  # ~2.5 h to ~7.5 h of the run.
   episodes_per_tier: 300
   tiers: []                     # empty = every tier under curriculum.tiers below
   deterministic: true           # argmax actions; lower variance, the usual choice for eval
@@ -223,11 +227,12 @@ eval:
   # that widens while eval/win_rate_mean climbs is the policy memorizing maps.
   # `best_model.zip` is still picked on the TRAINING-map mean alone -- choosing the checkpoint by
   # its holdout score would fit the choice to these two maps and spend the holdout.
-  # COST: eval wall-clock roughly DOUBLES (a second rollout of len(tiers) * episodes_per_tier envs
-  # per eval, ~92 evals over this file's 450M decisions), and a second eval env of that size is
-  # held in VRAM for the whole run (see the memory note above; NOT re-measured with two eval envs
-  # at 6 tiers x 300). Set to [] or null to switch the holdout eval off; a `--set
-  # run.env_overrides=...` that changes world.maps must keep these two out of it.
+  # COST: eval wall-clock DOUBLES (a second rollout of len(tiers) * episodes_per_tier envs per
+  # eval, measured 49.4 s against the training maps' 49.3 s; see every_timesteps above), and a
+  # second eval env of that size is held in VRAM for the whole run (both eval envs together
+  # added ~0.1GB to the peak; see the memory note above). Set to [] or null to switch the
+  # holdout eval off; a `--set run.env_overrides=...` that changes world.maps must keep these
+  # two out of it.
   holdout_maps: [split_river, hollow_ring]
 
 # ---------------------------------------------------------------------------------------------

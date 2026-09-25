@@ -111,6 +111,12 @@ def load_hud_mask(path=HUD_MASK_PATH) -> HudMask:
 # ever turns out to be starved of signal; nothing else depends on the value.
 PIXELS_PER_TILE = 48
 
+# Where the local player stands on screen while the camera tracks it, in tiles from the viewport
+# centre: +0.09 across and +0.80 down (configs/default.yaml's `view` comment has the measurement).
+# The sim's camera model (brawl_sim/core/camera.py, via the quad in default.yaml) and the deployed
+# edge flag (the tracked hero box against this nominal point) both take it from here.
+HERO_ANCHOR_TILES = (0.09, 0.80)
+
 # Below this, |H[2, :2]| is indistinguishable from zero and the camera is orthographic-oblique
 # rather than perspective. Measured on real footage it is ~1.2e-02, three orders above this.
 _AFFINE_EPS = 1e-5

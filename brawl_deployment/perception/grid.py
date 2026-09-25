@@ -30,7 +30,7 @@ subtly wrong:
 
 `_scatter_count` does `+= 1` per occupant, so two enemies sharing a cell give `2`. The terrain
 planes are 0/1 because they come from a per-tile lookup, but `enemy_revealed`, `hero`, `projectile`,
-`box` and `pickup` are occupancy counts clamped to 255. Reproduced here.
+`box`, `pickup` and the `enemy_hist` planes are occupancy counts clamped to 255. Reproduced here.
 
 #### Who supplies what
 
@@ -43,6 +43,7 @@ planes are 0/1 because they come from a per-tile lookup, but `enemy_revealed`, `
 | `projectile` | `ProjectileTracker.live()` | `live()` already excludes coasted tracks |
 | `box` | `LootMap.crates()` | sticky, one fixed cell per crate (`loot.py`) |
 | `pickup` | `LootMap.cubes()` | sticky, one fixed cell per cube on screen |
+| `enemy_hist1..K` | `DeployLoop`'s decision snapshots | past `seen_now` tracks, cut to the sim's block |
 
 `box` and `pickup` are what `configs/agent_obs_deploy3.yaml` added back after 9.11 dropped them for
 want of a detector. They are sticky where every other dynamic plane here is "seen this tick", and
@@ -57,6 +58,19 @@ unrevealed enemy appears in NO grid channel at all, so a coasted track -- one ca
 constant-velocity prediction because the detector missed it -- must not be deposited. It is also
 exactly the rule `entities.revealed_to_hero` uses in the `enemies` group, so the two halves of the
 observation cannot disagree about who is visible.
+
+#### The history planes are past sightings, cut to the sim's block
+
+`configs/agent_obs_deploy4.yaml` adds `enemy_hist1..3` (SIM_OVERHAUL_STEPS.md H4.3). Plane k marks
+the enemies that were `seen_now` k decisions ago, which `DeployLoop` keeps in its decision
+snapshots and hands over as `enemy_history`, newest first. Each is drawn at the world cell it stood
+on then, in the CURRENT window, with no re-centring, which is `observation._build_grid`'s rule. And
+only if that cell is within `history_radius_tiles` of the hero's cell NOW, by Chebyshev distance on
+tile indices: `observation._history_drawn` exactly. On tiles the rule is a (2r + 1) x (2r + 1)
+block of whole cells, so it holds cell for cell rather than to within a sub-tile. The positions are
+world-frame, so the loop drops its snapshots on a segment change like every other world-frame
+consumer, and `seen_now` is the same set `enemy_revealed` draws, as the sim's `hist_enemy_seen` is
+the same set its `enemy_revealed` channel draws.
 
 #### The gas is sticky, because it only ever grows
 
@@ -146,6 +160,9 @@ import yaml
 
 from brawl_sim.constants import (TILE_BLOCKS_PROJ, TILE_BLOCKS_UNIT, TILE_IS_BUSH, TILE_IS_WATER,
                                  Tile)
+# Borrowed rather than restated, so a plane named here is a plane `obs_select.channel_index`
+# resolves: "enemy_hist" + k for k in 1..history_frames.
+from brawl_sim.core.obs_select import _HISTORY_CHANNEL_PREFIX
 from brawl_vision.terrain.labeling import CLASSES
 from brawl_vision.terrain.occupancy import UNKNOWN
 
@@ -153,8 +170,9 @@ _CONFIGS_DIR = Path(__file__).resolve().parents[2] / "configs"
 _DEPLOY_SPEC = _CONFIGS_DIR / "agent_obs_deploy.yaml"
 _DEFAULT_CFG = _CONFIGS_DIR / "default.yaml"
 
-# Which of `_build_grid`'s twelve channels this module can fill, and how. The static four are
-# columns of the terrain lookup table; the rest are written by hand.
+# Which of `_build_grid`'s twelve base channels this module can fill, and how. The static four are
+# columns of the terrain lookup table; the rest are written by hand. The enemy_hist planes after
+# them are `GridSpec.history_slots`, since how many there are is the config's `history_frames`.
 _STATIC_COLUMN = {"blocks_unit": 0, "blocks_projectile": 1, "is_bush": 2, "is_water": 3}
 _DYNAMIC = ("in_zone", "enemy_revealed", "hero", "projectile", "box", "pickup")
 
@@ -193,10 +211,16 @@ def _tile_lut(unknown_tile: Tile) -> np.ndarray:
 
 @dataclass(frozen=True)
 class GridSpec:
-    """The shape of the grid group, read from the same files training read."""
+    """The shape of the grid group, read from the same files training read.
+
+    `history_frames` and `history_radius_tiles` are the sim config's `observation` pair: how
+    many `enemy_hist` planes a spec may name, and the block around the hero they are cut to.
+    """
     channels: tuple[str, ...]
     view_h: int
     view_w: int
+    history_frames: int
+    history_radius_tiles: int
 
     @property
     def shape(self) -> tuple[int, int, int]:
@@ -207,9 +231,16 @@ class GridSpec:
         """`(row, col)` of the hero's own cell -- `_view_origin`'s floor division, restated."""
         return (self.view_h // 2, self.view_w // 2)
 
+    @property
+    def history_slots(self) -> dict[str, int]:
+        """`enemy_hist{k}` -> k - 1, its index into `build`'s `enemy_history`, for k in
+        1..history_frames: the names `obs_select.channel_index` gives the sim's history planes."""
+        return {f"{_HISTORY_CHANNEL_PREFIX}{k}": k - 1 for k in range(1, self.history_frames + 1)}
+
     @classmethod
     def load(cls, spec_path=None, cfg_path=None, group: str = "grid") -> "GridSpec":
-        """Channels from the agent-obs spec, view dimensions from the sim config.
+        """Channels from the agent-obs spec; the view dimensions and the history pair from the
+        sim config.
 
         Reading both rather than hardcoding `(8, 13, 21)` is the same discipline
         `ShadowParams.load` applies to `configs/brawlers.yaml`: the deployed grid has to be the
@@ -224,8 +255,11 @@ class GridSpec:
         else:
             raise KeyError(f"{spec_path or _DEPLOY_SPEC} has no group named {group!r}")
 
-        view = yaml.safe_load(Path(cfg_path or _DEFAULT_CFG).read_text())["view"]
-        spec = cls(channels=channels, view_h=int(view["height"]), view_w=int(view["width"]))
+        raw_cfg = yaml.safe_load(Path(cfg_path or _DEFAULT_CFG).read_text())
+        view, observation = raw_cfg["view"], raw_cfg["observation"]
+        spec = cls(channels=channels, view_h=int(view["height"]), view_w=int(view["width"]),
+                   history_frames=int(observation["history_frames"]),
+                   history_radius_tiles=int(observation["history_radius_tiles"]))
         spec.check()
         return spec
 
@@ -239,19 +273,22 @@ class GridSpec:
         g = next((g for g in agent_spec.groups if g.view_channels is not None), None)
         if g is None:
             raise KeyError("the agent spec has no grid group (no group with view_channels)")
-        spec = cls(channels=tuple(g.view_channels), view_h=int(cfg.view_h), view_w=int(cfg.view_w))
+        spec = cls(channels=tuple(g.view_channels), view_h=int(cfg.view_h), view_w=int(cfg.view_w),
+                   history_frames=int(cfg.history_frames),
+                   history_radius_tiles=int(cfg.history_radius_tiles))
         spec.check()
         return spec
 
     def check(self) -> None:
+        history = self.history_slots
         for ch in self.channels:
             if ch in _REFUSED:
                 raise ValueError(f"grid channel {ch!r} has no supplier at deploy time: "
                                  f"{_REFUSED[ch]}")
-            if ch not in _STATIC_COLUMN and ch not in _DYNAMIC:
+            if ch not in _STATIC_COLUMN and ch not in _DYNAMIC and ch not in history:
                 raise ValueError(
                     f"unknown grid channel {ch!r}; this builder fills "
-                    f"{sorted([*_STATIC_COLUMN, *_DYNAMIC])}")
+                    f"{sorted([*_STATIC_COLUMN, *_DYNAMIC, *history])}")
 
 
 class GasMap:
@@ -373,7 +410,7 @@ class GridBuilder:
         return out
 
     def build(self, hero_pos, *, alive: bool = True, enemies=(), projectiles=(), crates=(),
-              cubes=(), out: np.ndarray | None = None) -> np.ndarray:
+              cubes=(), enemy_history=None, out: np.ndarray | None = None) -> np.ndarray:
         """One decision's grid.
 
         `hero_pos` is world tiles. `enemies` is `TrackerResult.enemies` -- slot-ordered, with
@@ -381,7 +418,22 @@ class GridBuilder:
         `ProjectileTracker.live()`. `crates` and `cubes` are `LootMap.crates()`/`cubes()`, world
         `(x, y)` tuples. `alive` is the shadow's, and is the only thing that empties the `hero`
         channel.
+
+        `enemy_history` is the loop's past sightings, newest first: entry k - 1 holds the world
+        `(x, y)` of every enemy seen k decisions ago, and feeds `enemy_hist{k}`. A spec with a
+        history plane must be handed it, empty at a match's first decision. `None` raises,
+        because an empty plane is a claim that nobody was seen, never a default.
         """
+        slots = self.spec.history_slots
+        if any(ch in slots for ch in self.spec.channels):
+            if enemy_history is None:
+                raise ValueError(
+                    "this grid has enemy_hist planes and no enemy_history was supplied; an empty "
+                    "plane would claim no enemy was seen, so it is never a default")
+            if len(enemy_history) > self.spec.history_frames:
+                raise ValueError(
+                    f"enemy_history holds {len(enemy_history)} decisions and the config keeps "
+                    f"{self.spec.history_frames}")
         h, w = self.spec.view_h, self.spec.view_w
         if out is None:
             out = np.zeros(self.spec.shape, np.uint8)
@@ -417,7 +469,21 @@ class GridBuilder:
                 if alive:
                     r, c = self.spec.centre
                     out[i, r, c] = 1
+            elif ch in slots:
+                k = slots[ch]
+                if k < len(enemy_history):
+                    self._scatter(out[i], origin, self._in_block(enemy_history[k], hero_pos))
         return out
+
+    def _in_block(self, positions, hero_pos) -> list:
+        """`observation._history_drawn`'s cut: a past position is drawn only if its tile is
+        within `history_radius_tiles` of the hero's tile NOW, by Chebyshev distance on tile
+        indices. Floors on both sides, so the block is whole cells wherever inside its tile each
+        of the two stood."""
+        r = self.spec.history_radius_tiles
+        hx, hy = int(np.floor(hero_pos[0])), int(np.floor(hero_pos[1]))
+        return [(x, y) for x, y in positions
+                if max(abs(int(np.floor(x)) - hx), abs(int(np.floor(y)) - hy)) <= r]
 
     def _scatter(self, plane: np.ndarray, origin: tuple[int, int], positions) -> None:
         """`_scatter_count`'s `+= 1` per occupant, clamped, out-of-window entries dropped.

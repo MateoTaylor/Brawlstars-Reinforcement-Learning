@@ -59,12 +59,11 @@ import numpy as np
 from brawl_sim.core import obs_select
 from brawl_deployment.perception.assemble import MapFrame, ObservationAssembler
 
-ATTACK_NONE, ATTACK_FIRE, ATTACK_SUPER = 0, 1, 2
+ATTACK_NONE, ATTACK_FIRE, ATTACK_SUPER, ATTACK_GADGET = 0, 1, 2, 3
 # The sim's attack column is 4 wide since SIM_OVERHAUL Step G3 (`[none, attack, super, gadget]`,
 # `cfg.action_nvec`), and it is the only width that loads: the 3-wide checkpoints trained before it
-# were retired by the operator on 2026-09-21. The shadow reports three legals; the fourth column is
-# held illegal until Step G5 wires the gadget button.
-_SHADOW_ATTACK_WIDTH = 3
+# were retired by the operator on 2026-09-21. Since Step G5 the shadow reports all four legals, so
+# the gadget column is live.
 _PRE_GADGET_ATTACK_WIDTH = 3   # only to NAME that refusal in `check_spaces`; nothing loads at it
 
 
@@ -106,15 +105,21 @@ class Decision:
     **Idle is a bin, not an absence** -- `control/joystick.py` moves the contact back to the anchor
     for it and does not release, which is the rule the whole floating-joystick design turns on.
 
-    `attack` is `action[:, 1]`: 0 nothing, 1 attack, 2 super. `legal` is the mask the network was
-    given, kept so telemetry can tell "the policy chose not to fire" from "the policy could not."
+    `attack` is `action[:, 1]`: 0 nothing, 1 attack, 2 super, 3 gadget. `legal` is the mask the
+    network was given, kept so telemetry can tell "the policy chose not to fire" from "the policy
+    could not."
     Those look identical in the action alone and mean completely different things when a live run
     goes quiet.
+
+    `move_legal` is the move half of the same mask -- `move_mask.py`'s dead-bin tuple, idle at
+    index 0 -- or None when the loop ran without it (`policy.dead_bin_mask: false`). Kept for the
+    same reason: "walked west" and "west was the only bin left" are the same action.
     """
 
     move_bin: int
     attack: int
-    legal: tuple[bool, bool, bool]
+    legal: tuple[bool, bool, bool, bool]
+    move_legal: tuple[bool, ...] | None = None
 
     @property
     def fired(self) -> bool:
@@ -132,8 +137,8 @@ class DeployedPolicy:
         self._n_move = int(cfg.n_move_bins) + 1
         # The sim's own `[move, attack]` layout, `cfg.action_nvec`: `check_spaces` has already
         # refused any checkpoint whose action space differs from it.
-        self._mask = np.ones((1, self._n_move + int(cfg.action_nvec[1])), dtype=bool)
-        self._mask[0, self._n_move + _SHADOW_ATTACK_WIDTH:] = False  # gadget column: illegal until Step G5 wires the shadow + button
+        self._n_attack = int(cfg.action_nvec[1])
+        self._mask = np.ones((1, self._n_move + self._n_attack), dtype=bool)
         self._batched: dict = {}
 
     # -- loading --------------------------------------------------------------
@@ -194,28 +199,50 @@ class DeployedPolicy:
 
     # -- the decision ---------------------------------------------------------
 
-    def act(self, obs: dict, attack_legal) -> Decision:
+    def act(self, obs: dict, attack_legal, move_legal=None) -> Decision:
         """One decision. `obs` is `ObservationAssembler.assemble`'s output; `attack_legal` is
-        `ShadowHero.attack_mask()`.
+        `ShadowHero.attack_mask()`; `move_legal`, when given, is `MoveMask.legal`'s tuple, one
+        flag per move bin with idle at index 0.
 
-        The mask is `[move (n_move_bins + 1), attack (4)]` flattened, with the gadget column
-        held False until Step G5, which is what
-        `wrappers/sb3_vecenv.py:action_masks` hands `MaskablePPO` during training. The move half
-        is all-True because `core/hero.action_mask` builds it that way and nothing has ever
-        narrowed it; the attack half comes from the shadow, which owns the hero's timers and ammo
-        and already reproduces `action_mask`'s formula exactly. **Reimplementing that formula here
-        would be a second copy of a rule that is only correct in one place.**
+        The mask is `[move (n_move_bins + 1), attack (4)]` flattened, which is what
+        `wrappers/sb3_vecenv.py:action_masks` hands `MaskablePPO` during training. The attack half
+        comes from the shadow, which owns the hero's timers and ammo and already reproduces
+        `action_mask`'s formula exactly. **Reimplementing that formula here would be a second copy
+        of a rule that is only correct in one place.**
+
+        The move half was all-True through training (`core/hero.action_mask` builds it that way)
+        and is all-True here too unless `move_legal` narrows it: `move_mask.py` is the one
+        narrowing the deployment applies, the sim's own collision rule on the grid the policy
+        sees, so a bin that would walk the hero into a wall is masked the way an uncharged super
+        is. It is reset on every call -- a mask that outlived its decision would be a wall the
+        map no longer shows.
         """
         legal = tuple(bool(v) for v in attack_legal)
-        if len(legal) != 3:
-            raise ValueError(f"attack_legal must be (no_fire, attack, super), got {attack_legal!r}")
+        if len(legal) != self._n_attack:
+            raise ValueError(f"attack_legal must be (no_fire, attack, super, gadget), one per "
+                             f"attack column, got {attack_legal!r}")
         if not legal[0]:
             # `no-fire` is unconditionally legal in `hero.action_mask` (`no_fire_ok = ones_like`).
             # An all-False row makes MaskablePPO's categorical distribution degenerate, which
             # surfaces as NaN logits rather than as an error, so refuse here instead.
             raise ValueError("attack_legal[0] (no-fire) must always be True; an all-illegal "
                              "dimension gives the policy a degenerate distribution, not an error")
-        self._mask[0, self._n_move:self._n_move + _SHADOW_ATTACK_WIDTH] = legal
+        self._mask[0, self._n_move:] = legal
+
+        moves = None
+        self._mask[0, :self._n_move] = True
+        if move_legal is not None:
+            moves = tuple(bool(v) for v in move_legal)
+            if len(moves) != self._n_move:
+                raise ValueError(f"move_legal must have one flag per move bin plus idle "
+                                 f"({self._n_move}), got {len(moves)}")
+            if not moves[0]:
+                # `legal_move_bins` never masks idle, so a False here is a caller's bug -- and
+                # the same degenerate-distribution failure as an all-False attack row.
+                raise ValueError("move_legal[0] (idle) must always be True; an all-illegal "
+                                 "dimension gives the policy a degenerate distribution, not an "
+                                 "error")
+            self._mask[0, :self._n_move] = moves
 
         for name, value in obs.items():
             slot = self._batched.get(name)
@@ -227,4 +254,4 @@ class DeployedPolicy:
         action, _ = self.model.predict(self._batched, deterministic=self.deterministic,
                                        action_masks=self._mask)
         move_bin, attack = (int(v) for v in np.asarray(action).reshape(-1)[:2])
-        return Decision(move_bin=move_bin, attack=attack, legal=legal)
+        return Decision(move_bin=move_bin, attack=attack, legal=legal, move_legal=moves)

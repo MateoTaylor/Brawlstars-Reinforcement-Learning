@@ -13,8 +13,8 @@ import struct
 import numpy as np
 import pytest
 
-from brawl_deployment.control import (ATTACK_FIRE, ATTACK_NONE, ATTACK_SUPER, Buttons, Joystick,
-                                      NullBackend, SLOT_MOVE, SLOT_TAP)
+from brawl_deployment.control import (ATTACK_FIRE, ATTACK_GADGET, ATTACK_NONE, ATTACK_SUPER,
+                                      Buttons, Joystick, NullBackend, SLOT_MOVE, SLOT_TAP)
 from brawl_deployment.control.adb import (DEVICE_FD, EVENT_STRUCTS, AdbTouchBackend,
                                           find_adb_serial)
 from brawl_deployment.capture import to_viewport
@@ -94,7 +94,7 @@ def test_apply_acquires_if_not_down():
 def test_a_press_goes_down_on_the_right_origin():
     """Fire goes down on the attack clearance point, super on the super button's centre."""
     b = NullBackend()
-    btn = Buttons(b, attack=(1690.0, 594.0), super_=(1462.5, 1000.5))
+    btn = Buttons(b, attack=(1690.0, 594.0), super_=(1462.5, 1000.5), gadget=(1559.9, 901.1))
     assert btn.press(ATTACK_FIRE, 0.0)
     assert b.log[-1] == ("down", SLOT_TAP, 1690.0, 594.0)
     btn.release()
@@ -104,7 +104,7 @@ def test_a_press_goes_down_on_the_right_origin():
 
 def test_none_presses_nothing():
     b = NullBackend()
-    btn = Buttons(b, attack=(1.0, 2.0), super_=(3.0, 4.0))
+    btn = Buttons(b, attack=(1.0, 2.0), super_=(3.0, 4.0), gadget=(5.0, 6.0))
     assert not btn.press(ATTACK_NONE, 0.0)
     assert b.log == []
     assert not btn.is_held
@@ -117,7 +117,8 @@ def test_a_press_is_down_then_drag_then_lift_one_step_per_settle():
     the floating stick's centre at the dragged point -- a zero-length drag, which the game reads
     as a tap and auto-aims. The lift is what fires, and it comes on the second settle."""
     b = NullBackend()
-    btn = Buttons(b, attack=(1000.0, 500.0), super_=(3.0, 4.0), aim_radius_px=80.0)
+    btn = Buttons(b, attack=(1000.0, 500.0), super_=(3.0, 4.0), gadget=(5.0, 6.0),
+                  aim_radius_px=80.0)
     btn.press(ATTACK_FIRE, 0.0)
     assert b.log == [("down", SLOT_TAP, 1000.0, 500.0)]
     assert btn.is_held
@@ -135,7 +136,8 @@ def test_the_drag_follows_the_bearing_with_no_y_flip():
     """World y and screen y both increase downward, so a quarter turn from +x drags DOWN the
     screen. A minus sign here would mirror every dash across the horizontal -- the attack twin of
     `test_bin_directions_have_no_y_flip`."""
-    btn = Buttons(NullBackend(), attack=(0.0, 0.0), super_=(500.0, 500.0), aim_radius_px=100.0)
+    btn = Buttons(NullBackend(), attack=(0.0, 0.0), super_=(500.0, 500.0),
+                  gadget=(300.0, 300.0), aim_radius_px=100.0)
     assert btn.aim_point(ATTACK_FIRE, 0.0) == pytest.approx((100.0, 0.0), abs=1e-9)
     assert btn.aim_point(ATTACK_FIRE, math.pi / 2) == pytest.approx((0.0, 100.0), abs=1e-9)
     assert btn.aim_point(ATTACK_FIRE, math.pi) == pytest.approx((-100.0, 0.0), abs=1e-9)
@@ -149,7 +151,8 @@ def test_a_press_over_a_press_in_flight_finishes_it_first():
     is completed before the next goes down -- dragged to ITS aim and lifted, so that shot still
     goes where it was aimed rather than being swallowed or fired as a tap."""
     b = NullBackend()
-    btn = Buttons(b, attack=(1000.0, 500.0), super_=(3.0, 4.0), aim_radius_px=80.0)
+    btn = Buttons(b, attack=(1000.0, 500.0), super_=(3.0, 4.0), gadget=(5.0, 6.0),
+                  aim_radius_px=80.0)
     btn.press(ATTACK_FIRE, 0.0)                   # not yet dragged
     btn.press(ATTACK_FIRE, math.pi)
     assert b.log == [("down", SLOT_TAP, 1000.0, 500.0), ("move", SLOT_TAP, 1080.0, 500.0),
@@ -165,7 +168,7 @@ def test_release_lifts_at_any_stage_and_is_idempotent():
     call sends nothing, because `Controls.release_all` runs in exception handlers."""
     for settles, kinds in ((0, ["down", "up"]), (1, ["down", "move", "up"])):
         b = NullBackend()
-        btn = Buttons(b, attack=(1000.0, 500.0), super_=(3.0, 4.0))
+        btn = Buttons(b, attack=(1000.0, 500.0), super_=(3.0, 4.0), gadget=(5.0, 6.0))
         btn.press(ATTACK_FIRE, 0.0)
         for _ in range(settles):
             btn.settle()
@@ -180,7 +183,7 @@ def test_a_press_does_not_disturb_the_movement_contact():
     at any step of the press."""
     b = NullBackend()
     j = Joystick(b, anchor=(300.0, 700.0), radius_px=140.0)
-    btn = Buttons(b, attack=(1676.5, 999.5), super_=(1462.5, 1000.5))
+    btn = Buttons(b, attack=(1676.5, 999.5), super_=(1462.5, 1000.5), gadget=(1559.9, 901.1))
     j.apply(7)
     held = b.contacts[SLOT_MOVE]
     before = len(b.log)
@@ -190,6 +193,49 @@ def test_a_press_does_not_disturb_the_movement_contact():
     assert b.contacts[SLOT_MOVE] == held
     assert [e[1] for e in b.log[before:]] == [SLOT_TAP] * 3
     assert j.is_down
+
+
+def test_a_gadget_press_is_a_bare_tap_on_the_gadget_button():
+    """The one press with no drag (SIM_OVERHAUL Step G5): the game aims the gadget at the nearest
+    enemy by itself, as the sim does, so there is no bearing to drag along. Down on the button
+    centre, up on the next settle, never a move, whatever bearing is passed."""
+    b = NullBackend()
+    btn = Buttons(b, attack=(1000.0, 500.0), super_=(3.0, 4.0), gadget=(1559.9, 901.1))
+    assert btn.press(ATTACK_GADGET, math.pi / 2)
+    assert b.log == [("down", SLOT_TAP, 1559.9, 901.1)]
+    assert btn.is_held
+    btn.settle()
+    assert b.log[1:] == [("up", SLOT_TAP)]
+    assert not btn.is_held and SLOT_TAP not in b.contacts
+    btn.settle()                                  # nothing in flight: nothing sent
+    assert len(b.log) == 2
+    with pytest.raises(ValueError, match="no aim point"):
+        btn.aim_point(ATTACK_GADGET, 0.0)
+
+
+def test_a_tap_and_a_press_in_flight_each_finish_the_other_first():
+    """The rule for two attacks holds across buttons. A dash in flight is dragged to ITS aim and
+    lifted before the gadget goes down, so it still fires where it was aimed; and a tap in
+    flight is lifted before the next press goes down."""
+    b = NullBackend()
+    btn = Buttons(b, attack=(1000.0, 500.0), super_=(3.0, 4.0), gadget=(1559.9, 901.1),
+                  aim_radius_px=80.0)
+    btn.press(ATTACK_FIRE, 0.0)
+    btn.press(ATTACK_GADGET, 0.0)
+    assert b.log == [("down", SLOT_TAP, 1000.0, 500.0), ("move", SLOT_TAP, 1080.0, 500.0),
+                     ("up", SLOT_TAP), ("down", SLOT_TAP, 1559.9, 901.1)]
+    btn.press(ATTACK_FIRE, 0.0)
+    assert b.log[4:] == [("up", SLOT_TAP), ("down", SLOT_TAP, 1000.0, 500.0)]
+
+
+def test_release_lifts_a_gadget_tap_and_is_idempotent():
+    b = NullBackend()
+    btn = Buttons(b, attack=(1000.0, 500.0), super_=(3.0, 4.0), gadget=(1559.9, 901.1))
+    btn.press(ATTACK_GADGET, 0.0)
+    btn.release()
+    btn.release()
+    assert [e[0] for e in b.log] == ["down", "up"]
+    assert not btn.is_held
 
 
 # ---------------------------------------------------------------- adb coordinate mapping
@@ -340,9 +386,31 @@ def test_calibration_loads_and_is_self_consistent():
     cal = Calibration.load()
     assert cal.screen == (1920, 1080)
     assert cal.gate_anchor in cal.buttons
-    for name in ("attack", "super", "gadget"):
+    # No `attack`, on purpose: attack is an AREA, and `control.attack_tap` picks a clearance
+    # point for it rather than a button centre. See the file's own notes.
+    assert set(cal.buttons) == {"gadget", "super", "hypercharge"}
+    for name in cal.buttons:
         x, y = cal.button(name)
         assert 0 < x < cal.screen[0] and 0 < y < cal.screen[1]
+
+
+def test_the_gate_never_anchors_on_a_button_the_policy_can_press():
+    """The invariant the 2026-09-22 re-labelling was missing.
+
+    The gate reads a button's ring score to decide whether we are in a match. Anchoring it on a
+    control the agent presses makes the agent able to switch itself off: a fired Super greys its
+    button for the whole recharge, which is many times the 4-tick exit. The file shipped in
+    exactly that state from Step G5 until it was caught live, because its anchor was named
+    `gadget` while sitting on the Super.
+
+    Stated against `Controls.build`'s own reads rather than a name list, so a fourth pressable
+    control cannot be added without this failing.
+    """
+    cal = Calibration.load()
+    pressed = {"super", "gadget"}           # Controls.build: super_=button("super"), gadget=...
+    assert cal.gate_anchor not in pressed, (
+        f"gate anchors on {cal.gate_anchor!r}, which the policy presses")
+    assert pressed <= set(cal.buttons), "Controls.build would KeyError on this calibration"
 
 
 def test_calibration_rejects_a_frame_that_is_not_at_the_viewport():
@@ -404,14 +472,17 @@ def _shipped_buttons() -> tuple[Buttons, tuple[int, int]]:
     w, h = cal.screen
     btn = Buttons(NullBackend(),
                   attack=(dcfg.control_attack_tap[0] * w, dcfg.control_attack_tap[1] * h),
-                  super_=cal.button("super"), aim_radius_px=dcfg.control_aim_radius_px)
+                  super_=cal.button("super"), gadget=cal.button("gadget"),
+                  aim_radius_px=dcfg.control_aim_radius_px)
     return btn, cal.screen
 
 
 def test_every_aim_stays_on_screen():
     """The attack twin of the test above, and it bites harder: the backend clamps an off-screen
     point to the edge, so a clamped DRAG lifts somewhere real, aimed the wrong way. The super
-    button sits 81 px above the bottom edge, so downward supers are the case that fails first.
+    button sits 179 px above the bottom edge, so downward supers are still the case that fails
+    first, but by a far wider margin since 2026-09-22: the disc this used to call the super sat
+    81 px up, and was really a third control nothing drags.
     Swept over bearings rather than trusting `require_on_screen`'s own arithmetic."""
     btn, (w, h) = _shipped_buttons()
     btn.require_on_screen((w, h))
@@ -423,12 +494,77 @@ def test_every_aim_stays_on_screen():
 
 
 def test_a_radius_that_drags_the_super_off_screen_is_refused():
-    """What `Controls.build` runs before the first match. 90 px clears the attack point by a mile
-    and still drags a downward super 9 px past the bottom edge."""
+    """What `Controls.build` runs before the first match. 185 px still clears the attack point
+    (229 px from the right edge) and drags a downward super 7 px past the bottom.
+
+    It was 90 px until 2026-09-22. The number moved because the SUPER moved: the disc the
+    calibration called the super sits at y=998, 81 px up, and turned out to be a control nothing
+    presses. The real Super is at y=901, so the ceiling roughly doubled."""
     btn, screen = _shipped_buttons()
-    btn.aim_radius_px = 90.0
+    btn.aim_radius_px = 185.0
     with pytest.raises(ValueError, match="super"):
         btn.require_on_screen(screen)
+
+
+def test_a_gadget_button_off_the_screen_is_refused():
+    """No drag, so no room is needed around it: only the tap point has to be on the screen. The
+    backend clamps, so an off-screen tap would land on the edge, on whatever is drawn there."""
+    btn, screen = _shipped_buttons()
+    btn.require_on_screen(screen)                 # the shipped calibration's centre is fine
+    w, h = screen
+    btn.gadget = (w - 1.0, 500.0)                 # the last column: on screen, zero room
+    btn.require_on_screen(screen)
+    btn.gadget = (w + 10.0, 500.0)
+    with pytest.raises(ValueError, match="gadget"):
+        btn.require_on_screen(screen)
+
+
+def test_controls_build_taps_the_calibrated_gadget(monkeypatch):
+    """`Controls.build` is the one place the loop's buttons come from, and `_shipped_buttons`
+    above only copies it. This runs the real build from the shipped calibration and config, with
+    just the ADB connection faked, and taps the gadget through what it returns. The down has to
+    land on the calibration's gadget centre, which is neither the super's nor the attack point."""
+    from brawl_deployment.config import load_deployment_config
+    from brawl_deployment.control import adb
+    from brawl_deployment.loop import Controls
+
+    backend = NullBackend()
+    monkeypatch.setattr(adb, "find_adb_serial", lambda conf=None, instance=None: "127.0.0.1:5555")
+    monkeypatch.setattr(adb, "AdbTouchBackend", lambda serial, screen: backend)
+    cal = Calibration.load()
+    controls = Controls.build(cal, load_deployment_config(), 16)
+
+    assert controls.backend is backend
+    gadget = cal.button("gadget")
+    assert gadget not in (cal.button("super"), controls.buttons.attack)
+    assert controls.buttons.press(ATTACK_GADGET, 0.0)
+    assert backend.log == [("down", SLOT_TAP, *gadget)]
+
+
+def test_a_dry_run_keeps_every_control_and_touches_only_the_null_backend():
+    """`scripts/deploy_run.py --dry-run` rebuilds the controls on a `NullBackend` through
+    `Controls.with_backend`. The script's own positional rebuild would have crashed every dry
+    run once the gadget became a required button (SIM_OVERHAUL Step G5), with nothing offline
+    to see it. Every field is a number nothing else uses, the defaults included, so a field
+    dropped or swapped in the copy shows."""
+    from brawl_deployment.loop import Controls
+
+    live = NullBackend()
+    controls = Controls(backend=live,
+                        joystick=Joystick(live, (310.0, 820.0), 121.0, n_bins=12),
+                        buttons=Buttons(live, attack=(1690.0, 594.0), super_=(1462.5, 1000.5),
+                                        gadget=(1559.9, 901.1), aim_radius_px=77.0))
+    null = NullBackend()
+    dry = controls.with_backend(null)
+
+    assert dry.backend is null and dry.joystick.backend is null and dry.buttons.backend is null
+    j, b = dry.joystick, dry.buttons
+    assert (j.anchor, j.radius_px, j.n_bins) == ((310.0, 820.0), 121.0, 12)
+    assert (b.attack, b.super_, b.gadget, b.aim_radius_px) == (
+        (1690.0, 594.0), (1462.5, 1000.5), (1559.9, 901.1), 77.0)
+    assert b.press(ATTACK_GADGET, 0.0)
+    assert null.log == [("down", SLOT_TAP, 1559.9, 901.1)]
+    assert live.log == []
 
 
 # ---------------------------------------------------------------- the in-match gate
@@ -562,8 +698,22 @@ def test_gate_separates_gameplay_from_menus_on_real_footage():
     """The end-to-end claim, against the real BlueStacks recording: the gate is out of a match at
     the start, in one through the middle, and out again after "Defeated".
 
-    Measured margins on this clip at the 2002x1126 viewport (gadget anchor, radius refined):
-    menus 0.000-0.077, gameplay 0.709-0.823, median 0.802 -- a 10.5x margin.
+    Measured margins on this clip at the 2002x1126 viewport, `hypercharge` anchor since 2026-09-22,
+    radius refined, 238 samples: menus 0.000-0.212, gameplay 0.968-0.994, median 0.985. That is
+    2.1x below the 0.45 threshold and 2.2x above it.
+
+    **This test failed for two weeks on `gameplay floor 0.675 too close to the threshold`, and
+    the anchor move fixed it at the root rather than by loosening a bound.** 0.675 is the SUPER
+    button's own in-match floor on this clip: its face changes as it charges, so its ring score
+    dips mid-match. The gate was watching it because all three button names in the calibration
+    sat one disc off (design 5.1). The bounds below describe `hypercharge` instead, and they are
+    looser on the menu side and far tighter on the gameplay side, because that is exactly where the
+    two discs differ: `hypercharge` reads 0.212 in menus where the Super read 0.083, and 0.968 in
+    play where the Super fell to 0.675. What matters is the 0.45 threshold, and `hypercharge`
+    clears it both ways.
+
+    The third disc is disqualified on this same clip without anyone pressing it: the real gadget's
+    in-match floor is 0.454, against a 0.45 threshold.
     """
     cv2 = pytest.importorskip("cv2")
     cal = Calibration.load()
@@ -604,10 +754,12 @@ def test_gate_separates_gameplay_from_menus_on_real_footage():
     hi = [s for s in scores if s >= cal.threshold]
     lo = [s for s in scores if s < cal.threshold]
     assert hi and lo
-    assert min(hi) > 0.7, f"gameplay floor {min(hi):.3f} too close to the threshold"
-    assert max(lo) < 0.2, f"menu ceiling {max(lo):.3f} too close to the threshold"
+    # Bounds are stated against the threshold, because the threshold is the thing they protect.
+    # Measured 0.968 and 0.212, so each keeps roughly a third of its own margin in reserve.
+    assert min(hi) > 1.7 * cal.threshold, f"gameplay floor {min(hi):.3f} too close to threshold"
+    assert max(lo) < 0.70 * cal.threshold, f"menu ceiling {max(lo):.3f} too close to threshold"
     # The gap is what makes the 0.45 threshold safe to leave alone across HUD-neutral changes.
-    assert min(hi) / max(lo) > 5.0
+    assert min(hi) / max(lo) > 4.0
 
 
 # ---- adb discovery ----------------------------------------------------------------------------

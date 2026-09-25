@@ -47,7 +47,10 @@ from .curriculum import FixedTierHook
 from .reward import ShapedReward
 
 # Per-tier metric names, in the order `summary_line` prints them.
-METRICS = ("win_rate", "mean_rank", "mean_ep_length", "mean_reward")
+METRICS = ("win_rate", "mean_rank", "mean_ep_length", "mean_reward", "gadgets_used")
+
+# The attack column's gadget value: [no-fire, attack, super, gadget] (core/hero.decode_action).
+_GADGET = 3
 
 
 class TierEvaluator:
@@ -121,10 +124,20 @@ class TierEvaluator:
     # ---- evaluation ------------------------------------------------------------------------
 
     def evaluate(self, model, deterministic: bool | None = None) -> dict:
-        """Returns `{tier_name: {win_rate, mean_rank, mean_ep_length, mean_reward}}`.
+        """Returns `{tier_name: {win_rate, mean_rank, mean_ep_length, mean_reward, gadgets_used,
+        episodes}}`.
 
         `model` is any SB3 algorithm; action masks are passed only when the run's algo is
         `maskable_ppo` (plain `PPO.predict` has no `action_masks` parameter and would raise).
+
+        `gadgets_used` is gadget throws per episode (SIM_OVERHAUL_STEPS.md Step I2). Nothing in the
+        sim state counts throws, so this loop counts the ones it sends, by the sim's own rule:
+        `core/hero.decode_action` throws on attack value 3 where the attack mask allows it, and
+        `env._held` clears the fire column after a decision's first tick, so a decision throws at
+        most once. The mask read here is the one the policy was given. The sim derives its own
+        after ticking the timers, and the two differ only on the tick before a charge completes,
+        where the policy's copy still says not ready. A `maskable_ppo` policy cannot press there,
+        so for it the count is exact.
         """
         deterministic = self.tcfg.eval.deterministic if deterministic is None else deterministic
         self.sim.gen.manual_seed(self.seed)   # identical scenarios on every call -- see docstring
@@ -136,10 +149,16 @@ class TierEvaluator:
         rank = np.zeros(n, dtype=np.int64)
         length = np.zeros(n, dtype=np.int64)
         ret = np.zeros(n, dtype=np.float64)
+        gadgets = np.zeros(n, dtype=np.int64)
+        gadget_col = self.env_cfg.action_nvec[0] + _GADGET   # the fused mask is [move, attack]
 
         for _ in range(self.max_steps):
-            kwargs = {"action_masks": self.venv.action_masks()} if self.uses_masks else {}
+            masks = self.venv.action_masks()
+            kwargs = {"action_masks": masks} if self.uses_masks else {}
             action, _ = model.predict(obs, deterministic=deterministic, **kwargs)
+            # Counted before this step's dones are recorded: a slot's last decision belongs to its
+            # first episode, and every decision after it to the autoreset one, which must not count.
+            gadgets += (action[:, 1] == _GADGET) & masks[:, gadget_col] & ~recorded
             obs, _, dones, infos = self.venv.step(action)
             for i in np.nonzero(dones & ~recorded)[0]:
                 outcome, episode = infos[i]["outcome"], infos[i]["episode"]
@@ -151,9 +170,9 @@ class TierEvaluator:
             if recorded.all():
                 break
 
-        return self._summarize(recorded, won, rank, length, ret)
+        return self._summarize(recorded, won, rank, length, ret, gadgets)
 
-    def _summarize(self, recorded, won, rank, length, ret) -> dict:
+    def _summarize(self, recorded, won, rank, length, ret, gadgets) -> dict:
         out = {}
         for t, name in enumerate(self.tier_names):
             block = (self._tier_of_env == t) & recorded
@@ -169,6 +188,7 @@ class TierEvaluator:
                 "mean_rank": float(rank[block].mean()),
                 "mean_ep_length": float(length[block].mean()),
                 "mean_reward": float(ret[block].mean()),
+                "gadgets_used": float(gadgets[block].mean()),
                 "episodes": count,
             }
         return out
@@ -204,10 +224,12 @@ def summary_line(results: dict) -> str:
 
 
 def format_table(results: dict) -> str:
-    header = f"  {'tier':<10} {'win rate':>9} {'mean rank':>10} {'mean len':>9} {'mean rew':>9} {'n':>5}"
+    header = (f"  {'tier':<10} {'win rate':>9} {'mean rank':>10} {'mean len':>9} {'mean rew':>9} "
+              f"{'gadgets':>8} {'n':>5}")
     rows = [
         f"  {name:<10} {r['win_rate']:>8.1%} {r['mean_rank']:>10.2f} "
-        f"{r['mean_ep_length']:>9.0f} {r['mean_reward']:>9.2f} {r['episodes']:>5d}"
+        f"{r['mean_ep_length']:>9.0f} {r['mean_reward']:>9.2f} {r['gadgets_used']:>8.2f} "
+        f"{r['episodes']:>5d}"
         for name, r in results.items()
     ]
     return "\n".join([header, *rows])

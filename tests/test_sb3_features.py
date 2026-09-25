@@ -1,4 +1,5 @@
 import numpy as np
+import pytest
 import torch
 import yaml
 from gymnasium import spaces
@@ -139,3 +140,42 @@ def test_float_group_names_excludes_the_uint8_grid_group():
     names = float_group_names(spec)
     assert "grid" not in names
     assert set(names) == {g.name for g in spec.groups if g.name != "grid"}
+
+
+# ---- the deploy specs' input widths, pinned (SIM_OVERHAUL_STEPS.md Step H3) -----------------
+
+# Measured at the default config in Step I1, with no extractor change. A checkpoint's first conv
+# and first linear layer are sized from these two numbers, so a change to either is a
+# from-scratch retrain, never a checkpoint swap. Deploy3 is the last trained run's spec and
+# deploy4 the next one's. Written out rather than read from the spec: a test that asked the spec
+# for its own width could not fail.
+DEPLOY_WIDTHS = {
+    "configs/agent_obs_deploy3.yaml": (10, 182, {"self": 24, "enemies": 81, "projectiles": 72,
+                                                 "zone": 5}),
+    "configs/agent_obs_deploy4.yaml": (13, 262, {"self": 26, "enemies": 81, "projectiles": 72,
+                                                 "zone": 5, "history": 78}),
+}
+
+
+@pytest.mark.parametrize("spec_path", sorted(DEPLOY_WIDTHS))
+def test_a_deploy_spec_builds_the_extractor_at_its_pinned_widths(spec_path):
+    """Deploy4 feeds the CNN 13 channels and the MLP 262 floats; deploy3 feeds 10 and 182.
+
+    Both specs are pinned, not only the one the next run trains. Deploy4's grid is 13 x 13 x 21,
+    so its channel count equals the view height, and an extractor that read the wrong axis would
+    still build 13 input channels for it. Deploy3's 10 channels are what tell the two apart.
+    The per-group widths say which group moved when the total does.
+    """
+    channels, float_width, group_widths = DEPLOY_WIDTHS[spec_path]
+    cfg = load_config(CONFIGS_DEFAULT)
+    space = obs_select.agent_space(obs_select.load_agent_spec(spec_path, cfg), cfg)
+    fe = BrawlFeaturesExtractor(space)
+
+    floats = {k: int(np.prod(s.shape)) for k, s in space.spaces.items() if s.dtype == np.float32}
+    assert floats == group_widths
+    assert sum(group_widths.values()) == float_width
+    assert fe.cnn[0].in_channels == channels
+    assert fe.mlp[0].in_features == float_width
+    out = fe(_sample_batch(space, batch_size=2))
+    assert out.shape == (2, fe.features_dim)
+    assert torch.isfinite(out).all()

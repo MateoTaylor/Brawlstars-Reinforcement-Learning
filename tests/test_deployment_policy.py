@@ -172,21 +172,20 @@ def test_the_mask_handed_to_the_network_is_the_sims_own_layout():
     `action_masks()` produced on every training step. A different split here would mask the wrong
     dimension while remaining exactly the right width, which no shape check catches.
 
-    The fourth attack column is the gadget (SIM_OVERHAUL Step G3). Deployment cannot press it
-    until Step G5, so it is held ILLEGAL here whatever the shadow says: a policy that could pick
-    it would pick an action the control layer has no button for."""
+    The fourth attack column is the gadget (SIM_OVERHAUL Step G3). Since Step G5 it is the
+    shadow's fourth legal, passed through like the other three. Two calls with different tuples,
+    so a column stuck at an earlier call's value, or at a constant, would show."""
     pol = _policy()
     obs = {k: np.zeros(v.shape, v.dtype) for k, v in
            obs_select.agent_space(pol.spec, pol.cfg).spaces.items()}
-    pol.act(obs, (True, False, True))
+    pol.act(obs, (True, False, True, True))
 
     mask = pol.model.seen["mask"]
     assert mask.shape == (1, 21)
     assert mask[0, :17].all(), "hero.action_mask builds the move half all-True"
-    assert list(mask[0, 17:]) == [True, False, True, False]
+    assert list(mask[0, 17:]) == [True, False, True, True]
 
-    # ...and it stays illegal across calls -- the three shadow legals never spill into it.
-    pol.act(obs, (True, True, True))
+    pol.act(obs, (True, True, True, False))
     assert list(pol.model.seen["mask"][0, 17:]) == [True, True, True, False]
 
 
@@ -205,22 +204,27 @@ def test_the_attack_mask_is_the_shadows_and_is_not_recomputed_here():
     shadow = ShadowHero(ShadowParams.load())
     shadow.reset()
     pol.act(obs, shadow.attack_mask())
-    assert list(pol.model.seen["mask"][0, n_move:n_move + 3]) == list(shadow.attack_mask())
-    assert list(shadow.attack_mask()) == [True, True, False]   # fresh shadow: full clip, no super
+    assert list(pol.model.seen["mask"][0, n_move:]) == list(shadow.attack_mask())
+    # A fresh shadow: a full clip, no super, and the gadget charged at the gate.
+    assert list(shadow.attack_mask()) == [True, True, False, True]
 
 
 def test_an_all_illegal_attack_column_is_rejected_rather_than_producing_nan():
     """`hero.action_mask` makes no-fire unconditionally legal (`no_fire_ok = ones_like`), so an
     all-False attack row cannot arise from the sim and means the caller built the tuple wrong.
     MaskablePPO's response to one is a degenerate categorical -- NaN logits, not an exception --
-    so it has to be caught before `predict`."""
+    so it has to be caught before `predict`.
+
+    A tuple of the wrong width is refused by name, the shadow's three-wide one from before
+    Step G5 included."""
     pol = _policy()
     obs = {k: np.zeros(v.shape, v.dtype) for k, v in
            obs_select.agent_space(pol.spec, pol.cfg).spaces.items()}
     with pytest.raises(ValueError, match="no-fire"):
-        pol.act(obs, (False, True, True))
-    with pytest.raises(ValueError, match="no_fire, attack, super"):
-        pol.act(obs, (True, True))
+        pol.act(obs, (False, True, True, True))
+    for short in ((True, True), (True, True, True)):
+        with pytest.raises(ValueError, match="no_fire, attack, super, gadget"):
+            pol.act(obs, short)
 
 
 def test_the_decision_keeps_the_mask_it_was_given():
@@ -231,11 +235,48 @@ def test_the_decision_keeps_the_mask_it_was_given():
     obs = {k: np.zeros(v.shape, v.dtype) for k, v in
            obs_select.agent_space(pol.spec, pol.cfg).spaces.items()}
 
-    chose_not_to = pol.act(obs, (True, True, True))
-    could_not = pol.act(obs, (True, False, False))
+    chose_not_to = pol.act(obs, (True, True, True, True))
+    could_not = pol.act(obs, (True, False, False, False))
     assert chose_not_to.attack == could_not.attack == 0
     assert chose_not_to.legal != could_not.legal
     assert not chose_not_to.fired
+
+
+def test_a_move_mask_is_anded_into_the_move_half_and_cleared_between_calls():
+    """`move_mask.py`'s tuple lands on the first `n_move_bins + 1` columns, exactly where
+    `wrappers/sb3_vecenv.py` put the sim's (all-True) move half, and the attack half is untouched
+    by it. A call WITHOUT one must hand the network the training-time all-True half again, not the
+    previous call's dead bins: the loop passes None whenever `policy.dead_bin_mask` is off, and a
+    mask that outlived its decision would be a wall the map no longer shows."""
+    pol = _policy()
+    obs = {k: np.zeros(v.shape, v.dtype) for k, v in
+           obs_select.agent_space(pol.spec, pol.cfg).spaces.items()}
+    n_move = pol.cfg.n_move_bins + 1
+    moves = tuple(i not in (1, 2) for i in range(n_move))
+
+    decision = pol.act(obs, (True, True, False, True), move_legal=moves)
+    mask = pol.model.seen["mask"]
+    assert list(mask[0, :n_move]) == list(moves)
+    assert list(mask[0, n_move:]) == [True, True, False, True]
+    assert decision.move_legal == moves
+
+    decision = pol.act(obs, (True, True, False, True))
+    assert pol.model.seen["mask"][0, :n_move].all()
+    assert decision.move_legal is None
+
+
+def test_a_move_mask_that_kills_idle_or_has_the_wrong_width_is_refused():
+    """`legal_move_bins` never masks idle, so a False at index 0 is a caller's bug and the same
+    degenerate-distribution failure as an all-False attack row; a tuple of the wrong width would
+    land on the attack columns. Both are refused before `predict` sees them."""
+    pol = _policy()
+    obs = {k: np.zeros(v.shape, v.dtype) for k, v in
+           obs_select.agent_space(pol.spec, pol.cfg).spaces.items()}
+    n_move = pol.cfg.n_move_bins + 1
+    with pytest.raises(ValueError, match="idle"):
+        pol.act(obs, (True, True, True, True), move_legal=(False,) + (True,) * (n_move - 1))
+    with pytest.raises(ValueError, match="one flag per move bin"):
+        pol.act(obs, (True, True, True, True), move_legal=(True,) * (n_move + 1))
 
 
 def test_the_batch_axis_is_added_without_disturbing_the_assemblers_output():
@@ -245,7 +286,7 @@ def test_the_batch_axis_is_added_without_disturbing_the_assemblers_output():
     pol = _policy()
     space = obs_select.agent_space(pol.spec, pol.cfg)
     obs = {k: np.full(v.shape, 3, v.dtype) for k, v in space.spaces.items()}
-    pol.act(obs, (True, True, True))
+    pol.act(obs, (True, True, True, True))
 
     seen = pol.model.seen["obs"]
     for name, value in obs.items():
@@ -254,7 +295,7 @@ def test_the_batch_axis_is_added_without_disturbing_the_assemblers_output():
         np.testing.assert_array_equal(seen[name][0], value)
 
     obs["self"][:] = 99          # the caller reuses its array; the staged copy must not follow
-    pol.act(obs, (True, True, True))
+    pol.act(obs, (True, True, True, True))
     assert pol.model.seen["obs"]["self"][0][0] == 99
 
 
@@ -266,11 +307,11 @@ def test_deterministic_is_passed_through_and_defaults_to_the_way_the_run_was_sco
     obs_of = lambda p: {k: np.zeros(v.shape, v.dtype) for k, v in                    # noqa: E731
                         obs_select.agent_space(p.spec, p.cfg).spaces.items()}
     pol = _policy()
-    pol.act(obs_of(pol), (True, True, True))
+    pol.act(obs_of(pol), (True, True, True, True))
     assert pol.model.seen["deterministic"] is True
 
     stoch = _policy(deterministic=False)
-    stoch.act(obs_of(stoch), (True, True, True))
+    stoch.act(obs_of(stoch), (True, True, True, True))
     assert stoch.model.seen["deterministic"] is False
 
 
@@ -281,7 +322,7 @@ def test_the_real_checkpoint_loads_and_decides_from_an_assembled_observation(run
     """The one test that touches the actual artifact: load the run, build ITS assembler, and push
     a real assembled observation through. It asserts the seam rather than the answer -- that
     `assemble`'s output is exactly what `predict` accepts, with no reshaping in between, and that
-    a masked-off super is never chosen over 30 varied frames.
+    a masked-off super or gadget is never chosen over 30 varied frames.
 
     The zone group comes from the real `ZoneEstimator`, not a hand-written dict. A dict written here
     carried both margin names while the estimator produced one, which is how this test passed for a
@@ -290,6 +331,13 @@ def test_the_real_checkpoint_loads_and_decides_from_an_assembled_observation(run
     from brawl_deployment.perception.zone import ZoneEstimator
 
     if not __import__("pathlib").Path(f"{run}/best_model.zip").exists():
+        # A DANGLING CONFIG POINTER is not the same as a machine without the artifact, and
+        # conflating them is how `deployment.yaml` sat on a deleted deploy3 run until 2026-09-22
+        # with this test green. Only `DEPLOYED_RUN` is held to it: the other parameters are
+        # historical constants and a machine that no longer has them is just a machine.
+        assert run != DEPLOYED_RUN, (
+            f"configs/deployment.yaml names {run}, which has no best_model.zip. A live run would "
+            f"fail on the missing path; repoint `run.dir` rather than letting this skip.")
         pytest.skip("runs/ is gitignored; the deployed checkpoint is not on every machine")
     try:
         pol = DeployedPolicy.from_run(run)
@@ -310,7 +358,8 @@ def test_the_real_checkpoint_loads_and_decides_from_an_assembled_observation(run
     shadow_obs = {"facing_vec": (1.0, 0.0), "ammo_frac": 0.8, "ammo_whole": 2.0, "attack_cd": 0.0,
                   "can_attack": True, "dashing": False, "dash_t": 0.0, "dash_dir": (0.0, 0.0),
                   "invuln": False, "long_dash_ready": True, "long_dash_frac": 1.0,
-                  "super_ready": False, "super_charge_frac": 0.4}
+                  "super_ready": False, "super_charge_frac": 0.4,
+                  "gadget_ready": False, "gadget_charge_frac": 0.5}
     rng = np.random.default_rng(0)
     supers = 0
     for i in range(30):
@@ -320,10 +369,13 @@ def test_the_real_checkpoint_loads_and_decides_from_an_assembled_observation(run
             enemies=[None] * (pol.cfg.n_entities - 1), enemy_hp={}, enemy_in_bush={},
             projectiles=[],
             zone=zone.estimate(gas, (10.0 + i, 10.0)),
+            # A match's first decision every time; the history's own parity is
+            # test_deployment_assemble.py's.
+            history=(),
             grid=rng.integers(0, 2, (len(asm._grid_channels), pol.cfg.view_h, pol.cfg.view_w),
                               dtype=np.uint8),
         )
-        d = pol.act(obs, (True, True, False))       # super masked off the whole way through
+        d = pol.act(obs, (True, True, False, False))   # super and gadget masked off throughout
         assert isinstance(d, Decision)
         assert 0 <= d.move_bin <= pol.cfg.n_move_bins
         assert d.attack in (0, ATTACK_FIRE)

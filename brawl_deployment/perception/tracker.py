@@ -49,6 +49,7 @@ error, the fix is a faster detection rate, not a fancier filter.
 import math
 from dataclasses import dataclass, field
 
+from brawl_vision.camera import HERO_ANCHOR_TILES
 from brawl_vision.object_detection.project import to_tiles
 
 # Fastest sustained ground speed in the roster (`configs/brawlers.yaml`: Mortis 2.73, the rest
@@ -84,12 +85,30 @@ class Track:
 
 @dataclass(frozen=True)
 class TrackerResult:
-    """One tick's output. `hero` is the `player` box; `enemies` are slot-ordered."""
+    """One tick's output. `hero` is the `player` box; `enemies` are slot-ordered. `hero_offset`
+    is the player box's tiles from its nominal screen anchor (`EntityTracker._nominal_tile`):
+    near zero while the camera tracks the hero, growing as the camera stops at a map edge, and
+    None until a player box has been seen this segment. Last, with a default, so the positional
+    constructions of the first five fields keep working."""
     hero: Track | None
     enemies: list
     status: str                    # "ok" | "reset" | odometry's own status when unusable
     segment: int
     n_detections: int
+    hero_offset: tuple[float, float] | None = None
+
+
+@dataclass(frozen=True)
+class _Point:
+    """A zero-size box, so `to_tiles` projects exactly this pixel: it takes `anchor(frac)`, which
+    for a box of no height is the point itself whatever `frac` is. Keeps the nominal hero tile
+    on the ONE pixel-to-tile path the detections use (OBS_PARITY_TASKS.md C7)."""
+    label: str
+    confidence: float
+    xyxy: tuple
+
+    def anchor(self, frac: float = 0.30) -> tuple[float, float]:
+        return (self.xyxy[0], self.xyxy[1])
 
 
 def _greedy_match(tracks, points, gate: float):
@@ -149,6 +168,9 @@ class EntityTracker:
         # it as a change. A sentinel that compares unequal to segment 0 would throw away the first
         # decision of every match, which is cheap but silent and surprising.
         self._segment: int | None = None
+        # The player box's tiles from its nominal screen anchor, kept across ticks with no
+        # player box (the hero track coasts) and cleared by reset(). `hero.near_edge` live.
+        self._hero_offset: tuple[float, float] | None = None
 
     # -- the tick ------------------------------------------------------------
 
@@ -172,7 +194,7 @@ class EntityTracker:
             return TrackerResult(None, [], "reset", odometry.segment, len(detections))
         if odometry.status != "ok":
             return TrackerResult(self.hero, self.slots(), odometry.status, self._segment,
-                                 len(detections))
+                                 len(detections), self._hero_offset)
 
         px, py = odometry.position_tiles
         placed = to_tiles(detections, plan, anchor_frac=self.anchor_frac) if self.anchor_frac \
@@ -180,8 +202,25 @@ class EntityTracker:
         world = [(d, (tx + px, ty + py)) for d, (tx, ty) in placed]
 
         self._update_hero([p for d, p in world if d.label == "player"], t)
+        if self.hero is not None and self.hero.seen_now:
+            # The box the hero track took, back in the plan's camera-relative frame (the
+            # odometry position added above comes off again), against where the hero stands
+            # while the camera follows it. Both sides go through `plan`, so any registration
+            # shift of `origin_tile` cancels.
+            nx, ny = self._nominal_tile(plan)
+            self._hero_offset = (self.hero.pos[0] - px - nx, self.hero.pos[1] - py - ny)
         self._update_enemies([p for d, p in world if d.label == "enemy"], t)
-        return TrackerResult(self.hero, self.slots(), "ok", self._segment, len(detections))
+        return TrackerResult(self.hero, self.slots(), "ok", self._segment, len(detections),
+                             self._hero_offset)
+
+    def _nominal_tile(self, plan) -> tuple[float, float]:
+        """Where the hero stands when the camera is tracking it, in the plan's camera-relative
+        tiles: the viewport's centre pixel through the same projection as the detections, plus
+        the measured anchor offset (`brawl_vision.camera.HERO_ANCHOR_TILES`)."""
+        w, h = plan.viewport
+        centre = _Point("viewport-centre", 1.0, (w / 2.0, h / 2.0, w / 2.0, h / 2.0))
+        (_, (tx, ty)), = to_tiles([centre], plan)
+        return (tx + HERO_ANCHOR_TILES[0], ty + HERO_ANCHOR_TILES[1])
 
     def _update_hero(self, points, t: float) -> None:
         """The hero is a singleton, so there is no association problem -- take the one box.
@@ -288,3 +327,4 @@ class EntityTracker:
         self.enemies.clear()
         self._pending.clear()
         self._segment = segment
+        self._hero_offset = None

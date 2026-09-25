@@ -65,13 +65,23 @@ release.
   (commanding 140 gave 91.7 / 92.6 / 92.0 across three directions), so `radius_px = 110` sits 20%
   past the clamp — drift-proof without leaving the play area.
 
+- **The move half of the action mask is no longer all-True (2026-09-23).** `move_mask.py` runs
+  the sim's own collision rule (`terrain.resolve_move`: x step, then y, `circle_blocked` at
+  `unit_radius`) on the `blocks_unit` plane the policy sees, and masks a bin that would leave the
+  hero where he is — the deploy4 checkpoint otherwise argmax-locks into a wall it can see for
+  seconds at a time. Idle is never masked; a footprint the map already blocks shrinks until free;
+  a blocked hero centre leaves everything legal. `policy.dead_bin_mask: false` is the off switch
+  and `TickRow.move_legal` the bitmask the policy was handed (design 6.16).
+
 ## Fire semantics: once per decision
 
-`attack ∈ {0, 1, 2}` — nothing / attack / super. The press starts on the **first** perception tick
+`attack ∈ {0, 1, 2, 3}`: nothing / attack / super / gadget, the 3 since 2026-09-21
+(SIM_OVERHAUL Step G5). The press starts on the **first** perception tick
 of the decision window and does **not** repeat. This mirrors `env._held`, which zeroes the fire
 column on sub-ticks 2..K. A held fire bit is a bug, not an optimization.
 
-**Every press is an aimed drag, never a bare tap** (design §4.4, revised 2026-09-15). A tap
+**Every attack and super press is an aimed drag, never a bare tap** (design §4.4, revised
+2026-09-15). A tap
 auto-aims at the nearest enemy; the sim dashes along the move bin, or `facing` when idle. So
 `Buttons.press` goes down on the origin, `settle()` drags it `control.aim_radius_px` along
 `ShadowHero.attack_bearing` on the next tick and lifts it on the one after (the lift fires), one
@@ -80,7 +90,18 @@ step per tick. Do not "simplify" it back to a tap: that silently changes where e
 Apply action masking at inference the way `MaskablePPO` saw it in training — an uncharged super
 means bin 2 is masked, not merely ignored.
 
-Gadgets are not in the action space. Never touch the gadget button.
+**The gadget is the one bare tap** (design §4.4, revised 2026-09-21, SIM_OVERHAUL Step G5; this
+line used to say never to touch the gadget button). `attack == 3` goes down on the calibrated
+gadget centre and lifts on the next tick, no drag: the game aims it at the nearest enemy, exactly
+as the sim's `hero.gadget_target` does. Its mask bit is the shadow's own 18 s timer, with no
+dash, cooldown or ammo term, and a throw is not an attack. **The gadget is NOT the match gate's
+anchor** (corrected 2026-09-22, design §5.1). It was believed to be for two weeks, because all three
+button names in `control_calibration.json` sat one disc off and a commanded gadget actually pressed
+the Super. The gate is now on `hypercharge`, the one disc in the cluster nothing presses. Keep it
+there: Step G6 measured the alternative live, and one throw drops the gadget's own ring score under
+threshold for 5.0 s, so an agent gated on its own gadget stops dead after every throw.
+Its trace comes from `scripts/deploy_calibrate.py --probe-gadget` (G6.1), in a real match,
+never Training Grounds.
 
 ## Fail closed
 
@@ -186,7 +207,7 @@ per-enemy slots the policy was trained on both need identity across frames.
 ## Centres transfer across frame sources; radii do not
 
 `ring_score_at` is sharply
-radius-sensitive. Measured on the same button, same screen resolution, same HUD: the gadget fits
+radius-sensitive. Measured on the same button, same screen resolution, same HUD: the Super fits
 r=33.2 on an OBS recording's temporal median and r=39.9 on a raw ADB framebuffer grab, and scoring
 one at the other's radius gives **0.083 instead of 0.984** — a 6.7 px error that flips the match
 gate. Centres agree to 1–3 px.
@@ -266,6 +287,8 @@ written for `enemies` and `projectiles`, where the agent is a spectator. **It do
 constants in `configs/brawlers.yaml`. Verified: `movement.py:54` and `hero.py:276` set
 `ent_facing` from `move_dir`/`dash_dir`; `hero.py:124` defines `long_dash_ready` as a stopwatch
 since our last attack; `hero.py:114-115` tick `attack_cd`/`invuln_t` as plain `-= dt` countdowns.
+Since 2026-09-21 (SIM_OVERHAUL Step G5) `gadget_ready` and `gadget_charge_frac` join them: an
+18 s countdown from `gadget_cooldown`, charged at the gate and restarted by our own throw.
 
 So maintain a **shadow hero state** — the hero's own timers, ticked at `cfg.dt`, advanced by the
 actions we emit, loading the same brawler params the sim loads. No CV, no retrain, exact values.
@@ -281,10 +304,38 @@ a dropped input, or a dash cut short by a wall. Guard it:
 - **Position** is likewise both CV-tracked and predicted; divergence means movement is not landing.
 - On desync: resync observables from CV, reseed unobservable timers **conservatively** (assume not
   ready), log it. Sustained desync is a fail-closed condition.
+- **The gadget timer is the one thing a resync leaves alone** (2026-09-21, SIM_OVERHAUL Step G5),
+  a queued throw included. The canary's evidence is ammo, which says nothing about the gadget,
+  and the shadow's gadget can lag the game's (a dropped tap) but never lead it, since the loop
+  taps only what `ShadowHero.act` modelled. Reseeding it to not ready would throw away up to 18 s
+  of a gadget the game still holds. Do not "fix" `resync` to cover it.
 
 **Never feed a constant or zero for a field you cannot supply.** A policy trained on a real value
 and deployed against a fabricated one is being lied to in a column it learned to trust; the
 failure is silent and looks like "the policy is bad at real Brawl Stars."
+
+## The history: one snapshot per decision, newest first
+
+`configs/agent_obs_deploy4.yaml` reads the last three decisions: the `history` group and the
+`enemy_hist1..3` grid planes (SIM_OVERHAUL Step H4, 2026-09-21); `configs/agent_obs_deploy5.yaml`
+(OBS_PARITY_TASKS.md C10, 2026-09-24) is deploy4 plus `hero.near_edge` after `hero.in_zone` and
+`slots: tracked` on `enemies`, with the history rules below unchanged, and `configs/deployment.yaml`
+stays on the deploy4 run until a deploy5 checkpoint exists. The loop keeps a deque of
+`DecisionSnapshot`s sized from `history_frames`. The load-bearing rules:
+
+- **Snapshot after `shadow.act`, holding the MODELLED attack**: what was pressed, not the
+  policy's pick. Everything else is what that decision's observation was built from, read once:
+  the HP numeral, the shadow's `ammo_frac` before the shot lands, the world position.
+- **`enemies` is `seen_now` only**, the set `enemy_revealed` draws. A coasted track is a
+  prediction, not a sighting.
+- **Clear at the gate and on a new odometry segment.** A snapshot's position lives in its
+  segment's world frame; the tracker drops its tracks for the same reason.
+- **A skipped decision pushes nothing**, so `valid` stays a prefix, as it always is in the sim.
+- **The block is Chebyshev on tile floors around the hero's tile NOW**, `history_radius_tiles`
+  = 4, the sim's `_history_drawn`. Not Euclidean, not raw distance, not the hero's tile then.
+- **The loop hands the grid the history**, because the assembler receives a built grid.
+  `GridBuilder.build(enemy_history=None)` raises for a spec with history planes: an empty plane
+  claims nobody was seen, so it is never a default.
 
 ## Resources: hunt unbounded growth, not microseconds
 

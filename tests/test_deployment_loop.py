@@ -16,7 +16,7 @@ import numpy as np
 import pytest
 
 from brawl_deployment.control.backend import SLOT_MOVE, SLOT_TAP
-from brawl_deployment.control.buttons import ATTACK_FIRE, ATTACK_NONE, ATTACK_SUPER
+from brawl_deployment.control.buttons import ATTACK_FIRE, ATTACK_GADGET, ATTACK_NONE, ATTACK_SUPER
 from brawl_deployment.loop import (ODOMETRY_LOST_SECONDS, TELEMETRY_ROWS, Controls, DeployLoop,
                                    Phase, TickRow, VisionStack)
 from brawl_deployment.config import DeploymentConfig
@@ -345,18 +345,24 @@ class _Policy:
                           else _Assembler())
         self.obs = []
         self.decision = decision or Decision(move_bin=3, attack=ATTACK_NONE,
-                                             legal=(True, True, False))
+                                             legal=(True, True, False, True))
         self.calls = 0
         self.raises = None
+        self.move_legal = []
 
     def make_assembler(self, **kw):
         return self.assembler
 
-    def act(self, obs, attack_legal):
+    def act(self, obs, attack_legal, move_legal=None):
         self.calls += 1
         self.obs.append(obs)
+        self.move_legal.append(move_legal)
         if self.raises is not None:
             raise self.raises
+        # `DeployedPolicy.act`'s own contract: one legal per attack column, four since Step G5,
+        # and the move half either absent or one flag per bin plus idle.
+        assert len(tuple(attack_legal)) == 4, attack_legal
+        assert move_legal is None or len(move_legal) == CFG.n_move_bins + 1, move_legal
         return self.decision
 
 
@@ -373,7 +379,8 @@ def loop(monkeypatch):
     backend = _Backend()
     controls = Controls(backend=backend,
                         joystick=Joystick(backend, (345.6, 669.6), 110.0, n_bins=16),
-                        buttons=Buttons(backend, attack=(1690.0, 594.0), super_=(1462.5, 1000.5)))
+                        buttons=Buttons(backend, attack=(1690.0, 594.0), super_=(1462.5, 1000.5),
+                                        gadget=(1559.9, 901.1)))
     vision = VisionStack(plan=_Plan(), odometry=_Odometry(), occupancy=_Occupancy(),
                          classifier=_Classifier(),
                          entities=_Detector([_Detection("player", HERO_PX)]),
@@ -754,7 +761,7 @@ def test_a_decision_moves_the_stick_and_the_stick_stays_down(loop):
 
 
 def test_an_idle_decision_does_not_release_the_contact(loop):
-    loop.policy.decision = Decision(move_bin=0, attack=ATTACK_NONE, legal=(True, True, False))
+    loop.policy.decision = Decision(move_bin=0, attack=ATTACK_NONE, legal=(True, True, False, True))
     _play(loop, loop.decision_every * 2)
     assert ("up", SLOT_MOVE) not in loop.backend.events
     assert loop.controls.joystick.is_down
@@ -763,7 +770,7 @@ def test_an_idle_decision_does_not_release_the_contact(loop):
 def test_the_fire_bit_does_not_repeat_across_the_decision_window(loop):
     """`env._held` zeroes the fire column on sub-ticks 2..K. One press per decision, and it is
     finished inside the window: down, drag, lift, and the slot is free for the next decision."""
-    loop.policy.decision = Decision(move_bin=1, attack=ATTACK_FIRE, legal=(True, True, False))
+    loop.policy.decision = Decision(move_bin=1, attack=ATTACK_FIRE, legal=(True, True, False, True))
     _play(loop, loop.decision_every)
     taps = [e for e in loop.backend.events if e[1:] == (SLOT_TAP,)]
     assert taps == [("down", SLOT_TAP), ("move", SLOT_TAP), ("up", SLOT_TAP)]
@@ -785,7 +792,7 @@ def test_an_attack_is_dragged_along_the_move_bin_one_step_per_tick(loop):
     bin. Bin 5 is a quarter turn from +x, which is DOWN the screen (no y flip): the press goes down
     on the attack point on the decision tick, drags `aim_radius_px` straight down on the next, and
     lifts -- which fires -- on the last tick of the window."""
-    loop.policy.decision = Decision(move_bin=5, attack=ATTACK_FIRE, legal=(True, True, False))
+    loop.policy.decision = Decision(move_bin=5, attack=ATTACK_FIRE, legal=(True, True, False, True))
     loop.match.gate = True
     ax, ay = loop.controls.buttons.attack
     r = loop.controls.buttons.aim_radius_px
@@ -801,7 +808,7 @@ def test_an_idle_attack_is_dragged_the_way_the_hero_last_faced(loop):
     dash goes the way the hero faces, so the drag must still go down -- NOT screen-right, which is
     where `facing` starts, and not a bare tap."""
     loop.match.gate = True
-    loop.policy.decision = Decision(move_bin=5, attack=ATTACK_NONE, legal=(True, True, False))
+    loop.policy.decision = Decision(move_bin=5, attack=ATTACK_NONE, legal=(True, True, False, True))
 
     def tick_in_real_time():
         # The shadow spends WALL-CLOCK seconds as sub-ticks, and a test tick takes microseconds.
@@ -813,7 +820,7 @@ def test_an_idle_attack_is_dragged_the_way_the_hero_last_faced(loop):
 
     for _ in range(loop.decision_every):
         tick_in_real_time()
-    loop.policy.decision = Decision(move_bin=0, attack=ATTACK_FIRE, legal=(True, True, False))
+    loop.policy.decision = Decision(move_bin=0, attack=ATTACK_FIRE, legal=(True, True, False, True))
     before = len(loop.backend.log)
     for _ in range(loop.decision_every):
         tick_in_real_time()
@@ -826,7 +833,7 @@ def test_an_idle_attack_is_dragged_the_way_the_hero_last_faced(loop):
 def test_a_press_in_flight_is_lifted_when_the_match_ends(loop):
     """Every path out of `PLAYING` lifts SLOT_TAP immediately -- `release`, not `settle`, which
     would only have dragged it one step further and left it down."""
-    loop.policy.decision = Decision(move_bin=1, attack=ATTACK_FIRE, legal=(True, True, False))
+    loop.policy.decision = Decision(move_bin=1, attack=ATTACK_FIRE, legal=(True, True, False, True))
     _play(loop, 1)
     assert loop.controls.buttons.is_held
     loop._end_match("test")
@@ -837,11 +844,37 @@ def test_a_press_in_flight_is_lifted_when_the_match_ends(loop):
 def test_only_what_the_shadow_modelled_is_tapped(loop):
     """The shadow's mask is the last word: an uncharged super never reaches the device, because
     modelling a shot the game did not take is the one error the shadow must never make."""
-    loop.policy.decision = Decision(move_bin=1, attack=ATTACK_SUPER, legal=(True, True, True))
+    loop.policy.decision = Decision(move_bin=1, attack=ATTACK_SUPER, legal=(True, True, True, True))
     _play(loop, loop.decision_every)
     assert not loop.shadow.super_ready
     assert ("down", SLOT_TAP) not in loop.backend.events
     assert _decisions(loop)[-1].attack == ATTACK_NONE
+
+
+def test_a_gadget_decision_is_a_bare_tap_on_the_gadget_button(loop):
+    """SIM_OVERHAUL Step G5: attack value 3 reaches the device as a tap on the gadget button,
+    down on the decision tick and up on the next, never a drag, and the row records 3. The next
+    decision's bitmask has lost bit 3 to the cooldown and kept bit 1, because a throw spends no
+    ammo and takes no attack cooldown; the second throw it asks for is refused, and nothing is
+    tapped."""
+    loop.policy.decision = Decision(move_bin=5, attack=ATTACK_GADGET,
+                                    legal=(True, True, False, True))
+    loop.match.gate = True
+    gx, gy = loop.controls.buttons.gadget
+    down, lift, quiet = _tap_steps_per_tick(loop, loop.decision_every)
+    assert down == [("down", SLOT_TAP, gx, gy)]
+    assert lift == [("up", SLOT_TAP)]
+    assert quiet == []
+    first = _decisions(loop)[0]
+    assert first.attack == ATTACK_GADGET and first.attack_legal == 0b1011
+
+    loop.shadow.advance(0.25)    # the shadow spends REAL time; the fixture ticks back to back
+    before = len(loop.backend.log)
+    loop.tick()
+    second = _decisions(loop)[1]
+    assert second.attack_legal == 0b0011
+    assert second.attack == ATTACK_NONE
+    assert [e for e in loop.backend.log[before:] if e[1] == SLOT_TAP] == []
 
 
 def test_a_policy_exception_fails_closed_before_it_propagates(loop):
@@ -949,6 +982,192 @@ def test_a_decision_reaches_the_policy_through_the_real_assembler(loop, spec_pat
     for name, sub in space.spaces.items():
         assert obs[name].shape == sub.shape, name
         assert obs[name].dtype == sub.dtype, name
+
+
+# -- hero_offset and hero.near_edge (OBS_PARITY_TASKS.md C7) ----------------------------------
+
+def _near_edge_spec() -> str:
+    """deploy4 with `hero.near_edge` after `hero.in_zone`, the shape C10's deploy5 takes."""
+    import tempfile
+    import yaml
+    doc = yaml.safe_load(open("configs/agent_obs_deploy4.yaml").read())
+    for g in doc["groups"]:
+        if "hero.in_zone" in g.get("fields", ()):
+            g["fields"].insert(g["fields"].index("hero.in_zone") + 1, "hero.near_edge")
+    path = tempfile.mktemp(suffix=".yaml")
+    with open(path, "w") as f:
+        yaml.dump(doc, f)
+    return path
+
+
+_OLD_RECORD = {"index": "7", "t": "0.35", "grab_ms": "1.5", "phase": "playing", "tick_ms": "40.0",
+               "odometry": "ok", "warmup": "False", "decision": "True", "move_bin": "3",
+               "attack": "1", "n_detections": "2", "ammo_cv": "2.0", "ammo_shadow": "2.0",
+               "lattice": "locked", "phase_x": "0.1", "phase_y": "-0.2", "note": ""}
+
+
+def test_the_trackers_hero_offset_reaches_the_assembler_and_the_telemetry(loop):
+    """`hero_offset` is the player box's tiles from its nominal screen anchor: the fixture's box
+    at HERO_PX against the viewport centre, minus the measured (0.09, 0.80), both through the
+    identity plan at 48 px per tile, so the plan's `origin_tile` cancels."""
+    _play(loop, 1)
+    want = ((HERO_PX[0] - VIEWPORT[0] / 2) / 48 - 0.09, (HERO_PX[1] - VIEWPORT[1] / 2) / 48 - 0.80)
+    assert loop.policy.assembler.calls[-1]["hero_offset"] == pytest.approx(want, abs=1e-6)
+    row = _decisions(loop)[-1]
+    assert (row.hero_offset_x, row.hero_offset_y) == pytest.approx(want, abs=1e-6)
+    assert row.near_edge == int(max(abs(want[0]), abs(want[1])) > CFG.camera_edge_flag_tiles)
+    old = TickRow.from_record(_OLD_RECORD)
+    assert (old.hero_offset_x, old.hero_offset_y, old.near_edge) == (0.0, 0.0, -1), "older CSVs"
+
+
+def test_a_spec_that_names_near_edge_decides_through_the_real_assembler(loop):
+    policy = _Policy(spec_path=_near_edge_spec(), real_assembler=True)
+    lp = DeployLoop(capture=_Capture(), guard=_Guard(), match=_Match(), vision=loop.vision,
+                    policy=policy, controls=loop.controls, cfg=DeploymentConfig())
+    _play(lp, 1)
+    assert policy.calls == 1, _last_attempt(lp).note
+
+
+# -- the history -------------------------------------------------------------------------------
+
+def _deploy4_loop(loop, decision=None, real_assembler=True):
+    """The fixture's loop with a deploy4 policy, the first spec that reads the history. The real
+    assembler by default, so the `hist` group is the one the checkpoint would read; the recorder
+    when a test wants the snapshots and the grid exactly as the loop handed them over."""
+    lp = DeployLoop(capture=_Capture(), guard=_Guard(), match=_Match(), vision=loop.vision,
+                    policy=_Policy(decision=decision, spec_path="configs/agent_obs_deploy4.yaml",
+                                   real_assembler=real_assembler),
+                    controls=loop.controls, cfg=DeploymentConfig())
+    lp.backend = loop.backend
+    return lp
+
+
+def _valid(lp) -> list:
+    """`hist.valid` of every observation the policy was handed, in order."""
+    return [obs["history"][:3].tolist() for obs in lp.policy.obs]
+
+
+def test_the_first_decisions_after_the_gate_fill_the_history_one_slot_at_a_time(loop):
+    """SIM_OVERHAUL_STEPS.md H4.1's verify, through the real assembler: [0,0,0], [1,0,0],
+    [1,1,0], and then the ring is full. A different HP read each decision shows the order:
+    newest first, as the sim's ring keeps it."""
+    lp = _deploy4_loop(loop)
+    for i, hp in enumerate((8000, 7000, 6000, 5000)):
+        lp.vision.health.readings = [_Reading("player", hp)]
+        _play(lp, lp.decision_every if i else 1)
+    assert _valid(lp) == [[0.0, 0.0, 0.0], [1.0, 0.0, 0.0], [1.0, 1.0, 0.0], [1.0, 1.0, 1.0]]
+    np.testing.assert_allclose(lp.policy.obs[3]["history"][66:69], [0.3, 0.35, 0.4])
+
+
+def test_a_snapshot_holds_the_modelled_attack_and_what_its_observation_was_built_from(loop):
+    """The policy asks for a super the shadow's mask refuses at the gate, so nothing is pressed,
+    and the next observation's history says nothing was: `hist.attack_onehot` is what the device
+    did. The rest is what the first observation was handed: move bin 3, the 8000 read, the full
+    clip a match starts with, and the hero's world position."""
+    lp = _deploy4_loop(loop, Decision(move_bin=3, attack=ATTACK_SUPER,
+                                      legal=(True, True, False, True)))
+    _play(lp, lp.decision_every + 1)
+    assert lp.policy.calls == 2, _last_attempt(lp).note
+    first = lp._history[1]
+    assert (first.move_bin, first.attack, first.hp, first.ammo_frac, first.pos) == (
+        3, ATTACK_NONE, 8000.0, 1.0, (0.0, 0.0))
+    hist = lp.policy.obs[1]["history"]
+    assert hist[3 + 3] == 1.0                    # slot 0's move one-hot, bin 3
+    assert hist[54] == 1.0 and hist[56] == 0.0   # slot 0's attack one-hot: no-fire, not super
+    assert hist[66] == pytest.approx(0.4)        # 8000 / 20000
+
+
+def test_the_history_holds_the_ammo_an_observation_saw_not_what_its_shot_left(loop):
+    """The sim pushes `hist_ammo` at the top of `env.step`, before the action lands, so slot 0
+    is the clip the previous observation was built from. Here that observation's answer is a
+    shot, the shadow spends it before the next decision, and the history still says full."""
+    lp = _deploy4_loop(loop, Decision(move_bin=3, attack=ATTACK_FIRE,
+                                      legal=(True, True, False, True)))
+    _play(lp, 1)
+    lp.shadow.advance(0.05)    # one sub-tick; the fixture ticks back to back, in no real time
+    assert lp.shadow.observe()["ammo_frac"] < 1.0, "the shot was not modelled"
+    _play(lp, lp.decision_every)
+    assert lp.policy.calls == 2, _last_attempt(lp).note
+    assert lp._history[1].attack == ATTACK_FIRE
+    assert lp.policy.obs[1]["history"][69] == 1.0      # slot 0's ammo_frac
+    assert lp._history[0].ammo_frac == pytest.approx(2 / 3)
+
+
+def test_a_snapshot_holds_the_heros_world_position_x_then_y(loop):
+    """World (3, 1), where the two axes differ, so a transposed snapshot shows. The hero never
+    moves, so the next decision's displacement for slot 0 must read zero."""
+    lp = _deploy4_loop(loop)
+    lp.vision.odometry.position = (3.0, 1.0)
+    _play(lp, lp.decision_every + 1)
+    assert lp.policy.calls == 2, _last_attempt(lp).note
+    assert lp._history[1].pos == (3.0, 1.0)
+    assert lp.policy.obs[1]["history"][72:74].tolist() == [0.0, 0.0]   # slot 0's displacement
+
+
+def test_a_new_match_starts_with_no_history(loop):
+    lp = _deploy4_loop(loop)
+    _play(lp, 2 * lp.decision_every + 1)
+    assert _valid(lp)[-1] == [1.0, 1.0, 0.0]
+    lp.match.gate = False
+    lp.tick()
+    _play(lp, 1)
+    assert lp.policy.calls == 4, _last_attempt(lp).note
+    assert _valid(lp)[-1] == [0.0, 0.0, 0.0]
+
+
+def test_a_new_segment_drops_the_history(loop):
+    """A snapshot's positions are world-frame, and a new segment has no defined offset to the old
+    one, so the ring empties the way every tracker does. The first decision in the new segment is
+    the tracker's reset tick and is skipped; the one after reads an empty history."""
+    lp = _deploy4_loop(loop)
+    _play(lp, 2 * lp.decision_every + 1)
+    assert _valid(lp)[-1] == [1.0, 1.0, 0.0]
+    lp.vision.odometry.segment += 1
+    _play(lp, 2 * lp.decision_every)
+    assert [r.note for r in lp.telemetry if r.note] == ["no hero box"]
+    assert lp.policy.calls == 4
+    assert _valid(lp)[-1] == [0.0, 0.0, 0.0]
+
+
+def test_a_skipped_decision_takes_no_snapshot(loop):
+    """No hero HP read, no decision, and no snapshot. The next decision's first slot is the last
+    decision that reached the policy, two windows back, and `valid` stays a prefix: the sim never
+    produces an invalid slot in front of a valid one."""
+    lp = _deploy4_loop(loop)
+    _play(lp, 1)
+    lp.vision.health.readings = []
+    _play(lp, lp.decision_every)
+    assert _last_attempt(lp).note == "no hero hp"
+    lp.vision.health.readings = [_Reading("player", 7000)]
+    _play(lp, lp.decision_every)
+    assert lp.policy.calls == 2, _last_attempt(lp).note
+    assert _valid(lp) == [[0.0, 0.0, 0.0], [1.0, 0.0, 0.0]]
+    assert lp.policy.obs[1]["history"][66] == pytest.approx(0.4)   # 8000, the decision before
+
+
+def test_a_snapshot_keeps_only_the_enemies_seen_that_decision(loop):
+    """The sim's `hist_enemy_seen` is alive AND revealed, the set its `enemy_revealed` plane draws;
+    on this side that set is `seen_now`. A coasted track is the tracker's prediction, not a
+    sighting, so the snapshot of a decision it coasted through leaves it out while the track
+    itself lives on. The planes follow the snapshots, oldest last."""
+    lp = _deploy4_loop(loop, real_assembler=False)
+    enemy = _Detection("enemy", (HERO_PX[0] + 2 * 48, HERO_PX[1]))     # world (2, 0)
+    lp.vision.entities.detections.append(enemy)
+    _play(lp, lp.decision_every + 1)      # two decisions: pending, then promoted and seen
+    lp.vision.entities.detections.remove(enemy)
+    _play(lp, 2 * lp.decision_every)      # one decision coasting, then one that reads them all
+    calls = lp.policy.assembler.calls
+    assert len(calls) == 4
+    # The track lives on, coasting. Read off the LAST call only: the recorder keeps the tracker's
+    # own Track objects, and every later update rewrites their `seen_now` in place.
+    assert [t.seen_now for t in calls[3]["enemies"] if t is not None] == [False]
+    assert [s.enemies for s in calls[3]["history"]] == [(), ((2.0, 0.0),), ()]
+
+    grid, channels = calls[3]["grid"], lp.grid.spec.channels
+    assert grid[channels.index("enemy_hist1")].sum() == 0
+    # The hero is world (0, 0) at crop (row 6, col 10); the enemy two columns right.
+    assert np.argwhere(grid[channels.index("enemy_hist2")]).tolist() == [[6, 12]]
+    assert grid[channels.index("enemy_hist3")].sum() == 0
 
 
 # -- crates and cubes --------------------------------------------------------------------------
@@ -1175,7 +1394,8 @@ def _loop_fixture_value():
     backend = _Backend()
     controls = Controls(backend=backend,
                         joystick=Joystick(backend, (345.6, 669.6), 110.0, n_bins=16),
-                        buttons=Buttons(backend, attack=(1690.0, 594.0), super_=(1462.5, 1000.5)))
+                        buttons=Buttons(backend, attack=(1690.0, 594.0), super_=(1462.5, 1000.5),
+                                        gadget=(1559.9, 901.1)))
     vision = VisionStack(plan=_Plan(), odometry=_Odometry(), occupancy=_Occupancy(),
                          classifier=_Classifier(), entities=_Detector(),
                          projectiles=_Detector(names=PROJECTILE_NAMES), health=_Health(),
@@ -1309,7 +1529,7 @@ def test_the_columns_are_the_shadows_state_the_policy_was_handed(loop):
     and the attack column is illegal: the bitmask and the timer on that row must agree with each
     other and with what `policy.act` received. The shadow spends REAL elapsed time and the fixture
     ticks back to back, so the decision period is advanced by hand."""
-    loop.policy.decision = Decision(move_bin=3, attack=ATTACK_FIRE, legal=(True, True, False))
+    loop.policy.decision = Decision(move_bin=3, attack=ATTACK_FIRE, legal=(True, True, False, True))
     _play(loop, 1)
     first = _decisions(loop)[0]
     assert first.attack == ATTACK_FIRE and first.attack_legal & 0b10
@@ -1317,7 +1537,8 @@ def test_the_columns_are_the_shadows_state_the_policy_was_handed(loop):
     for _ in range(loop.decision_every):
         loop.tick()
     second = _decisions(loop)[1]
-    assert second.attack_legal == 0b001, "0.35 s cooldown, 0.25 s later: only no-fire is legal"
+    assert second.attack_legal == 0b1001, ("0.35 s cooldown, 0.25 s later: only no-fire, and the "
+                                           "gadget, which neither the cooldown nor the dash gates")
     assert second.attack_cd_shadow == pytest.approx(0.15, abs=1e-6)
     assert second.attack == ATTACK_NONE, "the shadow refused the pick, and the row says what was sent"
     # The dash zeroed the long-dash timer on sub-tick 1; the four sub-ticks after it count up.
@@ -1372,7 +1593,7 @@ def test_write_csv_and_read_telemetry_csv_round_trip_the_cadence_columns(loop, t
     assert [r.index for r in back] == [r.index for r in loop.telemetry]
     decisions = [r for r in back if r.decision]
     assert len(decisions) == 2
-    assert decisions[1].attack_legal == 0b011 and decisions[1].enemy_in_reach is True
+    assert decisions[1].attack_legal == 0b1011 and decisions[1].enemy_in_reach is True
     assert decisions[1].attack_cd_shadow == 0.0
     held = [r for r in back if not r.decision]
     assert all(r.attack_legal == -1 and r.enemy_in_reach is False for r in held)
@@ -1406,7 +1627,7 @@ def test_a_decision_taken_while_the_hero_track_coasts_carries_the_shadows_ammo(l
     for _ in range(loop.decision_every):
         loop.tick()
     first, second = _decisions(loop)
-    assert second.attack_legal == 0b011 and second.note == ""
+    assert second.attack_legal == 0b1011 and second.note == ""
     assert second.ammo_shadow == 3.0
     assert second.ammo_cv == -1.0
 
@@ -1423,3 +1644,53 @@ def test_the_reach_and_the_shadow_share_one_brawler_kind(loop):
     assert dash_reach_tiles(loop.shadow.p, kind=HERO_KIND) == pytest.approx(3.77)
     with pytest.raises(KeyError, match="hero_nobody"):
         dash_reach_tiles(loop.shadow.p, kind="hero_nobody")
+
+
+# -- the dead-bin move mask (design 6.16) ------------------------------------------------------
+
+def test_a_wall_beside_the_hero_masks_the_bin_into_it(loop):
+    """`move_mask.py` through the loop, on the `blocks_unit` plane the policy is handed and in
+    that plane's units. The hero stands at world (0.5, 0.5), mid-cell. The first decision sees an
+    unobserved map -- UNKNOWN reads as floor, so every bin is legal and the row says 0x1FFFF --
+    then a WALL is written into the cell west of him and the next decision has bin 9 (west) dead
+    with idle, east and north still legal. The row's bitmask is the tuple the policy got."""
+    from brawl_sim.constants import Tile
+    from brawl_vision.terrain.labeling import CLASS_INDEX
+
+    lp = _deploy4_loop(loop, real_assembler=False)
+    lp.vision.entities.detections = [_Detection("player", (HERO_PX[0] + 24, HERO_PX[1] + 24))]
+    _play(lp, 1)
+    assert lp.policy.calls == 1, _last_attempt(lp).note
+    assert lp.policy.move_legal[0] == (True,) * 17
+    assert _decisions(lp)[-1].move_legal == 0x1FFFF
+
+    occ = lp.vision.occupancy
+    ox, oy = occ.origin
+    occ._best[0 - oy, -1 - ox] = CLASS_INDEX[Tile.WALL]          # world tile (-1, 0)
+    _play(lp, lp.decision_every)
+    assert lp.policy.calls == 2, _last_attempt(lp).note
+    legal = lp.policy.move_legal[1]
+    assert not legal[9]
+    assert legal[0] and legal[1] and legal[13]
+    assert legal.count(False) == 1
+    assert _decisions(lp)[-1].move_legal == sum(int(v) << i for i, v in enumerate(legal))
+    assert _decisions(lp)[-1].move_legal == 0x1FFFF & ~(1 << 9)
+
+
+def test_the_dead_bin_mask_is_off_by_config_and_the_row_says_so(loop):
+    """`policy.dead_bin_mask: false` is the A/B switch: the policy gets None -- `act` then hands
+    the network the training-time all-True move half -- and the row records -1, not 0x1FFFF,
+    because "every bin was legal" and "nothing was checked" are different facts. A CSV written
+    before the column existed loads to the same -1."""
+    from brawl_deployment.loop import TickRow
+
+    lp = DeployLoop(capture=_Capture(), guard=_Guard(), match=_Match(), vision=loop.vision,
+                    policy=_Policy(spec_path="configs/agent_obs_deploy4.yaml"),
+                    controls=loop.controls, cfg=DeploymentConfig(policy_dead_bin_mask=False))
+    lp.backend = loop.backend
+    assert lp.move_mask is None
+    _play(lp, 1)
+    assert lp.policy.calls == 1, _last_attempt(lp).note
+    assert lp.policy.move_legal == [None]
+    assert _decisions(lp)[-1].move_legal == -1
+    assert TickRow.from_record({"index": 0, "t": 0.0, "grab_ms": 0.0}).move_legal == -1

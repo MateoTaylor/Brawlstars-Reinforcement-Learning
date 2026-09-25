@@ -7,7 +7,7 @@ Kept as one declarative table (`_ROWS`, one row per leaf field) rather than ~130
 dict literals -- the same "declarative table + a small builder" shape config.py's
 PER_KIND_FIELDS/PER_ENV_FIELDS and state.py's _ENTITY_FIELDS already use for a long,
 mechanically similar list that has to stay in sync with real code. `_ROWS`' order matches
-`core/observation.py`'s own dict-construction order exactly (hero, entities [+ privileged],
+`core/observation.py`'s own dict-construction order exactly (hero, hist, entities [+ privileged],
 projectiles, boxes, pickups, zone, visibility, view, world, action_mask, meta) -- describe_obs
 and dump_obs_schema.py both render top-to-bottom in this order for free, no separate sort key.
 
@@ -40,6 +40,11 @@ _DIM_RESOLVERS = {
     "VH": lambda cfg: cfg.view_h,
     "VW": lambda cfg: cfg.view_w,
     "MOVE": lambda cfg: cfg.n_move_bins + 1,
+    "K": lambda cfg: cfg.history_frames,
+    "S": lambda cfg: cfg.n_enemies,          # tracker-style enemy slots: one per non-hero entity
+    # The grid's channels: observation._N_BASE_CHANNELS (terrain and occupancy), then one
+    # enemy_hist plane per history slot. obs_select._CHANNEL_INDEX restates the same 12.
+    "C": lambda cfg: 12 + cfg.history_frames,
 }
 
 _PI = 3.141592653589793
@@ -82,16 +87,27 @@ _ROWS: tuple[tuple, ...] = (
     ("hero.super_charge_frac", ("N",), "float32", "fraction", (0.0, 1.0), "super_charge / super_charge_hits; 1.0 = ready.", False, None),
     ("hero.long_dash_ready", ("N",), "bool", "bool", None, "Next dash reaches long_dash_multiplier x its normal distance.", False, None),
     ("hero.long_dash_frac", ("N",), "float32", "fraction", (0.0, 1.0), "Progress toward the long dash; 1.0 = ready.", False, None),
+    ("hero.gadget_ready", ("N",), "bool", "bool", None, "Gadget is charged and legal to throw this tick; equals action_mask.attack[:, 3].", False, None),
+    ("hero.gadget_charge_frac", ("N",), "float32", "fraction", (0.0, 1.0), "1 - gadget_cd / gadget_cooldown; 1.0 = charged, 0.0 for a kind without a gadget.", False, None),
     ("hero.attack_idle_t", ("N",), "float32", "seconds", (0.0, None), "Seconds since the hero last attacked (resets on attack only, not on damage).", False, None),
     ("hero.invuln", ("N",), "bool", "bool", None, "invuln_t > 0 (dash i-frames).", False, None),
     ("hero.in_bush", ("N",), "bool", "bool", None, "Standing on a BUSH tile.", False, None),
     ("hero.in_zone", ("N",), "bool", "bool", None, "Outside the safe rect (in the damaging area).", False, None),
+    ("hero.near_edge", ("N",), "bool", "bool", None, "The camera has stopped following the hero: |hero - cam| > camera.edge_flag_tiles on either axis (core/camera.py). Live: the player box's offset from its nominal screen anchor.", False, None),
     ("hero.tile", ("N", 2), "int64", "tiles", None, "floor(pos) tile index (col, row).", False, None),
     ("hero.damage_dealt", ("N",), "float32", "hp", (0.0, None), "Cumulative damage dealt this episode.", False, None),
     ("hero.damage_taken", ("N",), "float32", "hp", (0.0, None), "Cumulative damage taken this episode.", False, None),
     ("hero.kills", ("N",), "int32", "count", (0, None), "Kills this episode.", False, None),
     ("hero.shots_fired", ("N",), "int32", "count", (0, None), "Shots/dashes fired this episode.", False, None),
     ("hero.rank", ("N",), "int64", "index", (1, None), "1 = best placement so far; see obs_schema module docstring.", False, None),
+
+    # ---- hist: the last K = history_frames decisions, newest first (Phase H) ------------
+    ("hist.valid", ("N", "K"), "bool", "bool", None, "Slot k holds the decision k+1 back; every other hist field is 0 where this is False.", False, None),
+    ("hist.move_onehot", ("N", "K", "MOVE"), "uint8", "onehot", (0, 1), "One-hot of the move bin chosen then (0 = idle).", False, None),
+    ("hist.attack_onehot", ("N", "K", 4), "uint8", "onehot", (0, 1), "One-hot of the attack chosen then: [no-fire, attack, super, gadget].", False, None),
+    ("hist.hp", ("N", "K"), "float32", "hp", (0.0, None), "Hero HP then.", False, None),
+    ("hist.ammo_frac", ("N", "K"), "float32", "fraction", (0.0, 1.0), "Hero ammo / max_ammo then.", False, None),
+    ("hist.displacement", ("N", "K", 2), "float32", "tiles", None, "Hero position then minus hero position now.", False, None),
 
     # ---- entities: all E, index-stable, never sorted/masked ------------------------
     ("entities.alive", ("N", "E"), "bool", "bool", None, "Whether this entity is alive.", False, None),
@@ -123,12 +139,12 @@ _ROWS: tuple[tuple, ...] = (
     ("entities.bearing", ("N", "E"), "float32", "radians", (-_PI, _PI), "Angle to this entity relative to hero.facing.", False, None),
     ("entities.rel_vel", ("N", "E", 2), "float32", "tiles/s", None, "vel - hero.vel.", False, None),
     ("entities.closing_speed", ("N", "E"), "float32", "tiles/s", None, "Positive = closing in on the hero.", False, None),
-    ("entities.in_view", ("N", "E"), "bool", "bool", None, "Inside the egocentric view crop window.", False, None),
+    ("entities.in_view", ("N", "E"), "bool", "bool", None, "On screen: inside the camera's ground window around the clamped camera (core/camera.py).", False, None),
     ("entities.dist_rank", ("N", "E"), "int64", "index", (0, None), "0 = nearest to hero; a permutation of 0..E-1.", False, None),
-    ("entities.revealed_to_hero", ("N", "E"), "bool", "bool", None, "The hero currently sees this entity.", False, None),
+    ("entities.revealed_to_hero", ("N", "E"), "bool", "bool", None, "On screen and not concealed by a bush (core/camera.hero_view).", False, None),
     ("entities.hero_revealed_to", ("N", "E"), "bool", "bool", None, "This entity currently sees the hero.", False, None),
     ("entities.los_from_hero", ("N", "E"), "bool", "bool", None, "Clear physical (wall-only) line of sight from the hero.", False, None),
-    ("entities.hidden_by_bush", ("N", "E"), "bool", "bool", None, "In a bush and not revealed to the hero.", False, None),
+    ("entities.hidden_by_bush", ("N", "E"), "bool", "bool", None, "In a bush and not revealed; off screen counts as not revealed.", False, None),
     ("entities.death_step", ("N", "E"), "int32", "ticks", (-1, None), "step_count at death, or -1 if never died.", False, None),
     ("entities.death_cause", ("N", "E"), "int32", "enum", (0, 2), "brawl_sim.constants.DeathCause value.", False, None),
     ("entities.damage_dealt", ("N", "E"), "float32", "hp", (0.0, None), "Cumulative damage dealt this episode.", False, None),
@@ -167,7 +183,7 @@ _ROWS: tuple[tuple, ...] = (
     ("projectiles.time_to_closest", ("N", "P"), "float32", "seconds", (0.0, None), "Time to closest future approach to the hero.", False, None),
     ("projectiles.closest_dist", ("N", "P"), "float32", "tiles", (0.0, None), "Distance at that closest approach.", False, None),
     ("projectiles.threatens_hero", ("N", "P"), "bool", "bool", None, "Alive, not hero-owned, and on a path that hits the hero.", False, None),
-    ("projectiles.in_view", ("N", "P"), "bool", "bool", None, "Inside the egocentric view crop window.", False, None),
+    ("projectiles.in_view", ("N", "P"), "bool", "bool", None, "On screen: inside the camera's ground window around the clamped camera (core/camera.py).", False, None),
 
     # ---- boxes: all B slots ----------------------------------------------------------
     ("boxes.alive", ("N", "B"), "bool", "bool", None, "Whether this box is still standing.", False, None),
@@ -178,7 +194,7 @@ _ROWS: tuple[tuple, ...] = (
     ("boxes.hp_frac", ("N", "B"), "float32", "fraction", (0.0, 1.0), "hp / max_hp.", False, None),
     ("boxes.rel_pos", ("N", "B", 2), "float32", "tiles", None, "pos - hero.pos.", False, None),
     ("boxes.dist", ("N", "B"), "float32", "tiles", (0.0, None), "Distance to the hero.", False, None),
-    ("boxes.in_view", ("N", "B"), "bool", "bool", None, "Inside the egocentric view crop window.", False, None),
+    ("boxes.in_view", ("N", "B"), "bool", "bool", None, "On screen: inside the camera's ground window around the clamped camera (core/camera.py).", False, None),
 
     # ---- pickups: all U slots ---------------------------------------------------------
     ("pickups.alive", ("N", "U"), "bool", "bool", None, "Whether this pickup is still on the ground.", False, None),
@@ -188,14 +204,14 @@ _ROWS: tuple[tuple, ...] = (
     ("pickups.age", ("N", "U"), "float32", "seconds", (0.0, None), "Time since this pickup was dropped.", False, None),
     ("pickups.rel_pos", ("N", "U", 2), "float32", "tiles", None, "pos - hero.pos.", False, None),
     ("pickups.dist", ("N", "U"), "float32", "tiles", (0.0, None), "Distance to the hero.", False, None),
-    ("pickups.in_view", ("N", "U"), "bool", "bool", None, "Inside the egocentric view crop window.", False, None),
+    ("pickups.in_view", ("N", "U"), "bool", "bool", None, "On screen: inside the camera's ground window around the clamped camera (core/camera.py).", False, None),
 
     # ---- zone --------------------------------------------------------------------------
     ("zone.lo", ("N", 2), "float32", "tiles", None, "Safe rect lower corner.", False, None),
     ("zone.hi", ("N", 2), "float32", "tiles", None, "Safe rect upper corner.", False, None),
     ("zone.lo_norm", ("N", 2), "float32", "fraction", (0.0, 1.0), "lo / (map_w, map_h).", False, None),
     ("zone.hi_norm", ("N", 2), "float32", "fraction", (0.0, 1.0), "hi / (map_w, map_h).", False, None),
-    ("zone.active", ("N",), "bool", "bool", None, "cfg.zone_enabled, broadcast per env.", False, None),
+    ("zone.active", ("N",), "bool", "bool", None, "Latched: gas has been on screen at least once this episode (core/zone.mark_seen); always 0 with the zone disabled.", False, None),
     ("zone.step", ("N",), "int32", "count", (0, None), "Number of shrinks so far.", False, None),
     ("zone.dps", ("N",), "float32", "hp/s", (0.0, None), "Damage-per-second the HERO takes outside the rect (the zone's rate is a fraction of max HP, so it differs per entity).", False, None),
     ("zone.next_shrink_in", ("N",), "float32", "seconds", (0.0, None), "Seconds until the next shrink (0 if disabled/overdue).", False, None),
@@ -203,14 +219,18 @@ _ROWS: tuple[tuple, ...] = (
     ("zone.hero_margin_local", ("N", 4), "float32", "tiles", None, "hero_margin clamped to +/- cfg.zone_margin_horizon_tiles -- the same four distances as a bounded sensor sees them, which is what brawl_deployment can supply from observed gas. Deploy specs take this; full-information specs take hero_margin.", False, None),
     ("zone.safe_area_frac", ("N",), "float32", "fraction", (0.0, 1.0), "Safe rect area / map area.", False, None),
 
+    # ---- tracker-style slots (core/slots.py) ------------------------------------------------
+    ("slots.entity", ("N", "S"), "int64", "index", (0, None), "Entity index + 1 held by tracked slot k; 0 = empty (core/slots.py). Bookkeeping for obs_select's `slots: tracked`, refused in a spec's fields.", False, None),
+    ("slots.valid", ("N", "S"), "bool", "bool", None, "Tracked slot k holds an entity.", False, None),
+
     # ---- visibility ----------------------------------------------------------------------
     ("visibility.vis", ("N", "E", "E"), "bool", "bool", None, "vis[i,j]: i sees j (bush-aware targeting visibility).", False, None),
     ("visibility.los", ("N", "E", "E"), "bool", "bool", None, "los[i,j]: clear physical (wall-only) line of sight i -> j.", False, None),
     ("visibility.dist_matrix", ("N", "E", "E"), "float32", "tiles", (0.0, None), "Pairwise entity distances.", False, None),
 
     # ---- grids -----------------------------------------------------------------------------
-    ("view", ("N", 12, "VH", "VW"), "uint8", "count", (0, 255), "Egocentric 12-channel occupancy/terrain grid, hero-centered.", False, None),
-    ("world", ("N", 12, "H", "W"), "uint8", "count", (0, 255), "Full-map 12-channel occupancy/terrain grid.", False, "obs_include_world_grid"),
+    ("view", ("N", "C", "VH", "VW"), "uint8", "count", (0, 255), "Egocentric occupancy/terrain grid, hero-centered: 12 base channels, then enemy_hist1..K (enemies seen k decisions back, within history_radius_tiles of the hero now).", False, None),
+    ("world", ("N", "C", "H", "W"), "uint8", "count", (0, 255), "Full-map occupancy/terrain grid, the same C channels as view.", False, "obs_include_world_grid"),
 
     # ---- action_mask -----------------------------------------------------------------------
     ("action_mask.move", ("N", "MOVE"), "bool", "bool", None, "Legal move bins (idle + n_move_bins directions); always all-True today.", False, None),
@@ -314,7 +334,7 @@ def _fmt_vec(v: torch.Tensor) -> str:
 
 _HERO_DESCRIBE_FIELDS = (
     "pos", "hp_frac", "ammo", "cubes", "alive", "in_bush", "in_zone",
-    "dashing", "can_attack", "invuln", "rank",
+    "dashing", "can_attack", "gadget_ready", "invuln", "rank",
 )
 _MAX_ROWS_PER_GROUP = 8
 

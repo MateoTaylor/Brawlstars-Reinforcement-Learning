@@ -53,7 +53,8 @@ if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
 from brawl_sim.training import schedules
-from brawl_sim.training.builder import build_run, make_logger, tensorboard_available
+from brawl_sim.training.builder import (build_run, make_logger, no_image_transpose,
+                                        tensorboard_available)
 from brawl_sim.training.callbacks import (
     CurriculumCallback, TierEvalCallback, TrainingMonitorCallback, VecNormalizeCheckpoint,
 )
@@ -280,7 +281,9 @@ def _resume(model, venv, tcfg, model_path: Path, curriculum, run_dir: Path, stag
     finetune at stage 0 against a policy that had already reached the final stage is the kind of
     mistake that costs a day of GPU time before anyone notices the win rate looks too good."""
     algo_cls = type(model)
-    loaded = algo_cls.load(str(model_path), env=venv, device=tcfg.run.device)
+    # Both hand-offs to SB3 go through no_image_transpose, as build_model's does: either one
+    # alone would let SB3 transpose the grid of a view shorter than its channel count.
+    loaded = algo_cls.load(str(model_path), env=no_image_transpose(venv), device=tcfg.run.device)
     print(f"[resume] loaded {model_path} at {loaded.num_timesteps:,} timesteps")
 
     stats = sorted(model_path.parent.glob("*vecnormalize*.pkl"))
@@ -288,7 +291,7 @@ def _resume(model, venv, tcfg, model_path: Path, curriculum, run_dir: Path, stag
         from stable_baselines3.common.vec_env import VecNormalize
         restored = VecNormalize.load(str(stats[-1]), venv.venv)
         restored.training = True
-        loaded.set_env(restored)
+        loaded.set_env(no_image_transpose(restored))
         print(f"[resume] loaded VecNormalize stats from {stats[-1]}")
     elif tcfg.normalize.enabled:
         print(f"[resume] WARNING: normalize is on but no *vecnormalize*.pkl was found next to "

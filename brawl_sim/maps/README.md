@@ -133,8 +133,10 @@ mismatched (see below); the plan accepts that.
 
 ## What actually trains
 
-`configs/default.yaml`'s `world.maps` is the training rotation, and it is NOT every file in
-`csv/`. Two maps are excluded on purpose:
+Two lists, and they are not the same (SIM_OVERHAUL Steps M3 and M4, 2026-09-21).
+
+`configs/default.yaml`'s `world.maps` is the SIXTEEN the simulator loads by default, and it is
+NOT every file in `csv/`. Two maps are excluded on purpose:
 
 - `blank` is 20x20 and only loadable under the `debug_tiny` preset.
 - `walled` is the only 60x60 map with no bush at all, so nothing on it exercises concealment --
@@ -143,10 +145,23 @@ mismatched (see below); the plan accepts that.
   bush-free map surviving the loader) and stays pinnable via `scripts/watch.py --map walled`,
   but no training run selects it.
 
-Everything else in both tables (the six originals and the ten generated maps) is in the
-rotation, drawn uniformly per episode. Note that
-`cfg.map_names` is part of what a policy trains against, so changing this list makes existing
-checkpoints mismatched -- see the note in the repo-root `README.md`.
+Everything else in both tables (the six originals and the ten generated maps) is in that list.
+
+**A training run draws from FOURTEEN of them**, not sixteen. `configs/train.yaml`'s
+`run.env_overrides.world.maps` is the sixteen minus `split_river` and `hollow_ring`, drawn
+uniformly per episode. Those two are `eval.holdout_maps`: played only by the second eval
+rollout, never trained on, so `eval/holdout_win_rate` against `eval/win_rate` measures map
+overfitting instead of skill (Step M4). `best_model.zip` is chosen on the fourteen and never
+on the pair.
+
+**A new map needs BOTH entries.** In `default.yaml` alone it is loadable and watchable but
+never trained on, which looks exactly like training on it until the win rates disagree. Note
+that `cfg.map_names` is part of what a policy trains against, so changing either list makes
+existing checkpoints mismatched -- see the note in the repo-root `README.md`. The observation
+spec is the other half of that contract: `configs/train.yaml` still names
+`configs/agent_obs_deploy4.yaml`, `configs/agent_obs_deploy5.yaml` (OBS_PARITY_TASKS.md C10,
+2026-09-24) is the one built for the next run, and a spec change mismatches a checkpoint exactly as
+a map-list change does.
 
 ## Designing a map for THIS simulator
 

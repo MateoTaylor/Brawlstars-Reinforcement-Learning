@@ -45,6 +45,12 @@ of `g` spans several 20 Hz ticks; without that fall-through every tick after the
 a masked (no-op) 3 and eat the dash the player is also holding. The title shows the gadget's
 state (`READY` or the seconds left on its 18 s cooldown).
 
+**The super has no key, on purpose.** On 2026-09-21 the operator decided manual play does not need
+super or gadget controls, so attack-column value 2 has no binding and none should be added unless
+the operator asks for one. `g` above predates that decision (Step G3) and was left in place. This
+script is a feel-check for movement and the dash; super and gadget behaviour is verified by
+`tests/test_super.py` and `tests/test_gadget.py`, not here.
+
 **The window owns its keyboard.** `connect_input` disconnects matplotlib's default key handler
 from the figure before wiring this module's own: `g` is matplotlib's grid toggle, `s` its save
 dialog, `l`/`k` its log-scale switches -- see that method for what each one did to a live game.
@@ -86,7 +92,8 @@ _MOVE_KEYS = {
 }
 _FIRE_KEYS = {" ", "space"}
 _GADGET_KEYS = {"g"}
-# `action[:, 1]` values, as `core/hero.decode_action` reads them (2 = super has no key here).
+# `action[:, 1]` values, as `core/hero.decode_action` reads them. 2 (the super) has no key by the
+# operator's decision; see "The super has no key, on purpose" in the module docstring.
 _ATTACK_NONE, _ATTACK_FIRE, _ATTACK_GADGET = 0, 1, 3
 _QUIT_KEYS = {"q", "escape"}
 

@@ -1275,6 +1275,81 @@ def test_eval_callback_fires_once_per_interval_not_once_per_overshoot(tmp_path):
     assert calls == [1000, 1100], f"expected two evals, got {calls}"
 
 
+# ---- gadget throws per episode (SIM_OVERHAUL_STEPS.md Step I2) --------------------------------
+
+class _GadgetOnceModel(_StubModel):
+    """Throws the gadget on the first decision it is asked for, then idles."""
+    def __init__(self):
+        super().__init__()
+        self.decisions = 0
+
+    def predict(self, obs, deterministic=True, action_masks=None):
+        action, state = super().predict(obs, deterministic, action_masks)
+        if self.decisions == 0:
+            action[:, 1] = 3
+        self.decisions += 1
+        return action, state
+
+
+@pytest.mark.parametrize("model_cls, per_episode", [(_StubModel, 0.0), (_GadgetOnceModel, 1.0)])
+def test_evaluator_counts_the_gadgets_a_real_rollout_throws(model_cls, per_episode):
+    """Every hero spawns with its gadget charged, so one press on the first decision is one throw
+    in every slot, and the idle policy throws none. This reads the REAL env's mask: a count keyed
+    to the super's column would find an uncharged super there and report 0.0 for both."""
+    ev = TierEvaluator(_eval_tcfg(episodes_per_tier=3))
+    results = ev.evaluate(model_cls())
+    ev.close()
+    assert {name: r["gadgets_used"] for name, r in results.items()} == {
+        "easy": per_episode, "hard": per_episode}
+
+
+class _ScriptedVenv:
+    """Four slots with scripted gadget legality and dones, for the count's two gates. The mask is
+    the wrapper's real layout, written out: 17 move columns, then [no-fire, attack, super, gadget],
+    so the gadget is column 20 of 21 (brawl_sim/wrappers/sb3_vecenv.action_masks)."""
+    def __init__(self, gadget_legal, dones):
+        self.gadget_legal, self.dones, self.t = gadget_legal, dones, 0
+
+    def _obs(self):
+        return {"x": np.zeros((4, 1), dtype=np.float32)}
+
+    def reset(self):
+        self.t = 0
+        return self._obs()
+
+    def action_masks(self):
+        masks = np.ones((4, 21), dtype=bool)
+        masks[:, 20] = self.gadget_legal[self.t]
+        return masks
+
+    def step(self, action):
+        done = np.array(self.dones[self.t], dtype=bool)
+        self.t += 1
+        infos = [{"outcome": {"won": False, "rank": 1}, "episode": {"l": self.t, "r": 0.0}}
+                 if d else {} for d in done]
+        return self._obs(), np.zeros(4, dtype=np.float32), done, infos
+
+
+class _AlwaysGadgetModel(_StubModel):
+    def predict(self, obs, deterministic=True, action_masks=None):
+        action, state = super().predict(obs, deterministic, action_masks)
+        action[:, 1] = 3
+        return action, state
+
+
+def test_evaluator_counts_a_gadget_only_where_legal_and_only_in_the_first_episode():
+    """The policy presses the gadget in every slot at every decision. Slot 0 finishes at decision
+    0 and slot 1 at decision 1, so their later presses belong to autoreset episodes and must not
+    count; slot 2's first press and slot 3's last are masked out, which the sim does not throw.
+    Per slot that is 1, 2, 2, 2, and easy holds slots 0-1, hard 2-3."""
+    ev = TierEvaluator(_eval_tcfg(episodes_per_tier=2))
+    ev.venv = _ScriptedVenv(gadget_legal=[[1, 1, 0, 1], [1, 1, 1, 1], [1, 1, 1, 0]],
+                            dones=[[1, 0, 0, 0], [0, 1, 0, 0], [1, 1, 1, 1]])
+    results = ev.evaluate(_AlwaysGadgetModel())
+    assert {name: r["gadgets_used"] for name, r in results.items()} == {"easy": 1.5, "hard": 2.0}
+    assert {name: r["episodes"] for name, r in results.items()} == {"easy": 2, "hard": 2}
+
+
 # ---------------------------------------------------------------------------
 # map-overfitting eval: training maps vs holdout maps (SIM_OVERHAUL M4)
 # ---------------------------------------------------------------------------
@@ -1582,7 +1657,8 @@ class _CannedEvaluator:
 
     def evaluate(self, model):
         return {tier: {"win_rate": w, "mean_rank": 1.0, "mean_ep_length": 10.0, "mean_reward": 0.0,
-                       "episodes": 4} for tier, w in self.calls.pop(0).items()}
+                       "gadgets_used": 2 * w, "episodes": 4}
+                for tier, w in self.calls.pop(0).items()}
 
 
 def test_eval_callback_means_and_gap_are_per_evaluator(tmp_path):
@@ -1620,6 +1696,10 @@ def test_eval_callback_means_and_gap_are_per_evaluator(tmp_path):
     assert line("hard", "eval/win_rate") == [(0, 0.25)]
     assert line("easy", "eval/holdout_win_rate") == [(0, 0.25)]
     assert line("hard", "eval/holdout_win_rate") == [(0, 0.0)]
+    # The canned gadget count is twice the win rate, so each tier's line is its own number too.
+    assert recorded["eval/gadgets_used_easy"] == 1.0
+    assert line("easy", "eval/gadgets_used") == [(0, 1.0)]
+    assert line("hard", "eval/gadgets_used") == [(0, 0.5)]
 
 
 def test_best_model_is_chosen_on_the_training_maps_never_the_holdout(tmp_path):
@@ -1875,6 +1955,51 @@ def test_train_script_builds_the_evaluators_before_the_run_directory(tmp_path, m
         train_script.main(["--smoke", "--out-dir", str(tmp_path / "runs")])
     assert not (tmp_path / "runs" / "smoke").exists()
     assert not list(tmp_path.rglob("train.yaml"))
+
+
+
+# ---- SB3's image heuristic must not transpose the grid ------------------------------------------
+
+def _tiny_run_tcfg():
+    return load_train_config(TRAIN_CONFIG, overrides={
+        "run": {"device": "cpu", "n_envs": 8, "tensorboard": False,
+                "env_overrides": yaml.safe_load(DEBUG_TINY.read_text())},
+        "ppo": {"n_steps": 16, "batch_size": 32},
+        "eval": {"holdout_maps": None},
+    })
+
+
+def test_the_model_sees_the_grid_channels_first_as_the_env_builds_it():
+    """SB3 takes a uint8 [0, 255] Box of rank 3 for an image, guesses its channel axis from the
+    smallest dimension, and wraps the env in a transposing VecTransposeImage when it guesses
+    channels-last. debug_tiny's view is 10 x 14, so the shipped spec's grid is (13, 10, 14):
+    until 2026-09-21 every model built on it, `train.py --smoke` included, trained on
+    (14, 13, 10), view columns for channels. The real 13 x 21 view escapes it only on a tie."""
+    from brawl_sim.training.builder import build_run
+
+    tcfg = _tiny_run_tcfg()
+    model, venv, _ = build_run(tcfg)
+    assert tcfg.run.agent_obs == "configs/agent_obs_deploy4.yaml"
+    assert venv.observation_space["grid"].shape == (13, 10, 14)
+    assert model.observation_space["grid"].shape == (13, 10, 14)
+    assert model.policy.features_extractor.cnn[0].in_channels == 13
+
+
+def test_a_resumed_model_keeps_the_grid_channels_first(tmp_path):
+    """`scripts/train.py --resume` hands SB3 the env twice, at load and again with the saved
+    VecNormalize statistics, and either hand-off alone would transpose this grid. The saved
+    model holds the untransposed space, so a transposed env would not even load."""
+    import scripts.train as train_script
+    from brawl_sim.training.builder import build_run
+
+    tcfg = _tiny_run_tcfg()
+    model, venv, _ = build_run(tcfg)
+    model.save(tmp_path / "model.zip")
+    venv.save(str(tmp_path / "vecnormalize.pkl"))
+    loaded = train_script._resume(model, venv, tcfg, tmp_path / "model.zip", None, tmp_path)
+    assert loaded.get_vec_normalize_env() is not None, "the statistics branch did not run"
+    assert loaded.observation_space["grid"].shape == (13, 10, 14)
+    assert loaded.get_env().observation_space["grid"].shape == (13, 10, 14)
 
 
 @pytest.mark.slow

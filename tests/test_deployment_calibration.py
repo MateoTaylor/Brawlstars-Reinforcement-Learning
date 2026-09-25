@@ -110,7 +110,8 @@ class _GameBackend(NullBackend):
 def _game_buttons(game) -> Buttons:
     """The REAL `Buttons` on a backend wired to the game, so the touches under test are the ones
     the loop sends."""
-    return Buttons(_GameBackend(game), attack=(1690.0, 594.0), super_=(1462.5, 1000.5))
+    return Buttons(_GameBackend(game), attack=(1690.0, 594.0), super_=(1462.5, 1000.5),
+                   gadget=(1559.9, 901.1))
 
 
 # --- temporal_median ------------------------------------------------------------------------
@@ -701,3 +702,424 @@ def test_an_emulator_that_stays_covered_times_out_rather_than_hanging():
     rig = _WaitRig([OCCLUDED] * 500)
     assert mod.Rig.wait_for_gate(rig, timeout=0.25) is False
     assert rig.grabs == 0                      # nothing was measured through the covering window
+
+
+
+# ---------------------------------------------------------- the gadget anchor probe (G6.1)
+
+def _probe_cal():
+    from brawl_deployment.match_state import Calibration
+    return Calibration.load(viewport=(2002, 1126))
+
+
+def _button_frame(cal, discs):
+    """A viewport frame with a filled disc at each named button's calibrated centre, `discs`
+    mapping name to grey level. A filled disc scores 0.997 at every anchor, a grey-90 one
+    0.87-0.92, a blank frame 0.000 (measured 2026-09-21)."""
+    frame = np.zeros((1126, 2002, 3), np.uint8)
+    for name, level in discs.items():
+        cx, cy, r = cal.viewport_button(name)
+        cv2.circle(frame, (round(cx), round(cy)), round(r), (level, level, level), -1)
+    return frame
+
+
+def _probe_gates(cal, frame):
+    """The gates `probe_gadget` builds: the production gate as `wait_for_gate` leaves it (in
+    match and refined), and one gate per other button, refined with a floor of 0.
+
+    Keyed off `cal.gate_anchor` rather than a literal, because which disc gates is now a property
+    of the shipped file: it moved off the Super on 2026-09-22 and these fixtures must move with
+    it, or they assert the probe against a gate the probe does not use.
+    """
+    from dataclasses import replace
+
+    from brawl_deployment.match_state import MatchState
+    anchor = MatchState(cal)
+    for _ in range(cal.enter_samples):
+        anchor.update(frame)
+    anchor.refine(frame)
+    gates = {cal.gate_anchor: anchor}
+    for name in cal.buttons:
+        if name == cal.gate_anchor:
+            continue
+        gates[name] = MatchState(replace(cal, gate_anchor=name))
+        gates[name].refine(frame, min_score=0.0)
+    return gates
+
+
+class _FakeClock:
+    def __init__(self):
+        self.now = 1000.0
+
+    def __call__(self):
+        return self.now
+
+    def sleep(self, seconds):
+        assert seconds >= 0.0
+        self.now += seconds
+
+
+def _probe_buttons(backend):
+    """The shipped geometry, pinned rather than loaded: attack is `control.attack_tap`'s
+    clearance point (0.88, 0.55 of 1920x1080), and super/gadget are the discs the calibration
+    names after the 2026-09-22 rotation. Literals on purpose -- a double built from the same
+    source as the code cannot catch the code moving."""
+    return Buttons(backend, attack=(1689.6, 594.0), super_=(1559.9, 901.1),
+                   gadget=(1675.9, 997.0), aim_radius_px=77.0)
+
+
+def _record(mod, grab, gates, buttons, check=lambda: None, pre=8, post=12,
+            gate_name="hypercharge"):
+    clock = _FakeClock()
+    return mod.record_gadget_trace(grab, check, gates, buttons, gate_name=gate_name,
+                                   tick_seconds=1 / 12, pre_roll_ticks=pre, record_ticks=post,
+                                   check_every=4, clock=clock, sleep=clock.sleep)
+
+
+def test_the_probe_taps_the_gadget_once_after_the_pre_roll_and_lifts_it_on_the_next_tick():
+    """The one input the probe sends, sent the policy's way: a bare down on the gadget after
+    that tick's gate read, lifted by the next tick's settle, nothing else. Grabs are logged into
+    the same list, so the order of touches against ticks is asserted, not just their count."""
+    mod = _load_calibrate_script()
+    cal = _probe_cal()
+    lit = _button_frame(cal, {"gadget": 200, "super": 200, "hypercharge": 200})
+    null = NullBackend()
+
+    def grab():
+        null.log.append(("grab",))
+        return lit
+
+    trace = _record(mod, grab, _probe_gates(cal, lit), _probe_buttons(null))
+    assert null.log[:9] == [("grab",)] * 9
+    assert null.log[9:12] == [("down", SLOT_TAP, 1675.9, 997.0), ("grab",), ("up", SLOT_TAP)]
+    assert null.log[12:] == [("grab",)] * 10
+    assert trace["tap_tick"] == 8 and trace["aborted"] is None
+    assert [k["i"] for k in trace["ticks"] if k["tapped"]] == [8]
+    assert len(trace["ticks"]) == 20
+    assert trace["ticks"][0]["t"] == pytest.approx(-8 / 12, abs=1e-4)     # stored to 4 places
+    assert trace["ticks"][-1]["t"] == pytest.approx(11 / 12, abs=1e-4)
+    assert trace["tick_hz"] == 12.0 and trace["recharge_s"] == 18.0
+    assert (trace["threshold"], trace["enter_samples"], trace["exit_samples"]) == (0.45, 6, 4)
+    assert list(trace["anchors"]) == ["hypercharge", "gadget", "super"]
+
+
+def test_the_probe_records_each_anchor_through_the_real_gate_class():
+    """The gadget disc vanishes for six ticks after the tap and comes back, which is what a
+    recharge looks like. A gate anchored on the gadget would exit on the fourth dark tick and could
+    not re-enter for five more (enter_samples is 6) -- and that shadow gate is recorded, so G6.2
+    can see it. The PRODUCTION gate is on `hypercharge`, which the tap does not touch, so it holds
+    straight through: after 2026-09-22 that separation is the point of the whole probe."""
+    mod = _load_calibrate_script()
+    cal = _probe_cal()
+    lit = _button_frame(cal, {"gadget": 200, "super": 200, "hypercharge": 200})
+    dark = _button_frame(cal, {"super": 200, "hypercharge": 200})
+    frames = iter([lit] * 9 + [dark] * 6 + [lit] * 5)
+    trace = _record(mod, lambda: next(frames), _probe_gates(cal, lit),
+                    _probe_buttons(NullBackend()))
+    post = trace["ticks"][9:]
+    assert [k["in_match"]["gadget"] for k in post] == [True] * 3 + [False] * 8
+    assert all(k["in_match"]["super"] and k["in_match"]["hypercharge"] for k in post)
+    # The alternatives start out of match and enter on their sixth lit tick, inside the pre-roll.
+    assert [k["in_match"]["super"] for k in trace["ticks"][:6]] == [False] * 5 + [True]
+    assert all(k["score"]["gadget"] < 0.45 for k in post[:6])
+    assert all(k["score"]["gadget"] > 0.9 for k in trace["ticks"][:9] + post[6:])
+    assert all(k["score"]["super"] > 0.9 and k["score"]["hypercharge"] > 0.9 for k in post)
+    assert trace["ticks"][0]["colour"]["gadget"] == [200.0, 200.0, 200.0]
+    assert post[0]["colour"]["gadget"] == [0.0, 0.0, 0.0]
+    assert post[0]["colour"]["super"] == [200.0, 200.0, 200.0]
+
+
+def test_the_probe_never_taps_through_a_closed_gate():
+    """The interlock every press obeys. The `hypercharge` disc, which is what the gate reads, goes
+    dark on tick 2, so the production gate exits on tick 5 and reads out of match at the tap tick:
+    nothing goes down, and the trace ends there saying why. The gadget stays lit throughout, so
+    this asserts the interlock rather than the tapped button's own state."""
+    mod = _load_calibrate_script()
+    cal = _probe_cal()
+    lit = _button_frame(cal, {"gadget": 200, "super": 200, "hypercharge": 200})
+    dark = _button_frame(cal, {"gadget": 200, "super": 200})
+    frames = iter([lit] * 2 + [dark] * 20)
+    null = NullBackend()
+    trace = _record(mod, lambda: next(frames), _probe_gates(cal, lit), _probe_buttons(null))
+    assert [e for e in null.log if e[0] == "down"] == []
+    assert trace["tap_tick"] is None
+    assert "out of match at the tap tick" in trace["aborted"]
+    assert len(trace["ticks"]) == 9
+
+
+def test_a_covered_emulator_stops_the_probe_and_a_moved_one_raises():
+    """A covered window's frames show the terminal, not the buttons, so the recording stops there
+    rather than scoring it. A moved window makes every calibrated coordinate wrong, so it
+    raises. Neither leaves a contact down."""
+    mod = _load_calibrate_script()
+    cal = _probe_cal()
+    lit = _button_frame(cal, {"gadget": 200, "super": 200, "hypercharge": 200})
+    # Checks run on ticks 0, 4, 8 (the tap) and 12. Covered at the fourth: after the tap.
+    checks = iter([None, None, None, OCCLUDED])
+    null = NullBackend()
+    trace = _record(mod, lambda: lit, _probe_gates(cal, lit), _probe_buttons(null),
+                    check=lambda: next(checks))
+    assert trace["tap_tick"] == 8
+    assert "covered at tick 12" in trace["aborted"]
+    assert trace["window_faults"][0]["tick"] == 12
+    assert len(trace["ticks"]) == 12
+    assert null.log[-1] == ("up", SLOT_TAP) and not null.contacts
+
+    checks = iter([None, None, None, MOVED])
+    null = NullBackend()
+    buttons = _probe_buttons(null)
+    with pytest.raises(RuntimeError, match="moved or resized"):
+        _record(mod, lambda: lit, _probe_gates(cal, lit), buttons, check=lambda: next(checks))
+    assert not null.contacts
+
+
+def test_a_capture_failure_right_after_the_tap_still_lifts_it():
+    """The tick after the tap lifts it in its `settle()`, which runs after that tick's grab. A
+    grab that raises there would leave the gadget held down, so the probe lifts on the way out."""
+    mod = _load_calibrate_script()
+    cal = _probe_cal()
+    lit = _button_frame(cal, {"gadget": 200, "super": 200, "hypercharge": 200})
+    frames = [lit] * 9
+
+    def grab():
+        if not frames:
+            raise OSError("capture lost")
+        return frames.pop()
+
+    null = NullBackend()
+    with pytest.raises(OSError, match="capture lost"):
+        _record(mod, grab, _probe_gates(cal, lit), _probe_buttons(null))
+    assert null.log == [("down", SLOT_TAP, 1675.9, 997.0), ("up", SLOT_TAP)]
+    assert not null.contacts
+
+
+def test_the_probe_holds_its_tick_rate_without_bursting():
+    """`DeployLoop._pace`'s contract, which the probe copies: an on-time tick sleeps to the next
+    deadline, and an overrun restarts from now rather than firing the missed ticks back to back,
+    since the hysteresis counts samples and a burst would squeeze an exit into less time."""
+    mod = _load_calibrate_script()
+    clock = _FakeClock()
+    assert mod._pace(1000.0, 0.25, clock, clock.sleep) == 1000.25
+    assert clock.now == 1000.25
+    clock.now = 1001.0                          # the next tick ran 0.75 s long
+    assert mod._pace(1000.25, 0.25, clock, clock.sleep) == 1001.0
+    assert clock.now == 1001.0                  # and nothing slept
+
+
+def _probe_live(mod, monkeypatch, tmp_path, frame, null):
+    """`probe_gadget` on a fake rig holding one frame, with the recording shortened and the tick
+    rate raised to 1 kHz so it runs in a moment: 8 ticks, the tap, 11 more."""
+    from types import SimpleNamespace
+
+    from brawl_deployment.match_state import MatchState
+    monkeypatch.setattr(mod, "PROBE_PRE_ROLL_S", 0.008)
+    monkeypatch.setattr(mod, "PROBE_RECORD_S", 0.012)
+    cal = _probe_cal()
+    gate = MatchState(cal)                      # as `wait_for_gate` leaves it
+    for _ in range(cal.enter_samples):
+        gate.update(frame)
+    rig = SimpleNamespace(cal=cal, match=gate, gate_refine_score=gate.refine(frame),
+                          grab=lambda: SimpleNamespace(image=frame),
+                          guard=SimpleNamespace(check=lambda: None),
+                          controls=SimpleNamespace(buttons=_probe_buttons(null)))
+    cfg = SimpleNamespace(loop_tick_hz=1000.0, window_check_every_n_ticks=4)
+    out = tmp_path / "audit" / "trace.json"
+    return mod.probe_gadget(rig, cfg, SimpleNamespace(trace_out=str(out))), out
+
+
+def test_probe_gadget_writes_a_trace_that_loads_back_whole(tmp_path, monkeypatch):
+    """The live entry point end to end: every button gets a gate, a refine score and its
+    re-fitted radius, and the file on disk parses back to exactly the trace returned."""
+    mod = _load_calibrate_script()
+    cal = _probe_cal()
+    null = NullBackend()
+    trace, out = _probe_live(mod, monkeypatch, tmp_path,
+                             _button_frame(cal, {"gadget": 200, "super": 200, "hypercharge": 200}),
+                             null)
+    text = out.read_text(encoding="utf-8")
+    assert json.loads(text) == trace
+    assert len([l for l in text.splitlines() if l.startswith('  {"i": ')]) == len(trace["ticks"])
+    assert trace["tap_tick"] == 8 and len(trace["ticks"]) == 20
+    assert set(trace["anchors"]) == {"gadget", "super", "hypercharge"}
+    assert all(a["refine_score"] > 0.9 for a in trace["anchors"].values())
+    # Re-fitted radii: the stored 34.72 and 31.49 moved one and three 0.5 px refine steps. Both
+    # numbers are untouched by the 2026-09-22 rotation, which moved only which disc owns them:
+    # 34.72 was called the gadget's and is the Super's, 31.49 was the attack's and is the gadget's.
+    assert (trace["anchors"]["super"]["r"], trace["anchors"]["gadget"]["r"]) == (35.22, 29.99)
+    assert all(trace["ticks"][8]["in_match"].values())
+    assert [e[0] for e in null.log] == ["down", "up"]
+
+
+def test_a_button_that_cannot_anchor_the_gate_is_recorded_rather_than_fatal(tmp_path,
+                                                                            monkeypatch):
+    """The probe refines every non-gate button with a floor of 0. One that does not read as a
+    ring on this source is a finding for G6.2, not a reason to lose the trace.
+
+    The dark disc here is the GADGET, which is the strongest form of the case: the probe still
+    taps it, still records, and still writes the trace, because the interlock is the gate anchor's
+    reading and the gate anchor is lit. Before 2026-09-22 this could not have been expressed --
+    the gadget was believed to be the gate, so a dark gadget was a closed gate."""
+    mod = _load_calibrate_script()
+    cal = _probe_cal()
+    trace, _ = _probe_live(mod, monkeypatch, tmp_path,
+                           _button_frame(cal, {"hypercharge": 200, "super": 200}), NullBackend())
+    assert trace["anchors"]["gadget"]["refine_score"] < 0.45
+    assert trace["tap_tick"] == 8
+    warnings = mod.summarize_trace(trace)["warnings"]
+    assert any(w.startswith("gadget never read in match before the tap") for w in warnings)
+
+
+def test_the_probe_runs_alone(capsys):
+    """Every job presses attack or Super, each an anchor the trace measures, and `--write` stores
+    buttons the probe never fits. Refused before anything touches the emulator."""
+    mod = _load_calibrate_script()
+    for extra in (["--jobs", "tap"], ["--write"]):
+        with pytest.raises(SystemExit) as exc:
+            mod.main(["--probe-gadget", *extra])
+        assert exc.value.code == 2
+        assert "--probe-gadget runs alone" in capsys.readouterr().err
+
+
+def test_the_probe_waits_out_the_sims_own_gadget_recharge():
+    """A trace must cover the whole recharge to say KEEP, and the recharge it covers is the one
+    the sim trains on: Mortis's `gadget_cooldown` in configs/brawlers.yaml."""
+    import yaml
+    mod = _load_calibrate_script()
+    brawlers = yaml.safe_load((Path(__file__).resolve().parents[1] / "configs" /
+                               "brawlers.yaml").read_text(encoding="utf-8"))
+    assert brawlers["hero_mortis"]["gadget_cooldown"] == 18.0
+    assert mod.GADGET_RECHARGE_S == 18.0
+    assert mod.PROBE_RECORD_S > mod.GADGET_RECHARGE_S
+
+
+# Summaries of hand-built traces: tap on tick 2 at 12 Hz, a 0.25 s recharge so seven post-tap
+# ticks cover it. Every number below is a literal, so each expected value can be checked by eye.
+LIT, DIM = [200.0, 200.0, 200.0], [90.0, 90.0, 90.0]
+
+
+def _summary_trace(score, in_match, colour, *, recharge_s=0.25, aborted=None):
+    names = list(score)
+    return {"tick_hz": 12.0, "tap_tick": 2, "aborted": aborted, "recharge_s": recharge_s,
+            "gate_anchor": "gadget", "threshold": 0.45, "enter_samples": 6, "exit_samples": 4,
+            "anchors": {a: {"cx": 0.0, "cy": 0.0, "r": 30.0, "refine_score": 0.99}
+                        for a in names},
+            "window_faults": [],
+            "ticks": [{"i": i, "t": (i - 2) / 12, "window": None, "tapped": i == 2,
+                       "score": {a: score[a][i] for a in names},
+                       "in_match": {a: in_match[a][i] for a in names},
+                       "colour": {a: colour[a][i] for a in names}, "tick_ms": 1.0}
+                      for i in range(len(score[names[0]]))]}
+
+
+T, F = True, False
+STEADY = {"super": [0.70, 0.71, 0.70, 0.69, 0.66, 0.68, 0.70, 0.71, 0.70, 0.70],
+          "attack": [0.60, 0.58, 0.59, 0.50, 0.52, 0.55, 0.57, 0.58, 0.59, 0.60]}
+ALL_IN = [T] * 10
+
+
+def test_a_gadget_that_dims_but_never_dips_keeps_the_anchor():
+    mod = _load_calibrate_script()
+    score = {"gadget": [0.80, 0.81, 0.80, 0.60, 0.55, 0.52, 0.58, 0.62, 0.79, 0.80], **STEADY}
+    colour = {"gadget": [LIT] * 3 + [DIM] * 5 + [LIT] * 2, "super": [LIT] * 10,
+              "attack": [LIT] * 10}
+    s = mod.summarize_trace(_summary_trace(score, dict.fromkeys(score, ALL_IN), colour))
+    assert s["verdict"] == "KEEP"
+    assert s["anchors"]["gadget"]["ticks_under"] == 0
+    assert s["anchors"]["gadget"]["colour_moved"] == 110.0
+    assert s["anchors"]["gadget"]["post_min"] == 0.52
+    assert s["covered_s"] == pytest.approx(7 / 12)
+
+    # The same scores with a button that never changed: nothing shows the gadget fired, so a
+    # steady score proves nothing and the verdict must not be KEEP.
+    colour["gadget"] = [LIT] * 10
+    s = mod.summarize_trace(_summary_trace(score, dict.fromkeys(score, ALL_IN), colour))
+    assert s["verdict"] == "INCONCLUSIVE"
+    assert "looks the same after the tap" in s["reason"]
+
+
+def test_a_gadget_whose_gate_exits_mid_match_is_a_change_and_names_the_wider_margin():
+    """Dark for five ticks while super and attack stay up: a false exit on the fourth, the
+    alternatives ranked by floor, and the 2-of-3 vote holding, since two gates stay in."""
+    mod = _load_calibrate_script()
+    score = {"gadget": [0.80, 0.81, 0.80, 0.30, 0.20, 0.25, 0.28, 0.35, 0.79, 0.80], **STEADY}
+    in_match = {"gadget": [T] * 6 + [F] * 4, "super": ALL_IN, "attack": ALL_IN}
+    colour = {"gadget": [LIT] * 3 + [DIM] * 5 + [LIT] * 2, "super": [LIT] * 10,
+              "attack": [LIT] * 10}
+    s = mod.summarize_trace(_summary_trace(score, in_match, colour))
+    g = s["anchors"]["gadget"]
+    assert s["verdict"] == "CHANGE"
+    assert (g["ticks_under"], g["longest_under"]) == (5, 5)
+    assert g["false_exits"] == [pytest.approx(4 / 12)]
+    assert (g["post_min"], g["post_min_t"]) == (0.20, pytest.approx(2 / 12))
+    assert s["anchors"]["super"]["margin"] == pytest.approx(0.21)
+    assert s["anchors"]["attack"]["margin"] == pytest.approx(0.05)
+    assert s["vote"] == {"exits": [], "false_exits": []}
+    assert "widest alternative anchor is super" in s["reason"]
+    assert "EXITED at t=+0.33 s" in s["reason"] and "vote held throughout" in s["reason"]
+    lines = mod.format_summary(s)
+    assert lines[-1].startswith("CHANGE: ")
+    assert sum(" FALSE" in line for line in lines) == 1
+
+
+def test_two_buttons_down_at_once_close_the_vote_while_the_match_goes_on():
+    """The vote's worst case: the gadget recharging while something else hides the attack
+    button. Both gates exit on tick 6 with super still up, so one gate is left, the vote exits
+    too, and since super never dipped it is a false exit rather than the controls vanishing."""
+    mod = _load_calibrate_script()
+    score = {"gadget": [0.80, 0.81, 0.80, 0.30, 0.20, 0.25, 0.28, 0.35, 0.30, 0.30],
+             "super": STEADY["super"],
+             "attack": [0.60, 0.58, 0.59, 0.30, 0.30, 0.30, 0.30, 0.30, 0.59, 0.60]}
+    in_match = {"gadget": [T] * 6 + [F] * 4, "super": ALL_IN, "attack": [T] * 6 + [F] * 4}
+    colour = {"gadget": [LIT] * 3 + [DIM] * 7, "super": [LIT] * 10, "attack": [LIT] * 10}
+    s = mod.summarize_trace(_summary_trace(score, in_match, colour))
+    assert s["common_mode_ticks"] == 0
+    assert s["vote"] == {"exits": [pytest.approx(4 / 12)], "false_exits": [pytest.approx(4 / 12)]}
+    assert s["verdict"] == "CHANGE"
+    assert "widest alternative anchor is super" in s["reason"]
+    assert "vote would have exited at t=+0.33 s" in s["reason"]
+
+
+def test_a_dip_too_short_to_exit_is_still_a_change():
+    """G6.2's rule is about the score, not the exit: any post-tap tick under the threshold means
+    the margin is gone. Two dark ticks, one lit, three dark: five under, longest three, and no
+    run reaches exit_samples."""
+    mod = _load_calibrate_script()
+    score = {"gadget": [0.80, 0.81, 0.80, 0.30, 0.20, 0.50, 0.28, 0.35, 0.40, 0.80], **STEADY}
+    colour = {"gadget": [LIT] * 3 + [DIM] * 6 + [LIT], "super": [LIT] * 10,
+              "attack": [LIT] * 10}
+    s = mod.summarize_trace(_summary_trace(score, dict.fromkeys(score, ALL_IN), colour))
+    g = s["anchors"]["gadget"]
+    assert s["verdict"] == "CHANGE"
+    assert (g["ticks_under"], g["longest_under"], g["exits"]) == (5, 3, [])
+    assert "its gate held" in s["reason"]
+
+
+def test_every_button_going_dark_together_is_not_the_gadgets_doing():
+    """The hero died on tick 5: all three scores fall together, every gate exits on tick 8, and
+    none of it counts as a gadget dip or a false exit. The controls were up only to t=+0.17 s,
+    short of the 0.5 s recharge, so the trace cannot answer."""
+    mod = _load_calibrate_script()
+    gone = [0.05] * 5
+    score = {"gadget": [0.80, 0.81, 0.80, 0.78, 0.79] + gone,
+             "super": [0.70, 0.71, 0.70, 0.69, 0.66] + gone,
+             "attack": [0.60, 0.58, 0.59, 0.50, 0.52] + gone}
+    in_match = dict.fromkeys(score, [T] * 8 + [F] * 2)
+    colour = {"gadget": [LIT] * 3 + [DIM] * 7, "super": [LIT] * 10, "attack": [LIT] * 10}
+    s = mod.summarize_trace(_summary_trace(score, in_match, colour, recharge_s=0.5))
+    assert s["common_mode_ticks"] == 5
+    assert s["covered_s"] == pytest.approx(2 / 12)
+    assert all(st["ticks_under"] == 0 for st in s["anchors"].values())
+    assert all(st["exits"] == [pytest.approx(6 / 12)] and st["false_exits"] == []
+               for st in s["anchors"].values())
+    assert s["vote"]["false_exits"] == []
+    assert s["verdict"] == "INCONCLUSIVE" and "the controls vanished" in s["reason"]
+
+
+def test_an_aborted_probe_is_never_a_verdict():
+    mod = _load_calibrate_script()
+    score = {"gadget": [0.80] * 10, **STEADY}
+    colour = {"gadget": [LIT] * 3 + [DIM] * 7, "super": [LIT] * 10, "attack": [LIT] * 10}
+    s = mod.summarize_trace(_summary_trace(score, dict.fromkeys(score, ALL_IN), colour,
+                                           aborted="the emulator was covered at tick 4"))
+    assert s["verdict"] == "INCONCLUSIVE"
+    assert "covered at tick 4" in s["reason"]

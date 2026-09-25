@@ -405,6 +405,8 @@ class TierEvalCallback(BaseCallback):
             self._tier_writer(name).add_scalar("eval/win_rate", r["win_rate"], self.num_timesteps)
             self._tier_writer(name).add_scalar("eval/mean_rank", r["mean_rank"], self.num_timesteps)
             self._tier_writer(name).add_scalar("eval/mean_reward", r["mean_reward"], self.num_timesteps)
+            self._tier_writer(name).add_scalar("eval/gadgets_used", r["gadgets_used"],
+                                               self.num_timesteps)
         self.logger.record("eval/win_rate_mean", mean_win_rate)
 
         entry = {"timesteps": int(self.num_timesteps),

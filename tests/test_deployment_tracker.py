@@ -6,6 +6,7 @@ YOLO output would test the detector instead of the thing under test.
 """
 import numpy as np
 import pytest
+import torch
 
 from brawl_deployment.perception import EntityTracker
 from brawl_deployment.perception.tracker import GATE_NOISE_TILES, MAX_WALK_TILES_S, _greedy_match
@@ -18,6 +19,7 @@ class StubPlan:
     """The two things `to_tiles` touches: a pixel->rect matrix and rect->tile. Identity warp and a
     plain scale, so a detection's tile position is exactly what the test asked for."""
     M = np.eye(3, dtype=np.float64)
+    viewport = (2002, 1126)
 
     @staticmethod
     def rect_to_tile(rect):
@@ -256,3 +258,93 @@ def test_teammate_boxes_are_ignored_entirely():
         res = trk.update([det_at(4.0, 4.0, label="teammate")], StubPlan(), StubOdo(), t=i * 0.25)
     assert all(e is None for e in res.enemies)
     assert res.hero is None
+
+
+# ---------------------------------------------------------------- hero_offset (OBS_PARITY_TASKS.md C7)
+
+def _nominal():
+    """The stub's nominal hero tile: the viewport centre through the stub's own `rect_to_tile`,
+    plus the measured anchor offset."""
+    from brawl_vision.camera import HERO_ANCHOR_TILES
+    w, h = StubPlan.viewport
+    cx, cy = StubPlan.rect_to_tile(np.array([[w / 2.0, h / 2.0]]))[0]
+    return (cx + HERO_ANCHOR_TILES[0], cy + HERO_ANCHOR_TILES[1])
+
+
+def test_hero_offset_is_the_player_box_against_its_nominal_anchor():
+    nx, ny = _nominal()
+    trk = EntityTracker()
+    assert trk.update([], StubPlan(), StubOdo(), t=0.0).hero_offset is None, "before any sighting"
+    res = trk.update([det_at(nx - 1.5, ny, label="player")], StubPlan(), StubOdo(), t=0.25)
+    assert res.hero_offset == pytest.approx((-1.5, 0.0), abs=1e-9)
+    res = trk.update([det_at(nx - 0.5, ny, label="player")], StubPlan(), StubOdo(), t=0.5)
+    assert res.hero_offset == pytest.approx((-0.5, 0.0), abs=1e-9)
+    res = trk.update([], StubPlan(), StubOdo(), t=0.75)
+    assert res.hero_offset == pytest.approx((-0.5, 0.0), abs=1e-9), "no box: the previous value"
+    trk.reset(1)
+    assert trk.update([], StubPlan(), StubOdo(segment=1), t=1.0).hero_offset is None
+
+
+def test_hero_offset_is_camera_relative_whatever_odometry_says():
+    nx, ny = _nominal()
+    res = EntityTracker().update([det_at(nx + 2.0, ny + 0.25, label="player")], StubPlan(),
+                                 StubOdo(position=(5.0, -7.0)), t=0.0)
+    assert res.hero_offset == pytest.approx((2.0, 0.25), abs=1e-9)
+
+
+def test_hero_offset_on_the_shipped_plan_reads_the_anchor_not_the_centre():
+    """A player box whose anchor sits exactly on the viewport centre (a box of no height, so
+    the anchor fraction cannot move it): the offset is minus the anchor's nominal displacement,
+    because the hero's resting point is that displacement away from the centre."""
+    from brawl_vision.camera import HERO_ANCHOR_TILES, build_rectify_plan, load_camera_model
+    plan = build_rectify_plan(load_camera_model())
+    w, h = plan.viewport
+    det = Detection(label="player", confidence=0.9, xyxy=(w / 2 - 5.0, h / 2, w / 2 + 5.0, h / 2))
+    res = EntityTracker().update([det], plan, StubOdo(), t=0.0)
+    assert res.hero_offset == pytest.approx((-HERO_ANCHOR_TILES[0], -HERO_ANCHOR_TILES[1]),
+                                            abs=1e-6)
+
+
+# ---------------------------------------------------------------- parity with the sim's slot rule (C8)
+
+SIGHTINGS = [
+    "x...",  # d0  A first seen: pending
+    "x...",  # d1  A promoted to slot 0
+    "....",  # d2  A coasts (miss 1)
+    "....",  # d3  miss 2
+    "....",  # d4  miss 3: still held
+    ".xx.",  # d5  miss 4: A retired, slot 0 free; B and C pending
+    ".xx.",  # d6  B slot 0, C slot 1
+    "xxxx",  # d7  A back as a new track, D new: both pending
+    "xxxx",  # d8  A slot 2, D slot 3
+    ".x.x",  # d9  A and C coast
+    ".x.x",  # d10
+    ".x.x",  # d11
+    ".x.x",  # d12 A and C retired: slots 1 and 2 free
+    "xx.x",  # d13 A pending again
+    "xx.x",  # d14 A takes slot 1, the lowest free, not its old slot 2
+]
+
+
+def test_the_sims_slot_rule_reproduces_the_trackers_slot_table():
+    """Four enemies ten tiles apart (association is never in doubt) through `EntityTracker`, one
+    `update` per decision, and the same sightings through `brawl_sim.core.slots.update` as the
+    hero's reveal. The slot -> entity table must agree after every decision."""
+    from brawl_sim.config import load_config
+    from brawl_sim.core import slots
+    from brawl_sim.core.state import allocate
+
+    n = len(SIGHTINGS[0])
+    cfg = load_config("configs/default.yaml", overrides={"entities": {"n_enemies": n}})
+    state = allocate(cfg, n_envs=1, device="cpu", verbose=False)
+    state.ent_alive.fill_(True)
+    trk = EntityTracker(n_slots=n, max_misses=cfg.slots_max_misses,
+                        promote_hits=cfg.slots_promote_hits)
+    for d, row in enumerate(SIGHTINGS):
+        dets = [det_at(10.0 * (j + 1), 5.0) for j, ch in enumerate(row) if ch == "x"]
+        res = trk.update(dets, StubPlan(), StubOdo(), t=d * 0.25)
+        live = [round(tr.pos[0] / 10.0) if tr is not None else -1 for tr in res.enemies]
+        slots.update(state, torch.tensor([[False] + [ch == "x" for ch in row]]), cfg)
+        sim = [v - 1 for v in state.slot_ent[0].tolist()]
+        assert sim == live, f"decision {d}: sim {sim} tracker {live}"
+    assert sim == [2, 1, -1, 4]

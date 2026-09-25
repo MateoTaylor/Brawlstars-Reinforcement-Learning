@@ -13,6 +13,7 @@ Owned outright, because they are pure functions of our own actions and the clock
 
     ammo  ammo_frac  ammo_whole  attack_cd  can_attack  dashing  dash_t  dash_dir
     invuln  long_dash_ready  long_dash_frac  attack_idle_t  facing  facing_vec
+    gadget_ready  gadget_charge_frac        -- since Step G5; see "The gadget" below
 
 Held here but SOURCED FROM CV, because the shadow can only ever see them fall:
 
@@ -31,9 +32,11 @@ which is the only reason `alive` lives here rather than in the assembler.
 state this class holds:
 
     phase 2   tick_timers      ammo regen (gated on attack_cd, gate read BEFORE the decrement),
-                               attack_cd / invuln_t decrement, attack_idle_t counts UP
+                               attack_cd / invuln_t / gadget_cd decrement, attack_idle_t
+                               counts UP
     phase 3   decode_action    the fire bit, ANDed with action_mask
-    phase 6   _attack_phase    start_dash (or the super), then attack_idle_t := 0
+    phase 6   _attack_phase    start_dash (or the super), then attack_idle_t := 0; or the
+                               gadget throw, which restarts gadget_cd and nothing else
     phase 7   apply_movement   facing tracks move_dir whenever it is nonzero
     phase 8   advance_dash     dash_t decrement and the completion cleanup
 
@@ -122,6 +125,29 @@ Stale reads fail closed: past `SUPER_STALE_SECONDS` with no successful read, `su
 False and the fraction holds its last value. Holding a fraction is stale, not fabricated; claiming
 readiness is neither.
 
+#### The gadget is owned outright, and sits outside every attack gate
+
+Unlike the super, the gadget IS a function of our own action stream (SIM_OVERHAUL_PLAN.md S18):
+charged at the match gate, restarted to `gadget_cooldown` (18 s) by each throw we model, and
+changed by nothing a camera could see. So `gadget_ready` and `gadget_charge_frac` are
+proprioception, like `attack_cd`, and nothing reads the button with CV. Four things about it are
+deliberate, and each is the sim's (`hero.gadget_ready`, `env._attack_phase`):
+
+  * **Its mask has one timer and no attack gates.** `alive & gadget_cd <= 0` for a kind that
+    has one, and not ammo, `attack_cd` or `dash_t`. A throw in the middle of a dash is legal,
+    in the game and in training.
+  * **A throw is not an attack.** It restarts `gadget_cd` and touches nothing else: not the
+    clip, not `attack_cd`, not `attack_idle_t` (so it never costs the long dash), and not the
+    canary's grace window, because it spends no ammo for the bar to catch up with.
+  * **It shares the one pending slot.** A decision is one press of one button, whichever
+    button, and `env._held` zeroes the whole attack column on sub-ticks 2..K, the gadget's
+    value included.
+  * **`resync` leaves it alone**, the timer and a queued throw alike. `resync` says why.
+
+A throw writes 18.0, and float32 needs 360 decrements to bring that back to zero, so the mask
+reopens 360 sub-ticks after the throw's own tick: 18.05 s after the tap at 20 Hz, one sub-tick
+behind the sim's post-timer mask, which is the stale-but-safe direction above.
+
 #### A dash into a wall costs the owned fields nothing
 
 Section 10 item 7 asks for footage of one, on the assumption that a blocked dash is the clearest
@@ -187,15 +213,16 @@ in exactly one place, `start_dash`, and `obs_schema` says so in its own descript
 from __future__ import annotations
 
 import math
-from dataclasses import dataclass, fields
+from dataclasses import MISSING, dataclass, fields
 from pathlib import Path
 
 import numpy as np
 import yaml
 
 # One definition of the action encoding for the whole package, and it lives with the thing that
-# presses the buttons. `hero.decode_action`'s column-1 values: 0 = nothing, 1 = attack, 2 = super.
-from ..control.buttons import ATTACK_FIRE, ATTACK_NONE, ATTACK_SUPER
+# presses the buttons. `hero.decode_action`'s column-1 values: 0 = nothing, 1 = attack, 2 = super,
+# 3 = gadget.
+from ..control.buttons import ATTACK_FIRE, ATTACK_GADGET, ATTACK_NONE, ATTACK_SUPER
 
 _CONFIGS_DIR = Path(__file__).resolve().parents[2] / "configs"
 
@@ -280,6 +307,8 @@ class ShadowParams:
     long_dash_multiplier: float
     super_charge_hits: int
     move_speed: float
+    # The one field allowed to be absent, and last because it has a default. See `load`.
+    gadget_cooldown: float = 0.0
 
     @classmethod
     def load(cls, kind: str = "hero_mortis", path: Path | str | None = None) -> "ShadowParams":
@@ -288,6 +317,11 @@ class ShadowParams:
         A field given as a RANGE (a two-element list, which `config._resolve_value` would sample
         per environment) raises rather than picking an end. Dead reckoning against a randomized
         constant is not dead reckoning, and the deployment has to commit to one number.
+
+        A missing field raises too, unless it has a default here. Only `gadget_cooldown` does:
+        the sim resolves an absent per-kind field to 0 (`config.PER_KIND_FIELDS`), and a 0
+        cooldown is the sim's "this kind has no gadget", so a kind without one dead-reckons as
+        a kind without one.
         """
         spec = yaml.safe_load(Path(path or _CONFIGS_DIR / "brawlers.yaml").read_text())
         if kind not in spec:
@@ -296,6 +330,8 @@ class ShadowParams:
         values = {}
         for f in fields(cls):
             if f.name not in block:
+                if f.default is not MISSING:
+                    continue
                 raise KeyError(f"{kind!r} has no {f.name!r} -- it cannot be dead-reckoned")
             raw = block[f.name]
             if isinstance(raw, (list, tuple)):
@@ -347,6 +383,7 @@ class ShadowHero:
         self._ammo_gain = (_F32(1.0) / _F32(params.reload_seconds)) * _F32(dt)
         self._attack_cooldown = _F32(params.attack_cooldown)
         self._dash_duration = _F32(params.dash_duration)
+        self._gadget_cooldown = _F32(params.gadget_cooldown)
         self._bin_step = _TWO_PI / n_move_bins
 
         self.reset()
@@ -354,9 +391,9 @@ class ShadowHero:
     # -- lifecycle -----------------------------------------------------------
 
     def reset(self, *, facing: float = 0.0) -> None:
-        """Spawn state, matching `core/spawn.py`: a full clip, no cooldown, no charge, and an
-        `attack_idle_t` of zero -- so the long dash is genuinely unavailable for the first
-        `long_dash_seconds` of a match, exactly as in training.
+        """Spawn state, matching `core/spawn.py`: a full clip, no cooldown, no super charge, a
+        charged gadget, and an `attack_idle_t` of zero -- so the long dash is genuinely
+        unavailable for the first `long_dash_seconds` of a match, exactly as in training.
 
         `facing` has no CV source at spawn. The sim seeds it toward the map centre; here it
         defaults to 0 rad (screen +x) and is corrected by the first nonzero move bin, which in
@@ -379,6 +416,9 @@ class ShadowHero:
         self._super_read_at: float | None = None
         self._super_spend_pending = False
 
+        # Charged at the gate: `state.ent_gadget_cd` is 0 (ready) when every sim episode starts.
+        self.gadget_cd = _ZERO
+
         self.elapsed = 0.0            # tick-quantised seconds since reset
         self._bank = 0.0              # wall-clock remainder not yet worth a sub-tick
         self._move = 0
@@ -397,15 +437,20 @@ class ShadowHero:
 
     # -- the decision --------------------------------------------------------
 
-    def attack_mask(self) -> tuple[bool, bool, bool]:
-        """`hero.action_mask`'s attack column: (no-fire, attack, super), all three legal-now.
+    def attack_mask(self) -> tuple[bool, bool, bool, bool]:
+        """`hero.action_mask`'s attack column: (no-fire, attack, super, gadget), all four
+        legal-now.
+
+        The gadget's term is `gadget_ready` alone, outside the `ready` gate the attack and the
+        super share: see "The gadget" in the module docstring.
 
         No move mask: `action_mask` builds it as all-ones and nothing has ever narrowed it, so
         there is nothing here to supply. See the class docstring on why this is one sub-tick stale
         and why that is the safe side.
         """
         ready = self.alive and self.attack_cd <= 0 and self.dash_t <= 0
-        return (True, bool(ready and self.ammo >= 1.0), bool(ready and self.super_ready))
+        return (True, bool(ready and self.ammo >= 1.0), bool(ready and self.super_ready),
+                self.gadget_ready)
 
     def act(self, move: int, attack: int = ATTACK_NONE) -> int:
         """Record the decision we are about to send to the device. Returns the attack that will
@@ -421,6 +466,9 @@ class ShadowHero:
         that shot on this decision's terms either -- `Buttons.press` finishes a press still in
         flight before starting another -- and modelling a shot the game did not take is the one
         error this class must never make.
+
+        The gadget queues in the same single slot as the attack and the super: one decision is
+        one press of one button, whichever button it is.
         """
         self._move = int(move)
         if attack == ATTACK_NONE or self._pending_attack != ATTACK_NONE:
@@ -430,6 +478,8 @@ class ShadowHero:
             self._pending_attack = ATTACK_FIRE
         elif attack == ATTACK_SUPER and legal[2]:
             self._pending_attack = ATTACK_SUPER
+        elif attack == ATTACK_GADGET and legal[3]:
+            self._pending_attack = ATTACK_GADGET
         else:
             return ATTACK_NONE
         return self._pending_attack
@@ -446,7 +496,8 @@ class ShadowHero:
 
         The super reads it too. In the sim an idle super goes along a zero `move_dir` and does not
         travel; the game has no such shot, and `facing` is the nearest thing to what the policy
-        meant.
+        meant. The gadget does not read it: it is a tap, and the game aims it at the nearest
+        enemy, as `hero.gadget_target` does (SIM_OVERHAUL_PLAN.md S10).
         """
         move_dir = self._dir_from_bin(self._move)
         if move_dir is None:
@@ -489,6 +540,7 @@ class ShadowHero:
             self.ammo = min(self.ammo + self._ammo_gain, self._max_ammo)
         self.attack_cd = max(_ZERO, self.attack_cd - self.dt)
         self.invuln_t = max(_ZERO, self.invuln_t - self.dt)
+        self.gadget_cd = max(_ZERO, self.gadget_cd - self.dt)
         self.attack_idle_t = self.attack_idle_t + self.dt
 
         # ---- phases 3 and 6: decode, then attack. The mask is re-applied here for the same
@@ -503,6 +555,10 @@ class ShadowHero:
         elif attack == ATTACK_SUPER and legal[2]:
             self._fire_super()
             attacked = True
+        elif attack == ATTACK_GADGET and legal[3]:
+            # The throw's whole cost. Not `attacked`: a gadget moves neither the long-dash
+            # stopwatch nor the canary's grace window, and spends no ammo (env._attack_phase).
+            self.gadget_cd = self._gadget_cooldown
         if attacked:
             # AFTER start_dash, which reads this to decide whether the dash was the long one.
             self.attack_idle_t = _ZERO
@@ -620,6 +676,13 @@ class ShadowHero:
 
         `facing` is left alone: it has no CV source and no safe default, and the next nonzero move
         bin overwrites it anyway.
+
+        So is the gadget, its timer and a queued throw alike (Step G5). The canary's evidence is
+        ammo, which a throw never spends, so a trip says nothing about the gadget. The loop taps
+        only what `act` modelled, so the shadow's gadget can lag the game's, when the game drops
+        a tap, but never lead it. And a queued throw was pressed on the device in the decision
+        that queued it: dropping it here would offer the policy, for a whole cooldown, a gadget
+        the game has already spent.
         """
         if reading is not None:
             self.ammo = _F32(min(float(reading.ammo), float(self._max_ammo)))
@@ -632,7 +695,8 @@ class ShadowHero:
         self.super_charge_frac = 0.0
         self._super_ready_cv = False
         self._super_spend_pending = False
-        self._pending_attack = ATTACK_NONE
+        if self._pending_attack != ATTACK_GADGET:
+            self._pending_attack = ATTACK_NONE
         self.strikes = 0
         self.desyncs += 1
 
@@ -672,6 +736,22 @@ class ShadowHero:
     def can_attack(self) -> bool:
         return bool(self.alive and self.ammo >= 1.0 and self.attack_cd <= 0 and self.dash_t <= 0)
 
+    @property
+    def gadget_ready(self) -> bool:
+        """`hero.gadget_ready`: alive, off cooldown, and a kind that has a gadget. The mask's
+        gadget column and the observation's field are this one value, as they are in the sim."""
+        return bool(self.alive and self._gadget_cooldown > 0 and self.gadget_cd <= 0)
+
+    @property
+    def gadget_charge_frac(self) -> float:
+        """`hero.gadget_charge_frac`, in the sim's float32 and in its order: 1.0 at the gate, 0.0
+        on the tick of a throw, and 0.0 for a kind with no gadget. No `alive` term, like the
+        sim's: a dead hero's timer keeps running, and only `gadget_ready` goes False."""
+        if self._gadget_cooldown <= 0:
+            return 0.0
+        frac = _F32(1.0) - self.gadget_cd / self._gadget_cooldown
+        return float(min(max(frac, _ZERO), _F32(1.0)))
+
     def observe(self) -> dict:
         """The `hero.*` fields this class owns, under `core/observation.py`'s own key names and in
         its units -- tiles, seconds, radians, raw rather than normalized. `obs_select` does the
@@ -694,4 +774,6 @@ class ShadowHero:
             "long_dash_frac": self.long_dash_frac,
             "super_ready": self.super_ready,
             "super_charge_frac": self.super_charge_frac,
+            "gadget_ready": self.gadget_ready,
+            "gadget_charge_frac": self.gadget_charge_frac,
         }

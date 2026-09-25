@@ -3,7 +3,7 @@
     backend.py      the InputBackend protocol, slot assignments, and a NullBackend for dry runs
     adb.py          the real injector -- persistent `adb shell`, builtin writes to the touch device
     joystick.py     move_bin -> screen point, and the held-contact policy
-    buttons.py      attack / super, each a press dragged along the move direction
+    buttons.py      attack / super, each a press dragged along the move direction; gadget, a tap
     calibration.py  where those points come from, and the live checks that prove them
 
 **The first four know nothing about the screen**, which is what keeps them testable with no
@@ -13,11 +13,11 @@ the ammo bar -- and it is deliberately the last file, imported by the calibratio
 than by the control path. Nothing the loop runs depends on it.
 """
 from .backend import SLOT_MOVE, SLOT_TAP, InputBackend, NullBackend
-from .buttons import ATTACK_FIRE, ATTACK_NONE, ATTACK_SUPER, Buttons
+from .buttons import ATTACK_FIRE, ATTACK_GADGET, ATTACK_NONE, ATTACK_SUPER, Buttons
 from .joystick import Joystick
 
 __all__ = [
     "SLOT_MOVE", "SLOT_TAP", "InputBackend", "NullBackend",
-    "Buttons", "ATTACK_NONE", "ATTACK_FIRE", "ATTACK_SUPER",
+    "Buttons", "ATTACK_NONE", "ATTACK_FIRE", "ATTACK_SUPER", "ATTACK_GADGET",
     "Joystick",
 ]

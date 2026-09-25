@@ -4,8 +4,8 @@ import torch
 import yaml
 
 from brawl_sim.config import load_config, build_params
-from brawl_sim.core import zone
-from brawl_sim.core.state import allocate
+from brawl_sim.core import camera, zone
+from brawl_sim.core.state import allocate, zero_
 
 CONFIGS_DEFAULT = "configs/default.yaml"
 CONFIGS = Path(__file__).resolve().parent.parent / "configs"
@@ -319,3 +319,48 @@ def test_batched_smoke():
     assert grid.shape == (8, 20, 40)
     assert not torch.any(torch.isnan(state.zone_lo))
     assert not torch.any(torch.isnan(state.zone_hi))
+
+
+# ---- mark_seen: the zone.active latch (OBS_PARITY_TASKS.md C5) ---------------------------
+
+def _cam(cfg, x, y):
+    return camera.camera_centre(torch.tensor([[x, y]]), cfg)
+
+
+def test_zone_seen_latches_once_gas_has_been_on_screen():
+    """Default 60x60 map, one shrink of `tiles_per_step` (1) tile: a ring at the map's edge.
+    Mid-map the window's box spans x 15.9..44.8 and y 19.1..37.5 and holds no gas; with the
+    hero at x 10 the camera stops at 12.1 and the box starts at -2.0, past the ring at x 1."""
+    cfg, params, gen = _cfg_and_params(n_envs=1)
+    assert float(params.zone_tiles_per_step[0]) < 15.0
+    state = _fresh_state(cfg)
+    mask = torch.ones(1, dtype=torch.bool)
+    zone.init_zone(state, mask, params, cfg)
+    assert not bool(state.zone_seen[0])
+
+    zone.mark_seen(state, _cam(cfg, 10.0, 30.0), cfg)
+    assert not bool(state.zone_seen[0]), "before the first shrink there is no gas to see"
+
+    state.time.fill_(params.zone_start_time[0].item())
+    zone.step_zone(state, params, cfg)
+    assert int(state.zone_step[0]) == 1
+    zone.mark_seen(state, _cam(cfg, 30.0, 30.0), cfg)
+    assert not bool(state.zone_seen[0]), "the ring is off screen from mid-map"
+    zone.mark_seen(state, _cam(cfg, 10.0, 30.0), cfg)
+    assert bool(state.zone_seen[0])
+    zone.mark_seen(state, _cam(cfg, 30.0, 30.0), cfg)
+    assert bool(state.zone_seen[0]), "latched for the rest of the episode"
+
+    zero_(state, mask)
+    assert not bool(state.zone_seen[0]), "a reset row starts over"
+
+
+def test_zone_seen_never_latches_with_the_zone_disabled():
+    cfg, params, gen = _cfg_and_params(n_envs=1, zone={"enabled": False})
+    state = _fresh_state(cfg)
+    zone.init_zone(state, torch.ones(1, dtype=torch.bool), params, cfg)
+    state.zone_step.fill_(3)
+    state.zone_lo.fill_(20.0)
+    state.zone_hi.fill_(40.0)
+    zone.mark_seen(state, _cam(cfg, 10.0, 30.0), cfg)
+    assert not bool(state.zone_seen[0])

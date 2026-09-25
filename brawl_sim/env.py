@@ -107,8 +107,8 @@ import yaml
 from .bots import perception, policy
 from .config import EnvConfig, apply_randomization, build_params, load_randomization, validate
 from .constants import DeathCause
-from .core import boxes, combat, events, geometry as geo, hero, history, melee_sweep, movement
-from .core import observation, obs_schema, projectiles, spawn, stats, zone
+from .core import boxes, camera, combat, events, geometry as geo, hero, history, melee_sweep, movement
+from .core import observation, obs_schema, projectiles, slots, spawn, stats, zone
 from .core.reward import ZeroReward
 from .core.state import allocate, check_invariants, snapshot
 from .maps.loader import build_map_bank
@@ -210,7 +210,12 @@ class BrawlVecEnv:
         # The (N,E,E) visibility behind the most recent observation, stashed by
         # `_build_observation` so `step` can hand it to `history.push` (Phase H) without a
         # second visibility pass. None until the first reset()/step() builds an observation.
+        # `_obs_hero_view` is that visibility's hero row cut to the camera window
+        # (`core/camera.hero_view`, OBS_PARITY_TASKS.md C3): what the observation actually
+        # revealed, and so what `history.push` may remember. A test that teleports entities
+        # after an observation sets it to None so the next step() recomputes both.
         self._obs_vis: torch.Tensor | None = None
+        self._obs_hero_view: torch.Tensor | None = None
 
         # `_tick_fn` is built once here, not per-step -- torch.compile(fn) itself is cheap (it
         # doesn't compile anything yet, just wraps `fn` in a guard/dispatch shim); the actual
@@ -250,12 +255,13 @@ class BrawlVecEnv:
 
         # Phase H: record (pre-step state, this action) as the newest history slot BEFORE the
         # world moves -- once per decision, outside `_run_tick`, so action_repeat can't touch
-        # the ring cadence. `_obs_vis` is the visibility of the observation this action
+        # the ring cadence. `_obs_hero_view` is the reveal of the observation this action
         # answers; a caller that steps without ever observing (nothing does, but tests could)
         # gets a fresh pass instead of a None.
-        if self._obs_vis is None:
+        if self._obs_hero_view is None:
             self._obs_vis = perception.visibility(self.state, self.bank, self.params, self.cfg)
-        history.push(self.state, action, self._obs_vis)
+            self._obs_hero_view = camera.hero_view(self.state, self._obs_vis, self.cfg)
+        history.push(self.state, action, self._obs_hero_view)
 
         (dmg_by_total, newly_dead, newly_broken, cubes_gained, hp_healed, attacks_in_reach,
          decision) = self._run_decision(action, override)
@@ -308,9 +314,16 @@ class BrawlVecEnv:
 
     def _build_observation(self) -> dict:
         vis = perception.visibility(self.state, self.bank, self.params, self.cfg)
-        self._obs_vis = vis  # read by step() -> history.push (Phase H)
+        hero_view = camera.hero_view(self.state, vis, self.cfg)  # concealment AND the camera window
+        self._obs_vis, self._obs_hero_view = vis, hero_view       # read by step() -> history.push (Phase H)
+        # Tracker-style enemy slots, promoted on this decision's sighting as the live tracker
+        # does (OBS_PARITY_TASKS.md C8); `build_obs` reads them after the update.
+        slots.update(self.state, hero_view, self.cfg)
+        # zone.active is a latch: gas has been on screen at least once (OBS_PARITY_TASKS.md C5).
+        zone.mark_seen(self.state, camera.camera_centre(self.state.ent_pos[:, 0], self.cfg), self.cfg)
         los = perception.raw_los(self.state, self.bank, self.cfg)
-        return observation.build_obs(self.state, self.bank, vis, los, self.params, self.cfg)
+        return observation.build_obs(self.state, self.bank, vis, los, self.params, self.cfg,
+                                     hero_view=hero_view)
 
     def _run_tick(self, action: torch.Tensor, override: torch.Tensor | None):
         """Section 4 phases 1-15, exactly the sequence `step()` ran inline before Step 31 --

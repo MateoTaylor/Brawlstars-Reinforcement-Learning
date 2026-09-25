@@ -29,6 +29,15 @@ def _valid(env) -> list:
     return env.state.hist_valid.to(torch.int64).tolist()
 
 
+def _place(env, hero, *enemies):
+    """Hand-set positions in env 0 and drop the reveal stashed by the last observation, so the
+    next step() recomputes it from these positions (the stash is what `history.push` reads)."""
+    env.state.ent_pos[0, 0] = torch.tensor(hero)
+    for j, pos in enumerate(enemies, start=1):
+        env.state.ent_pos[0, j] = torch.tensor(pos)
+    env._obs_hero_view = None
+
+
 def test_rings_start_empty_and_fill_one_slot_per_decision():
     env = _env(n_envs=2)
     env.reset()
@@ -68,18 +77,33 @@ def test_slot_zero_holds_the_last_action_and_the_pre_step_hero_state():
 
 
 def test_enemy_seen_is_alive_and_visible_and_never_the_hero_itself():
-    env = _env(n_envs=1)
+    env = _env(n_envs=1, overrides={"entities": {"n_enemies": 2}})
     env.reset()
+    # Everyone beside the hero: the 20-wide tiny map pins the camera at x 9.65 and only tracks
+    # the hero on y, so a random spawn can be off screen (OBS_PARITY_TASKS.md C3).
+    _place(env, (10.5, 10.5), (12.5, 10.5), (8.5, 12.5))
     env.step(_idle(1))
     seen = env.state.hist_enemy_seen[:, 0]
     assert not seen[:, 0].any(), "the hero's own column is never 'seen'"
-    assert seen[:, 1:].all(), "blank map, no bushes, everyone alive: every enemy is visible"
+    assert seen[:, 1:].all(), "blank map, no bushes, everyone alive and on screen: every enemy is seen"
 
     env.state.ent_alive[0, 1] = False
     env.state.ent_hp[0, 1] = 0.0
     env.step(_idle(1))
     assert not env.state.hist_enemy_seen[0, 0, 1], "a dead entity is not seen"
     assert env.state.hist_enemy_seen[0, 1, 1], "...but the slot before it still says it was"
+
+
+def test_enemy_seen_is_what_the_screen_showed_not_the_whole_map():
+    """The tiny map's camera sits at x 9.65 and tracks the hero on y only between 8.9 and 14.5.
+    With the hero at the top, an enemy on row 18 is 9.6 tiles below the camera centre and off
+    screen (the window ends about 7.2 south), while one beside the hero is on it."""
+    env = _env(n_envs=1, overrides={"entities": {"n_enemies": 2}})
+    env.reset()
+    _place(env, (10.5, 2.5), (12.5, 2.5), (10.5, 18.5))
+    env.step(_idle(1))
+    seen = env.state.hist_enemy_seen[0, 0]
+    assert bool(seen[1]) and not bool(seen[2]), seen.tolist()
 
 
 def test_history_is_per_decision_regardless_of_action_repeat():
@@ -113,8 +137,8 @@ def test_push_shifts_oldest_first_so_nothing_is_read_after_being_overwritten():
     leave the newest at slot 0 and the oldest at slot 2, for a ring deeper than the plan's 3."""
     env = _env(n_envs=1, overrides={"observation": {"history_frames": 4}})
     env.reset()
-    vis = torch.ones(1, env.cfg.n_entities, env.cfg.n_entities, dtype=torch.bool)
+    hero_view = torch.ones(1, env.cfg.n_entities, dtype=torch.bool)
     for value in (1, 2, 3):
-        history.push(env.state, torch.tensor([[value, value]]), vis)
+        history.push(env.state, torch.tensor([[value, value]]), hero_view)
     assert env.state.hist_action[0, :, 0].tolist() == [3, 2, 1, 0]
     assert env.state.hist_valid[0].tolist() == [True, True, True, False]

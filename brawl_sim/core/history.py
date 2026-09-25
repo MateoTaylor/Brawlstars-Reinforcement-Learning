@@ -20,7 +20,7 @@ RING_FIELDS = ("hist_valid", "hist_action", "hist_hp", "hist_ammo", "hist_pos",
                "hist_enemy_pos", "hist_enemy_seen")
 
 
-def push(state, action: torch.Tensor, vis: torch.Tensor) -> None:
+def push(state, action: torch.Tensor, hero_view: torch.Tensor) -> None:
     """MUTATES every `hist_*` ring. Shifts slots 0..K-2 into 1..K-1 (K-1 non-overlapping slice
     copies per ring, oldest slot first, so nothing is read after it has been overwritten) and
     writes slot 0 from the PRE-step state:
@@ -30,9 +30,11 @@ def push(state, action: torch.Tensor, vis: torch.Tensor) -> None:
         hp / ammo   the hero's, absolute (the observation normalizes)
         pos         the hero's position
         enemy_pos   EVERY entity's position (slot 0 of the E axis is the hero itself)
-        enemy_seen  alive & vis[:, 0, :], with the hero's own column forced False
+        enemy_seen  alive & hero_view, with the hero's own column forced False
 
-    `vis` is `bots/perception.visibility`'s (N,E,E) for the observation this action answers.
+    `hero_view` is `core/camera.hero_view`'s (N,E) for the observation this action answers:
+    the hero's reveal, concealment AND the camera window, so a sighting the screen never showed
+    is never remembered either (OBS_PARITY_TASKS.md C3).
     """
     depth = state.hist_valid.shape[1]
     for name in RING_FIELDS:
@@ -46,6 +48,6 @@ def push(state, action: torch.Tensor, vis: torch.Tensor) -> None:
     state.hist_ammo[:, 0].copy_(state.ent_ammo[:, 0])
     state.hist_pos[:, 0].copy_(state.ent_pos[:, 0])
     state.hist_enemy_pos[:, 0].copy_(state.ent_pos)
-    seen = state.ent_alive & vis[:, 0, :]
+    seen = state.ent_alive & hero_view
     seen[:, 0] = False
     state.hist_enemy_seen[:, 0].copy_(seen)

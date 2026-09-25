@@ -231,7 +231,10 @@ numbers. Named for the brawler because "shotgun" is already Shelly's role.
 
 ### Still unimplemented
 
-- **Gadgets, Star Powers and Hypercharges** — out of scope; see BRAWL_SIM_BUILD_PLAN.md Appendix A.
+- **Star Powers and Hypercharges** — out of scope; see BRAWL_SIM_BUILD_PLAN.md Appendix A. Gadgets
+  moved OUT of this list on 2026-09-21: Mortis throws one (the block above, SIM_OVERHAUL Phase G),
+  and no other kind has one, since `gadget_cooldown: 0` means "no gadget". Giving a bot one is the
+  same shape of change as giving it a super, below.
 - **Supers for bots.** Only Mortis has one. Nothing about the mechanic is hero-specific — the charge
   counter, readiness test, projectile and lifesteal are all per-entity, and `super_charge_hits: 0`
   is what means "this kind has no super" — so giving a bot one is a `brawlers.yaml` block plus a

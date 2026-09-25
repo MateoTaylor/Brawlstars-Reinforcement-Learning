@@ -132,6 +132,12 @@ class VisionConfig:
     # configs/vision.yaml has the measurement; occupancy.py's docstring has the table.
     occupancy_min_votes: int = 5
     occupancy_lock_ratio: float = 0.8
+    # The one-wide-gap rule (terrain/gaps.py): a frame whose classification shows a walkable cell
+    # pinched between two blockers is claiming a passage the map rules forbid, so that frame's
+    # vote on those three cells counts this much instead of 1. Strictly positive: at 0 a cell
+    # that looks pinched from every view would never be observed at all, and the deploy grid
+    # reads UNKNOWN as FLOOR -- the wrong direction for a wall. 1.0 turns the rule off.
+    occupancy_gap_rule_weight: float = 0.1
 
     # --- classifier (Phase H) ------------------------------------------------------------
     # CPU by default, and this is a real choice rather than a placeholder: the GPU will be busy
@@ -343,6 +349,7 @@ _VISION_CONFIG_FIELDS = (
     ("occupancy.grid_w", "occupancy_grid_w", int),
     ("occupancy.min_votes", "occupancy_min_votes", int),
     ("occupancy.lock_ratio", "occupancy_lock_ratio", float),
+    ("occupancy.gap_rule_weight", "occupancy_gap_rule_weight", float),
     ("classifier.device", "classifier_device", str),
     ("detector.model", "detector_model", str),
     ("detector.conf", "detector_conf", float),
@@ -521,6 +528,12 @@ def validate(cfg: VisionConfig) -> None:
         raise ValueError(
             f"occupancy.lock_ratio must be in (0.2, 1.0] -- at or below 1/5 (five terrain "
             f"classes) an even vote split would lock a cell. Got {cfg.occupancy_lock_ratio}"
+        )
+    # Zero would withhold the vote entirely and leave an always-pinched cell UNKNOWN for the
+    # match, which the deploy grid reads as FLOOR; see VisionConfig.
+    if not 0.0 < cfg.occupancy_gap_rule_weight <= 1.0:
+        raise ValueError(
+            f"occupancy.gap_rule_weight must be in (0, 1], got {cfg.occupancy_gap_rule_weight}"
         )
     if cfg.classifier_device not in ("cpu", "cuda"):
         raise ValueError(f"classifier.device must be 'cpu' or 'cuda', got {cfg.classifier_device!r}")

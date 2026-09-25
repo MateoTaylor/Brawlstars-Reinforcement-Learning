@@ -31,7 +31,7 @@ jittering period, not a slow one. §6.13 has the measurement.
 | terrain classify + occupancy deposit | accumulating; a skipped frame is evidence thrown away |
 | `grid.observe_zone` | same, and it is what `ZoneEstimator` reads |
 | `shadow.advance` | it spends REAL elapsed seconds as whole sub-ticks, which is what keeps the two rates honest when a decision runs long |
-| `buttons.settle` | walks an attack press one step: the tick after the down drags it along the aim, the tick after that lifts, which fires |
+| `buttons.settle` | walks an attack press one step: the tick after the down drags it along the aim, the tick after that lifts, which fires; a gadget tap lifts on the tick after its down |
 
 | every decision (4 Hz) | why not faster |
 |---|---|
@@ -49,7 +49,9 @@ contact stays down and only moves when the bin changes; the fire bit does not re
 `Buttons.press` is called once per decision and `ShadowHero.act` queues exactly one attack for the
 next sub-tick. The press is dragged along `ShadowHero.attack_bearing` -- the move bin, or `facing`
 when idle -- because that is where the sim's dash goes, and a bare tap would auto-aim instead.
-None of it is a simplification of the trained behaviour -- all of it is it.
+The gadget, attack value 3 since SIM_OVERHAUL Step G5, is the one bare tap, because the game aims
+it at the nearest enemy exactly as the sim does. None of it is a simplification of the trained
+behaviour -- all of it is it.
 
 **Failure routes to one place** (§8). `_stop` releases every contact, drops the gate, and refuses
 to emit again. Occlusion is the single exception: it `_pause`s instead, because a window drawn
@@ -78,9 +80,11 @@ from brawl_vision.config import EMULATOR_HUD_MASK_PATH
 from .config import DeploymentConfig, resolve_rates
 from .control import Buttons, Joystick
 from .match_state import Calibration, MatchState
+from .move_mask import MoveMask
 from .perception import (EntityTracker, GridBuilder, GridSpec, LatticePhase, LootMap,
                          ProjectileTracker, ShadowHero, ShadowParams, ZoneEstimator,
                          box_occlusion, crate_occlusion, require_loot_classes)
+from .perception.assemble import DecisionSnapshot
 
 # The emulator's HUD, NOT `brawl_vision`'s default. That one is the iOS recordings' layout; on
 # BlueStacks frames it masks floor and leaves every button in view, which the terrain map deposits
@@ -141,7 +145,8 @@ class TickRow:
 
     `move_bin` and `attack` are `-1` on a tick with no decision, which is a different thing from
     `0` -- idle is a bin the policy chose and a contact the loop moved. Telemetry that conflated
-    them would make a stalled loop and a stationary agent look identical.
+    them would make a stalled loop and a stationary agent look identical. On a decision row
+    `attack` is 0..3, and 3, the gadget, is not an attack to `scripts/audit_attack_cadence.py`.
     """
 
     index: int
@@ -184,7 +189,8 @@ class TickRow:
     #
     # `attack_legal`: `ShadowHero.attack_mask()` as a bitmask, bit i = attack column i, so bit 0
     # (no-fire, always legal) is set on every decision row and `attack_legal & 0b10` is "the
-    # dash was legal" -- the audit's `can_attack`. `attack_cd_shadow` / `attack_idle_t_shadow`
+    # dash was legal" -- the audit's `can_attack`. Bit 3 is the gadget since SIM_OVERHAUL Step G5,
+    # so a fresh match's first row reads 0b1011. `attack_cd_shadow` / `attack_idle_t_shadow`
     # are the shadow's two timers the audit reads (phasing loss and long-dash waiting).
     # `enemy_in_reach` is the audit's own criterion applied to the tracks the assembler was given:
     # any enemy within `dash_distance + dash_radius + unit_radius` tiles of the hero
@@ -200,6 +206,19 @@ class TickRow:
     # unambiguous, because a zero error is inside every tolerance and can never trip the canary.
     resync: bool = False
     resync_error: float = 0.0
+    # The move half of the mask the policy was handed (`move_mask.py`), a bitmask like
+    # `attack_legal`: bit i = move bin i, bit 0 the always-legal idle, so a decision in the open
+    # reads 0x1FFFF. `-1` on a tick with no decision, and on every row of a run with
+    # `policy.dead_bin_mask: false` -- a row that says "every bin was legal" and one that says
+    # "nothing was checked" must not read the same. Appended last, like the columns above.
+    move_legal: int = -1
+    # OBS_PARITY_TASKS.md C7: the player box's tiles from its nominal screen anchor
+    # (`TrackerResult.hero_offset`) and the `hero.near_edge` flag the assembler derives from it
+    # against the sim config's `camera.edge_flag_tiles`; `-1` on a tick with no decision or no
+    # offset yet. Appended last, like the columns above.
+    hero_offset_x: float = 0.0
+    hero_offset_y: float = 0.0
+    near_edge: int = -1
 
     @classmethod
     def from_record(cls, record: dict) -> "TickRow":
@@ -393,6 +412,7 @@ class Controls:
         buttons = Buttons(backend,
                           attack=(dcfg.control_attack_tap[0] * w, dcfg.control_attack_tap[1] * h),
                           super_=cal.button("super"),
+                          gadget=cal.button("gadget"),
                           aim_radius_px=dcfg.control_aim_radius_px)
         try:
             buttons.require_on_screen(cal.screen)
@@ -404,6 +424,24 @@ class Controls:
             joystick=Joystick(backend, cal.joystick_anchor, cal.joystick_radius_px,
                               n_bins=n_move_bins),
             buttons=buttons,
+        )
+
+    def with_backend(self, backend) -> "Controls":
+        """The same joystick and buttons, driving `backend` instead. `scripts/deploy_run.py
+        --dry-run` swaps in a `NullBackend` this way, so no code path in a dry run can touch the
+        device.
+
+        Every geometry field is carried over by name, the gadget's included. The script used to
+        rebuild these itself, positionally, where the gadget becoming a required button
+        (SIM_OVERHAUL Step G5) would have crashed every dry run before its first tick, and
+        nothing offline could have seen it. A test calls this instead.
+        """
+        j, b = self.joystick, self.buttons
+        return type(self)(
+            backend=backend,
+            joystick=type(j)(backend, j.anchor, j.radius_px, n_bins=j.n_bins),
+            buttons=type(b)(backend, attack=b.attack, super_=b.super_, gadget=b.gadget,
+                            aim_radius_px=b.aim_radius_px),
         )
 
     def release_all(self) -> None:
@@ -469,7 +507,26 @@ class DeployLoop:
         # Here rather than in `VisionStack.build`, because it takes both halves: a deploy3 policy
         # on a model with no crate class would read an empty `box` plane forever, silently.
         require_loot_classes(vision.projectiles.names, self.grid.spec.channels)
+        # The dead-bin move mask (`move_mask.py`): the sim's own collision rule on the
+        # `blocks_unit` plane the grid hands the policy, so a bin that would walk into a wall is
+        # masked rather than chosen. Its constants come from the three sources the sim walks with;
+        # the plane is looked up here, so a spec without it fails at build rather than on the
+        # first decision. Off by config only (`policy.dead_bin_mask`), for A/B runs.
+        self.move_mask = (MoveMask.from_configs(self.shadow.p, self.sim)
+                          if cfg.policy_dead_bin_mask else None)
+        if self.move_mask is not None and "blocks_unit" not in self.grid.spec.channels:
+            raise ValueError("policy.dead_bin_mask needs the grid's blocks_unit plane, which the "
+                             f"policy's spec does not carry ({self.grid.spec.channels}); set "
+                             "policy.dead_bin_mask: false to deploy it without the mask")
+        self._blocks_plane = (self.grid.spec.channels.index("blocks_unit")
+                              if self.move_mask is not None else -1)
         self.zone = ZoneEstimator(self.sim)
+        # The `hist` group's and the enemy_hist planes' supplier (SIM_OVERHAUL_STEPS.md H4.1): one
+        # snapshot per decision that reached the policy, newest first, as many as the checkpoint's
+        # config keeps. Its positions are world-frame, so it is dropped where every world-frame
+        # consumer is: at the gate, and on a new segment (`_decide`).
+        self._history: deque[DecisionSnapshot] = deque(maxlen=int(self.sim.history_frames))
+        self._history_segment: int | None = None
 
         self.phase = Phase.WAITING
         self.stop_reason: str | None = None
@@ -691,6 +748,11 @@ class DeployLoop:
         named in the telemetry row, because "the agent stood still" and "no observation could be
         built" look identical from outside and mean opposite things.
 
+        A skip also takes no history snapshot, so the next decision's first `hist` slot is two
+        windows old where the sim's is always one. Its alternative, a snapshot of the held action,
+        needs the very reads whose absence caused the skip, and an invalid slot mid-ring is a
+        pattern the sim never produces: its `valid` is always a prefix.
+
         `odo` is the WORLD odometry `_perceive` returned, the frame every track and map is in.
         """
         if odo.status != "ok":
@@ -725,10 +787,28 @@ class DeployLoop:
             row.note = "no brawlers-left read"
             return
 
+        # A snapshot's positions are in the world frame of the segment it was taken in, and a new
+        # segment has no defined offset to the old one; the tracker has already dropped its tracks
+        # for the same reason. Checked here, where the snapshots are read, because the segment can
+        # change on any tick in between and only ever moves forward.
+        if odo.segment != self._history_segment:
+            self._history.clear()
+            self._history_segment = odo.segment
+        history = tuple(self._history)
+        # Read once: the observation and this decision's snapshot must hold the same ammo.
+        shadow_obs = self.shadow.observe()
+        seen = tuple((float(t.pos[0]), float(t.pos[1]))
+                     for t in tracked.enemies if t is not None and t.seen_now)
+        # Bound, not inlined: the move mask below reads the same planes the policy is handed.
+        grid = self.grid.build(hero_pos, alive=self.shadow.alive, enemies=tracked.enemies,
+                               projectiles=self.projectiles.live(),
+                               crates=self.loot.crates(), cubes=self.loot.cubes(),
+                               enemy_history=tuple(s.enemies for s in history))
+
         obs = self.assembler.assemble(
             hero_pos=hero_pos,
             hero_vel=hero_vel,
-            shadow=self.shadow.observe(),
+            shadow=shadow_obs,
             hero_hp=hero_hp,
             n_enemies_alive=n_enemies,
             elapsed_s=time.perf_counter() - self._match_t0,
@@ -740,10 +820,9 @@ class DeployLoop:
                            for slot, tr in enumerate(tracked.enemies) if tr is not None},
             projectiles=self.projectiles.snapshot(hero_pos),
             zone=self.zone.estimate(self.grid.gas, hero_pos),
-            grid=self.grid.build(hero_pos, alive=self.shadow.alive,
-                                 enemies=tracked.enemies,
-                                 projectiles=self.projectiles.live(),
-                                 crates=self.loot.crates(), cubes=self.loot.cubes()),
+            history=history,
+            grid=grid,
+            hero_offset=tracked.hero_offset,
         )
 
         # Step A2 cadence columns, written BEFORE the policy call so a policy that raises still
@@ -754,9 +833,18 @@ class DeployLoop:
         row.attack_cd_shadow = float(self.shadow.attack_cd)
         row.attack_idle_t_shadow = float(self.shadow.attack_idle_t)
         row.enemy_in_reach = self._enemy_in_reach(hero_pos, tracked.enemies)
+        # The move half (`move_mask.py`), from the very plane the policy is about to read and in
+        # that plane's own units -- the hero relative to the crop's origin tile. On the row before
+        # the call, for the same reason as `attack_legal`.
+        move_legal = None
+        if self.move_mask is not None:
+            ox, oy = self.grid.origin_tile(hero_pos)
+            move_legal = self.move_mask.legal(grid[self._blocks_plane],
+                                              (float(hero_pos[0]) - ox, float(hero_pos[1]) - oy))
+            row.move_legal = sum(int(v) << i for i, v in enumerate(move_legal))
 
         try:
-            decision = self.policy.act(obs, legal)
+            decision = self.policy.act(obs, legal, move_legal=move_legal)
         except Exception as exc:                      # noqa: BLE001 -- re-raised after failing closed
             self._stop(f"policy raised: {exc!r}")
             raise
@@ -769,8 +857,19 @@ class DeployLoop:
         self.controls.joystick.apply(decision.move_bin)
         self.controls.buttons.press(modelled, self.shadow.attack_bearing)
         self._last_decision = decision
+        # This decision as the next ones read it back, after `shadow.act` so the attack is the
+        # modelled one. Everything else is what this observation was built from.
+        self._history.appendleft(DecisionSnapshot(
+            move_bin=int(decision.move_bin), attack=int(modelled), hp=float(hero_hp),
+            ammo_frac=float(shadow_obs["ammo_frac"]),
+            pos=(float(hero_pos[0]), float(hero_pos[1])), enemies=seen))
         row.decision = True
         row.move_bin = decision.move_bin
+        if tracked.hero_offset is not None:
+            row.hero_offset_x, row.hero_offset_y = (float(tracked.hero_offset[0]),
+                                                    float(tracked.hero_offset[1]))
+            row.near_edge = int(max(abs(row.hero_offset_x), abs(row.hero_offset_y))
+                                > float(self.sim.camera_edge_flag_tiles))
         # What was SENT, not what was chosen. They differ when the shadow's mask refused the
         # policy's pick, and a telemetry row that recorded the choice would show a shot the game
         # never saw.
@@ -981,6 +1080,8 @@ class DeployLoop:
         self.projectiles.reset(self.lattice.epoch)
         self.loot.reset(self.lattice.epoch)
         self.grid.reset(self.lattice.epoch)
+        self._history.clear()
+        self._history_segment = self.lattice.epoch
         self.vision.health.reset()
         self._enemy_hp.clear()
         self._slot_ids.clear()

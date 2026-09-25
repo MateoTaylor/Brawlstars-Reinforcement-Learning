@@ -205,6 +205,30 @@ def test_projectile_group_selects_k_nearest_by_time_to_closest_and_zero_pads():
     assert torch.equal(out["projectiles"], torch.zeros_like(out["projectiles"]))
 
 
+def test_a_fair_projectile_group_admits_only_what_is_on_screen():
+    """deploy4's projectile group is gated by `projectiles.in_view`, and since C4 that is the
+    camera window, not the crop. A projectile 20 tiles east flying at the hero has the smallest
+    time_to_closest on the map and still gets an all-zero row; 5 tiles east it fills one."""
+    env, cfg, _ = _env_and_obs(n_envs=1, overrides={
+        "world": {"map_h": 60, "map_w": 60, "maps": ["walled"], "map_selection": "fixed",
+                  "fixed_map": "walled"}})
+    spec = obs_select.load_agent_spec("configs/agent_obs_deploy4.yaml", cfg)
+    buffers = obs_select.make_agent_obs_buffers(spec, cfg, n_envs=1, device="cpu")
+    st = env.state
+    st.ent_pos[0, 0] = torch.tensor([30.5, 30.5])
+    st.prj_alive[0] = False
+    st.prj_alive[0, 0] = True
+    st.prj_owner[0, 0] = 1
+    st.prj_vel[0, 0] = torch.tensor([-8.0, 0.0])
+    rows = {}
+    for dx in (20.0, 5.0):
+        st.prj_pos[0, 0] = torch.tensor([30.5 + dx, 30.5])
+        out = obs_select.build_agent_obs(env._build_observation(), spec, cfg, buffers)
+        rows[dx] = out["projectiles"][0].clone()
+    assert not rows[20.0].any(), "off screen: no row at all, whatever its rank"
+    assert rows[5.0][0].any() and not rows[5.0][1:].any()
+
+
 # ---- build_agent_obs allocates nothing per call (steady-state memory doesn't grow) --------
 
 def test_build_agent_obs_reuses_the_same_out_buffer_tensors():
@@ -232,6 +256,33 @@ def test_dump_obs_schema_regenerates_agent_obs_docs_deterministically():
     second = dump_mod.render_agent_obs()
     assert first == second
     assert "## `self`" in first and "## `grid`" in first
+
+
+def test_each_spec_renders_to_a_doc_named_after_itself():
+    """SIM_OVERHAUL Step I3: `--spec` gives every sibling spec its own doc, because each narrowing
+    is a different width and a different from-scratch run, so a column index only means something
+    next to the spec it came from. The default path is the one the constant already names."""
+    import importlib
+    dump_mod = importlib.import_module("scripts.dump_obs_schema")
+    assert dump_mod.agent_docs_path("configs/agent_obs.yaml") == dump_mod.AGENT_DOCS_PATH
+    assert dump_mod.agent_docs_path("configs/agent_obs.yaml").name == "AGENT_OBS.md"
+    assert dump_mod.agent_docs_path("configs/agent_obs_deploy4.yaml").name == "AGENT_OBS_DEPLOY4.md"
+    assert dump_mod.agent_docs_path("configs/agent_obs_lowinfo.yaml").name == "AGENT_OBS_LOWINFO.md"
+
+
+def test_the_deployed_spec_renders_its_own_layout_not_the_full_one():
+    """The deploy4 doc has to show the widths H3 pins and say which file it came from, or the
+    deployment mirrors have no readable reference for a column index."""
+    import importlib
+    dump_mod = importlib.import_module("scripts.dump_obs_schema")
+    deploy4 = dump_mod.render_agent_obs("configs/agent_obs_deploy4.yaml")
+    assert "`configs/agent_obs_deploy4.yaml`" in deploy4.splitlines()[2]
+    assert "## `history`" in deploy4
+    assert "shape: `(26,)`" in deploy4                    # self, the gadget pair included
+    assert "`hero.gadget_ready`" in deploy4
+    assert "shape: `(13, 13, 21)`" in deploy4             # ten deploy3 planes + three history
+    assert "| 12 | `enemy_hist3` |" in deploy4
+    assert deploy4 != dump_mod.render_agent_obs()         # --spec really changes the render
 
 
 # ---- normalize: true, per unit ------------------------------------------------------------
@@ -380,3 +431,177 @@ def test_two_specs_with_a_same_named_grid_do_not_share_channel_indices(first, se
         for s, p in zip((first, second), paths):
             if isinstance(s, dict):
                 os.remove(p)
+
+
+# ---- the history group and planes (SIM_OVERHAUL Step H2) ---------------------------------------
+
+_HIST_FIELDS = ["hist.valid", "hist.move_onehot", "hist.attack_onehot", "hist.hp", "hist.ammo_frac",
+                "hist.displacement"]
+
+
+def _hist_spec(normalize):
+    return {"fair": True, "normalize": normalize,
+            "groups": [{"name": "history", "per_entity": False, "dtype": "float32", "fields": _HIST_FIELDS}]}
+
+
+def _load_spec(spec_dict, cfg):
+    path = _write_spec(spec_dict)
+    try:
+        return obs_select.load_agent_spec(path, cfg)
+    finally:
+        os.remove(path)
+
+
+def test_the_six_hist_fields_make_a_78_column_group():
+    """3 * (1 + 17 + 4 + 1 + 1 + 2), the width H2.2 pins."""
+    cfg = _cfg()
+    spec = _load_spec(_hist_spec(normalize=False), cfg)
+    assert spec.groups[0].shape == (78,)
+    assert obs_select.agent_space(spec, cfg)["history"].shape == (78,)
+    assert obs_select.agent_obs_index_map(spec, cfg)["history"] == {
+        "hist.valid": (0, 3), "hist.move_onehot": (3, 54), "hist.attack_onehot": (54, 66),
+        "hist.hp": (66, 69), "hist.ammo_frac": (69, 72), "hist.displacement": (72, 78),
+    }
+
+
+def test_a_rank_3_field_flattens_slot_by_slot():
+    """Row-major: slot 0's 17 move columns, then slot 1's, then slot 2's, and displacement as
+    (x0, y0, x1, y1, x2, y2). A hand-made package, so every column's value is known."""
+    cfg = _cfg()
+    spec = _load_spec(_hist_spec(normalize=False), cfg)
+    move = torch.zeros(1, 3, 17, dtype=torch.uint8)
+    move[0, 0, 5] = move[0, 1, 0] = move[0, 2, 16] = 1
+    attack = torch.zeros(1, 3, 4, dtype=torch.uint8)
+    attack[0, 0, 1] = attack[0, 1, 3] = attack[0, 2, 2] = 1
+    full_obs = {"hist": {
+        "valid": torch.tensor([[True, True, True]]),
+        "move_onehot": move,
+        "attack_onehot": attack,
+        "hp": torch.tensor([[100.0, 200.0, 300.0]]),
+        "ammo_frac": torch.tensor([[0.5, 0.25, 1.0]]),
+        "displacement": torch.tensor([[[1.0, 2.0], [3.0, 4.0], [5.0, 6.0]]]),
+    }}
+    buffers = obs_select.make_agent_obs_buffers(spec, cfg, 1, torch.device("cpu"))
+    row = obs_select.build_agent_obs(full_obs, spec, cfg, buffers)["history"][0]
+    assert row[0:3].tolist() == [1.0, 1.0, 1.0]
+    assert row[3:54].nonzero().flatten().tolist() == [5, 17, 50]  # 17 * slot + bin
+    assert row[54:66].nonzero().flatten().tolist() == [1, 7, 10]  # 4 * slot + attack
+    assert row[66:72].tolist() == [100.0, 200.0, 300.0, 0.5, 0.25, 1.0]
+    assert row[72:78].tolist() == [1.0, 2.0, 3.0, 4.0, 5.0, 6.0]
+
+
+def test_normalize_scales_hist_hp_by_the_hp_scale_and_displacement_by_the_map():
+    cfg = _cfg()  # debug_tiny: a 20 x 20 map
+    g = _load_spec(_hist_spec(normalize=True), cfg).groups[0]
+    assert g.norm_scale == (1.0,) * 66 + (20000.0,) * 3 + (1.0,) * 3 + (20.0,) * 6
+
+
+def test_a_hist_group_builds_on_a_real_env():
+    env, cfg, full_obs = _env_and_obs(n_envs=2)
+    spec = _load_spec(_hist_spec(normalize=True), cfg)
+    buffers = obs_select.make_agent_obs_buffers(spec, cfg, 2, torch.device("cpu"))
+    assert not obs_select.build_agent_obs(full_obs, spec, cfg, buffers)["history"].any()  # no past yet
+    full_obs, *_ = env.step(torch.tensor([[5, 0], [0, 0]]))
+    out = obs_select.build_agent_obs(full_obs, spec, cfg, buffers)["history"]
+    assert out[:, 0:3].tolist() == [[1.0, 0.0, 0.0], [1.0, 0.0, 0.0]]
+    assert out[:, 3:20].argmax(dim=1).tolist() == [5, 0]
+
+
+def test_channel_index_appends_one_enemy_hist_plane_per_history_frame():
+    base = dict(obs_select._CHANNEL_INDEX)
+    assert len(base) == 12 and base["projectile"] == 11
+    three = obs_select.channel_index(_cfg())
+    assert {k: v for k, v in three.items() if k not in base} == {
+        "enemy_hist1": 12, "enemy_hist2": 13, "enemy_hist3": 14}
+    assert {k: three[k] for k in base} == base
+    one = obs_select.channel_index(_cfg({"observation": {"history_frames": 1}}))
+    assert {k: v for k, v in one.items() if k not in base} == {"enemy_hist1": 12}
+    assert obs_select._CHANNEL_INDEX == base, "the fixed table is not mutated"
+
+
+def test_a_grid_spec_selects_history_planes_and_refuses_one_past_k():
+    env, cfg, full_obs = _env_and_obs(n_envs=2)
+    spec = _load_spec(_grid_spec(["enemy_revealed", "enemy_hist1", "enemy_hist3"]), cfg)
+    assert spec.groups[0].channel_idx == (6, 12, 14)
+    full_obs["view"][:, 14] = 7  # a marker only the oldest history plane carries
+    buffers = obs_select.make_agent_obs_buffers(spec, cfg, 2, torch.device("cpu"))
+    grid = obs_select.build_agent_obs(full_obs, spec, cfg, buffers)["grid"]
+    assert grid.shape == (2, 3, 10, 14)
+    assert (grid[:, 2] == 7).all() and not (grid[:, :2] == 7).any()
+    with pytest.raises(ValueError, match="enemy_hist4"):
+        _load_spec(_grid_spec(["enemy_hist4"]), cfg)
+
+
+# ---- slots: tracked (OBS_PARITY_TASKS.md C9) -------------------------------------------------
+
+DEPLOY4_YAML = "configs/agent_obs_deploy4.yaml"
+
+
+def _enemies_group(doc: dict) -> dict:
+    """deploy4's one hero-axis per-entity group."""
+    (g,) = [g for g in doc["groups"]
+            if g.get("per_entity") and all(f.startswith("entities.") for f in g.get("fields", ()))]
+    return g
+
+
+def _deploy4_variant(**group_keys) -> str:
+    """deploy4 written to a temp file with `group_keys` set on its enemies group."""
+    doc = yaml.safe_load(open(DEPLOY4_YAML).read())
+    _enemies_group(doc).update(group_keys)
+    return _write_spec(doc)
+
+
+def test_tracked_slots_order_the_rows_by_the_sims_slot_table():
+    """Slot 0 <- entity 3, slot 1 <- entity 1, slot 2 empty: the tracked build's rows are the
+    plain build's rows for those entities, and the empty slot is a zero row."""
+    env, cfg, full = _env_and_obs(
+        n_envs=1, overrides={"entities": {**CONFIGS_TINY.get("entities", {}), "n_enemies": 3}})
+    plain = obs_select.load_agent_spec(_deploy4_variant(), cfg)
+    tracked = obs_select.load_agent_spec(_deploy4_variant(slots="tracked"), cfg)
+    assert [g.slots for g in tracked.groups if g.entity_prefix == "entities"] == ["tracked"]
+    assert all(g.slots is None for g in plain.groups)
+    assert [g.shape for g in tracked.groups] == [g.shape for g in plain.groups], "same width"
+
+    full["entities"]["revealed_to_hero"][:] = True       # every row lit: the gather is what moves them
+    entity = torch.tensor([[4, 2, 0]])
+    full["slots"] = {"entity": entity, "valid": entity > 0}
+    want = obs_select.build_agent_obs(
+        full, plain, cfg, obs_select.make_agent_obs_buffers(plain, cfg, n_envs=1, device="cpu"))
+    want = want["enemies"][0].clone()
+    tbuf = obs_select.make_agent_obs_buffers(tracked, cfg, n_envs=1, device="cpu")
+    got = obs_select.build_agent_obs(full, tracked, cfg, tbuf)["enemies"][0].clone()
+    assert want.abs().sum(1).gt(0).all(), "the plain rows are non-zero, so the equalities below bite"
+    assert torch.equal(got[0], want[2]) and torch.equal(got[1], want[0])
+    assert not got[2].any()
+
+    full["entities"]["revealed_to_hero"][0, 3] = False    # the entity in slot 0 goes unrevealed
+    got = obs_select.build_agent_obs(full, tracked, cfg, tbuf)["enemies"][0].clone()
+    assert not got[0].any() and torch.equal(got[1], want[0])
+
+
+@pytest.mark.parametrize("group_keys, message", [
+    ({"slots": "other"}, "'tracked'"),
+    ({"slots": "tracked", "max_slots": 2}, "max_slots"),
+])
+def test_tracked_slots_refuses_a_bad_option_at_load_time(group_keys, message):
+    with pytest.raises(ValueError, match=message):
+        obs_select.load_agent_spec(_deploy4_variant(**group_keys), _cfg())
+
+
+def test_tracked_slots_is_only_for_the_hero_axis():
+    cfg = _cfg()
+    for group in ({"name": "p", "per_entity": True, "dtype": "float32", "slots": "tracked",
+                   "fields": ["projectiles.rel_pos"]},
+                  {"name": "s", "per_entity": False, "dtype": "float32", "slots": "tracked",
+                   "fields": ["hero.hp"]}):
+        path = _write_spec({"fair": True, "normalize": False, "groups": [group]})
+        with pytest.raises(ValueError, match="entities"):
+            obs_select.load_agent_spec(path, cfg)
+
+
+def test_the_slot_bookkeeping_is_not_an_observation():
+    path = _write_spec({"fair": True, "normalize": False,
+                        "groups": [{"name": "x", "per_entity": True, "dtype": "float32",
+                                    "fields": ["slots.entity"]}]})
+    with pytest.raises(ValueError, match="slots"):
+        obs_select.load_agent_spec(path, _cfg())

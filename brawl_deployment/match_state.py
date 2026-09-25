@@ -11,21 +11,59 @@ button chrome does and the map underneath, however busy, does not.
 MEASURED on tests/fixtures/vision/bluestacks-example-new.mp4 (1920x1080, 30 fps, BlueStacks
 fullscreen, Mortis), every 5th frame:
 
-                          attack anchor      gadget anchor
+                          the GADGET disc    the SUPER disc
     pre-match / loading   0.000 - 0.198      0.001 - 0.078
     gameplay              0.582 - 0.593      0.776 - 0.823
     post-match            0.000 - 0.198      0.001 - 0.078
 
-**The gate watches the GADGET button, not the attack button**, and the reason is margin rather
-than preference. Both separate cleanly at the shipped 0.45 threshold, but the gadget sits 5.8x
-above the menu ceiling and 1.8x below the gameplay floor, against attack's 2.3x and 1.3x. Attack
-reads lower here than in the iOS footage `gameplay.py` was tuned on (0.585 vs 0.649-0.790) because
-Nulls Brawl draws a bright filled disc where iOS drew a dark annulus, and `ring_score_at` is
-measuring radial gradient either way.
+Those columns were headed `attack anchor` and `gadget anchor` until 2026-09-22. **Both names were
+wrong.** Every button name in `control_calibration.json` sat one disc off: stored `attack` is the
+gadget, stored `gadget` is the Super, and the third disc, which nothing pressed, is now stored as
+`hypercharge` after its icon. No number above moved; only the names did. Design 5.1 is the full
+account, including why `fit_buttons`, `job_tap` and `job_super` could not have caught it. The old
+docstring read the left column's 0.585 as the attack button scoring lower than in the iOS footage
+(0.649-0.790) because Nulls Brawl draws a bright filled disc where iOS drew a dark annulus. That
+disc-versus-annulus effect is real and still governs every score here; the comparison is not,
+because the left column is not an attack button.
 
-There is a second reason, and it is the one that would survive a re-tune: **the policy never
-presses the gadget button**, so the agent cannot perturb its own in-match signal. Watching the
-attack button means every shot the agent fires lands a finger on the thing being measured.
+**The two tables here disagree, and only the second one reproduces.** Scoring the same clip today
+at the 2026-09-08 radii: the Super's row comes back exactly, 0.082 menu max and 0.677 play min
+against today's 0.083 and 0.675, because its stored radius barely moved (33.2 to 33.3). The
+gadget's row does not come back at all -- at r=35.1 it never crosses 0.45 on any frame of the
+clip, so it has no gameplay range to report; its stored radius is 30.2. Whatever produced
+`0.582 - 0.593` was not this code path at this calibration. Read the first table as history and
+the numbers below as the claim. A ring-score table is worth only the code path it was measured
+through.
+
+**The gate watches `hypercharge`, the one disc in the cluster the policy never touches**
+(2026-09-22, SIM_OVERHAUL Step G6.2). That is the property a gate needs, and it is the property
+this docstring spent two weeks claiming for whichever disc was called `gadget`. Re-measured on the
+same clip through this class's own path, stored centres and radii, 238 samples, scores partitioned
+by the threshold the way `test_gate_separates_gameplay_from_menus_on_real_footage` partitions them:
+
+    disc          menu max   play min   play median
+    hypercharge     0.212      0.968       0.985
+    super           0.083      0.675       0.770
+    gadget          0.336      0.454       0.978
+
+`hypercharge` clears the 0.45 threshold by 2.1x below and 2.2x above. `super` has the cleanest
+menus but the policy fires it, and its face changes as it charges: that 0.675 is the exact number
+the real-footage gate test failed on for two weeks while the gate sat here. The gadget's in-match
+floor is 0.454 against a 0.45 threshold with nobody pressing it, so it is unusable before the press
+hazard is even considered.
+
+**Confirmed live 2026-09-22**, `runs/audit/gadget_anchor_trace.json`: a real match, 264 ticks at 12
+Hz, one gadget throw. `hypercharge` held 0.991 with a floor of 0.991, zero ticks under threshold
+and zero colour movement. The same trace shows why the disjointness is load-bearing rather than
+tidy: the real gadget FALSE-EXITED 0.58 s after the throw and stayed under 0.45 for 60 consecutive
+ticks, 5.0 s, while the recharge sweep ran. An agent gated on its own gadget stops dead for five
+seconds after every throw.
+
+**The guarantee is inertness, and it is conditional on the roster.** Mortis has no hypercharge, so
+this button is drawn and never fills, sweeps or animates. That is stronger than "the policy never
+presses it", which is all the gate was originally chosen on. It is also contingent: give Mortis a
+hypercharge and the disc gains a charge meter that fills during a match, which is exactly what
+disqualifies the Super here. Re-measure this gate if the brawler or its unlocks change.
 
 **Hysteresis is asymmetric, because the two errors are not.** Entering gameplay wrongly means
 spraying inputs at a menu; exiting wrongly means standing still for a beat. Exit still cannot be
@@ -184,7 +222,7 @@ def refine_radius(frame, cx: float, cy: float, r0: float,
     frame source does not transfer to another.** Measured, same buttons, same screen resolution,
     same fixed HUD:
 
-        source                          gadget button      score at the OTHER source's radius
+        source                          the SUPER button   score at the OTHER source's radius
         OBS recording, temporal median  r = 33.2                       --
         raw ADB framebuffer grab        r = 39.9           0.083  (vs 0.984 at its own radius)
 
@@ -283,3 +321,9 @@ class MatchState:
     @property
     def in_match(self) -> bool:
         return self._in_match
+
+    @property
+    def anchor(self) -> tuple[float, float, float]:
+        """`(cx, cy, r)` in viewport pixels, as `update` scores it: the stored centre, and after
+        `refine` the re-fitted radius."""
+        return self._anchor

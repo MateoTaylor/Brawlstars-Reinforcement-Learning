@@ -17,7 +17,7 @@ from pathlib import Path
 import torch
 import yaml
 from stable_baselines3 import PPO
-from stable_baselines3.common.vec_env import VecMonitor, VecNormalize
+from stable_baselines3.common.vec_env import VecMonitor, VecNormalize, VecTransposeImage
 
 from ..config import load_config
 from ..core import obs_select
@@ -90,6 +90,21 @@ def check_reward_is_observable(reward, spec: obs_select.AgentObsSpec, spec_path)
             "it cannot see. Pass `--set reward.cube_pickup=0` for this spec (the deploy and deploy2 "
             "specs need it), or train on one that sees cubes (agent_obs_deploy3.yaml)."
         )
+
+
+def no_image_transpose(venv):
+    """`venv` behind SB3's own opt-out from its image heuristic, `VecTransposeImage(skip=True)`
+    (SB3 GH issue #671). `build_model` and `scripts/train.py`'s resume hand SB3 the env through it.
+
+    SB3 takes a uint8 [0, 255] Box of rank 3 for an image and guesses its channel axis from its
+    SMALLEST dimension. When it guesses channels-last it wraps the env in a VecTransposeImage that
+    reorders every observation, and says so only in a UserWarning. The grid is
+    (channels, view_h, view_w) by construction and `BrawlFeaturesExtractor` reads it that way, so
+    the guess is right only by accident. deploy4 at the default 13 x 21 view is (13, 13, 21),
+    channels-first on a tie. At debug_tiny's 10 x 14 view it is (13, 10, 14), and SB3 trained
+    `--smoke` on (14, 13, 10), view columns for channels, until 2026-09-21. A skip wrapper already
+    in the chain makes SB3 add none, and it passes observations through untouched."""
+    return VecTransposeImage(venv, skip=True)
 
 
 def build_env(tcfg: TrainConfig, n_envs: int | None = None, verbose: bool | None = None):
@@ -218,7 +233,7 @@ def build_model(tcfg: TrainConfig, venv, agent_spec, env_cfg):
     torch.distributions.Distribution.set_default_validate_args(False)
 
     return algo_cls(
-        "MultiInputPolicy", venv,
+        "MultiInputPolicy", no_image_transpose(venv),
         policy_kwargs=build_policy_kwargs(tcfg, agent_spec, env_cfg),
         learning_rate=make_schedule(tcfg.learning_rate),
         clip_range=make_schedule(tcfg.clip_range),

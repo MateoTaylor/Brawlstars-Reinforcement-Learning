@@ -156,6 +156,16 @@ def test_validate_rejects_a_lock_ratio_an_even_split_would_clear():
         validate(_cfg(occupancy_lock_ratio=0.2))
 
 
+def test_validate_rejects_a_gap_rule_weight_that_withholds_the_vote():
+    """At 0 a cell that looks pinched from every view is never observed at all, and the deploy
+    grid reads UNKNOWN as FLOOR -- the wrong direction for a wall. 1.0 (the rule off) is fine."""
+    with pytest.raises(ValueError, match="gap_rule_weight"):
+        validate(_cfg(occupancy_gap_rule_weight=0.0))
+    with pytest.raises(ValueError, match="gap_rule_weight"):
+        validate(_cfg(occupancy_gap_rule_weight=1.5))
+    validate(_cfg(occupancy_gap_rule_weight=1.0))
+
+
 # ---------------------------------------------------------------------------
 # Phase 0 packaging invariants
 # ---------------------------------------------------------------------------

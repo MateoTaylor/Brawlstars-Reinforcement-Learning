@@ -260,7 +260,8 @@ SUPPLIABLE_SUBSTITUTIONS = {
 # Every spec in the deploy lineage. The properties below hold for all of them -- each new file is
 # a change to the last for a stated reason, so a test that only ever checked the first would stop
 # guarding the file actually being trained on.
-DEPLOY_SPECS = ("agent_obs_deploy.yaml", "agent_obs_deploy2.yaml", "agent_obs_deploy3.yaml")
+DEPLOY_SPECS = ("agent_obs_deploy.yaml", "agent_obs_deploy2.yaml", "agent_obs_deploy3.yaml",
+                "agent_obs_deploy4.yaml", "agent_obs_deploy5.yaml")
 
 
 def test_deploy_agent_obs_yaml_loads_as_a_real_agent_spec():
@@ -380,11 +381,14 @@ def test_the_deploy_spec_has_no_unnormalized_field_of_large_magnitude(spec_name)
 
 
 # Which deploy specs can see a cube lying on the ground. deploy and deploy2 dropped `box`/`pickup`
-# as a TEMPORARY operator decision; deploy3 is its reversal (2026-09-11).
+# as a TEMPORARY operator decision; deploy3 is its reversal (2026-09-11), deploy4 keeps
+# deploy3's grid planes (2026-09-21) and deploy5 keeps deploy4's (2026-09-24).
 SEES_PICKUPS = {
     "agent_obs_deploy.yaml": False,
     "agent_obs_deploy2.yaml": False,
     "agent_obs_deploy3.yaml": True,
+    "agent_obs_deploy4.yaml": True,
+    "agent_obs_deploy5.yaml": True,
 }
 
 
@@ -648,3 +652,201 @@ def test_no_deploy_spec_shows_how_many_cubes_anyone_holds(spec_name):
 
     counts = fields & {"hero.cubes", "entities.cubes", "pickups.cubes"}
     assert not counts, f"configs/{spec_name} shows cube counts: {sorted(counts)}"
+
+
+# ---- configs/agent_obs_deploy4.yaml: the gadget pair, the history group, three history planes --
+#
+# deploy4 is deploy3 plus what Phases G and H added to build_obs (2026-09-21): the gadget pair in
+# `self`, the six `hist.*` fields as a new `history` group, and `enemy_hist1..3` after deploy3's
+# grid planes. The tests below pin exactly that in both directions, and the widths the extractor
+# is built on (Step H3 builds it). The parametrized deploy-lineage tests above cover it too.
+
+GADGET_FIELDS = ("hero.gadget_ready", "hero.gadget_charge_frac")
+HISTORY_FIELDS = ("hist.valid", "hist.move_onehot", "hist.attack_onehot", "hist.hp",
+                  "hist.ammo_frac", "hist.displacement")
+HISTORY_CHANNELS = ("enemy_hist1", "enemy_hist2", "enemy_hist3")
+
+
+def test_deploy4_agent_obs_yaml_loads_as_a_real_agent_spec():
+    """Six groups, the most `obs_select` loads (each is its own device-to-host copy), with
+    `history` before `grid` so the grid stays last as in every other spec. The column maps are
+    the ones the yaml header documents."""
+    from brawl_sim.core.obs_select import _MAX_GROUPS, agent_obs_index_map, load_agent_spec
+
+    cfg = load_config(CONFIGS / "default.yaml")
+    spec = load_agent_spec(CONFIGS / "agent_obs_deploy4.yaml", cfg)
+    assert spec.fair is True and spec.normalize is True
+    assert [g.name for g in spec.groups] == [
+        "self", "enemies", "projectiles", "zone", "history", "grid"]
+    assert len(spec.groups) == _MAX_GROUPS == 6, (
+        "deploy4 is at the group cap. A seventh group does not load; the next field joins a group.")
+    assert {g.name: g.shape for g in spec.groups} == {
+        "self": (26,), "enemies": (9, 9), "projectiles": (12, 6), "zone": (5,),
+        "history": (78,), "grid": (13, 13, 21),
+    }
+
+    index = agent_obs_index_map(spec, cfg)
+    assert index["history"] == {
+        "hist.valid": (0, 3), "hist.move_onehot": (3, 54), "hist.attack_onehot": (54, 66),
+        "hist.hp": (66, 69), "hist.ammo_frac": (69, 72), "hist.displacement": (72, 78),
+    }
+    assert index["self"]["hero.gadget_ready"] == (22, 23)
+    assert index["self"]["hero.gadget_charge_frac"] == (23, 24)
+
+    grid = next(g for g in spec.groups if g.name == "grid")
+    assert grid.channel_idx == (0, 1, 2, 3, 4, 6, 8, 9, 10, 11, 12, 13, 14), (
+        "deploy3's ten sim planes, then the sim's enemy_hist1..3 at 12, 13 and 14")
+
+
+def test_deploy4_differs_from_deploy3_by_exactly_the_history_and_gadget_additions():
+    """Pinned in both directions like every other pair in this file. deploy4 adds what Phases G
+    and H put in build_obs and nothing else: a change to `enemies`, `projectiles` or `zone`, or a
+    deploy3 field dropped or moved, is a second decision riding along unannounced."""
+    dep3 = yaml.safe_load((CONFIGS / "agent_obs_deploy3.yaml").read_text(encoding="utf-8"))
+    dep4 = yaml.safe_load((CONFIGS / "agent_obs_deploy4.yaml").read_text(encoding="utf-8"))
+
+    assert dep4["fair"] == dep3["fair"] and dep4["normalize"] == dep3["normalize"]
+
+    by_name = lambda spec: {g["name"]: g for g in spec["groups"]}  # noqa: E731
+    a, b = by_name(dep3), by_name(dep4)
+    assert a.keys() <= b.keys() and b.keys() - a.keys() == {"history"}
+    for name in sorted(a.keys() - {"self", "grid"}):
+        assert a[name] == b[name], (
+            f"configs/agent_obs_deploy4.yaml changed the {name!r} group. It is meant to differ "
+            f"from its parent by the gadget pair, the history group and the history planes ONLY.")
+
+    rest = lambda group, key: {k: v for k, v in group.items() if k != key}  # noqa: E731
+    old, new = a["self"]["fields"], b["self"]["fields"]
+    assert rest(a["self"], "fields") == rest(b["self"], "fields")
+    assert len(new) == len(old) + len(GADGET_FIELDS)
+    assert [f for f in new if f not in GADGET_FIELDS] == old, (
+        "deploy4's self must be deploy3's fields, in deploy3's order, plus the gadget pair")
+    after_super = new.index("hero.super_charge_frac") + 1
+    assert tuple(new[after_super:after_super + 2]) == GADGET_FIELDS, (
+        "the gadget pair sits right after the super pair: long dash, super, gadget")
+
+    old, new = a["grid"]["view_channels"], b["grid"]["view_channels"]
+    assert rest(a["grid"], "view_channels") == rest(b["grid"], "view_channels")
+    assert new == old + list(HISTORY_CHANNELS), (
+        "deploy4's grid must be deploy3's planes, in deploy3's order, then enemy_hist1..3, so a "
+        "deploy3 channel index means the same plane in deploy4")
+
+    assert b["history"] == {"name": "history", "per_entity": False, "dtype": "float32",
+                            "fields": list(HISTORY_FIELDS)}
+
+
+def test_the_shipped_run_trains_deploy4_at_its_pinned_input_widths():
+    """SIM_OVERHAUL_STEPS.md Step I2: a bare `python scripts/train.py` trains the deployable spec,
+    and the extractor it builds takes 13 grid channels and 262 floats. Built through the run's own
+    env config and overrides, as `builder.build_env` does, so an override that moved a width shows
+    here; tests/test_sb3_features.py pins the same numbers at the default config."""
+    from brawl_sim.core import obs_select
+    from brawl_sim.training.config import load_train_config
+    from brawl_sim.wrappers.sb3_features import BrawlFeaturesExtractor
+
+    tcfg = load_train_config(CONFIGS / "train.yaml")
+    assert tcfg.run.agent_obs == "configs/agent_obs_deploy4.yaml"
+    repo = CONFIGS.parent
+    env_cfg = load_config(repo / tcfg.run.env_config, overrides=tcfg.run.env_overrides or None)
+    spec = obs_select.load_agent_spec(repo / tcfg.run.agent_obs, env_cfg)
+    fe = BrawlFeaturesExtractor(obs_select.agent_space(spec, env_cfg))
+    assert fe.cnn[0].in_channels == 13
+    assert fe.mlp[0].in_features == 262
+
+
+# ---- configs/agent_obs_deploy5.yaml: hero.near_edge, and the enemies rows in tracked-slot order --
+#
+# deploy5 is deploy4 plus what OBS_PARITY_TASKS.md C1-C9 put in build_obs (2026-09-24): the
+# `hero.near_edge` bit in `self`, right after `hero.in_zone`, and `slots: tracked` on `enemies`.
+# The camera window and the zone.active latch change no column, so they leave no trace here; the
+# tests below pin the two changes that do, in both directions, and the widths the extractor is
+# built on. The parametrized deploy-lineage tests above cover it too.
+
+NEAR_EDGE_FIELD = "hero.near_edge"
+
+
+def test_deploy5_agent_obs_yaml_loads_as_a_real_agent_spec():
+    """Still six groups at the cap, `self` one float wider, `enemies` in tracked-slot order at the
+    same shape. The column numbers are the ones the yaml header documents."""
+    from brawl_sim.core.obs_select import (_MAX_GROUPS, agent_obs_index_map, agent_space,
+                                           load_agent_spec)
+    from brawl_sim.wrappers.sb3_features import BrawlFeaturesExtractor
+
+    cfg = load_config(CONFIGS / "default.yaml")
+    spec = load_agent_spec(CONFIGS / "agent_obs_deploy5.yaml", cfg)
+    assert spec.fair is True and spec.normalize is True
+    assert [g.name for g in spec.groups] == [
+        "self", "enemies", "projectiles", "zone", "history", "grid"]
+    assert len(spec.groups) == _MAX_GROUPS == 6
+    assert {g.name: g.shape for g in spec.groups} == {
+        "self": (27,), "enemies": (9, 9), "projectiles": (12, 6), "zone": (5,),
+        "history": (78,), "grid": (13, 13, 21),
+    }
+
+    index = agent_obs_index_map(spec, cfg)
+    assert index["self"]["hero.in_zone"] == (17, 18)
+    assert index["self"][NEAR_EDGE_FIELD] == (18, 19), (
+        "right after in_zone, so the two where-am-I bits read together")
+    assert index["self"]["hero.gadget_ready"] == (23, 24)
+    assert index["self"]["hero.gadget_charge_frac"] == (24, 25)
+    assert index["self"]["meta.n_enemies_alive"] == (26, 27)
+
+    assert {g.name: g.slots for g in spec.groups} == {
+        "self": None, "enemies": "tracked", "projectiles": None, "zone": None, "history": None,
+        "grid": None}
+    enemies = next(g for g in spec.groups if g.name == "enemies")
+    assert enemies.max_slots is None, "tracked slots and max_slots are both row orders"
+
+    grid = next(g for g in spec.groups if g.name == "grid")
+    assert grid.channel_idx == (0, 1, 2, 3, 4, 6, 8, 9, 10, 11, 12, 13, 14), "deploy4's planes"
+
+    fe = BrawlFeaturesExtractor(agent_space(spec, cfg))
+    assert fe.cnn[0].in_channels == 13
+    assert fe.mlp[0].in_features == 263, "deploy4's 262 plus the near_edge bit"
+
+
+def test_deploy5_differs_from_deploy4_by_exactly_near_edge_and_tracked_slots():
+    """Pinned in both directions like every other pair in this file: a change to any other group,
+    or a deploy4 field dropped or moved, is a second decision riding along unannounced."""
+    from brawl_sim.core.obs_select import load_agent_spec
+
+    dep4 = yaml.safe_load((CONFIGS / "agent_obs_deploy4.yaml").read_text(encoding="utf-8"))
+    dep5 = yaml.safe_load((CONFIGS / "agent_obs_deploy5.yaml").read_text(encoding="utf-8"))
+
+    assert dep5["fair"] == dep4["fair"] and dep5["normalize"] == dep4["normalize"]
+
+    by_name = lambda spec: {g["name"]: g for g in spec["groups"]}  # noqa: E731
+    a, b = by_name(dep4), by_name(dep5)
+    assert a.keys() == b.keys()
+    for name in sorted(a.keys() - {"self", "enemies"}):
+        assert a[name] == b[name], (
+            f"configs/agent_obs_deploy5.yaml changed the {name!r} group. It is meant to differ "
+            f"from its parent by hero.near_edge and the enemies group's slot order ONLY.")
+
+    rest = lambda group, key: {k: v for k, v in group.items() if k != key}  # noqa: E731
+    old, new = a["self"]["fields"], b["self"]["fields"]
+    assert rest(a["self"], "fields") == rest(b["self"], "fields")
+    assert [f for f in new if f != NEAR_EDGE_FIELD] == old, (
+        "deploy5's self must be deploy4's fields, in deploy4's order, plus hero.near_edge")
+    assert new.index(NEAR_EDGE_FIELD) == new.index("hero.in_zone") + 1
+
+    assert "slots" not in a["enemies"] and b["enemies"]["slots"] == "tracked"
+    assert rest(b["enemies"], "slots") == a["enemies"], (
+        "deploy5's enemies group is deploy4's, field for field, plus `slots: tracked`")
+
+    cfg = load_config(CONFIGS / "default.yaml")
+    f4 = _spec_fields(load_agent_spec(CONFIGS / "agent_obs_deploy4.yaml", cfg))
+    f5 = _spec_fields(load_agent_spec(CONFIGS / "agent_obs_deploy5.yaml", cfg))
+    assert f5 - f4 == {NEAR_EDGE_FIELD} and not (f4 - f5)
+
+
+def test_near_edge_is_read_by_deploy5_and_by_nothing_older():
+    """OBS_PARITY_TASKS.md C6 and C10: the bit went into deploy5 only. The older deploy specs are
+    named by path in shipped runs and keep their widths; the full-information and low-info views
+    are not deploy targets and stay as they were."""
+    from brawl_sim.core.obs_select import load_agent_spec
+
+    cfg = load_config(CONFIGS / "default.yaml")
+    for name in ("agent_obs.yaml", "agent_obs_lowinfo.yaml") + DEPLOY_SPECS[:-1]:
+        assert NEAR_EDGE_FIELD not in _spec_fields(load_agent_spec(CONFIGS / name, cfg)), name
+    assert DEPLOY_SPECS[-1] == "agent_obs_deploy5.yaml"

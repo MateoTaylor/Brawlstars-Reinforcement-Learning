@@ -11,6 +11,7 @@ this small.
 """
 import torch
 
+from . import camera
 from . import geometry as geo
 
 
@@ -64,6 +65,25 @@ def step_zone(state, params, cfg) -> None:
     state.zone_hi.copy_(torch.where(due_b, new_hi, state.zone_hi))
     state.zone_next_t.copy_(torch.where(due, state.zone_next_t + params.zone_step_seconds, state.zone_next_t))
     state.zone_step.copy_(torch.where(due, state.zone_step + 1, state.zone_step))
+
+
+def mark_seen(state, cam: torch.Tensor, cfg) -> None:
+    """MUTATES zone_seen: latches True for every env whose screen shows gas right now, i.e.
+    the zone has shrunk at least once (`zone_step > 0`) and the camera window's bounding box
+    around `cam` ((N,2), `core/camera.camera_centre`) crosses the safe rect on any side. The
+    box rather than the trapezoid, by decision: gas is an axis-aligned rect, so the box only
+    over-counts the window's two cut corners. No-op when cfg.zone_enabled is False, so
+    `zone.active` stays 0 all episode.
+
+    Runs once per decision from `env._build_observation`, before `build_obs` reads `zone_seen`
+    into `zone.active` (OBS_PARITY_TASKS.md C5). Live, ZoneEstimator.active latches the same
+    way, on the first gas the sticky GasMap holds."""
+    if not cfg.zone_enabled:
+        return
+    lo, hi = camera.window_bbox(cfg, cam.device, cam.dtype)          # (2,), (2,)
+    bbox_lo, bbox_hi = cam + lo, cam + hi                             # (N,2)
+    crosses = ((bbox_lo < state.zone_lo) | (bbox_hi > state.zone_hi)).any(-1)
+    state.zone_seen.logical_or_((state.zone_step > 0) & crosses)
 
 
 def current_fraction(state, params) -> torch.Tensor:

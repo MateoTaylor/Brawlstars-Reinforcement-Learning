@@ -120,6 +120,14 @@ occupancy:                # Phase I
   # with five terrain classes an even split would otherwise count as locked.
   min_votes: 5
   lock_ratio: 0.8
+  # The one-wide-gap rule (brawl_vision/terrain/gaps.py). Maps never hold a walkable passage one
+  # tile wide, so a frame that classifies a FLOOR/BUSH cell with blockers on both sides of it is
+  # claiming something impossible; its vote on those three cells counts this much instead of 1,
+  # and the views that make no such claim decide the cell. Symmetric across the three cells, so
+  # a cell every view agrees on is never flipped by it. Must be > 0: at 0 an always-pinched
+  # cell is never observed and the deploy grid reads UNKNOWN as FLOOR. 1.0 disables the rule.
+  # MEASURED 2026-09-22 -- see the sweep table in occupancy.py's docstring.
+  gap_rule_weight: 0.1
 
 classifier:               # Phase H
   # MEASURED 2026-09-08 and moved, which is what the previous comment here asked for. It read:

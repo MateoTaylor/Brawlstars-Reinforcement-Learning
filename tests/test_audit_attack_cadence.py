@@ -260,7 +260,8 @@ def _match(start, n_decisions, *, resync_at=(), skip_at=(), in_reach=True):
         else:
             ticks.append(_tick(
                 index, decision=True, move_bin=1, attack=1 if legal else 0,
-                attack_legal=0b011 if legal else 0b001,
+                # Bit 3 is a charged gadget, set on real rows since SIM_OVERHAUL Step G5.
+                attack_legal=0b1011 if legal else 0b1001,
                 attack_cd_shadow=0.0 if legal else 0.15, attack_idle_t_shadow=0.0,
                 ammo_shadow=3.0, ammo_cv=3.0, enemy_in_reach=in_reach,
                 resync=i in resync_at, resync_error=1.0 if i in resync_at else 0.0))
