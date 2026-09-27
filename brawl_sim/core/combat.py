@@ -46,7 +46,12 @@ def apply_damage(state, dmg: torch.Tensor, cause: int, attacker: torch.Tensor, p
     else:
         effective_dmg = torch.where(blocked, torch.zeros_like(dmg), dmg)
 
-    took_damage = (effective_dmg > 0) & state.ent_alive
+    # An entity already at 0 HP is dead in everything but the bookkeeping: `resolve_deaths` runs
+    # once, after every damage source of the tick, so a later source must not overwrite the
+    # finisher's credit in `ent_last_hit_by`. The gas is the one that did (phase 10, after the
+    # dash and projectile phases; `zone.zone_damage` hits every alive entity outside the rect),
+    # so a bot the hero finished in the gas counted as a zone death: no kill reward, no credit.
+    took_damage = (effective_dmg > 0) & state.ent_alive & (state.ent_hp > 0)
 
     state.ent_hp.copy_(torch.clamp(state.ent_hp - effective_dmg, min=0))
     state.ent_damage_taken.copy_(state.ent_damage_taken + torch.where(took_damage, effective_dmg, torch.zeros_like(effective_dmg)))

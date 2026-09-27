@@ -637,6 +637,106 @@ def test_a_camper_never_shoots_a_box():
         assert bool(tgt.is_box[0, 1]) is expected, person
 
 
+def test_a_crate_is_a_fire_target_only_within_five_tiles():
+    """The lead, 2026-09-25: bots shoot the crate beside them, not every crate in range. The
+    sniper reaches 8 tiles; a crate at 6 is no target, one at 4 is."""
+    cfg, params, gen = cfg_and_params(n_enemies=1)
+    bank = FakeBank(grid(20, 20))
+    assert params.attack_range[0, int(Kind.BOT_SNIPER)].item() > policy._BOX_TARGET_TILES
+    for x, expected in ((16.0, False), (14.0, True)):
+        state = fresh_state(cfg, params, person=Person.RUSH)
+        state.ent_alive[0, 0] = False
+        state.ent_pos[0, 1] = torch.tensor([10.0, 10.0])
+        state.box_alive[0, 0] = True
+        state.box_pos[0, 0] = torch.tensor([x, 10.0])
+        _vis, tgt = build_targeting(state, bank, params, cfg)
+        assert bool(tgt.is_box[0, 1]) is expected, x
+
+
+def test_a_camper_is_never_pulled_to_a_crate():
+    """`targeting` never lets a camper shoot a crate, so a pull could only park it beside one:
+    27 % of camper time within 1.5 tiles of a crate, measured 2026-09-25 with the raw-vector
+    pull, 4 % before it. Any mobile personality is pulled at the full weight."""
+    cfg, params, gen = cfg_and_params(n_enemies=1)
+    bank = FakeBank(grid(20, 20))
+    for person, expected_w in ((Person.CAMPER, 0.0), (Person.RUSH, policy._BOX_APPROACH_WEIGHT)):
+        state = fresh_state(cfg, params, person=person)
+        state.ent_alive[0, 0] = False
+        state.ent_pos[0, 1] = torch.tensor([10.0, 10.0])
+        state.box_alive[0, 0] = True
+        state.box_pos[0, 0] = torch.tensor([13.0, 10.0])
+        build_targeting(state, bank, params, cfg)
+        direction, w = policy.box_contribution(state, bank, cfg)
+        assert w[0, 1].item() == expected_w, person
+        assert torch.allclose(direction[0, 1], torch.tensor([1.0, 0.0]))  # a unit direction
+
+
+def test_an_engaged_bot_leaves_a_far_cube_but_grabs_one_at_its_feet():
+    """The cube pull has the crate pull's enemy gate (no target within 8 tiles) with one
+    exception, a cube within 2 tiles: that is where a kill's drop lands, and the next enemy is
+    usually in sight. Without any gate (the first strong version) engaged bots walked away from
+    their target 40 % of the time, measured 2026-09-25."""
+    cfg, params, gen = cfg_and_params(n_enemies=1, map_h=30, map_w=30)
+    bank = FakeBank(grid(30, 30))
+    for cube_x, expected_w in ((6.0, 0.0), (11.0, policy._CUBE_COLLECT_WEIGHT)):
+        state = fresh_state(cfg, params, person=Person.RUSH)
+        state.ent_pos[0, 0] = torch.tensor([17.0, 15.0])  # the hero 5 tiles east: inside the gate
+        state.ent_pos[0, 1] = torch.tensor([12.0, 15.0])
+        state.pku_alive[0, 0] = True
+        state.pku_pos[0, 0] = torch.tensor([cube_x, 15.0])
+        _vis, tgt = build_targeting(state, bank, params, cfg)
+        assert bool(tgt.has_enemy[0, 1])
+        _direction, w = policy.cube_contribution(state, bank, cfg)
+        assert w[0, 1].item() == expected_w, cube_x
+
+
+def test_a_loot_pull_replaces_the_personality_steering():
+    """steering.seek is raw `target - pos` and combine normalises once, so a summed pull weighed
+    weight x distance and two pulls rested at a weighted midpoint (measured 2026-09-25: campers
+    parked at crates, retreating bots walked back toward the enemy for a cube). A RUSH bot two
+    tiles from a crate with an enemy ten tiles the other way (past the 8-tile loot gate, so the
+    pull is live) now walks to the crate. Under the old sum the enemy's 1.0 x 10 beat the crate's
+    3.0 x 2, and the bot walked away from loot at its feet toward an enemy it could not reach."""
+    cfg, params, gen = cfg_and_params(n_enemies=1, map_h=30, map_w=30)
+    bank = FakeBank(grid(30, 30))
+    state = fresh_state(cfg, params, person=Person.RUSH)
+    state.ent_pos[0, 0] = torch.tensor([22.0, 15.0])  # the hero 10 tiles east, in sight
+    state.ent_pos[0, 1] = torch.tensor([12.0, 15.0])
+    state.box_alive[0, 0] = True
+    state.box_pos[0, 0] = torch.tensor([10.0, 15.0])  # a crate 2 tiles west
+    _vis, tgt = build_targeting(state, bank, params, cfg)
+    assert bool(tgt.has_enemy[0, 1])
+    move_dir, mode = personality.movement(state, tgt, bank, params, cfg, gen)
+    assert Mode(int(mode[0, 1])) == Mode.CLOSE
+    assert torch.allclose(move_dir[0, 1], torch.tensor([-1.0, 0.0]), atol=1e-5)
+
+
+def test_a_retreating_bot_is_pulled_to_no_loot():
+    """RETREAT exists to break contact, so neither pull is live in it. A HUNTER at a fifth of its
+    HP with the enemy ten tiles east (past the 8-tile loot gate, so both pulls would otherwise be
+    live) and a crate, then a cube, two tiles east between them: it flees west both times. With
+    the crate pull live a fleeing bot turned around on 0.60 of those decisions (0.09 of retreat
+    decisions at elite, measured 2026-09-25)."""
+    cfg, params, gen = cfg_and_params(n_enemies=1, map_h=30, map_w=30)
+    bank = FakeBank(grid(30, 30))
+    for loot in ("crate", "cube"):
+        state = fresh_state(cfg, params, person=Person.HUNTER)
+        state.ent_pos[0, 0] = torch.tensor([22.0, 15.0])  # the hero 10 tiles east, in sight
+        state.ent_pos[0, 1] = torch.tensor([12.0, 15.0])
+        state.ent_hp[0, 1] = 0.2 * state.ent_max_hp[0, 1]
+        if loot == "crate":
+            state.box_alive[0, 0] = True
+            state.box_pos[0, 0] = torch.tensor([14.0, 15.0])
+        else:
+            state.pku_alive[0, 0] = True
+            state.pku_pos[0, 0] = torch.tensor([14.0, 15.0])
+        _vis, tgt = build_targeting(state, bank, params, cfg)
+        assert bool(tgt.has_enemy[0, 1])
+        move_dir, mode = personality.movement(state, tgt, bank, params, cfg, gen)
+        assert Mode(int(mode[0, 1])) == Mode.RETREAT, loot
+        assert move_dir[0, 1, 0].item() < -0.5, (loot, move_dir[0, 1])  # west, away from both
+
+
 # =============================================================================================
 # aggression (SIM_OVERHAUL_PLAN.md Step B3): three consumers, every threshold pinned as a literal
 # =============================================================================================

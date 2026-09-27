@@ -1,4 +1,5 @@
-"""Attack and Super as aimed drags, the gadget as a bare tap. See BRAWL_DEPLOYMENT_DESIGN.md 4.4.
+"""Attack and Super as aimed drags, the gadget and the auto-aimed attack as bare taps. See
+BRAWL_DEPLOYMENT_DESIGN.md 4.4.
 
 **Attack is an AREA, not a button, and this is the fact most likely to be un-learned later.**
 Per the operator: any tap on the right side of the screen fires, as long as it does not overlap
@@ -11,20 +12,22 @@ under a green chevron button that exists only in that venue; 2 of 3 taps consume
 anchor was not mis-aimed -- it was aimed at a real button that swallowed the touch. Choosing the
 touch point by CLEARANCE is immune to that whole class of failure, including HUD-layout drift.
 
-**Aimed along the move direction, never a bare tap.** A bare tap AUTO-AIMS in the real game: it
-sends Mortis at the nearest enemy, which is not what the policy trained on. The sim's
-`hero.start_dash` sends him along the decision's `move_dir`, or along `facing` when the move bin is
-idle (`action.dash_on_idle: facing`), and the super goes along `move_dir` too. So a press here is
+**Attack value 1 is aimed along the move direction, never a bare tap.** A bare tap AUTO-AIMS in
+the real game: it sends Mortis at the nearest enemy, which is not what value 1 trained on (value
+4, below, is exactly that). The sim's `hero.start_dash` sends him along the decision's `move_dir`,
+or along `facing` when the move bin is idle (`action.dash_on_idle: facing`), and the super goes
+along `move_dir` too. So a press here is
 the attack stick worked by hand, the way the movement stick is: a contact goes down on the origin,
 drags `aim_radius_px` along the bearing, and lifts. **The lift is what fires**, as it is for a
 thumb. The bearing comes from `ShadowHero.attack_bearing`, which reads the same state the shadow's
 `_start_dash` does, so the device and the shadow agree on the direction by construction.
 
-This is not an action-space change. The policy's action is still `(move_bin, attack)`, and what
-deployment emits is `attack in {0, 1, 2, 3}` since SIM_OVERHAUL Step G5 (2026-09-21):
+The drag is not an action-space change. The policy's action is still `(move_bin, attack)`, and
+what deployment emits is `attack in {0, 1, 2, 3}` since SIM_OVERHAUL Step G5 (2026-09-21):
 `brawl_sim/config.py`'s `action_nvec` is `(n_move_bins + 1, 4)` since Step G3, and the fourth
 value is the gadget. The aim is not a new choice, it is the one the policy already made with its
-move bin.
+move bin. The auto-aimed attack IS one (2026-09-26): a run trained under `action.auto_aim` has a
+5-wide column and emits 4 as well, and only such a run does (`cfg.action_nvec[1]`, per run).
 
 **One step per perception tick: down, drag, lift.** Never two in one call. The game samples touch
 state on its own frame clock, and two events inside one device write can land in one sample.
@@ -46,6 +49,16 @@ button was never touched). The game aims a gadget at the nearest enemy by itself
 `press` puts a contact down on the button centre and the next `settle` lifts it. Two ticks, the
 shortest press here.
 
+**The auto-aimed attack is the other bare tap (2026-09-26).** `attack == 4`, which only a run
+trained under `action.auto_aim` can emit, goes down on the attack point and lifts on the next
+tick, no drag: the game aims a bare tap at the nearest target by itself, which is what the sim's
+`hero.auto_aim_target` gives the policy (the nearest enemy or crate within the dash's reach, in
+or out of view). The tap point is the aimed press's own floating-stick origin, chosen for
+clearance for the same reason. The shadow models the dash along its own estimate of that
+direction (`ShadowHero.act`'s `aim`, from the tracks and the loot map); where its estimate and
+the game's target differ, the dash direction is wrong for one dash and the odometry corrects the
+position after it.
+
 That button is NOT the anchor `match_state.py` watches, and never was (corrected 2026-09-22, design
 5.1). Every button name in `control_calibration.json` sat one disc off, so what this file called
 the gadget was the Super: a commanded gadget pressed the Super, and the gate sat on the Super too.
@@ -58,8 +71,9 @@ import math
 
 from .backend import SLOT_TAP
 
-# Action column 1 values, from `hero.decode_action`.
-ATTACK_NONE, ATTACK_FIRE, ATTACK_SUPER, ATTACK_GADGET = 0, 1, 2, 3
+# Action column 1 values, from `hero.decode_action`. 4, the auto-aimed attack, exists only for a
+# run trained under `action.auto_aim` (`cfg.action_nvec[1] == 5`).
+ATTACK_NONE, ATTACK_FIRE, ATTACK_SUPER, ATTACK_GADGET, ATTACK_AUTO = 0, 1, 2, 3, 4
 
 # Perception ticks one press occupies: the down, the drag, the lift. See the module docstring. A
 # gadget tap takes two, the down and the lift, so this stays the longest press.
@@ -82,9 +96,10 @@ class Buttons:
     dash and his super both travel a fixed distance, so how far the drag goes past the game's
     aim deadzone changes nothing, and one radius serves both.
 
-    `gadget` is the third origin and the only tap: a `down` on the button centre and an `up`,
-    with no aim. It is required like the other two, so a `Buttons` that cannot press the gadget
-    fails at construction rather than at the policy's first throw.
+    `gadget` is the third origin and a tap: a `down` on the button centre and an `up`, with no
+    aim. It is required like the other two, so a `Buttons` that cannot press the gadget fails at
+    construction rather than at the policy's first throw. The auto-aimed attack is the other tap,
+    on the `attack` origin.
     """
 
     def __init__(self, backend, attack: tuple[float, float], super_: tuple[float, float],
@@ -99,7 +114,7 @@ class Buttons:
 
     def origin(self, action: int) -> tuple[float, float] | None:
         """Where a press for this action goes down. None for `ATTACK_NONE`."""
-        if action == ATTACK_FIRE:
+        if action == ATTACK_FIRE or action == ATTACK_AUTO:
             return self.attack
         if action == ATTACK_SUPER:
             return self.super_
@@ -116,6 +131,9 @@ class Buttons:
         """
         if action == ATTACK_GADGET:
             raise ValueError("the gadget is a tap on a fixed button and the game aims it, so it "
+                             "has no aim point")
+        if action == ATTACK_AUTO:
+            raise ValueError("the auto-aimed attack is a bare tap and the game aims it, so it "
                              "has no aim point")
         origin = self.origin(action)
         if origin is None:
@@ -149,8 +167,8 @@ class Buttons:
                 f"clamps, so the tap would land on the edge, on whatever is drawn there.")
 
     def press(self, action: int, bearing: float) -> bool:
-        """Start one press: aimed for an attack or a super, a bare tap for the gadget. Returns
-        whether anything was pressed.
+        """Start one press: aimed for an attack or a super, a bare tap for the gadget and for the
+        auto-aimed attack. Returns whether anything was pressed.
 
         Only the down goes out here; `settle()` sends the drag and then the lift, or for a tap
         the lift alone, and a tap never reads `bearing`. A press that
@@ -168,7 +186,7 @@ class Buttons:
             return False
         if self._stage is not _IDLE:
             self._finish()
-        if action == ATTACK_GADGET:
+        if action == ATTACK_GADGET or action == ATTACK_AUTO:
             self.backend.down(SLOT_TAP, *origin)
             self._stage = _TAPPED
             return True
@@ -181,11 +199,12 @@ class Buttons:
     def settle(self) -> None:
         """Advance a press by one step. Called once per perception tick by the loop: the tick
         after the down drags to the aim point, and the tick after that lifts, which fires. A
-        gadget tap has no drag, so the tick after its down lifts it."""
+        tap (the gadget, the auto-aimed attack) has no drag, so the tick after its down lifts
+        it."""
         if self._stage is _DOWN:
             self.backend.move(SLOT_TAP, *self._aim)
             self._stage = _AIMED
-        elif self._stage is not _IDLE:      # aimed, or a gadget tap
+        elif self._stage is not _IDLE:      # aimed, or a tap
             self._lift()
 
     def release(self) -> None:

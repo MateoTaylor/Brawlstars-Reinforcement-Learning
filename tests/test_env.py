@@ -532,3 +532,45 @@ def test_a_dash_hit_still_charges_the_super():
 
     assert hp_before - st.ent_hp[0, 1].item() == 2000.0  # one dash hit at base_damage 2000
     assert int(st.ent_super_charge[0, 0]) == 1
+
+
+# ---- the auto-aimed attack (action.auto_aim, attack value 4; the lead, 2026-09-26) ------------
+
+def test_an_auto_aimed_attack_dashes_at_the_nearest_target_not_along_the_move_bin():
+    """Attack value 4 dashes at the nearest enemy or crate in reach whatever the move bin says,
+    and with nothing in reach it dashes along the move bin, as value 1 does. The dash costs
+    what a plain dash costs (one ammo), and `move_dir` itself is untouched: the walk after the
+    dash still follows the bin."""
+    env = _tiny_env(n_envs=2, overrides={**_PER_TICK, "action": {"auto_aim": True}},
+                    autoreset=False)
+    env.reset()
+    assert env.action_spec == {"nvec": (17, 5)}
+    st = env.state
+    st.ent_pos[:, 0] = torch.tensor([10.0, 10.0])
+    st.ent_pos[:, 1:] = torch.tensor([17.0, 17.0])       # ~9.9 tiles away, out of reach
+    st.box_alive.fill_(False)
+    st.ent_ammo[:, 0] = 3.0
+    st.ent_attack_cd[:, 0] = 0.0
+    st.ent_dash_t[:, 0] = 0.0
+    st.ent_pos[0, 1] = torch.tensor([12.0, 10.0])         # env 0: an enemy 2 tiles east
+    action = torch.tensor([[5, 4], [5, 4]])               # bin 5 = +y; value 4 = auto-aim
+    env.step(action)
+    assert torch.allclose(st.ent_dash_dir[0, 0], torch.tensor([1.0, 0.0]), atol=1e-4)
+    assert torch.allclose(st.ent_dash_dir[1, 0], torch.tensor([0.0, 1.0]), atol=1e-4)
+    assert st.ent_dash_t[:, 0].min().item() > 0
+    assert st.ent_ammo[:, 0].tolist() == pytest.approx([2.0, 2.0], abs=1e-5)
+    assert st.ent_shots_fired[:, 0].tolist() == [1, 1]
+
+
+def test_without_the_flag_a_4_in_the_attack_column_is_a_silent_no_op():
+    """The default config keeps the 4-wide column, so every run trained before the flag decodes
+    exactly as it did; a 4 there is an illegal value and does nothing."""
+    env = _tiny_env(n_envs=1, overrides=_PER_TICK, autoreset=False)
+    env.reset()
+    assert env.action_spec == {"nvec": (17, 4)}
+    st = env.state
+    st.ent_pos[:, 1:] = torch.tensor([17.0, 17.0])
+    st.ent_ammo[:, 0] = 3.0
+    env.step(torch.tensor([[5, 4]]))
+    assert st.ent_dash_t[0, 0].item() == 0.0
+    assert st.ent_shots_fired[0, 0].item() == 0

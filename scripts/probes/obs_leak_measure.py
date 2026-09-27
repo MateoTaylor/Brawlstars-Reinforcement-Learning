@@ -28,7 +28,7 @@ from sb3_contrib import MaskablePPO                                # noqa: E402
 EPS = int(sys.argv[1]) if len(sys.argv) > 1 else 16
 MAX_STEPS = int(sys.argv[2]) if len(sys.argv) > 2 else 800
 device = "cpu"
-run = ROOT / "runs" / "mortis_deploy4-20260921-185945"
+run = ROOT / (sys.argv[3] if len(sys.argv) > 3 else "runs/mortis_deploy4-20260921-185945")  # argv: [episodes] [max_steps] [run dir]
 tcfg = load_train_config(run / "train.yaml", check_holdout=False)
 tcfg = replace(tcfg, eval=replace(tcfg.eval, episodes_per_tier=EPS, tiers=("elite",)))
 model = MaskablePPO.load(run / "best_model.zip", device=device)

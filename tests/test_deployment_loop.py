@@ -11,12 +11,15 @@ button anyway, which is the exact bug the interlock exists to make impossible.
 """
 from pathlib import Path
 
+import math
+
 import cv2
 import numpy as np
 import pytest
 
 from brawl_deployment.control.backend import SLOT_MOVE, SLOT_TAP
-from brawl_deployment.control.buttons import ATTACK_FIRE, ATTACK_GADGET, ATTACK_NONE, ATTACK_SUPER
+from brawl_deployment.control.buttons import (ATTACK_AUTO, ATTACK_FIRE, ATTACK_GADGET, ATTACK_NONE,
+                                              ATTACK_SUPER)
 from brawl_deployment.loop import (ODOMETRY_LOST_SECONDS, TELEMETRY_ROWS, Controls, DeployLoop,
                                    Phase, TickRow, VisionStack)
 from brawl_deployment.config import DeploymentConfig
@@ -338,10 +341,10 @@ class _Policy:
     """
 
     def __init__(self, decision=None, spec_path="configs/agent_obs_deploy.yaml",
-                 real_assembler=False):
-        self.cfg = CFG
-        self.spec = load_agent_spec(spec_path, CFG)
-        self.assembler = (ObservationAssembler(self.spec, CFG) if real_assembler
+                 real_assembler=False, cfg=None):
+        self.cfg = CFG if cfg is None else cfg
+        self.spec = load_agent_spec(spec_path, self.cfg)
+        self.assembler = (ObservationAssembler(self.spec, self.cfg) if real_assembler
                           else _Assembler())
         self.obs = []
         self.decision = decision or Decision(move_bin=3, attack=ATTACK_NONE,
@@ -359,16 +362,16 @@ class _Policy:
         self.move_legal.append(move_legal)
         if self.raises is not None:
             raise self.raises
-        # `DeployedPolicy.act`'s own contract: one legal per attack column, four since Step G5,
-        # and the move half either absent or one flag per bin plus idle.
-        assert len(tuple(attack_legal)) == 4, attack_legal
-        assert move_legal is None or len(move_legal) == CFG.n_move_bins + 1, move_legal
+        # `DeployedPolicy.act`'s own contract: one legal per attack column, four since Step G5
+        # and five under `action.auto_aim`, and the move half either absent or one flag per bin
+        # plus idle.
+        assert len(tuple(attack_legal)) == self.cfg.action_nvec[1], attack_legal
+        assert move_legal is None or len(move_legal) == self.cfg.n_move_bins + 1, move_legal
         return self.decision
 
 
-@pytest.fixture
-def loop(monkeypatch):
-    """A `DeployLoop` wired to fakes on the vision side and the real thing everywhere else."""
+def _patch_vision(monkeypatch):
+    """The three vision reads the fixture stubs out: the zone, and the ammo and super bars."""
     monkeypatch.setattr("brawl_vision.terrain.zone.detect_zone",
                         lambda rect, plan, cfg=None: _Zone())
     monkeypatch.setattr("brawl_vision.object_detection.hp_detection.hero_bars.read_ammo",
@@ -376,6 +379,16 @@ def loop(monkeypatch):
     monkeypatch.setattr("brawl_vision.object_detection.hp_detection.hero_bars.read_super",
                         lambda image, det, cfg=None: None)
 
+
+@pytest.fixture
+def loop(monkeypatch):
+    """A `DeployLoop` wired to fakes on the vision side and the real thing everywhere else."""
+    _patch_vision(monkeypatch)
+    return _build_loop(_Policy())
+
+
+def _build_loop(policy):
+    """The fixture's loop around `policy`; `_patch_vision` first."""
     backend = _Backend()
     controls = Controls(backend=backend,
                         joystick=Joystick(backend, (345.6, 669.6), 110.0, n_bins=16),
@@ -388,7 +401,7 @@ def loop(monkeypatch):
                          health=_Health([_Reading("player", 8000)]),
                          hud=_Hud(), cfg=None)
     lp = DeployLoop(capture=_Capture(), guard=_Guard(), match=_Match(), vision=vision,
-                    policy=_Policy(), controls=controls, cfg=DeploymentConfig())
+                    policy=policy, controls=controls, cfg=DeploymentConfig())
     lp.backend = backend                       # test handle; the loop never reads it
     lp.vision.warm = lambda image: None         # no detectors to JIT
     return lp
@@ -1008,10 +1021,11 @@ _OLD_RECORD = {"index": "7", "t": "0.35", "grab_ms": "1.5", "phase": "playing", 
 
 def test_the_trackers_hero_offset_reaches_the_assembler_and_the_telemetry(loop):
     """`hero_offset` is the player box's tiles from its nominal screen anchor: the fixture's box
-    at HERO_PX against the viewport centre, minus the measured (0.09, 0.80), both through the
-    identity plan at 48 px per tile, so the plan's `origin_tile` cancels."""
+    at HERO_PX against the viewport centre, minus the ring's measured (0.09, 0.80) and the box's
+    measured (-0.08, -0.78) from the ring, both through the identity plan at 48 px per tile, so
+    the plan's `origin_tile` cancels."""
     _play(loop, 1)
-    want = ((HERO_PX[0] - VIEWPORT[0] / 2) / 48 - 0.09, (HERO_PX[1] - VIEWPORT[1] / 2) / 48 - 0.80)
+    want = ((HERO_PX[0] - VIEWPORT[0] / 2) / 48 - 0.01, (HERO_PX[1] - VIEWPORT[1] / 2) / 48 - 0.02)
     assert loop.policy.assembler.calls[-1]["hero_offset"] == pytest.approx(want, abs=1e-6)
     row = _decisions(loop)[-1]
     assert (row.hero_offset_x, row.hero_offset_y) == pytest.approx(want, abs=1e-6)
@@ -1694,3 +1708,71 @@ def test_the_dead_bin_mask_is_off_by_config_and_the_row_says_so(loop):
     assert lp.policy.move_legal == [None]
     assert _decisions(lp)[-1].move_legal == -1
     assert TickRow.from_record({"index": 0, "t": 0.0, "grab_ms": 0.0}).move_legal == -1
+
+
+# -- the auto-aimed attack (action.auto_aim, attack value 4; the lead, 2026-09-26) ---------------
+#
+# A run trained with the flag has a 5-wide attack column. The loop reads the flag off the run's own
+# config (`policy.cfg`), gives its shadow the fifth mask column, sends value 4 to the device as a
+# bare tap on the attack point (the game aims it) and hands the shadow its own estimate of the
+# game's target, so the modelled dash goes where the real one does.
+
+AUTO_CFG = load_config("configs/default.yaml", overrides={"action": {"auto_aim": True}})
+AUTO_LEGAL = (True, True, False, True, True)
+
+
+def test_an_auto_aimed_attack_is_a_bare_tap_aimed_at_the_nearest_track(monkeypatch):
+    """The row records 4 and a 5-bit mask; the device gets the tap, down on the decision tick and
+    up on the next, no drag; and the shadow dashes at the nearest enemy track in reach, 2 tiles
+    +x here, not along bin 5 (+y). The track is confirmed on its second sighting, so the first
+    window only looks."""
+    _patch_vision(monkeypatch)
+    lp = _build_loop(_Policy(cfg=AUTO_CFG))
+    assert lp.shadow.auto_aim and lp.shadow.attack_mask() == AUTO_LEGAL
+    lp.vision.entities.detections = [_Detection("player", HERO_PX),
+                                     _Detection("enemy", (HERO_PX[0] + 2 * 48, HERO_PX[1]))]
+    _play(lp, lp.decision_every)
+    assert _decisions(lp)[0].attack_legal == 0b11011
+
+    lp.policy.decision = Decision(move_bin=5, attack=ATTACK_AUTO, legal=AUTO_LEGAL)
+    ax, ay = lp.controls.buttons.attack
+    before = len(lp.backend.log)
+    lp.tick()
+    assert [e for e in lp.backend.log[before:] if e[1] == SLOT_TAP] == [("down", SLOT_TAP, ax, ay)]
+    row = _decisions(lp)[1]
+    assert row.attack == ATTACK_AUTO and row.attack_legal == 0b11011
+    assert row.enemy_in_reach is True
+    assert lp.shadow.attack_bearing == pytest.approx(0.0, abs=1e-6)
+    lp.shadow.advance(0.05)                 # the sub-tick that starts the modelled dash
+    s = lp.shadow.observe()
+    assert s["dash_dir"] == pytest.approx((1.0, 0.0), abs=1e-6) and s["ammo"] == 2.0
+
+    lift, *quiet = _tap_steps_per_tick(lp, lp.decision_every - 1)
+    assert lift == [("up", SLOT_TAP)] and all(q == [] for q in quiet)
+
+
+def test_an_auto_aimed_attack_with_nothing_in_reach_dashes_along_the_move_bin(monkeypatch):
+    """No track and no crate within the dash's reach: the tap still goes out (the game then
+    dashes along the joystick, which is the sim's fallback too) and the shadow's aim is the bin."""
+    _patch_vision(monkeypatch)
+    lp = _build_loop(_Policy(cfg=AUTO_CFG, decision=Decision(move_bin=5, attack=ATTACK_AUTO,
+                                                             legal=AUTO_LEGAL)))
+    lp.match.gate = True
+    ax, ay = lp.controls.buttons.attack
+    before = len(lp.backend.log)
+    lp.tick()
+    assert [e for e in lp.backend.log[before:] if e[1] == SLOT_TAP] == [("down", SLOT_TAP, ax, ay)]
+    row = _decisions(lp)[0]
+    assert row.attack == ATTACK_AUTO and row.enemy_in_reach is False
+    assert lp.shadow.attack_bearing == pytest.approx(math.pi / 2)
+    lp.shadow.advance(0.05)
+    assert lp.shadow.observe()["dash_dir"] == pytest.approx((0.0, 1.0), abs=1e-6)
+
+
+def test_a_run_trained_without_the_flag_never_taps_an_auto_aimed_attack(loop):
+    """The fixture's run has the 4-wide column. A 4 from its policy is an illegal value: the
+    shadow refuses it, nothing is tapped, and the row says what was sent."""
+    loop.policy.decision = Decision(move_bin=5, attack=ATTACK_AUTO, legal=(True, True, False, True))
+    _play(loop, loop.decision_every)
+    assert ("down", SLOT_TAP) not in loop.backend.events
+    assert _decisions(loop)[0].attack == ATTACK_NONE

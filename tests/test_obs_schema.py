@@ -217,7 +217,8 @@ def test_the_hist_rows_are_declared_as_the_plan_specifies():
     assert rows == {
         "hist.valid": (("N", "K"), "bool", "bool", None, False, None),
         "hist.move_onehot": (("N", "K", "MOVE"), "uint8", "onehot", (0, 1), False, None),
-        "hist.attack_onehot": (("N", "K", 4), "uint8", "onehot", (0, 1), False, None),
+        # `ATTACK` resolves to `cfg.action_nvec[1]`: 4, or 5 under `action.auto_aim` (2026-09-26).
+        "hist.attack_onehot": (("N", "K", "ATTACK"), "uint8", "onehot", (0, 1), False, None),
         "hist.hp": (("N", "K"), "float32", "hp", (0.0, None), False, None),
         "hist.ammo_frac": (("N", "K"), "float32", "fraction", (0.0, 1.0), False, None),
         "hist.displacement": (("N", "K", 2), "float32", "tiles", None, False, None),
@@ -260,3 +261,17 @@ def test_the_docs_put_hist_between_hero_and_entities_and_define_k_and_c():
     assert text.index("## `hero`") < text.index("## `hist`") < text.index("## `entities`")
     assert "`K` = history_frames" in text
     assert "`C` = 12 + history_frames" in text
+
+
+def test_the_attack_width_symbol_follows_the_auto_aim_flag():
+    """`ATTACK` resolves to `cfg.action_nvec[1]` (2026-09-26), so `hist.attack_onehot` and
+    `action_mask.attack` are 5 wide under `action.auto_aim` and stay 4 without it, in the spec
+    and in what build_obs produces."""
+    for flag, width in ((False, 4), (True, 5)):
+        cfg, obs = _obs(overrides={"action": {"auto_aim": flag}})
+        spec = schema.obs_spec(cfg)
+        assert spec["hist.attack_onehot"].shape == ("N", cfg.history_frames, width)
+        assert spec["action_mask.attack"].shape == ("N", width)
+        flat = schema._flatten(obs)
+        assert flat["hist.attack_onehot"].shape == (8, cfg.history_frames, width)
+        assert flat["action_mask.attack"].shape == (8, width)

@@ -13,8 +13,10 @@ envs in the same batch, but torch.topk takes one Python int k for the whole call
 "per-row k" -- so a single sorted ranking plus a per-row mask is the sync-free way to let each
 env keep a different number of its own smallest-key spots. Assumes cfg.max_boxes <=
 MAX_BOX_SPOTS (64, MapBank's fixed padded capacity, Step 6); true for every config in this
-repo, and Step 5's map generation minimum (>=16 X markers) plus the default max_boxes=16 make
-that comfortable headroom, not a coincidence to rely on carefully.
+repo. Since 2026-09-25 the default is n_boxes 48 with max_boxes 48, so the min() in spawn_boxes
+resolves to the map's own spot count (16 to 44 on the shipped maps) and every marked spot holds
+a crate: the real maps carry 20 to 30, and the 8 this used to spawn let the hero out-farm the
+bots (bots/policy.py's loot constants carry the measurements).
 
 Because a full respawn (via reset_mask) always repopulates every one of the k selected slots
 (and explicitly clears the rest), there's no need for projectiles.alloc_slots' incremental

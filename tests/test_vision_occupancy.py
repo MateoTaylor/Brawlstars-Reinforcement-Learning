@@ -229,7 +229,11 @@ def test_a_frame_claiming_a_one_wide_gap_votes_at_the_rule_weight(plan):
     assert total[mr, mc] == pytest.approx(0.25)
     assert total[mr, mc - 1] == pytest.approx(0.25) and total[mr, mc + 1] == pytest.approx(0.25)
     assert total[mr - 1, mc] == pytest.approx(1.0) and total[mr, mc + 2] == pytest.approx(1.0)
-    assert m.confidence()[mr, mc] == pytest.approx(1.0), "a fractional vote is still 100% agreed"
+    # Was 1.0 until 2026-09-26, asserted as "a fractional vote is still 100% agreed". It is the
+    # agreement of one view and that much is true, but reporting it as full confidence threw the
+    # rule's doubt away: the weight divided straight back out of the share. `confidence` now
+    # divides by the number of views instead, so the fraction survives into the answer.
+    assert m.confidence()[mr, mc] == pytest.approx(0.25), "the rule's doubt must reach confidence"
 
 
 def test_views_making_no_impossible_claim_decide_a_disputed_cell(plan):
@@ -288,6 +292,118 @@ def test_a_flank_the_frame_may_not_vote_on_does_not_pinch(plan):
     mr, mc = _map_cell(m, plan, (r, c))
     assert m.votes.sum(axis=2)[mr, mc] == pytest.approx(1.0)
     assert m.votes.sum(axis=2)[mr, mc + 1] == 0, "the occluded flank itself never voted"
+
+
+# ---------------------------------------------------------------------------
+# the rule's doubt reaching confidence, and the floor that acts on it
+# ---------------------------------------------------------------------------
+
+def test_confidence_is_a_share_of_views_not_of_vote_weight(plan):
+    """The defect this fixed, stated as the numbers that used to be equal. Thirty views all
+    claiming the same one-wide passage leave a tenth of the evidence a clean cell has, and the
+    old share-of-mass reported both as 1.000 because the weight cancelled out of the ratio."""
+    cfg = VisionConfig(occupancy_gap_rule_weight=0.1, occupancy_min_votes=99)
+    m = _map(cfg)
+    cells, (r, c) = _pinched(plan, m)
+    for _ in range(30):
+        m.update(cells, _odo(), plan, cfg=cfg)
+    mr, mc = _map_cell(m, plan, (r, c))
+    assert m.views[mr, mc] == 30, "every one of those frames looked at the cell"
+    assert m.votes.sum(axis=2)[mr, mc] == pytest.approx(3.0), "and left a tenth of the evidence"
+    assert m.confidence()[mr, mc] == pytest.approx(0.1)
+    # The flanks are weighted alike, and an untouched cell two columns over is not.
+    assert m.confidence()[mr, mc + 1] == pytest.approx(0.1)
+    assert m.confidence()[mr, mc + 2] == pytest.approx(1.0)
+
+
+def test_confidence_is_unchanged_wherever_the_gap_rule_never_fired(plan):
+    """The property that makes the change safe to ship: off the rule's cells the summed weight IS
+    the view count, so share-of-views and the old share-of-mass are the same expression. Asserted
+    against the old formula directly rather than against remembered numbers."""
+    cfg = VisionConfig(occupancy_min_votes=99, occupancy_lock_ratio=0.99)
+    m = _map(cfg)
+    for i in range(7):
+        m.update(_cells(plan, Tile.WALL if i % 3 else Tile.BUSH), _odo(), plan, cfg=cfg)
+    assert m.votes.sum(axis=2).max() > 0, "the deposit has to have happened"
+    old = np.where(m.views > 0, m.votes.max(axis=2) / np.maximum(m.votes.sum(axis=2), 1e-9), 0.0)
+    assert np.allclose(m.confidence(), old)
+
+
+def test_a_cell_every_view_calls_an_impossible_passage_never_locks(plan):
+    """Locking moved onto the same share. A pinched cell used to reach share 1.0 and lock the
+    moment its weighted mass cleared `min_votes`; now the share itself never clears the ratio, so
+    the map declines to call impossible geometry settled however long it looks at it."""
+    cfg = VisionConfig(occupancy_gap_rule_weight=0.1, occupancy_min_votes=5,
+                       occupancy_lock_ratio=0.8)
+    m = _map(cfg)
+    cells, (r, c) = _pinched(plan, m)
+    for _ in range(200):
+        m.update(cells, _odo(), plan, cfg=cfg)
+    mr, mc = _map_cell(m, plan, (r, c))
+    assert m.votes.sum(axis=2)[mr, mc] > cfg.occupancy_min_votes, "mass alone would have locked it"
+    assert not m.locked[mr, mc]
+    assert m.locked[mr, mc + 2], "an ordinary cell beside it still locks"
+
+
+def test_the_confidence_floor_blanks_a_cell_to_unknown(plan):
+    """`best` is where the floor lives, so the deploy grid, the loop and the render all get it."""
+    cfg = VisionConfig(occupancy_gap_rule_weight=0.1, occupancy_min_votes=99)
+    m = OccupancyMap.from_config(cfg)
+    cells, (r, c) = _pinched(plan, m)
+    for _ in range(30):
+        m.update(cells, _odo(), plan, cfg=cfg)
+    mr, mc = _map_cell(m, plan, (r, c))
+    assert m.best()[mr, mc] == CLASS_INDEX[Tile.FLOOR], "floor 0.0 leaves the argmax alone"
+
+    lifted = OccupancyMap.from_config(VisionConfig(occupancy_gap_rule_weight=0.1,
+                                                   occupancy_min_votes=99,
+                                                   occupancy_confidence_floor=0.5))
+    for _ in range(30):
+        lifted.update(cells, _odo(), plan, cfg=cfg)
+    assert lifted.best()[mr, mc] == UNKNOWN
+    assert lifted.best()[mr, mc + 1] == UNKNOWN, "the flanking walls blank too -- see the config"
+    assert lifted.best()[mr, mc + 2] == CLASS_INDEX[Tile.FLOOR]
+
+
+def test_the_floor_can_only_take_a_class_away_never_invent_one(plan):
+    """Unobserved cells read confidence 0, which is under every legal floor. They must stay
+    UNKNOWN by the same answer rather than be swept into a class by the comparison."""
+    cfg = VisionConfig(occupancy_confidence_floor=0.7)
+    m = OccupancyMap.from_config(cfg)
+    assert (m.best() == UNKNOWN).all(), "a fresh map is unknown, floor or no floor"
+    m.update(_cells(plan), _odo(), plan, cfg=cfg)
+    blanked = m.best() == UNKNOWN
+    assert blanked[~m.observed].all(), "never-observed cells are still unknown"
+
+
+def test_the_floor_blanks_what_best_claims_and_not_what_the_map_observed(plan):
+    """`observed` must stay clear of the floor, because a coverage curve built on `best` is no
+    longer an odometry signal once a floor exists: a cell can return to UNKNOWN with the world
+    frame perfectly still. `evaluate.RenderReport.unknown_curve` counts `~observed` for this
+    reason, and its monotonicity check is only about odometry while that holds."""
+    cfg = VisionConfig(occupancy_gap_rule_weight=0.1, occupancy_min_votes=99)
+    floored = OccupancyMap.from_config(VisionConfig(occupancy_gap_rule_weight=0.1,
+                                                    occupancy_min_votes=99,
+                                                    occupancy_confidence_floor=0.5))
+    plain = OccupancyMap.from_config(cfg)
+    cells, _ = _pinched(plan, plain)
+    for _ in range(30):
+        plain.update(cells, _odo(), plan, cfg=cfg)
+        floored.update(cells, _odo(), plan, cfg=cfg)
+    assert (floored.observed == plain.observed).all(), "the floor is not allowed to unobserve"
+    assert (floored.best() == UNKNOWN).sum() > (plain.best() == UNKNOWN).sum(), \
+        "and it has to actually blank something, or this proves nothing"
+
+
+def test_a_new_segment_resets_the_views_with_the_votes(plan):
+    """A stale view count would make the new segment's first cells look long-observed and
+    under-confident at once -- the votes are gone but the denominator is not."""
+    cfg = VisionConfig()
+    m = _map(cfg)
+    m.update(_cells(plan), _odo(), plan, cfg=cfg)
+    assert m.views.max() > 0
+    m.update(_cells(plan), _odo(segment=1), plan, cfg=cfg)
+    assert m.views.max() == 0, "reset drops the denominator too"
 
 
 # ---------------------------------------------------------------------------

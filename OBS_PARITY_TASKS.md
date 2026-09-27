@@ -1,6 +1,6 @@
 # Observation parity: delegable task chunks (Phase 1 and Phase 2)
 
-**Status 2026-09-24: Phase 1 chunks C1–C11 are BUILT and verified (the Status block below is authoritative); C12 is the lead's run and is TRAINING (`mortis_deploy5`, started 2026-09-24); the wall-push baseline, the stuck-clip replay harness, P1 and Z1 were measured concurrently on the CPU (Status block); Z2–Z4 wait for the run.** This is the execution breakdown of both phases of
+**Status 2026-09-25: Phase 1 chunks C1–C11 are BUILT and verified (the Status block below is authoritative); C12's run `mortis_deploy5` FINISHED and passed its offline gates, `configs/deployment.yaml` names it, and only the live BlueStacks session is left (the lead's); the three pending decisions are resolved and built (the tracker offset is live now; the dash stop and the gas at 1.3× the game's pace train in the next run); Z1–Z3 are done and Z4 is the lead's next run; the cube economy (every crate spot filled, farming bots, `cube_pickup` 1.0) is built for that same run, "Done 2026-09-25" below.** This is the execution breakdown of both phases of
 `OBS_PARITY_PLAN.md` (read its §0–§2 and §4 first for the *why*; this file is the *how*): Phase 1
 is chunks C1–C12 plus the probe P1, Phase 2 (the zone schedule) is Z1–Z4 at the end. Each chunk is
 sized for one agent session, states its inputs and outputs, and ends with an acceptance check
@@ -55,11 +55,12 @@ Probes, deploy4 checkpoint rolled in the NEW sim on CPU (`64` episodes, 9 048 de
 | zone margin under the horizon while that edge is off screen | 0.170 | 0.186 |
 | `zone.active` | constant 1 | latched (0 until gas was on screen) |
 
-**Open.** C12 started 2026-09-24: the lead launched `mortis_deploy5` on the deploy4 recipe with
-`configs/agent_obs_deploy5.yaml`, and it holds the GPU. Its gates wait on the finished checkpoint:
-C3's leak numbers, the wall-push protocol against the baseline below, the stuck-clip replay
-(`replay_clip.py --run runs/<deploy5> --mask both`), `configs/deployment.yaml` `run.dir`, a live
-session. `configs/train.yaml` and `configs/deployment.yaml` still name deploy4.
+**Open.** C12's run `runs/mortis_deploy5-20260924-090436` finished 2026-09-25 and passed gates
+1–3; `configs/deployment.yaml` named it (gate 4) until 2026-09-26, when the lead moved the target
+to `runs/mortis_ppo-20260925-194025`, the run trained after it on deploy5's spec. Gate 5, a live
+BlueStacks session, is the lead's (`scripts/deploy_run.py --dry-run`, then without the flag).
+Results in "Done 2026-09-25" below. `configs/train.yaml` names deploy5's spec since 2026-09-25
+(the mortis_ppo run trained on it).
 
 **Done concurrently with C12 (2026-09-24, CPU only; nothing `TierEvaluator` re-reads from disk
 was touched).**
@@ -91,7 +92,7 @@ sim trap the mask cannot see:
 | holdout | off | 0.041 | 0.028 | 65 | 65 | 0.041 |
 | holdout | on | 0.036 | 0.022 | 57 | 57 | 0.036 |
 
-*The dash wedge (pending decision: sim physics, not for the running run).* `hero.start_dash`
+*The dash wedge (resolved 2026-09-25: a dash now stops at the wall, "Done 2026-09-25" below).* `hero.start_dash`
 marches only the CENTRE against `blocks_unit` and backs off by `los_step_tiles + unit_radius`
 along the dash direction alone, so a dash along or beside a wall face lands the 0.4-tile body
 inside the wall (hero local x 10.81 against a wall at column 11 was one case). From there
@@ -100,9 +101,9 @@ describes for the head-on case, until the next dash. 100 % of wedge onsets follo
 of decisions are wedged, 2.2–2.8 % have no legal bin at all, and the longest stalls (81–83
 decisions ≈ 20 s) are all wedges. The deployed `legal_move_bins` shrink rule (written for the
 real game, where the map is an estimate) calls those bins legal, so no mask fixes it, and it caps
-what any retrain can show on this metric. Proposed fix for the NEXT run: resolve each dash tick
-through `resolve_move` so a dash slides along a wall and never lands inside one, then re-run the
-table. §6.16's 0.000 with the mask on was the narrower definition, not a clean sim.
+what any retrain can show on this metric. The fix proposed here (resolve each dash tick
+through `resolve_move`, so a dash slides along a wall) was not taken: the lead chose to have a
+wall stop a dash's momentum rather than redirect it. §6.16's 0.000 with the mask on was the narrower definition, not a clean sim.
 
 *Stuck-clip replay through the live path.* `scripts/probes/replay_clip.py` feeds a recording
 through the real `DeployLoop` (`ClipCapture` in place of `Capture`, `NullBackend` controls, the
@@ -151,9 +152,10 @@ replaces it; nothing drifts, so the single-period model stands. `zone_probe.py` 
 gas map at the gate, measures per-line fronts (sharp and raw rates, band steps) and takes
 `--t0-frame` from the harness's gate because `scan_gameplay` mis-gates the OBS recordings.
 
-**Pending decisions (the lead's; none blocks the running C12).**
+**Pending decisions (the lead's; all three resolved 2026-09-25, results in "Done 2026-09-25" below).**
 
-1. The dash wedge: resolve dash ticks through `resolve_move` for the run after deploy5, then
+1. **Resolved: stop at the wall, not slide; built.** The dash wedge. Proposed, not taken:
+   resolve dash ticks through `resolve_move` for the run after deploy5, then
    re-run `wall_push_measure.py` (above). Mechanism confirmed by an angle sweep on the fixture of
    `tests/test_hero.py::test_no_dash_approach_angle_can_leave_an_entity_stuck_against_a_wall`
    (wall column at x = 30, 300 start offsets per angle, CPU): share of wall-meeting dashes that end
@@ -161,14 +163,14 @@ gas map at the gate, measures per-line fronts (sharp and raw rates, band steps) 
    12 / 12 % at 60°, 28 / 29 % at 45°, 57 / 67 % at 30°, 76 / 87 % at 20°, 100 / 100 % at 10°.
    That test sweeps only the head-on direction despite its name; the fix's regression test is the
    same sweep over angles, asserting zero at every angle.
-2. The `hero_offset` y bias: give `_nominal_tile` the player box's own nominal point, a second,
+2. **Resolved as proposed; built.** The `hero_offset` y bias: give `_nominal_tile` the player box's own nominal point, a second,
    live-only measured offset of about (−0.15, −0.78) tiles from the ring, pinned by a replay test
    on recorded footage. Do NOT change `HERO_ANCHOR_TILES`: it is the green ground ring's position
    and the sim's `camera.quad` is derived from it (`tests/test_sim_camera.py`), so changing it
    would move the sim's reveal window by 0.8 tiles. Live side only; the trainer never imports the
    tracker, so it is safe during the run. Timing: deploy5 is the first spec that reads
    `hero.near_edge` (deploy4's does not), so the fix must land before deploy5's first live session.
-3. Z2's numbers (`start_fraction ≈ 0.127`, `step_seconds ≈ 6.5–7`, `tiles_per_step 1`, ±10 %
+3. **Resolved: 1.3× the game's pace in a 185 s episode; built for the next run.** Z2's numbers (`start_fraction ≈ 0.127`, `step_seconds ≈ 6.5–7`, `tiles_per_step 1`, ±10 %
    overlay in `configs/randomization.yaml`): applied after the run finishes, never while
    `TierEvaluator` re-reads `configs/default.yaml`.
 
@@ -199,6 +201,182 @@ gas map at the gate, measures per-line fronts (sharp and raw rates, band steps) 
    schedule alone. Caveat: deploy4 never trained on slow gas or a 240 s denominator, so the wins
    and rank columns are indicative; the 30 % truncation is mechanical, and a policy that survives
    longer only raises it.
+
+**Done 2026-09-25 (CPU only; nothing trains).**
+
+*C12's gates.* The run finished (`best_model.zip` 01:44, `final_model.zip` 02:47). Every gate is on
+`best_model.zip`, the checkpoint `configs/deployment.yaml` names.
+
+| gate | result |
+|---|---|
+| 1. C3's leak numbers | ≥1 enemy revealed 0.627, revealed but none on screen 0.000; revealed rows per decision, total / on screen / off screen, 0.78 / 0.78 / 0.00; top-12 projectile slots held by off-screen projectiles 2.56 (quirk kept); on-screen projectile dropped by the top-12 0.024; zone margin under the horizon while that edge is off screen 0.178 |
+| 2. the wall-push protocol against deploy4 + mask, same sim | better on the training maps, level within noise on holdout (table below) |
+| 3. the 2026-09-23 stuck clip through the live path | east picked on 0/41 decisions in the 22–32 s window (deploy4: 37/41); the mask vetoes 3/171 over the clip (deploy4: 49/171); no dead-bin pick; the bin changes on 45 |
+| 4. `configs/deployment.yaml` `run.dir` | deploy5, `best_model.zip` |
+| 5. a live BlueStacks session | the lead's |
+
+Gate 2, both checkpoints with the mask on, 96 elite episodes per cell, before the dash fix below:
+
+| maps | run | wall-push decisions | stalls ≥ 2 s / episode | longest stall | win | mean rank |
+|---|---|---|---|---|---|---|
+| training | deploy4 | 0.036 | 0.19 | 81 | 0.20 | 3.11 |
+| training | deploy5 | 0.022 | 0.12 | 32 | 0.30 | 2.79 |
+| holdout | deploy4 | 0.031 | 0.22 | 83 | 0.15 | 3.21 |
+| holdout | deploy5 | 0.030 | 0.23 | 27 | 0.14 | 3.38 |
+
+Every deploy5 wall-push with the mask on was a dash wedge (48–67 onsets per cell), which the
+next item removes.
+
+*Pending decision 1, built: a dash stops where the body first touches a wall.* The lead's call:
+a wall stops a dash's momentum rather than redirecting it, so a glancing dash keeps its line and
+stops short, with no slide. `terrain.body_travel` tests the whole body (`circle_blocked`, the test
+walking uses) every `los_step_tiles` along the line, bisects 4 times (`_BODY_REFINE_STEPS`) inside
+the step where it first fails, and backs off `_WALL_CLEARANCE` only at a contact; `hero.start_dash`
+calls it with `params.dash_ray_tiles` as the ray budget. A body that starts overlapping stays where
+it is rather than tunnelling out. Tests: four `body_travel` cases in `tests/test_terrain.py`;
+`tests/test_hero.py::test_a_glancing_dash_stops_on_its_line_at_the_wall_instead_of_sliding` and
+`::test_a_dash_alongside_a_wall_with_the_body_clear_is_not_shortened`. The wall-push protocol on
+deploy5 under the fixed sim:
+
+| maps | mask | wall-push decisions | of which wedged | stalls ≥ 2 s / episode | longest stall | win | mean rank | decisions |
+|---|---|---|---|---|---|---|---|---|
+| training | off | 0.026 | 0.000 | 0.12 | 26 | 0.36 | 2.72 | 14 696 |
+| training | on | 0.000 | 0.000 | 0.00 | 0 | 0.31 | 2.90 | 14 556 |
+| holdout | off | 0.034 | 0.000 | 0.17 | 33 | 0.15 | 3.40 | 14 037 |
+| holdout | on | 0.000 | 0.000 | 0.00 | 0 | 0.17 | 3.17 | 14 542 |
+
+Stuck (all 16 bins dead) 0.000 and mask ≠ sim truth 0.000 in every cell; wedge onsets 0, 0, 2 and
+1, against 48–67 per cell before. A sweep over the real map bank (16 maps × 512 random clear
+starts × 16 bins × both dash lengths, 262 144 dashes) lands no body inside a wall; 433 (0.17 %)
+clip a corner between two samples mid-dash and land clear, which is where the three one-decision
+onsets come from (a decision boundary fell mid-dash). Left as is: brief and harmless, and closing
+it would mean sampling every dash more finely. This sim change reaches only the next run; deploy5
+trained under the old dash.
+
+*Pending decision 2, built: the tracker's player-box offset.* `tracker.PLAYER_BOX_FROM_RING_TILES
+= (−0.08, −0.78)`, added in `_nominal_tile`, measured through the live path on five BlueStacks
+recordings (1 113 single-box sightings while tracking; per-clip medians −0.15 to −0.04 in x,
+−0.92 to −0.71 in y). `HERO_ANCHOR_TILES` is unchanged. Pinned by
+`tests/test_deployment_tracker.py::test_recorded_player_boxes_read_near_zero_offset_while_tracking`
+on `tests/fixtures/vision/player_boxes_tracking.json`. Live only, so deploy5 gets it now. Found
+with it: `tests/test_deployment_policy.py`'s end-to-end checkpoint test had never met a spec that
+reads `hero.near_edge` (it skipped until deploy5's checkpoint existed) and now passes
+`hero_offset` the way the loop does.
+
+*Pending decision 3, built for the next run: the gas at 1.3× the game's pace.* The lead's call:
+1.3× Z1's pace, in an episode a little shorter than a real match. `configs/train.yaml`
+`run.env_overrides` sets `sim.max_episode_steps: 3700` (185 s, 740 decisions) and
+`zone.step_seconds: 5.0` (6.5 s ÷ 1.3); the existing `start_fraction 0.08` then puts the first gas
+at 14.8 s (19 s ÷ 1.3 is 14.6). `run.randomization` names `configs/randomization.yaml`, which now
+ships exactly the two ±10 % lines (first gas 13.3–16.3 s, 4.5–5.5 s per tile, redrawn per env at
+every reset); evaluation stays at the nominal schedule. Pins:
+`tests/test_configs_files.py::test_randomization_file_ships_only_the_gas_jitter` and
+`::test_the_shipped_run_trains_the_gas_at_1_3x_the_games_pace`,
+`tests/test_zone.py::test_the_run_jitters_each_envs_gas_schedule_and_redraws_it_at_reset`. Design
+doc §9 entry 20; the plan's §4 status line.
+
+Two deviations from Z2 as written. The schedule is a run setting in `configs/train.yaml`, not new
+scalars in `configs/default.yaml`: runs name `default.yaml` by path, so the reason item 3 above
+gives for the episode length holds for the whole schedule, and every run trained before keeps its
+150 s. `check_zone_ranges` is not built: the shipped draws (4.5 s at the least, first gas at 16.3 s
+at the latest) sit far inside `validate`'s bounds, so it would guard only a hand-edited range.
+
+Episode length at 1.3× (deploy5 `best_model.zip`, 64 elite episodes per row through
+`TierEvaluator` with the schedule passed as overrides, CPU):
+
+| schedule | wins | mean rank | episode s, median / mean | hit the time cap | longest |
+|---|---|---|---|---|---|
+| as trained: gas at 12 s, 1.5 s per tile, 150 s episode | 0.36 | 2.42 | 44.6 / 38.9 | 0 % | 55.2 s |
+| 1.3× nominal: gas at 14.8 s, 5.0 s per tile, 185 s episode | 0.19 | 3.33 | 81.2 / 76.3 | 0 % | 155.8 s |
+| 1.3× slow end: gas at 16.3 s, 5.5 s per tile, 185 s episode | 0.20 | 3.41 | 79.8 / 82.1 | 0 % | 171.2 s |
+
+No episode reaches the cap even at the slow end of the jitter, 14 s to spare. Episodes run about
+twice as long as deploy5 trained on, so a run gets about half as many matches per million steps.
+deploy5 never trained on slow gas, so its wins here are indicative only.
+
+*Next run (Z4).* Everything above is in `configs/train.yaml` as the lead left it; only the spec is
+passed, as for deploy5:
+
+```
+.venv/Scripts/python.exe scripts/train.py --set run.agent_obs=configs/agent_obs_deploy5.yaml
+```
+
+Add `--set run.name=<name>` to name it. A fine-tune adds `--resume
+runs/mortis_deploy5-20260924-090436/best_model.zip`, which builds the new recipe and loads the
+weights; it relearns what each `time_frac` value means, since the denominator moves from 150 s to
+185 s.
+
+*Z3.* Design doc entry 20 and the plan's §4 status line are written; §10 item 9 stays as written
+(no burst period was measurable). Schema proof, rendered in memory because
+`scripts/dump_obs_schema.py` always rewrites `docs/OBSERVATION.md`: `docs/OBSERVATION.md` and
+`docs/AGENT_OBS_DEPLOY5.md` are identical to the committed files. Suite
+`pytest tests -q -m "not vision"`: `4 failed, 2499 passed, 2 skipped, 85 deselected in 1486.94s
+(0:24:46)`. Three were `tests/test_deployment_grid.py::test_the_grid_matches_the_sim_channel_for_channel`
+for deploy, deploy3 and deploy4, "episode ended mid-comparison" with no plane mismatched: the dash
+stop moved that test's seeded, crowded run into two bot rifles firing point-blank, and the hero
+died at decision 19 of 40. The test now zeroes the bots' damage after the reset, so survival no
+longer rides on the seed; the file re-ran `57 passed`. The fourth,
+`tests/test_training.py::test_shipped_stage_walk_is_the_plan_walk`, pins
+`curriculum.max_timesteps_at_stage` at 75M against the lead's local `configs/train.yaml` retune
+(100M per stage, 300M total), and is left for the lead: deploy5 force-advanced at the cap on all
+four transitions (`curriculum.json`: win rates 0.25–0.30 against the 0.35 gates), so at 100M per
+stage in 300M the next run would end as `veteran` finishes and never train against the expert or
+elite stages. Run as deploy5 did (75M, 450M), it spent its last 150M at elite.
+
+*Cube economy, built for the next run (the lead's request of 2026-09-25: the agent loses live to
+7+ cube bots and never builds cubes early).* Measured first, deploy5 `best_model.zip` at elite
+under the 1.3× gas, 64 episodes per cell: with the 8 crates deploy5 trained on, the richest bot
+held 2.6 cubes at 60 s and the hero's killer 1.0, and the hero collected 32 % of every cube picked
+up; the sim had the pressure backwards. Built: `configs/default.yaml` fills every marked crate spot
+(`n_boxes 48`, `max_boxes 48`, `max_pickups 64`; 16 to 44 crates per map, 24.7 on average, where
+real maps carry 20 to 30); `brawl_sim/bots/policy.py` pulls bots to crates at 20 tiles × 3.0
+unless an enemy target is within 8, and to cubes at 12 tiles × 4.0 with no enemy gate, both gated
+on a clear straight walk (`_walk_clear`, a `terrain.march` on `blocks_unit`, because
+`resolve_move` has no pathfinding: about a tenth of mobile bots' crate-pulled decisions stalled
+against a wall without it; the 41 % / 17 % first quoted here mostly counted HUNT_BUSH wall
+stalls, corrected later that day) and on the loot being a tile out of the gas; `targeting` lets
+a bot shoot a crate while its enemy is out of attack range; `bots/personality.py` drops the crate
+pull while a cube pull is active; `configs/train.yaml` `reward.cube_pickup` 0.5 → 1.0. Result at
+elite: richest bot 7.4 at 60 s, 7+ in 48 % of matches, killer's cubes 4.3, hero share 16 %, deploy5
+win 0.17; at hard: richest bot 7.3, killer's cubes 8.9, win 0.56 (rank 1.67 → 1.00). Granting bots
+cubes on a clock (the lead's fallback) was not needed and is not built. Tables in design doc §9
+entry 21; probe `scripts/probes/cube_economy_measure.py`. Found on the way: `tests/test_boxes.py`'s
+fixture passed `n_boxes` to `cfg` but not to the spec `build_params` reads, so its crate-count
+assertions had been passing off `default.yaml`'s own 8; fixed to merge the overrides into both.
+Suite: the 33 files that touch bots, crates, configs, rewards, the grid and the env ran green
+(900 passed) apart from the stage-cap pin above; the full suite was not re-run end to end that
+day because the machine was under load from another program (a 10 000-step autoreset test was
+crawling at 0.4 s per step, against about 10 ms unloaded).
+
+**The pre-run audit, the same evening** (design doc §9 entry 22; the lead decided on eight
+findings). Built: `brawl_sim/bots/policy.py` and `personality.py`, a loot pull is a unit direction
+that REPLACES the mode steering instead of summing with it (`steering.seek`/`flee` return raw
+`target - pos` and `combine` normalises once, so the summed 3.0 × 20-tile pull weighed weight ×
+distance and froze bots at weighted midpoints: campers parked at crates 27 % of their time, engaged
+bots were cube-pulled on 27 % of decisions); both pulls need no enemy target within 8 tiles (a
+cube within 2 is grabbed regardless), are off in RETREAT and HOLD_STILL, and a crate is a fire
+target only within `min(attack_range, 5)` tiles (the lead: nearby crates, not every crate in
+range). `core/hero.py`: the dash grants no i-frames (the lead: an animation during which Mortis
+can be hit); `hero.invuln` stays in the spec, always False, `perception/shadow.py` never seeds it,
+docs/OBSERVATION.md regenerated. `core/movement.py`: speed scales with the intent's length, so the
+EMA-smoothed bot intent decelerates instead of coasting at full speed along its old heading (47 %
+of HOLD_STILL ticks moved at hard). `core/combat.py`: the zone can no longer overwrite the
+finisher's last-hit on an entity already at 0 HP, so the hero keeps a kill it finishes in the gas.
+Settled without a change: crates stay walkable (correct to the game, the lead), the curriculum
+keeps its forced advance with `advance_win_rate` 0.25 (the lead's own edit, the 75M pin still
+theirs), and the three zone-observation mismatches (pre-shrink `hero_margin_local` to the map edge
+vs +10 live, `zone_grid` off-map cells gas from tick 0 vs zeros until seen, one negated side vs
+four in the gas) are recorded in the entry only. Measured at elite, 32 episodes: campers in bush
+0.60 → 0.86, parked at a crate 0.27 → 0.00, engaged bots cube-pulled 0.27 → 0.03, retreat
+decisions moving toward the enemy → 0.00, gas-stolen hero kills 1 → 0, hero combat damage inside
+i-frames 0.40 → 0 (1.14 reward per episode had been charged for it); deploy5's own win 0.25 →
+0.06, expected, since it dashed through damage that now lands. Found on the way: C4's kept quirk
+(the sim ranks an off-screen projectile into a slot and blanks it; the tracker never holds one)
+had let `tests/test_deployment_assemble.py`'s parity tests pass by trajectory luck; the fixture now
+feeds only on-screen projectiles and the tests skip the projectile group in a frame where the sim
+holds an off-screen one, the sim unchanged. Probes in the repo: `scripts/probes/bot_pull_measure.py`
+and `kill_credit_measure.py`. Suite on the final code: 2509 passed, 2 skipped, 1 failed (the
+stage-cap pin above), 33 min with three CPU probes running beside it.
 
 ---
 
@@ -927,6 +1105,9 @@ The report is a markdown table plus the pasted test summary. No opinions on retr
 
 ## C12 — Retrain and gates (lead, not a delegate)
 
+**Status: FINISHED 2026-09-25; gates 1–4 passed, gate 5 (live) is the lead's** (Status block,
+"Done 2026-09-25").
+
 Not for a small model: it needs the GPU and judgement calls.
 
 1. Check nothing is training (`nvidia-smi`; a running `scripts/train.py`).
@@ -1190,6 +1371,10 @@ a false-positive check only: its "first gas" should not land in the lobby or at 
 
 ## Z2 — Config: measured schedule, ±10 % overlay, range-aware validation
 
+**Status: BUILT 2026-09-25, adapted** (Status block, "Done 2026-09-25"): at the lead's 1.3× pace,
+as a run setting in `configs/train.yaml` rather than scalars in `configs/default.yaml`; step 2's
+overlay shipped as written; step 3 (`check_zone_ranges`) not built.
+
 **Goal.** `configs/default.yaml` carries the measured schedule with provenance; training jitters
 `start_fraction` and `step_seconds` ±10 % per episode; a configuration whose range could sample
 an invalid value is refused when the environment is built, not at the thousandth reset.
@@ -1281,6 +1466,9 @@ overlay lines uncommented; nothing under `runs/`; no `agent_obs_*` edits (no sch
 
 ## Z3 — Docs, pins and the verification pass
 
+**Status: DONE 2026-09-25** (Status block, "Done 2026-09-25"; the design doc's entry is 20, the
+"9.20" below).
+
 **Goal.** The measurement and the config change are recorded where the next reader looks, and
 the suite is green with both phases in.
 
@@ -1310,6 +1498,11 @@ Report per rule 12. No opinions on the retrain.
 ## Z4 — Fine-tune or retrain under the jittered schedule (lead, not a delegate)
 
 Needs the GPU and judgement.
+
+**Status: the lead's next run; the recipe is in the Status block ("Done 2026-09-25").** Z2 landed
+after C12 started, so the fold-in path of step 2 is gone. The new recipe's episode is 185 s: step
+4's live check reads `T0 / 185` (about 0.10 at the game's 19 s) against the sim's 0.08, a gap that
+is the 1.3× pace, by design.
 
 1. Prerequisites: C12's deploy5 checkpoint has passed its gates; Z2 and Z3 landed; nothing is
    training (`nvidia-smi`; a running `scripts/train.py`).

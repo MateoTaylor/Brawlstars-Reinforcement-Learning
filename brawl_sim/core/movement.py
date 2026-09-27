@@ -23,12 +23,22 @@ from . import terrain
 
 
 def apply_movement(state, move_dir: torch.Tensor, bank, params, cfg) -> None:
-    """move_dir: (N,E,2), normalized or zero. MUTATES: ent_pos, ent_vel, ent_facing."""
+    """move_dir: (N,E,2), length <= 1 or zero. MUTATES: ent_pos, ent_vel, ent_facing.
+
+    The length is a throttle. The hero's decoded action is a unit vector or zero, so it always
+    walks at full speed; a bot's intent is bots/policy.all_bot_intents's EMA-smoothed steering,
+    which decays toward zero after the bot decides to stop. Renormalising that decaying vector to
+    unit length (the rule until 2026-09-25) made a stopping bot walk at full speed along its old
+    heading until the vector underflowed geometry's epsilon: measured, 47 % of HOLD_STILL ticks
+    at hard were moving, about 6 tiles of coasting per stop (9 at medium, none at elite, whose
+    reaction delay is under one tick). Scaling speed by the length turns that into a decelerating
+    stop of a fraction of a tile."""
     active = state.ent_alive & (state.ent_dash_t <= 0)  # skipped: dead or dashing
 
     speed = stats.effective_speed(state.ent_kind, params)  # (N,E)
     norm_dir = geo.normalize(move_dir)
-    delta = norm_dir * speed.unsqueeze(-1) * cfg.dt
+    throttle = torch.clamp(geo.safe_norm(move_dir, dim=-1), max=1.0)
+    delta = norm_dir * (speed * throttle).unsqueeze(-1) * cfg.dt
     delta = delta * active.unsqueeze(-1).to(delta.dtype)  # multiplicative mask, not indexing
 
     radius = params.unit_radius.unsqueeze(-1)  # (N,1), broadcasts against (N,E)

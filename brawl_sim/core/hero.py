@@ -27,21 +27,31 @@ from . import stats
 from . import terrain
 
 _EPS = 1e-6
-# Extra clearance a clipped dash keeps from a wall face, beyond the geometric back-off. See
-# start_dash: landing with the hitbox edge exactly ON the face still reads as blocked.
+# The attack column's values (config.EnvConfig.action_nvec): one column, one value.
+ATTACK_NONE, ATTACK_FIRE, ATTACK_SUPER, ATTACK_GADGET, ATTACK_AUTO = 0, 1, 2, 3, 4
+# A crate's collision radius, projectiles.BOX_RADIUS restated here so this module keeps its
+# import list (projectiles is downstream of hero); tests pin the two equal.
+_BOX_RADIUS = 0.5
+# How far a clipped dash stops short of the contact `terrain.body_travel` finds, so float32
+# rounding across advance_dash's increments cannot carry the body into the wall. See start_dash.
 _WALL_CLEARANCE = 1e-3
 
 
 def action_mask(state, params, cfg) -> dict:
-    """Hero-only (entity index 0). {"move": (N,17) bool, "attack": (N,4) bool}.
+    """Hero-only (entity index 0). {"move": (N,17) bool, "attack": (N,4) bool}, the attack half
+    (N,5) under `cfg.auto_aim`.
 
     The attack column is `[no-fire, attack, SUPER, GADGET]` (Step D2 / bot_overhaul.md D1 for the
-    super; SIM_OVERHAUL_PLAN.md Step G3 / S7 for the gadget). Widening the existing dimension
-    rather than adding a third keeps `action.shape == (N,2)`, so every wrapper, `act_buf`, and
-    `env._held`'s fire-clearing keep working untouched -- the super and the gadget are distinct
-    VALUES in the attack column, not new columns, which is why one decision still means at most
-    one attack attempt for either of them too. The price is that a gadget and a dash cannot share
-    one decision (plan §8).
+    super; SIM_OVERHAUL_PLAN.md Step G3 / S7 for the gadget), plus `[AUTO]` under
+    `action.auto_aim` (the lead, 2026-09-26): an attack whose dash is aimed for the policy, at
+    the nearest enemy or crate in reach (`auto_aim_target`). It is legal exactly when the plain
+    attack is -- the same ammo, cooldown and no-dashing gates, since it is the same dash with a
+    different direction. Widening the existing dimension rather than adding a third keeps
+    `action.shape == (N,2)`, so every wrapper, `act_buf`, and `env._held`'s fire-clearing keep
+    working untouched -- the super, the gadget and the auto-aim are distinct VALUES in the
+    attack column, not new columns, which is why one decision still means at most one attack
+    attempt for any of them. The price is that a gadget and a dash cannot share one decision
+    (plan §8).
     """
     hero_alive = state.ent_alive[:, 0]
     hero_ammo = state.ent_ammo[:, 0]
@@ -61,29 +71,46 @@ def action_mask(state, params, cfg) -> dict:
     # gadget go in all three.
     gadget_ok = gadget_ready(state, params)[:, 0]
     no_fire_ok = torch.ones_like(fire_ok)
-    attack = torch.stack([no_fire_ok, fire_ok, super_ok, gadget_ok], dim=1)
+    columns = [no_fire_ok, fire_ok, super_ok, gadget_ok]
+    if cfg.auto_aim:
+        columns.append(fire_ok)
+    attack = torch.stack(columns, dim=1)
 
     return {"move": move, "attack": attack}
 
 
 def decode_action(action: torch.Tensor, state, params, cfg):
     """Hero-only. action: (N,2) i64. Returns (move_dir (N,2) f32, fire (N,) bool,
-    super_fire (N,) bool, gadget_fire (N,) bool).
+    super_fire (N,) bool, gadget_fire (N,) bool, auto (N,) bool).
 
-    `action[:, 1]` is four-valued: 0 = nothing, 1 = attack, 2 = super, 3 = gadget. Every output
-    is ANDed with the mask, so an illegal request of any kind is a silent no-op rather than an
-    error. The three are mutually exclusive by construction -- one column, one value."""
+    `action[:, 1]` is four-valued: 0 = nothing, 1 = attack, 2 = super, 3 = gadget, and
+    five-valued under `cfg.auto_aim`, where 4 = auto-aimed attack. Every output is ANDed with
+    the mask, so an illegal request of any kind is a silent no-op rather than an error. The
+    values are mutually exclusive by construction -- one column, one value.
+
+    `fire` is True for BOTH attack values (1 and 4): everything downstream that means "the hero
+    dashed" (ammo, cooldown, reveal, the reward's in-reach term, the cadence audit) is one code
+    path. `auto` is the refinement that only `env._attack_phase` reads, to swap the dash's
+    direction for `auto_aim_target`'s before `start_dash`. Without the flag the mask has no
+    fifth column and `auto` is all-False; a 4 in the column is then a no-op, like any other
+    illegal value."""
     move_bin = action[:, 0]
     is_idle = move_bin == 0
     dirs = geo.dir_from_bin(torch.clamp(move_bin - 1, min=0), cfg.n_move_bins)
     move_dir = torch.where(is_idle.unsqueeze(-1), torch.zeros_like(dirs), dirs)
 
     mask = action_mask(state, params, cfg)["attack"]
-    fire = (action[:, 1] == 1) & mask[:, 1]
-    super_fire = (action[:, 1] == 2) & mask[:, 2]
-    gadget_fire = (action[:, 1] == 3) & mask[:, 3]
+    attack = action[:, 1]
+    fire = (attack == ATTACK_FIRE) & mask[:, ATTACK_FIRE]
+    super_fire = (attack == ATTACK_SUPER) & mask[:, ATTACK_SUPER]
+    gadget_fire = (attack == ATTACK_GADGET) & mask[:, ATTACK_GADGET]
+    if cfg.auto_aim:
+        auto = (attack == ATTACK_AUTO) & mask[:, ATTACK_AUTO]
+        fire = fire | auto
+    else:
+        auto = torch.zeros_like(fire)
 
-    return move_dir, fire, super_fire, gadget_fire
+    return move_dir, fire, super_fire, gadget_fire, auto
 
 
 def tick_timers(state, params, cfg) -> None:
@@ -279,7 +306,7 @@ def gadget_target(state, vis: torch.Tensor, params, bank, cfg):
 
     # Wall clip. `march` samples every `los_step_tiles` and reports the first BLOCKED sample, so
     # `hit_t` is at or past the true wall face, never before it; landing one full sample short of
-    # it is the same back-off `step_projectiles` and `start_dash` apply, and it guarantees the
+    # it is the same back-off `step_projectiles` applies, and it guarantees the
     # landing point (which `spawn_gadget` turns into `prj_target`, the detonation point) is on
     # the thrower's side of the wall. `hit_pos == pos + hit_t * dir` exactly, so the plan's
     # `|hit_pos - los_step * dir - pos|` is `hit_t - los_step` wherever `hit_t >= los_step`; the
@@ -287,7 +314,7 @@ def gadget_target(state, vis: torch.Tensor, params, bank, cfg):
     # to a wall, where the endpoint sample itself is the hit and the norm would come back as a
     # positive distance in the WRONG direction. Default ray budget: `gadget_range` is a per-kind
     # tensor, and march's budget must be a Python scalar (see its docstring), so this pays the
-    # full `cfg.ray_steps` over an (N,E) grid -- the same cost `start_dash`'s march already pays.
+    # full `cfg.ray_steps` over an (N,E) grid.
     hit, _, hit_t = terrain.march(bank.blocks_proj, state.map_id, state.ent_pos, direction, travel, cfg)
     clipped = torch.clamp(hit_t - cfg.los_step_tiles, min=0.0)
     travel = torch.where(hit, torch.minimum(clipped, travel), travel)
@@ -295,12 +322,70 @@ def gadget_target(state, vis: torch.Tensor, params, bank, cfg):
     return direction, travel
 
 
+def auto_aim_target(state, params, cfg):
+    """Where the hero's AUTO-AIMED dash (attack value 4) points this tick: `(direction (N,2)
+    f32 unit vectors, has_target (N,) bool)`. Pure. `env._attack_phase` swaps it in for the
+    hero's dash direction on the rows whose action asked for it.
+
+    The target is the nearest alive enemy or unbroken crate within the dash's reach -- the
+    dash's current distance (the long-dash multiplier included, since `start_dash` applies it
+    to this same dash) plus `dash_radius` plus the target's body: `unit_radius` for an enemy,
+    the crate's `_BOX_RADIUS` for a crate. Nearest by centre distance across BOTH lists; the
+    lead asked for "the nearest enemy player OR cube in range" and named no priority between
+    them. Visibility is deliberately NOT consulted: the lead wants the flag to work on enemies
+    out of view, so a policy that tracks one off-screen (its `enemy_hist` planes, the last
+    known slot) can dash at it, which mirrors the game, whose bare tap auto-aims at the
+    nearest target whether the player can see it or not.
+
+    With nothing in reach `has_target` is False and `direction` is the facing, the fallback the
+    caller replaces with the ordinary rule (the move bin, or the facing when idle), the same as
+    a bare tap in the game with nothing near: the dash still goes, in the walking direction.
+    A target coincident with the hero (distance below `_EPS`) has no direction either and
+    counts as no target, `gadget_target`'s convention.
+    """
+    hero_pos = state.ent_pos[:, 0]                                    # (N,2)
+    dash_distance = stats.gather_kind(params.dash_distance, state.ent_kind)[:, 0]
+    dash_distance = dash_distance * long_dash_scale(state, params)[:, 0]
+    dash_radius = stats.gather_kind(params.dash_radius, state.ent_kind)[:, 0]
+    base_reach = dash_distance + dash_radius                          # (N,)
+
+    enemy_diff = state.ent_pos[:, 1:] - hero_pos.unsqueeze(1)         # (N,E-1,2)
+    enemy_dist = geo.safe_norm(enemy_diff, dim=-1)                    # (N,E-1)
+    enemy_reach = (base_reach + params.unit_radius).unsqueeze(-1)
+    enemy_ok = state.ent_alive[:, 1:] & (enemy_dist <= enemy_reach)
+
+    box_diff = state.box_pos - hero_pos.unsqueeze(1)                  # (N,B,2)
+    box_dist = geo.safe_norm(box_diff, dim=-1)                        # (N,B)
+    box_ok = state.box_alive & (box_dist <= (base_reach + _BOX_RADIUS).unsqueeze(-1))
+
+    diff = torch.cat([enemy_diff, box_diff], dim=1)                   # (N,E-1+B,2)
+    dist = torch.cat([enemy_dist, box_dist], dim=1)
+    ok = torch.cat([enemy_ok, box_ok], dim=1)
+    dist_eff = torch.where(ok, dist, torch.full_like(dist, float("inf")))
+    nearest = torch.argmin(dist_eff, dim=-1)                          # (N,)
+    N = hero_pos.shape[0]
+    to_vec = diff.gather(1, nearest.view(N, 1, 1).expand(N, 1, 2)).squeeze(1)  # (N,2)
+    nearest_dist = dist.gather(1, nearest.unsqueeze(-1)).squeeze(-1)           # (N,)
+
+    has_target = ok.any(dim=-1) & (nearest_dist > _EPS)
+    facing_vec = geo.from_angle(state.ent_facing[:, 0])
+    direction = torch.where(has_target.unsqueeze(-1), geo.normalize(to_vec), facing_vec)
+    return direction, has_target
+
+
 def start_dash(state, fire: torch.Tensor, move_dir: torch.Tensor, bank, params, cfg) -> None:
     """fire: (N,E) bool, move_dir: (N,E,2) f32 -- kind-agnostic, gated on dash_distance[kind] >
     0, so melee lunges and Mortis's Super can reuse this later (Step 11).
 
     MUTATES: ent_ammo, ent_attack_cd, ent_dash_t, ent_dash_dir, ent_dash_speed, ent_dash_hits,
-    ent_invuln_t, ent_facing, ent_shots_fired.
+    ent_facing, ent_shots_fired.
+
+    The dash grants NO invulnerability (the lead, 2026-09-25: it is an attack animation, and
+    Mortis can be hit throughout it). Until then this seeded `ent_invuln_t = dash_duration`, and
+    combat.apply_damage zeroed every combat hit on him for the seven ticks it took to expire:
+    40 % of all combat damage aimed at the hero landed in those frames, measured with deploy5 at
+    elite. Nothing seeds `ent_invuln_t` any more; the field stays, so `hero.invuln` keeps its
+    slot in every observation spec and reads False.
     """
     E = state.ent_kind.shape[1]
 
@@ -312,7 +397,7 @@ def start_dash(state, fire: torch.Tensor, move_dir: torch.Tensor, bank, params, 
     # `long_dash_multiplier` times its normal distance. `dash_duration` is deliberately NOT
     # scaled, so a long dash is also genuinely FASTER (5.34 tiles in 0.30 s instead of 2.67) --
     # that is what the real ability feels like, and everything downstream is distance-agnostic:
-    # the terrain clip below, its `safe_hit_t` back-off, and `dash_speed = clipped / duration`.
+    # the body clip below and `dash_speed = clipped / duration`.
     #
     # Gated on `long_dash_seconds > 0` so a kind without the ability can never trigger it, rather
     # than relying on a huge threshold never being reached.
@@ -326,52 +411,28 @@ def start_dash(state, fire: torch.Tensor, move_dir: torch.Tensor, bank, params, 
     facing_vec = geo.from_angle(state.ent_facing)
     dash_dir = torch.where(move_is_zero.unsqueeze(-1), facing_vec, move_dir)
 
-    # Retroactive fix (found while building Step 29's end-to-end integration tests): march()
-    # only samples every los_step_tiles, so hit_t is the distance to the first BLOCKED sample
-    # -- the true wall boundary lies somewhere in the los_step_tiles gap before it, not AT it.
-    # Clipping to hit_t directly could land (or, with float rounding, land fractionally past)
-    # the entity right on the wall tile itself, which check_invariants correctly flags as
-    # out-of-bounds near a map edge. Backing off by one full los_step_tiles guarantees the
-    # clipped landing point is on the known-safe side of that gap.
+    # **The dash stops where the BODY first touches a wall** (OBS_PARITY_TASKS.md, pending
+    # decision 1; the lead's call 2026-09-25: walls stop momentum, they do not redirect it).
     #
-    # march() samples the bare CENTER point against blocks_unit -- unlike resolve_move's
-    # circle_blocked, it has no notion of the dasher's own body. Backing off only by
-    # los_step_tiles leaves the landing point's clearance from the true wall face anywhere in
-    # [0, los_step_tiles), so a center that clears the tile boundary by less than unit_radius
-    # still lands with its hitbox embedded in the wall. That's a one-way trap: apply_movement's
-    # resolve_move (post-dash, once dash_t <= 0) rejects a candidate step outright unless the
-    # ENTIRE circle at the destination is clear, so from inside the wall every escape attempt
-    # keeps failing the same way every tick -- permanently stuck. Backing off by radius as well
-    # guarantees at least unit_radius of clearance from the wall face, so the dash can never
-    # land the body inside it in the first place.
+    # What traps an entity is its body overlapping a wall: `terrain.circle_blocked` probes all 8
+    # compass points, so an overlapping circle is blocked in EVERY direction, including away, and
+    # `movement.resolve_move` rejects every step until the next dash. This clip used to march the
+    # CENTRE against `blocks_unit` and back the landing off by `los_step_tiles + unit_radius`
+    # along the dash line. That clears the body head-on only: beside a wall the perpendicular
+    # clearance is the back-off times the sine of the angle to the face, so shallow dashes landed
+    # the 0.4-tile body inside the wall (12 % of wall-meeting dashes at 60 degrees, 57 % at 30,
+    # 100 % at 10), and every wedge the wall-push probe found began with one.
+    #
+    # `terrain.body_travel` runs that same `circle_blocked` test along the line and stops at the
+    # first contact, so a glancing dash ends where it meets the wall instead of sliding along it,
+    # and the landing is always a point walking can leave. `_WALL_CLEARANCE` keeps it a millitile
+    # short of the contact. The march is budgeted by `params.dash_ray_tiles`, the spec's longest
+    # possible dash, rather than the full `cfg.ray_steps`.
     radius = params.unit_radius.unsqueeze(-1)  # (N,1), broadcasts against (N,E)
-    # **March PAST the landing point, by the same margin the back-off below removes.**
-    #
-    # Marching only to `dash_distance` finds walls the CENTRE's path crosses, but the thing that
-    # traps an entity is its BODY overlapping one. `terrain.circle_blocked` probes all 8 compass
-    # points at a candidate destination, so a circle overlapping a wall is blocked in EVERY
-    # direction -- including away from it -- and `movement.resolve_move` then rejects every escape
-    # step identically, forever. A dash landing within `unit_radius` of a wall face is therefore
-    # just as stuck as one landing on the wall itself.
-    #
-    # Because march samples every `los_step_tiles`, a wall in that band could sit between the last
-    # sample and the endpoint and never be seen at all -- in which case `hit` was False, no
-    # back-off was applied, and the entity landed grazing the wall. Extending the probe by
-    # `los_step_tiles + radius` makes exactly that band visible, so the existing back-off can do
-    # its job. Found by test_a_charged_dash_into_a_wall_still_lands_the_body_clear_of_it: Step D1
-    # doubled the dash distance, which made the failure easy to reproduce, but the trap predates it
-    # and applies to an ordinary 2.67-tile dash too.
-    probe_distance = dash_distance + cfg.los_step_tiles + radius
-    hit, _, hit_t = terrain.march(bank.blocks_unit, state.map_id, state.ent_pos, dash_dir, probe_distance, cfg)
-    # `_WALL_CLEARANCE` on top of the two geometric terms: backing off by exactly
-    # `los_step_tiles + radius` puts the hitbox edge EXACTLY on the wall face, and a tile lookup
-    # of `floor(30.0)` is tile 30 -- the wall. Touching counts as blocked, so exact is not enough.
-    # One millitile is far below anything observable and clears the boundary (and float32's ~2e-6
-    # ulp at these magnitudes) outright.
-    safe_hit_t = torch.clamp(hit_t - cfg.los_step_tiles - radius - _WALL_CLEARANCE, min=0.0)
-    # `minimum` because the probe now reaches beyond the dash: a wall found past the landing point
-    # must not EXTEND the dash, only ever shorten it.
-    clipped_distance = torch.where(hit, torch.minimum(safe_hit_t, dash_distance), dash_distance)
+    clipped_distance = terrain.body_travel(
+        bank.blocks_unit, state.map_id, state.ent_pos, dash_dir, dash_distance, radius, cfg,
+        max_tiles=params.dash_ray_tiles, clearance=_WALL_CLEARANCE,
+    )
     dash_speed = clipped_distance / torch.clamp(dash_duration, min=_EPS)
 
     state.ent_ammo.copy_(torch.where(can_dash, state.ent_ammo - 1.0, state.ent_ammo))
@@ -379,7 +440,6 @@ def start_dash(state, fire: torch.Tensor, move_dir: torch.Tensor, bank, params, 
     state.ent_dash_t.copy_(torch.where(can_dash, dash_duration, state.ent_dash_t))
     state.ent_dash_dir.copy_(torch.where(can_dash.unsqueeze(-1), dash_dir, state.ent_dash_dir))
     state.ent_dash_speed.copy_(torch.where(can_dash, dash_speed, state.ent_dash_speed))
-    state.ent_invuln_t.copy_(torch.where(can_dash, dash_duration, state.ent_invuln_t))
     state.ent_facing.copy_(torch.where(can_dash, geo.angle_of(dash_dir), state.ent_facing))
     state.ent_shots_fired.copy_(torch.where(can_dash, state.ent_shots_fired + 1, state.ent_shots_fired))
 
@@ -406,10 +466,10 @@ def advance_dash(state, params, cfg):
     # for one more tick.
     #
     # That is a correctness bug rather than a cosmetic one, because `start_dash` clips the dash
-    # against terrain and backs the landing point off by `los_step_tiles + unit_radius`
-    # specifically to GUARANTEE the body never lands inside a wall. Overshooting the clipped
-    # distance by 16.7% silently spends that safety margin, and past it the entity is stuck --
-    # `movement.resolve_move` rejects every escape step whose whole circle is not clear.
+    # at the body's first contact with terrain specifically to GUARANTEE the body never lands
+    # inside a wall. Overshooting the clipped distance by 16.7% carries it past that contact, and
+    # there the entity is stuck -- `movement.resolve_move` rejects every escape step whose whole
+    # circle is not clear.
     # Found by tests/test_hero.py::test_a_charged_dash_into_a_wall_still_lands_the_body_clear_of_it
     # (Step D1 doubled the dash distance, which doubled the absolute overshoot and made it
     # reproducible against a wall).

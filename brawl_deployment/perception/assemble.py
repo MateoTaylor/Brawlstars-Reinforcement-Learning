@@ -156,7 +156,9 @@ class DecisionSnapshot:
 
     * `move_bin` -- the policy's move bin, which the joystick holds.
     * `attack` -- the MODELLED attack, `ShadowHero.act`'s return: what was pressed, not what was
-      chosen, which differ when the shadow's mask refused the pick.
+      chosen, which differ when the shadow's mask refused the pick. 0..3, or 4 (the auto-aimed
+      attack) for a run trained under `action.auto_aim`; the one-hot is as wide as the run's
+      attack column either way.
     * `hp` -- the HP numeral the observation was handed. `_decide` skips a decision with no
       read, so there is never a gap to carry a last good value across.
     * `ammo_frac` -- `ShadowHero.observe()["ammo_frac"]`, the value the observation used.

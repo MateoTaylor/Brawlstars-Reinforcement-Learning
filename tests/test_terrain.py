@@ -179,6 +179,65 @@ def test_march_no_hit_when_max_dist_too_short():
     assert not bool(hit)
 
 
+# ---- body_travel -------------------------------------------------------------
+
+def _body_travel_fixture():
+    cfg = _cfg(map_h=20, map_w=20, los_step_tiles=0.5, max_ray_tiles=30.0)
+    tiles = _tiles(20, 20)
+    tiles[:, 15] = Tile.WALL                      # a face at x = 15
+    return cfg, _unit_mask(tiles)
+
+
+def test_body_travel_stops_where_the_body_touches_not_where_the_centre_does():
+    """Head-on at the face x = 15 from x = 10: the body touches when its centre reaches
+    15 - radius, and the answer is within one bisection step of that, never past it."""
+    cfg, mask = _body_travel_fixture()
+    map_id = torch.zeros(1, dtype=torch.int64)
+    p0 = torch.tensor([[10.0, 10.5]])
+    radius = torch.tensor([0.4])
+    travel = terrain.body_travel(mask, map_id, p0, torch.tensor([[1.0, 0.0]]),
+                                 torch.tensor([8.0]), radius, cfg)
+    contact = 15.0 - 0.4 - 10.0
+    assert contact - cfg.los_step_tiles / 16 <= travel.item() < contact
+    landed = p0 + torch.tensor([[travel.item(), 0.0]])
+    assert not terrain.circle_blocked(mask, map_id, landed, radius, cfg).item()
+
+
+def test_body_travel_is_max_dist_exactly_on_an_open_line_and_honours_a_budget():
+    cfg, mask = _body_travel_fixture()
+    map_id = torch.zeros(1, dtype=torch.int64)
+    args = (mask, map_id, torch.tensor([[5.0, 10.5]]), torch.tensor([[1.0, 0.0]]),
+            torch.tensor([3.3]), torch.tensor([0.4]), cfg)
+    assert terrain.body_travel(*args).item() == torch.tensor(3.3).item()
+    assert terrain.body_travel(*args, max_tiles=3.3).item() == torch.tensor(3.3).item()
+
+
+def test_body_travel_leaves_a_body_that_starts_inside_a_wall_where_it_is():
+    """Unreachable in the sim (spawns are tile centres; walking and dashing refuse to end in a
+    wall), and the conservative answer: travelling on until clear would carry this body, facing
+    into a one-tile wall, out through its far side."""
+    cfg, mask = _body_travel_fixture()
+    map_id = torch.zeros(2, dtype=torch.int64)
+    p0 = torch.tensor([[14.8, 10.5], [14.8, 10.5]])
+    dirs = torch.tensor([[1.0, 0.0], [-1.0, 0.0]])
+    travel = terrain.body_travel(mask, map_id, p0, dirs, torch.tensor([2.0, 2.0]),
+                                 torch.tensor([0.4, 0.4]), cfg)
+    assert travel.tolist() == [0.0, 0.0]
+
+
+def test_body_travel_backs_off_by_the_clearance_only_at_a_contact():
+    cfg, mask = _body_travel_fixture()
+    map_id = torch.zeros(2, dtype=torch.int64)
+    p0 = torch.tensor([[10.0, 10.5], [5.0, 10.5]])
+    dirs = torch.tensor([[1.0, 0.0], [1.0, 0.0]])
+    max_dist = torch.tensor([8.0, 3.3])
+    radius = torch.tensor([0.4, 0.4])
+    plain = terrain.body_travel(mask, map_id, p0, dirs, max_dist, radius, cfg)
+    backed = terrain.body_travel(mask, map_id, p0, dirs, max_dist, radius, cfg, clearance=1e-3)
+    assert abs((plain[0] - backed[0]).item() - 1e-3) < 1e-5, "the wall-bound dash backs off"
+    assert backed[1].item() == plain[1].item(), "an open dash keeps its full distance"
+
+
 def test_march_blank_csv_terminates_at_border_every_direction():
     overrides = yaml.safe_load((CONFIGS / "presets" / "debug_tiny.yaml").read_text())
     cfg = load_config(CONFIGS / "default.yaml", overrides=overrides)

@@ -142,11 +142,11 @@ def test_decode_action_maps_two_to_super_and_one_to_attack():
     state.ent_ammo[:, 0] = 3.0
     state.ent_super_charge[0, 0] = int(params.super_charge_hits[0, _HERO])
 
-    _mv, fire, sup, _gadget = hero.decode_action(torch.tensor([[0, 1]]), state, params, cfg)
+    _mv, fire, sup, _gadget, _auto = hero.decode_action(torch.tensor([[0, 1]]), state, params, cfg)
     assert bool(fire[0]) and not bool(sup[0])
-    _mv, fire, sup, _gadget = hero.decode_action(torch.tensor([[0, 2]]), state, params, cfg)
+    _mv, fire, sup, _gadget, _auto = hero.decode_action(torch.tensor([[0, 2]]), state, params, cfg)
     assert not bool(fire[0]) and bool(sup[0])
-    _mv, fire, sup, _gadget = hero.decode_action(torch.tensor([[0, 0]]), state, params, cfg)
+    _mv, fire, sup, _gadget, _auto = hero.decode_action(torch.tensor([[0, 0]]), state, params, cfg)
     assert not bool(fire[0]) and not bool(sup[0])
 
 
@@ -154,7 +154,7 @@ def test_an_uncharged_super_request_is_a_silent_no_op():
     cfg, params = _cfg_and_params()
     state = _state(cfg, params)
     state.ent_super_charge.fill_(0)
-    _mv, _fire, sup, _gadget = hero.decode_action(torch.tensor([[0, 2]]), state, params, cfg)
+    _mv, _fire, sup, _gadget, _auto = hero.decode_action(torch.tensor([[0, 2]]), state, params, cfg)
     assert not bool(sup[0])
 
 

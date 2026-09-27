@@ -1979,7 +1979,8 @@ def test_the_model_sees_the_grid_channels_first_as_the_env_builds_it():
 
     tcfg = _tiny_run_tcfg()
     model, venv, _ = build_run(tcfg)
-    assert tcfg.run.agent_obs == "configs/agent_obs_deploy4.yaml"
+    # deploy5 since 2026-09-25 (the operator moved train.yaml to it); its grid is deploy4's 13 channels
+    assert tcfg.run.agent_obs == "configs/agent_obs_deploy5.yaml"
     assert venv.observation_space["grid"].shape == (13, 10, 14)
     assert model.observation_space["grid"].shape == (13, 10, 14)
     assert model.policy.features_extractor.cnn[0].in_channels == 13

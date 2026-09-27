@@ -1,9 +1,21 @@
-# Domain randomization overlay (N08). Ships fully commented out -- uncomment any subset of
-# lines to layer per-env variation onto configs/brawlers.yaml / configs/default.yaml with no
-# other change. Keys are "section.field" dotted paths matching those two files' section and
-# leaf key names exactly. mode defaults to "additive" (the sampled range replaces the base
-# value outright); mode: multiplicative scales the base value instead.
+# Domain randomization overlay (N08): per-env variation layered onto configs/brawlers.yaml /
+# configs/default.yaml (plus a run's `env_overrides`), redrawn at every reset. Keys are
+# "section.field" dotted paths matching those files' section and leaf key names exactly. mode
+# defaults to "additive" (the sampled range replaces the base value outright); mode:
+# multiplicative scales the base value instead, so the base must be a plain number.
 #
+# configs/train.yaml's `run.randomization` names this file, so every UNCOMMENTED line trains in
+# the next run. Keep the examples at the bottom commented unless a run means them.
+#
+# ACTIVE: the gas schedule, +/-10 % per env (OBS_PARITY_PLAN.md section 4), so the policy learns
+# the gas rather than one clock. Multiplicative, so it follows the run's own values: with
+# train.yaml's overrides that is 4.5-5.5 s per tile and a first gas at 13.3-16.3 s.
+# `zone.tiles_per_step` stays fixed because the game shrinks by whole tiles. TierEvaluator never
+# applies this file, so eval scores are at the nominal schedule.
+zone.start_fraction: {low: 0.9, high: 1.1, mode: multiplicative}
+zone.step_seconds:   {low: 0.9, high: 1.1, mode: multiplicative}
+
+# Examples, off:
 # entities.enemy_hp_mult:       {low: 0.8, high: 1.25}
 # entities.enemy_damage_mult:   {low: 0.8, high: 1.25}
 # bot_sniper.aim_noise_std_rad: {low: 0.03, high: 0.20}

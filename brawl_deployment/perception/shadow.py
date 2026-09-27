@@ -82,18 +82,21 @@ every constant is cast before use. `dash_duration: 0.30` is the same story from 
 takes seven ticks to expire in BOTH precisions, which is the 1.19e-8 residue
 `core/hero.advance_dash` documents at length and pays for with `step_seconds = min(dash_t, dt)`.
 
-What one dash actually looks like, sub-tick by sub-tick, all three flags confirmed equal to the
-sim's by `tests/test_deployment_shadow.py`:
+What one dash actually looks like, sub-tick by sub-tick, both flags confirmed equal to the sim's
+by `tests/test_deployment_shadow.py`:
 
     sub-tick     1  2  3  4  5  6  7  8
     dashing      *  *  *  *  *  *  .  .     6 ticks -- exactly dash_duration
-    invuln       *  *  *  *  *  *  *  .     7 ticks -- one longer
     reload held  *  *  *  *  *  *  *  .     7 ticks -- exactly attack_cooldown
 
-The i-frames outlast the dash because `dash_t` is decremented in phase 8 of the very tick that set
-it while `invuln_t` waits for phase 2 of the next one. Both are seeded from the same 0.30. Nothing
-here is a rounding artifact to tidy up: it is the sim's behaviour, so it is the behaviour the
-policy trained against.
+The reload hold outlasts the dash because `dash_t` is decremented in phase 8 of the very tick that
+set it while `attack_cd` waits for phase 2 of the next one. Nothing here is a rounding artifact to
+tidy up: it is the sim's behaviour, so it is the behaviour the policy trained against.
+
+`invuln` is always False. Until 2026-09-25 the dash also seeded `invuln_t` from the same 0.30 (and
+it read True for seven ticks, one longer than `dashing`, by the same phase-order argument); the
+lead removed the i-frames from the sim because the live dash is an attack animation Mortis can be
+hit throughout. The field and its countdown stay so the observation keeps its shape.
 
 #### The action mask this exposes is one sub-tick stale, and always in the safe direction
 
@@ -147,6 +150,19 @@ deliberate, and each is the sim's (`hero.gadget_ready`, `env._attack_phase`):
 A throw writes 18.0, and float32 needs 360 decrements to bring that back to zero, so the mask
 reopens 360 sub-ticks after the throw's own tick: 18.05 s after the tap at 20 Hz, one sub-tick
 behind the sim's post-timer mask, which is the stale-but-safe direction above.
+
+#### The auto-aimed attack is the same dash with a direction the loop supplies
+
+Attack value 4 (`action.auto_aim`, 2026-09-26) exists only for a run trained with the flag, so it
+is a constructor choice here, `auto_aim`, read from the run's own config by the loop: with it the
+mask has a fifth column, equal to the attack's (the sim's `hero.action_mask` ANDs the same three
+gates), and without it the mask stays four wide and `act` refuses a 4 like any other illegal
+value. Everything the dash costs is `_start_dash`'s, unchanged; only the direction differs. The
+sim's `env._attack_phase` swaps in `hero.auto_aim_target`'s nearest enemy-or-crate in reach, and
+here the loop hands `act` its own estimate of that as `aim`, a unit direction in the sim's frame
+from the tracks and the loot map, or None when nothing is in reach, in which case the dash goes
+along the move bin, or `facing` when idle, exactly as value 1 does. On the device it is a bare
+tap on the attack area, which the game aims by itself.
 
 #### A dash into a wall costs the owned fields nothing
 
@@ -206,9 +222,9 @@ The comparison itself belongs to whoever holds the CV position, which is `assemb
 #### One correction to section 6.3's table
 
 It lists `hero.invuln` as "a `-= dt` countdown, seeded at spawn". It is not seeded at spawn --
-`core/spawn.py` sets pos, hp, ammo, facing and alive, and nothing else. `ent_invuln_t` is written
-in exactly one place, `start_dash`, and `obs_schema` says so in its own description of the field:
-"invuln_t > 0 (dash i-frames)". The countdown is right; the seed is the dash.
+`core/spawn.py` sets pos, hp, ammo, facing and alive, and nothing else. Until 2026-09-25
+`ent_invuln_t` was written in exactly one place, `start_dash`; since then it is written nowhere
+(the dash has no i-frames), so the countdown only ever counts down from zero.
 """
 from __future__ import annotations
 
@@ -222,7 +238,7 @@ import yaml
 # One definition of the action encoding for the whole package, and it lives with the thing that
 # presses the buttons. `hero.decode_action`'s column-1 values: 0 = nothing, 1 = attack, 2 = super,
 # 3 = gadget.
-from ..control.buttons import ATTACK_FIRE, ATTACK_GADGET, ATTACK_NONE, ATTACK_SUPER
+from ..control.buttons import ATTACK_AUTO, ATTACK_FIRE, ATTACK_GADGET, ATTACK_NONE, ATTACK_SUPER
 
 _CONFIGS_DIR = Path(__file__).resolve().parents[2] / "configs"
 
@@ -363,8 +379,11 @@ class ShadowHero:
                  ammo_tolerance_unpainted: float = AMMO_TOLERANCE_UNPAINTED,
                  desync_strikes: int = DESYNC_STRIKES,
                  desync_grace_seconds: float = DESYNC_GRACE_SECONDS,
-                 super_stale_seconds: float = SUPER_STALE_SECONDS):
+                 super_stale_seconds: float = SUPER_STALE_SECONDS,
+                 auto_aim: bool = False):
         self.p = params
+        # The run's `action.auto_aim`: a fifth attack value, see the module docstring.
+        self.auto_aim = bool(auto_aim)
         self.dt = _F32(dt)
         self._dt_py = float(dt)
         self.n_move_bins = n_move_bins
@@ -423,6 +442,9 @@ class ShadowHero:
         self._bank = 0.0              # wall-clock remainder not yet worth a sub-tick
         self._move = 0
         self._pending_attack = ATTACK_NONE
+        # The direction a pending auto-aimed attack will dash along, or None for "nothing in
+        # reach, use the move bin". Set by `act`, consumed by the next sub-tick.
+        self._aim = None
         self._last_attack_at = -math.inf
 
         self.travel = 0.0
@@ -437,9 +459,9 @@ class ShadowHero:
 
     # -- the decision --------------------------------------------------------
 
-    def attack_mask(self) -> tuple[bool, bool, bool, bool]:
+    def attack_mask(self) -> tuple[bool, ...]:
         """`hero.action_mask`'s attack column: (no-fire, attack, super, gadget), all four
-        legal-now.
+        legal-now, plus (auto-aim) under `auto_aim`, which is legal exactly when the attack is.
 
         The gadget's term is `gadget_ready` alone, outside the `ready` gate the attack and the
         super share: see "The gadget" in the module docstring.
@@ -449,13 +471,18 @@ class ShadowHero:
         and why that is the safe side.
         """
         ready = self.alive and self.attack_cd <= 0 and self.dash_t <= 0
-        return (True, bool(ready and self.ammo >= 1.0), bool(ready and self.super_ready),
-                self.gadget_ready)
+        fire_ok = bool(ready and self.ammo >= 1.0)
+        mask = (True, fire_ok, bool(ready and self.super_ready), self.gadget_ready)
+        return mask + (fire_ok,) if self.auto_aim else mask
 
-    def act(self, move: int, attack: int = ATTACK_NONE) -> int:
+    def act(self, move: int, attack: int = ATTACK_NONE, aim=None) -> int:
         """Record the decision we are about to send to the device. Returns the attack that will
         actually be modelled -- `ATTACK_NONE` if the mask refuses it -- which is what the caller
         should tap, so a caller that forgot to mask cannot desync the shadow.
+
+        `aim` is read for `ATTACK_AUTO` only: the (dx, dy) direction, in the sim's frame, to the
+        target the loop expects the game's auto-aim to pick, or None when nothing is in reach.
+        Normalised here, so a raw offset serves; a zero vector counts as None.
 
         Nothing is applied here. The move bin is held from now until the next `act`, and the
         attack is consumed by the next sub-tick, which is `env._held`'s rule reached from the
@@ -480,9 +507,23 @@ class ShadowHero:
             self._pending_attack = ATTACK_SUPER
         elif attack == ATTACK_GADGET and legal[3]:
             self._pending_attack = ATTACK_GADGET
+        elif attack == ATTACK_AUTO and self.auto_aim and legal[4]:
+            self._pending_attack = ATTACK_AUTO
+            self._aim = self._unit(aim)
         else:
             return ATTACK_NONE
         return self._pending_attack
+
+    @staticmethod
+    def _unit(aim):
+        """A unit (dx, dy) in float32, or None for None and for a zero vector."""
+        if aim is None:
+            return None
+        dx, dy = float(aim[0]), float(aim[1])
+        norm = math.hypot(dx, dy)
+        if norm <= 1e-6:
+            return None
+        return (_F32(dx / norm), _F32(dy / norm))
 
     @property
     def attack_bearing(self) -> float:
@@ -497,8 +538,12 @@ class ShadowHero:
         The super reads it too. In the sim an idle super goes along a zero `move_dir` and does not
         travel; the game has no such shot, and `facing` is the nearest thing to what the policy
         meant. The gadget does not read it: it is a tap, and the game aims it at the nearest
-        enemy, as `hero.gadget_target` does (SIM_OVERHAUL_PLAN.md S10).
+        enemy, as `hero.gadget_target` does (SIM_OVERHAUL_PLAN.md S10). A pending auto-aimed
+        attack with a target reads its `aim`, the direction `_start_dash` will use; it is a tap
+        too, so the device never reads this for it, and telemetry does.
         """
+        if self._pending_attack == ATTACK_AUTO and self._aim is not None:
+            return math.atan2(float(self._aim[1]), float(self._aim[0]))
         move_dir = self._dir_from_bin(self._move)
         if move_dir is None:
             return float(self.facing)
@@ -547,10 +592,15 @@ class ShadowHero:
         # reason `env._attack_phase` re-applies it after `decode_action` already did: it makes an
         # illegal attack impossible from any source rather than merely unlikely.
         attack, self._pending_attack = self._pending_attack, ATTACK_NONE
+        aim, self._aim = self._aim, None
         legal = self.attack_mask()
         attacked = False
         if attack == ATTACK_FIRE and legal[1]:
             self._start_dash(move_dir)
+            attacked = True
+        elif attack == ATTACK_AUTO and self.auto_aim and legal[4]:
+            # `env._attack_phase`'s swap: the aim where there is one, else the ordinary rule.
+            self._start_dash(aim if aim is not None else move_dir)
             attacked = True
         elif attack == ATTACK_SUPER and legal[2]:
             self._fire_super()
@@ -600,7 +650,7 @@ class ShadowHero:
         self.dash_t = self._dash_duration
         self.dash_dir = direction
         self.dash_speed = _F32(distance / max(self.p.dash_duration, 1e-6))
-        self.invuln_t = self._dash_duration
+        # No `invuln_t` seed: the sim's start_dash stopped granting i-frames on 2026-09-25.
         self.facing = _F32(math.atan2(float(direction[1]), float(direction[0])))
 
     def _fire_super(self) -> None:
@@ -697,6 +747,7 @@ class ShadowHero:
         self._super_spend_pending = False
         if self._pending_attack != ATTACK_GADGET:
             self._pending_attack = ATTACK_NONE
+            self._aim = None
         self.strikes = 0
         self.desyncs += 1
 

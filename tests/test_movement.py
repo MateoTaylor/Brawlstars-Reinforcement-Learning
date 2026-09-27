@@ -6,7 +6,7 @@ import yaml
 
 from brawl_sim.config import load_config, build_params
 from brawl_sim.constants import Kind, Tile, TILE_BLOCKS_UNIT
-from brawl_sim.core import movement, terrain
+from brawl_sim.core import movement, stats, terrain
 from brawl_sim.core.state import allocate
 
 CONFIGS = Path(__file__).resolve().parent.parent / "configs"
@@ -290,6 +290,31 @@ def test_facing_survives_idle_ticks():
     for _ in range(10):
         movement.apply_movement(state, idle, bank, params, cfg)
     assert torch.allclose(state.ent_facing[0, 0], facing_after_move)
+
+
+# ---- the intent's length is a throttle --------------------------------------------
+
+def test_intent_length_throttles_speed_and_caps_at_full():
+    """A bot's intent is bots/policy.all_bot_intents's EMA-smoothed steering, which decays toward
+    zero after the bot decides to stop; renormalising it to unit length made a stopping bot coast
+    at full speed along its old heading (~6 tiles at hard, measured 2026-09-25). Half the length
+    is half the step. Anything at or above unit length is full speed, so the hero's unit action
+    and the wall tests' diagonal (1, 1) intents are unchanged."""
+    cfg, params = _cfg_and_params(map_h=20, map_w=20)
+    bank = _bank_from_grid(_grid(20, 20))
+    step = {}
+    for name, vec in (("unit", (1.0, 0.0)), ("half", (0.5, 0.0)), ("long", (3.0, 0.0))):
+        state = _fresh_state(cfg)
+        state.ent_pos[0, 0] = torch.tensor([10.0, 10.0])
+        move_dir = torch.zeros(1, cfg.n_entities, 2)
+        move_dir[0, 0] = torch.tensor(vec)
+        movement.apply_movement(state, move_dir, bank, params, cfg)
+        step[name] = state.ent_pos[0, 0, 0].item() - 10.0
+    speed = stats.effective_speed(state.ent_kind, params)[0, 0].item()
+    assert abs(step["unit"] - speed * cfg.dt) < 1e-6
+    assert abs(step["half"] - 0.5 * step["unit"]) < 1e-6
+    assert abs(step["long"] - step["unit"]) < 1e-6
+    assert abs(state.ent_vel[0, 0, 0].item() - speed) < 1e-3  # ent_vel reports the real speed
 
 
 # ---- dashers untouched -----------------------------------------------------------

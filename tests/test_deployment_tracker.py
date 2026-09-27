@@ -263,12 +263,14 @@ def test_teammate_boxes_are_ignored_entirely():
 # ---------------------------------------------------------------- hero_offset (OBS_PARITY_TASKS.md C7)
 
 def _nominal():
-    """The stub's nominal hero tile: the viewport centre through the stub's own `rect_to_tile`,
-    plus the measured anchor offset."""
+    """The stub's nominal player-box tile: the viewport centre through the stub's own
+    `rect_to_tile`, plus the ring's measured offset and the box's measured offset from the ring."""
     from brawl_vision.camera import HERO_ANCHOR_TILES
+    from brawl_deployment.perception.tracker import PLAYER_BOX_FROM_RING_TILES
     w, h = StubPlan.viewport
     cx, cy = StubPlan.rect_to_tile(np.array([[w / 2.0, h / 2.0]]))[0]
-    return (cx + HERO_ANCHOR_TILES[0], cy + HERO_ANCHOR_TILES[1])
+    return (cx + HERO_ANCHOR_TILES[0] + PLAYER_BOX_FROM_RING_TILES[0],
+            cy + HERO_ANCHOR_TILES[1] + PLAYER_BOX_FROM_RING_TILES[1])
 
 
 def test_hero_offset_is_the_player_box_against_its_nominal_anchor():
@@ -294,15 +296,43 @@ def test_hero_offset_is_camera_relative_whatever_odometry_says():
 
 def test_hero_offset_on_the_shipped_plan_reads_the_anchor_not_the_centre():
     """A player box whose anchor sits exactly on the viewport centre (a box of no height, so
-    the anchor fraction cannot move it): the offset is minus the anchor's nominal displacement,
-    because the hero's resting point is that displacement away from the centre."""
-    from brawl_vision.camera import HERO_ANCHOR_TILES, build_rectify_plan, load_camera_model
+    the anchor fraction cannot move it): the offset is minus the nominal displacement, the ring's
+    (0.09, 0.80) from the centre plus the box's (-0.08, -0.78) from the ring. Literals on
+    purpose: rebuilding them from the two constants would pass whatever the constants became."""
+    from brawl_vision.camera import build_rectify_plan, load_camera_model
     plan = build_rectify_plan(load_camera_model())
     w, h = plan.viewport
     det = Detection(label="player", confidence=0.9, xyxy=(w / 2 - 5.0, h / 2, w / 2 + 5.0, h / 2))
     res = EntityTracker().update([det], plan, StubOdo(), t=0.0)
-    assert res.hero_offset == pytest.approx((-HERO_ANCHOR_TILES[0], -HERO_ANCHOR_TILES[1]),
-                                            abs=1e-6)
+    assert res.hero_offset == pytest.approx((-0.01, -0.02), abs=1e-6)
+
+
+def test_recorded_player_boxes_read_near_zero_offset_while_tracking():
+    """The live detector's own player boxes, recorded while the camera tracked the hero on five
+    BlueStacks clips (tests/fixtures/vision/player_boxes_tracking.json), read within 0.2 tiles of
+    nominal per clip and within 0.1 over the clips. Before `PLAYER_BOX_FROM_RING_TILES` every
+    clip read 0.71 to 0.92 tiles north, which fired `hero.near_edge` early to the north.
+    Tracked text, so it runs without the clips; a change to the projection, the anchor fraction
+    or either anchor constant moves these medians."""
+    import json
+    import statistics
+    from pathlib import Path
+    from brawl_vision.camera import build_rectify_plan, load_camera_model
+    fixture = json.loads((Path(__file__).parent / "fixtures" / "vision"
+                          / "player_boxes_tracking.json").read_text(encoding="utf-8"))
+    plan = build_rectify_plan(load_camera_model())
+    assert tuple(plan.viewport) == tuple(fixture["viewport"])
+    medians = []
+    for clip, boxes in fixture["clips"].items():
+        offsets = [EntityTracker().update([Detection("player", 0.9, tuple(b))], plan, StubOdo(),
+                                          t=0.0).hero_offset for b in boxes]
+        mx = statistics.median(o[0] for o in offsets)
+        my = statistics.median(o[1] for o in offsets)
+        assert abs(mx) < 0.2 and abs(my) < 0.2, (clip, mx, my)
+        medians.append((mx, my))
+    assert len(medians) == 5
+    assert abs(statistics.median(m[0] for m in medians)) < 0.1
+    assert abs(statistics.median(m[1] for m in medians)) < 0.1
 
 
 # ---------------------------------------------------------------- parity with the sim's slot rule (C8)

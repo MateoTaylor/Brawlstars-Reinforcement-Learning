@@ -756,3 +756,17 @@ def test_validate_max_projectiles_too_small():
     params = _dummy_params(cfg)
     with pytest.raises(ValueError):
         validate(cfg, params)
+
+
+def test_auto_aim_widens_the_attack_column_and_reads_from_the_yaml():
+    """`action.auto_aim` (the lead, 2026-09-26): a fifth attack value, the auto-aimed dash. Off
+    by default, so every config and run from before it keeps (17, 4); on, the column is 5 wide.
+    Structural (the one-hot and the mask widen with it), hence a per-run override in train.yaml
+    rather than a default.yaml edit."""
+    assert EnvConfig().action_nvec == (17, 4)
+    assert EnvConfig(auto_aim=True).action_nvec == (17, 5)
+    shipped = load_config(_SHIPPED / "default.yaml")
+    assert shipped.auto_aim is False
+    flagged = load_config(_SHIPPED / "default.yaml", overrides={"action": {"auto_aim": True}})
+    assert flagged.auto_aim is True and flagged.action_nvec == (17, 5)
+    assert flagged.n_move_bins == shipped.n_move_bins == 16     # the deep merge keeps the rest

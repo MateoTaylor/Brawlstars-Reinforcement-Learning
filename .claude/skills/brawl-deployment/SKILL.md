@@ -76,7 +76,9 @@ release.
 ## Fire semantics: once per decision
 
 `attack ∈ {0, 1, 2, 3}`: nothing / attack / super / gadget, the 3 since 2026-09-21
-(SIM_OVERHAUL Step G5). The press starts on the **first** perception tick
+(SIM_OVERHAUL Step G5), plus 4, the auto-aimed attack, for a run trained under `action.auto_aim`
+(2026-09-26; the mask and `Decision.legal` are then five wide, and `policy.cfg` says which). The
+press starts on the **first** perception tick
 of the decision window and does **not** repeat. This mirrors `env._held`, which zeroes the fire
 column on sub-ticks 2..K. A held fire bit is a bug, not an optimization.
 
@@ -85,7 +87,8 @@ column on sub-ticks 2..K. A held fire bit is a bug, not an optimization.
 auto-aims at the nearest enemy; the sim dashes along the move bin, or `facing` when idle. So
 `Buttons.press` goes down on the origin, `settle()` drags it `control.aim_radius_px` along
 `ShadowHero.attack_bearing` on the next tick and lifts it on the one after (the lift fires), one
-step per tick. Do not "simplify" it back to a tap: that silently changes where every dash goes.
+step per tick. Do not "simplify" it back to a tap: that silently changes where every dash goes. The tap exists as
+its own action, value 4 below, chosen by the policy, never substituted for value 1.
 
 Apply action masking at inference the way `MaskablePPO` saw it in training — an uncharged super
 means bin 2 is masked, not merely ignored.
@@ -102,6 +105,14 @@ there: Step G6 measured the alternative live, and one throw drops the gadget's o
 threshold for 5.0 s, so an agent gated on its own gadget stops dead after every throw.
 Its trace comes from `scripts/deploy_calibrate.py --probe-gadget` (G6.1), in a real match,
 never Training Grounds.
+
+**The auto-aimed attack (`attack == 4`) is the other bare tap** (design §4.4 and §9 entry 23,
+2026-09-26). Down on the attack point, up on the next tick, no drag: the game aims it, which is
+what the sim's `hero.auto_aim_target` models, the nearest enemy or crate within the dash's reach,
+visibility ignored, and along the move bin when nothing is in reach. The loop hands the shadow
+its own estimate as `aim` (`DeployLoop._auto_aim`, from the tracks and the loot map), the mask's
+fifth bit is the attack's, and a run trained without the flag never sees a 4: its column is four
+wide and `ShadowHero.act` refuses the value.
 
 ## Fail closed
 

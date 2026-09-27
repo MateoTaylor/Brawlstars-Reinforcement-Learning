@@ -101,9 +101,41 @@ def test_the_shipped_hero_authors_the_gadget_as_specified_and_no_bot_has_one():
             assert float(params.gadget_cooldown[:, k].max()) == 0, f"{name} must not have a gadget"
 
 
-def test_randomization_file_ships_fully_commented():
+def test_randomization_file_ships_only_the_gas_jitter():
+    """configs/train.yaml's `run.randomization` names this file, so every uncommented line trains
+    in the next run: the gas schedule's +/-10 % (OBS_PARITY_PLAN.md section 4) and nothing else.
+    A bot or stat example uncommented by accident would change what the run trains against."""
     spec = load_randomization(CONFIGS / "randomization.yaml")
-    assert spec == {}
+    jitter = {"low": 0.9, "high": 1.1, "mode": "multiplicative"}
+    assert spec == {"zone.start_fraction": jitter, "zone.step_seconds": jitter}
+
+
+def test_the_shipped_run_trains_the_gas_at_1_3x_the_games_pace():
+    """OBS_PARITY_TASKS.md pending decision 3, the lead's call 2026-09-25. Z1 measured the game's
+    first gas 19 s after the start and one tile per side every ~6.5 s after that; the run trains
+    at 1.3x that pace in a 185 s episode, a little shorter than a real match. Read through the
+    run's own merge (env config plus `run.env_overrides`), as `builder.build_env` reads it.
+
+    default.yaml keeps its 150 s: runs name it by path and brawl_deployment/policy.py rebuilds the
+    live `time_frac` denominator from it plus the run's own overrides, so moving it would stretch
+    the live clock of every run trained before this one."""
+    from brawl_sim.training.builder import build_spec
+    from brawl_sim.training.config import load_train_config
+
+    tcfg = load_train_config(CONFIGS / "train.yaml")
+    cfg = load_config(CONFIGS.parent / tcfg.run.env_config, overrides=tcfg.run.env_overrides or None)
+    spec = build_spec(tcfg)
+    episode_s = cfg.max_episode_steps * cfg.dt
+    assert episode_s == pytest.approx(185.0)
+    assert cfg.max_episode_steps % cfg.action_repeat == 0
+    first_gas_s = float(spec["zone"]["start_fraction"]) * episode_s
+    assert 19.0 / first_gas_s == pytest.approx(1.3, abs=0.05)
+    assert 6.5 / float(spec["zone"]["step_seconds"]) == pytest.approx(1.3, abs=0.05)
+    assert spec["zone"]["tiles_per_step"] == 1
+    assert tcfg.run.randomization == "configs/randomization.yaml"
+
+    default = load_config(CONFIGS / "default.yaml")
+    assert default.max_episode_steps * default.dt == pytest.approx(150.0)
 
 
 def test_uncommenting_one_randomization_line_only_adds_variation():
@@ -125,7 +157,12 @@ def test_uncommenting_one_randomization_line_only_adds_variation():
     from brawl_sim.config import _parse_range_entry  # test-only introspection
 
     raw = yaml.safe_load(uncommented_text)
-    randomization = {k: _parse_range_entry(v) for k, v in raw.items()}
+    parsed = {k: _parse_range_entry(v) for k, v in raw.items()}
+    # The shipped file already has active lines (the gas jitter). The uncommented line must add
+    # exactly its own entry on top of them, and that entry alone is layered on below.
+    shipped = load_randomization(CONFIGS / "randomization.yaml")
+    assert {k: parsed[k] for k in shipped} == shipped
+    randomization = {k: v for k, v in parsed.items() if k not in shipped}
     assert randomization == {"entities.enemy_hp_mult": {"low": 0.8, "high": 1.25, "mode": "additive"}}
 
     merged = apply_randomization(dict(base_spec), randomization)
@@ -735,23 +772,27 @@ def test_deploy4_differs_from_deploy3_by_exactly_the_history_and_gadget_addition
                             "fields": list(HISTORY_FIELDS)}
 
 
-def test_the_shipped_run_trains_deploy4_at_its_pinned_input_widths():
+def test_the_shipped_run_trains_deploy5_at_its_pinned_input_widths():
     """SIM_OVERHAUL_STEPS.md Step I2: a bare `python scripts/train.py` trains the deployable spec,
-    and the extractor it builds takes 13 grid channels and 262 floats. Built through the run's own
-    env config and overrides, as `builder.build_env` does, so an override that moved a width shows
-    here; tests/test_sb3_features.py pins the same numbers at the default config."""
+    deploy5 since the operator moved train.yaml to it on 2026-09-25 (the mortis_ppo run trained on
+    it), and the extractor it builds takes 13 grid channels and 266 floats. Built through the run's
+    own env config and overrides, as `builder.build_env` does, so an override that moved a width
+    shows here -- and one does: `action.auto_aim` (2026-09-26) adds a fifth `hist.attack_onehot`
+    value in each of the 3 history slots, deploy5's 263 -> 266. The 263 is pinned further down at
+    the default config, where the flag is off, and tests/test_sb3_features.py pins deploy4's 262
+    there."""
     from brawl_sim.core import obs_select
     from brawl_sim.training.config import load_train_config
     from brawl_sim.wrappers.sb3_features import BrawlFeaturesExtractor
 
     tcfg = load_train_config(CONFIGS / "train.yaml")
-    assert tcfg.run.agent_obs == "configs/agent_obs_deploy4.yaml"
+    assert tcfg.run.agent_obs == "configs/agent_obs_deploy5.yaml"
     repo = CONFIGS.parent
     env_cfg = load_config(repo / tcfg.run.env_config, overrides=tcfg.run.env_overrides or None)
     spec = obs_select.load_agent_spec(repo / tcfg.run.agent_obs, env_cfg)
     fe = BrawlFeaturesExtractor(obs_select.agent_space(spec, env_cfg))
     assert fe.cnn[0].in_channels == 13
-    assert fe.mlp[0].in_features == 262
+    assert fe.mlp[0].in_features == 266
 
 
 # ---- configs/agent_obs_deploy5.yaml: hero.near_edge, and the enemies rows in tracked-slot order --
@@ -850,3 +891,19 @@ def test_near_edge_is_read_by_deploy5_and_by_nothing_older():
     for name in ("agent_obs.yaml", "agent_obs_lowinfo.yaml") + DEPLOY_SPECS[:-1]:
         assert NEAR_EDGE_FIELD not in _spec_fields(load_agent_spec(CONFIGS / name, cfg)), name
     assert DEPLOY_SPECS[-1] == "agent_obs_deploy5.yaml"
+
+
+def test_the_shipped_run_trains_the_auto_aimed_attack_and_default_yaml_does_not():
+    """`action.auto_aim` (the lead, 2026-09-26) is structural -- a 5-wide attack column, a wider
+    `hist.attack_onehot` and mask -- so it is a run's own override: default.yaml keeps `false`
+    (every run trained before it still loads through its frozen train.yaml, and
+    `brawl_deployment/policy.py` builds the deployed config the same way) and train.yaml's
+    `env_overrides` turns it on for the next run."""
+    from brawl_sim.training.config import load_train_config
+
+    tcfg = load_train_config(CONFIGS / "train.yaml")
+    assert tcfg.run.env_overrides["action"]["auto_aim"] is True
+    plain = load_config(CONFIGS / "default.yaml")
+    assert plain.auto_aim is False and plain.action_nvec == (17, 4)
+    merged = load_config(CONFIGS.parent / tcfg.run.env_config, overrides=tcfg.run.env_overrides or None)
+    assert merged.auto_aim is True and merged.action_nvec == (17, 5)

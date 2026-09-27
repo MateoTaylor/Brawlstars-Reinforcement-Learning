@@ -65,9 +65,17 @@ Two decisions filled in beyond the plan's literal text:
     steering well-defined today and costs nothing once Step 23 lands (a freshly-reset env's
     zone_lo/zone_hi legitimately spans the whole map, which independently yields `in_zone`
     False everywhere too).
-  - Box/cube approach weight is fixed at 1.0, matching the personality-neutral baseline `seek`
-    weight already used elsewhere (e.g. Step 19 melee's `seek` 1.0) -- the plan gives an exact
-    weight for zone escape (3.0) but not for these two.
+  - Box/cube approach weights were 1.0 until 2026-09-25, matching the personality-neutral
+    baseline `seek` weight (the plan gives an exact weight for zone escape, 3.0, but not for
+    these two). They are now 3.0 and 4.0 because a bot that only farmed when nothing else
+    pulled it never caught up with the live game's bots. Both pulls are UNIT directions, and
+    bots/personality.movement silences the personality's own steering terms while one is
+    active, so the weights only ever compete with the zone terms. The first version of the
+    stronger pulls returned `steering.seek`'s raw `target - pos` and was summed with the mode
+    terms; `steering.combine` normalises once, so a pull weighed weight x distance and any two
+    summed pulls rested at a weighted midpoint -- campers parked at crates they may not shoot,
+    retreating bots walked back toward the enemy for a cube behind it. See the constants below
+    and `box_contribution` / `cube_contribution` for the gates that make the pulls safe.
   - `strafe_sign` moved here from the melee archetype once Step 20 (rifle) needed the identical
     alternating-by-slot pattern -- promoted on second use, same as `projectiles.alloc_slots`/
     `_set_scalar`/`_set_vec2` were promoted for `combat.py` to reuse in Step 14.
@@ -83,11 +91,21 @@ from ..core import terrain
 from . import perception
 from . import steering
 
-_BOX_APPROACH_RADIUS = 10.0
-_BOX_APPROACH_WEIGHT = 1.0
-_CUBE_COLLECT_RADIUS = 8.0
-_CUBE_COLLECT_ENEMY_CLEARANCE = 6.0
-_CUBE_COLLECT_WEIGHT = 1.0
+# Loot farming (2026-09-25). Live bots farm: a lobby's richest bot holds 7+ cubes by mid-match.
+# At the old pulls (10 tiles and 1.0 for crates, 8 tiles, 1.0 and no enemy within 6 tiles for
+# cubes) the richest sim bot held about 3 at 60 s even with every crate spot filled, and the hero
+# collected 39 % of all cubes picked up. These values, with the walk and zone gates below and the
+# cube-first rule in bots/personality.movement, were measured with deploy5 at elite under the
+# 1.3x gas: richest bot 7.4 at 60 s, 7+ in half the matches. See box_contribution.
+_BOX_APPROACH_RADIUS = 20.0
+_BOX_APPROACH_WEIGHT = 3.0
+_BOX_TARGET_TILES = 5.0         # a bot SHOOTS a crate only this close (the lead, 2026-09-25):
+                                # live bots break the crate beside them, not one across the map
+_LOOT_ENEMY_FAR_TILES = 8.0     # an enemy target farther than this does not stop a loot pull
+_CUBE_COLLECT_RADIUS = 12.0
+_CUBE_COLLECT_WEIGHT = 4.0
+_CUBE_AT_FEET_TILES = 2.0       # a cube this close is grabbed whoever is near (a kill's drop)
+_LOOT_ZONE_MARGIN_TILES = 1.0   # loot this close to the gas, or in it, pulls no one
 _ZONE_ESCAPE_WEIGHT = 3.0
 _ZONE_AVOID_WEIGHT = 2.0
 # SIM_OVERHAUL_PLAN.md Step B3.2: bounds on the KITE hold-distance multiplier 1 / aggression.
@@ -113,9 +131,10 @@ class Targeting:
     """One tick's resolved aim target for every (N,E) entity. `has_enemy`/`enemy_*` describe the
     visible ENTITY target (state.ent_target, sticky, chosen by perception.select_target);
     `pos`/`vel`/`dist`/`los`/`has_target` describe the EFFECTIVE aim target, which is that enemy
-    when there is one and otherwise the nearest in-range loot box (`is_box`). Movement steers off
-    `has_enemy`/`enemy_pos` -- a bot does not chase a box the way it chases a player, it just
-    shoots one it happens to be standing near -- while fire/aim use the effective target."""
+    when there is one within attack range and otherwise the nearest in-range loot box (`is_box`).
+    Movement steers off `has_enemy`/`enemy_pos` -- a bot does not chase a box the way it chases
+    a player, it just shoots one it happens to be standing near -- while fire/aim use the
+    effective target."""
     idx: torch.Tensor          # (N,E) i64 entity index, clamped; meaningless where ~has_enemy
     has_enemy: torch.Tensor    # (N,E) bool
     enemy_pos: torch.Tensor    # (N,E,2)
@@ -180,7 +199,14 @@ def targeting(state, vis: torch.Tensor, los: torch.Tensor, bank, params, cfg) ->
     so it never adopts a box. Every other personality does, which is what stops the hero from
     having uncontested access to every cube on the map -- previously bots only ever broke boxes by
     accident, with stray shots aimed at each other, since fire_gate has always required an ENTITY
-    target."""
+    target.
+
+    Since 2026-09-25 an enemy target OUTSIDE the bot's own attack range does not block the box:
+    the bot could not have fired at that enemy this tick anyway (fire_gate's `dist <=
+    attack_range`), so it shoots the crate it is standing next to instead of holding its ammo
+    while it walks. "Next to" is literal: the crate must be within _BOX_TARGET_TILES (or the
+    attack range, if shorter). `has_enemy`/`enemy_pos` are unchanged, so movement still closes
+    on the enemy."""
     idx, has_enemy, enemy_pos, enemy_vel = target_info(state)
     E = state.ent_pos.shape[1]
     device = state.ent_pos.device
@@ -214,8 +240,15 @@ def targeting(state, vis: torch.Tensor, los: torch.Tensor, bank, params, cfg) ->
     if cfg.bots_attack_boxes:
         # `box_alive` is False for every unused slot, so nearest_alive returns +inf there and the
         # range test rejects it -- no separate "does this env have any boxes left" check needed.
+        #
+        # A crate is a target only within _BOX_TARGET_TILES, or the bot's own attack range if
+        # that is shorter (the lead, 2026-09-25). At full range a Brock shot every crate within 8
+        # tiles, and with an enemy in sight 43 % of the crate shots were fired at crates the bot
+        # was not even walking to; the live bots break the crate beside them.
+        enemy_far = has_enemy & (geo.dist(state.ent_pos, enemy_pos) > attack_range)
+        crate_reach = torch.clamp(attack_range, max=_BOX_TARGET_TILES)
         is_box = (
-            ~has_enemy & (box_dist <= attack_range)
+            (~has_enemy | enemy_far) & (box_dist <= crate_reach)
             & (state.ent_person != int(Person.CAMPER))
         )
     else:
@@ -330,9 +363,49 @@ def zone_avoid_contribution(state, cfg):
     return direction, weight
 
 
-def box_contribution(state, cfg):
-    """(direction, weight): steering.seek the nearest alive box when cfg.bots_break_boxes, no
-    visible enemy (ent_target < 0), and it's within 10 tiles."""
+def _walk_clear(state, bank, cfg, target_pos: torch.Tensor, max_tiles: float) -> torch.Tensor:
+    """(N,E) bool: the straight line from each entity to `target_pos` crosses no unit-blocking
+    tile (wall or water). The loot pulls need it because bot movement has no pathfinding:
+    terrain.resolve_move slides along a wall one axis at a time, so a pull aimed through a wall
+    pins the bot against it. Measured 2026-09-25 at the farming weights: about a tenth of mobile
+    bots' crate-pulled decisions ground against a wall without this gate. (The first measurement
+    read 41 % -> 17 %, but that proxy also counted HUNT_BUSH bots grinding toward a waypoint
+    behind a wall, which this gate does not touch; hunters have no pathfinding either.)
+
+    `max_tiles` is march's ray budget. Both callers pass their own pull radius and zero every
+    pull farther than that, so the shortened ray never decides an answer that is used."""
+    delta = target_pos - state.ent_pos
+    hit, _, _ = terrain.march(bank.blocks_unit, state.map_id, state.ent_pos, delta,
+                              geo.safe_norm(delta, dim=-1), cfg, max_tiles=max_tiles)
+    return ~hit
+
+
+def _loot_is_safe(state, cfg, target_pos: torch.Tensor) -> torch.Tensor:
+    """(N,E) bool: `target_pos` sits at least _LOOT_ZONE_MARGIN_TILES inside the safe rect, or no
+    zone is active. A loot pull is the only non-zone term while it is active, and it outweighs
+    zone avoidance (2.0) up close, so without this a bot would walk into the gas after a crate
+    or cube and stall there."""
+    zone_lo, zone_hi, rect_active = zone_rect(state)
+    room = perception.zone_clearance(target_pos, zone_lo, zone_hi)
+    if not cfg.zone_enabled:
+        return torch.ones_like(room, dtype=torch.bool)
+    return ~rect_active | (room >= _LOOT_ZONE_MARGIN_TILES)
+
+
+def box_contribution(state, bank, cfg):
+    """(direction, weight): the UNIT direction to the nearest alive box, weight
+    _BOX_APPROACH_WEIGHT, when cfg.bots_break_boxes and the box is within _BOX_APPROACH_RADIUS
+    tiles, the bot is not a CAMPER, it has no enemy target or that target is more than
+    _LOOT_ENEMY_FAR_TILES away, the walk to the box is clear (`_walk_clear`) and the box is out
+    of the gas (`_loot_is_safe`).
+
+    Campers are out because `targeting` never lets one shoot a crate: pulled anyway, a camper
+    looking for a bush parked beside a crate it could not break (27 % of camper time within 1.5
+    tiles of a crate, measured 2026-09-25 with the raw-vector pull; 4 % before it).
+
+    bots/personality.movement drops this pull wherever cube_contribution is pulling (a cube on
+    the ground comes first) and silences the personality's own steering while either pull is
+    active, so the bot walks straight to the loot and nothing sums against it."""
     zero_dir = torch.zeros_like(state.ent_pos)
     zero_w = torch.zeros_like(state.ent_pos[..., 0])
     if not cfg.bots_break_boxes:
@@ -340,28 +413,31 @@ def box_contribution(state, cfg):
 
     idx, dist = perception.nearest_alive(state.box_pos, state.box_alive, state.ent_pos)
     box_pos = gather_rows(state.box_pos, idx)
-    direction = steering.seek(state.ent_pos, box_pos)
-    no_enemy = state.ent_target < 0
-    gate = no_enemy & (dist <= _BOX_APPROACH_RADIUS)
+    direction = geo.normalize(steering.seek(state.ent_pos, box_pos))
+    _, has_enemy, enemy_pos, _ = target_info(state)
+    free = ~has_enemy | (geo.dist(state.ent_pos, enemy_pos) > _LOOT_ENEMY_FAR_TILES)
+    gate = (
+        free & (dist <= _BOX_APPROACH_RADIUS)
+        & (state.ent_person != int(Person.CAMPER))
+        & _walk_clear(state, bank, cfg, box_pos, _BOX_APPROACH_RADIUS)
+        & _loot_is_safe(state, cfg, box_pos)
+    )
     weight = torch.where(gate, torch.full_like(zero_w, _BOX_APPROACH_WEIGHT), zero_w)
     return direction, weight
 
 
-def _nearest_other_alive_dist(state) -> torch.Tensor:
-    """(N,E) distance to the nearest OTHER alive entity (self excluded), +inf if none."""
-    E = state.ent_pos.shape[1]
-    diff = state.ent_pos.unsqueeze(2) - state.ent_pos.unsqueeze(1)
-    dist = geo.safe_norm(diff, dim=-1)
-    not_self = ~torch.eye(E, dtype=torch.bool, device=state.ent_pos.device).unsqueeze(0)
-    candidates = not_self & state.ent_alive.unsqueeze(1)
-    dist_masked = torch.where(candidates, dist, torch.full_like(dist, float("inf")))
-    return dist_masked.min(dim=-1).values
+def cube_contribution(state, bank, cfg):
+    """(direction, weight): the UNIT direction to the nearest alive pickup, weight
+    _CUBE_COLLECT_WEIGHT, when cfg.bots_collect_cubes and the pickup is within
+    _CUBE_COLLECT_RADIUS tiles, the walk to it is clear, it is out of the gas, and either no
+    enemy target is within _LOOT_ENEMY_FAR_TILES or the cube is within _CUBE_AT_FEET_TILES.
 
-
-def cube_contribution(state, cfg):
-    """(direction, weight): steering.seek the nearest alive pickup when
-    cfg.bots_collect_cubes, it's within 8 tiles, and no (any, not just visible) enemy is
-    within 6 tiles."""
+    The at-feet exception is how the cubes a kill drops get collected: they land where the
+    fight was, and the next enemy is usually in sight. Farther cubes wait for the fight to end.
+    The first strong version had no enemy gate at all and, summed with the mode terms, walked
+    engaged bots away from their target 40 % of the time and retreating bots back toward it
+    (41 % of retreat ticks; 5 % without a pull). bots/personality.movement also drops this pull
+    in RETREAT outright."""
     zero_dir = torch.zeros_like(state.ent_pos)
     zero_w = torch.zeros_like(state.ent_pos[..., 0])
     if not cfg.bots_collect_cubes:
@@ -369,9 +445,15 @@ def cube_contribution(state, cfg):
 
     idx, dist = perception.nearest_alive(state.pku_pos, state.pku_alive, state.ent_pos)
     pku_pos = gather_rows(state.pku_pos, idx)
-    direction = steering.seek(state.ent_pos, pku_pos)
-    enemy_dist = _nearest_other_alive_dist(state)
-    gate = (dist <= _CUBE_COLLECT_RADIUS) & (enemy_dist > _CUBE_COLLECT_ENEMY_CLEARANCE)
+    direction = geo.normalize(steering.seek(state.ent_pos, pku_pos))
+    _, has_enemy, enemy_pos, _ = target_info(state)
+    free = ~has_enemy | (geo.dist(state.ent_pos, enemy_pos) > _LOOT_ENEMY_FAR_TILES)
+    gate = (
+        (dist <= _CUBE_COLLECT_RADIUS)
+        & (free | (dist <= _CUBE_AT_FEET_TILES))
+        & _walk_clear(state, bank, cfg, pku_pos, _CUBE_COLLECT_RADIUS)
+        & _loot_is_safe(state, cfg, pku_pos)
+    )
     weight = torch.where(gate, torch.full_like(zero_w, _CUBE_COLLECT_WEIGHT), zero_w)
     return direction, weight
 

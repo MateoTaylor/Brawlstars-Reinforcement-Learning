@@ -1,7 +1,7 @@
 import pytest
 import torch
 
-from brawl_sim.config import load_config, build_params, validate
+from brawl_sim.config import _deep_merge, load_config, build_params, validate
 from brawl_sim.constants import Tile, TILE_BLOCKS_UNIT
 from brawl_sim.core import boxes, terrain
 from brawl_sim.core.state import allocate
@@ -11,19 +11,24 @@ CONFIGS_DEFAULT = "configs/default.yaml"
 
 
 def _cfg_and_params(n_envs=1, max_boxes=16, n_boxes=8, cubes=None):
-    cfg = load_config(CONFIGS_DEFAULT, overrides={
+    overrides = {
         "world": {"map_h": 20, "map_w": 20},
         "entities": {"n_enemies": 1},
         "limits": {"max_boxes": max_boxes},
         "boxes": {"n_boxes": n_boxes},
         "zone": {"enabled": False},
         "cubes": cubes or {},
-    })
+    }
+    cfg = load_config(CONFIGS_DEFAULT, overrides=overrides)
     import yaml
-    spec = {
+    # `n_boxes` and the cube numbers are PER-ENV PARAMS, read by build_params from the spec, not
+    # from cfg -- so the overrides have to reach the spec too. Until 2026-09-25 they reached only
+    # cfg, and every `n_boxes=` below was a no-op that default.yaml's own 8 happened to satisfy;
+    # the day default.yaml went to 48 (every marked spot), the 8-crate assertions failed.
+    spec = _deep_merge({
         **yaml.safe_load(open(CONFIGS_DEFAULT).read()),
         **yaml.safe_load(open("configs/brawlers.yaml").read()),
-    }
+    }, overrides)
     gen = torch.Generator(device="cpu")
     gen.manual_seed(0)
     params = build_params(cfg, n_envs=n_envs, device="cpu", gen=gen, spec=spec)

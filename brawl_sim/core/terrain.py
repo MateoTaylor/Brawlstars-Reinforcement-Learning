@@ -154,6 +154,71 @@ def march(
     return hit, hit_pos, hit_t
 
 
+# Bisection halvings `body_travel` spends inside the sample step where the body first touches: 4
+# turn a 0.5-tile step into 1/32 of a tile, well under anything the policy or the camera resolves.
+_BODY_REFINE_STEPS = 4
+
+
+def body_travel(
+    bank_mask: torch.Tensor, map_id: torch.Tensor, p0: torch.Tensor, dir: torch.Tensor,
+    max_dist: torch.Tensor, radius: torch.Tensor, cfg, max_tiles: float | None = None,
+    clearance: float = 0.0,
+) -> torch.Tensor:
+    """How far a body of `radius` can travel from `p0` along `dir` before it first touches
+    `bank_mask`, capped at `max_dist`. Shapes as `march`, with `radius` broadcasting against
+    `max_dist`; returns distances shaped like `max_dist`.
+
+    The body test is `circle_blocked`, the one walking uses, taken at `p0`, every
+    `los_step_tiles` along the line and at `max_dist` itself; inside the step where it first
+    fails, `_BODY_REFINE_STEPS` bisections close in on the contact. The answer is the last
+    distance tested clear (at a contact, backed off by `clearance` when that point is also
+    clear), so a body moved there is never inside a wall and `resolve_move` can always walk it
+    away. An unobstructed line returns `max_dist` exactly.
+
+    A body that starts overlapping stays where it is (0). Nothing in the sim makes one: spawns
+    are tile centres, and walking and dashing both refuse to end inside a wall. Letting one
+    travel until it cleared would let it pass through a thin wall.
+
+    `max_tiles` is a ray budget with `march`'s rules: a Python scalar that bounds `max_dist`
+    over its whole configured range. Samples past it are never taken, so a longer `max_dist`
+    is checked only at its endpoint.
+    """
+    lead = max_dist.shape
+    map_id = _broadcast_map_id(map_id, lead)
+    dir = geo.normalize(dir)
+    steps = cfg.ray_steps if max_tiles is None else ray_steps_for(max_tiles, cfg)
+    r = radius.expand(lead)
+
+    def clear_at(dist):                                   # (..., S) distances -> (..., S) clear
+        pts = p0.unsqueeze(-2) + dir.unsqueeze(-2) * dist.unsqueeze(-1)
+        rr = r.unsqueeze(-1).expand(dist.shape)
+        return ~circle_blocked(bank_mask, map_id.unsqueeze(-1).expand(dist.shape), pts, rr, cfg)
+
+    fixed = torch.arange(0, steps + 1, device=p0.device, dtype=p0.dtype) * cfg.los_step_tiles
+    fixed = fixed.view((1,) * len(lead) + (steps + 1,)).expand(*lead, steps + 1)
+    dists = torch.cat([torch.minimum(fixed, max_dist.unsqueeze(-1)), max_dist.unsqueeze(-1)], dim=-1)
+    clear = clear_at(dists)                               # sample 0 is the start itself
+
+    # The first blocked sample after the start; every sample before it is clear.
+    blocked = ~clear[..., 1:]
+    hit = blocked.any(dim=-1)
+    first = torch.argmax(blocked.to(torch.int64), dim=-1).unsqueeze(-1) + 1
+    lo = torch.gather(dists, -1, first - 1).squeeze(-1)
+    hi = torch.gather(dists, -1, first).squeeze(-1)
+    for _ in range(_BODY_REFINE_STEPS):                   # fixed count: branch-free, no host sync
+        mid = 0.5 * (lo + hi)
+        ok = clear_at(mid.unsqueeze(-1)).squeeze(-1)
+        lo = torch.where(ok, mid, lo)
+        hi = torch.where(ok, hi, mid)
+
+    travel = torch.where(hit, lo, max_dist)
+    travel = torch.where(clear[..., 0], travel, torch.zeros_like(travel))
+    if clearance > 0.0:
+        backed = torch.clamp(travel - clearance, min=0.0)
+        travel = torch.where(hit & clear_at(backed.unsqueeze(-1)).squeeze(-1), backed, travel)
+    return travel
+
+
 def line_of_sight(
     bank, map_id: torch.Tensor, p0: torch.Tensor, p1: torch.Tensor, cfg,
     max_tiles: float | None = None,

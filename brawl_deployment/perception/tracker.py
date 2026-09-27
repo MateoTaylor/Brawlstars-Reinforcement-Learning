@@ -56,6 +56,18 @@ from brawl_vision.object_detection.project import to_tiles
 # 2.40-2.57), in tiles/s. Sizes the gate's motion allowance.
 MAX_WALK_TILES_S = 2.73
 
+# Where the player box's anchor sits relative to the ground ring while the camera tracks the hero,
+# in tiles, at `to_tiles`' default anchor (the loop builds the tracker without `anchor_frac`). The
+# ring (`HERO_ANCHOR_TILES`) is where the brawler stands; the box spans the whole sprite, so its
+# anchor sits about a tile's worth north of the ring, near the viewport centre. Measured through
+# the live path (`scripts/probes/replay_clip.py`, deploy5, 2026-09-25) on five BlueStacks
+# recordings, 1 113 single-box sightings while tracking: the median of the per-clip medians, with
+# per-clip medians from -0.15 to -0.04 in x and -0.92 to -0.71 in y. Live only: the sim has no
+# boxes, and `HERO_ANCHOR_TILES` must stay the ring's position because the sim's `camera.quad` is
+# derived from it (OBS_PARITY_TASKS.md, pending decision 2). Pinned against the recordings by
+# tests/test_deployment_tracker.py::test_recorded_player_boxes_read_near_zero_offset_while_tracking.
+PLAYER_BOX_FROM_RING_TILES = (-0.08, -0.78)
+
 # Gate slack for everything that is not motion: projection-anchor error, box breathing as auras
 # come and go (`detector.anchor_frac` measured the player box swinging 264-380 px tall inside one
 # clip), and odometry's sub-tile drift. Dominates the motion term at 4 Hz, which is worth seeing
@@ -214,13 +226,18 @@ class EntityTracker:
                              self._hero_offset)
 
     def _nominal_tile(self, plan) -> tuple[float, float]:
-        """Where the hero stands when the camera is tracking it, in the plan's camera-relative
-        tiles: the viewport's centre pixel through the same projection as the detections, plus
-        the measured anchor offset (`brawl_vision.camera.HERO_ANCHOR_TILES`)."""
+        """Where the player box reads when the camera is tracking the hero, in the plan's
+        camera-relative tiles: the viewport's centre pixel through the same projection as the
+        detections, plus the ring's measured offset from the centre
+        (`brawl_vision.camera.HERO_ANCHOR_TILES`), plus the box anchor's measured offset from the
+        ring (`PLAYER_BOX_FROM_RING_TILES`). Without the second term every tracking tick read
+        0.78 tiles north of nominal, so `near_edge` fired 1.2 tiles early to the north and 2.8
+        late to the south."""
         w, h = plan.viewport
         centre = _Point("viewport-centre", 1.0, (w / 2.0, h / 2.0, w / 2.0, h / 2.0))
         (_, (tx, ty)), = to_tiles([centre], plan)
-        return (tx + HERO_ANCHOR_TILES[0], ty + HERO_ANCHOR_TILES[1])
+        return (tx + HERO_ANCHOR_TILES[0] + PLAYER_BOX_FROM_RING_TILES[0],
+                ty + HERO_ANCHOR_TILES[1] + PLAYER_BOX_FROM_RING_TILES[1])
 
     def _update_hero(self, points, t: float) -> None:
         """The hero is a singleton, so there is no association problem -- take the one box.

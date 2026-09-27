@@ -59,12 +59,15 @@ import numpy as np
 from brawl_sim.core import obs_select
 from brawl_deployment.perception.assemble import MapFrame, ObservationAssembler
 
-ATTACK_NONE, ATTACK_FIRE, ATTACK_SUPER, ATTACK_GADGET = 0, 1, 2, 3
+ATTACK_NONE, ATTACK_FIRE, ATTACK_SUPER, ATTACK_GADGET, ATTACK_AUTO = 0, 1, 2, 3, 4
 # The sim's attack column is 4 wide since SIM_OVERHAUL Step G3 (`[none, attack, super, gadget]`,
-# `cfg.action_nvec`), and it is the only width that loads: the 3-wide checkpoints trained before it
-# were retired by the operator on 2026-09-21. Since Step G5 the shadow reports all four legals, so
-# the gadget column is live.
+# `cfg.action_nvec`), or 5 wide for a run trained under `action.auto_aim` (2026-09-26; the fifth
+# value is the auto-aimed attack). The width is the run's own: `from_run` builds `cfg` from the
+# run's frozen train.yaml, overrides included, so a run trained before the flag keeps 4 and loads.
+# The 3-wide checkpoints trained before the gadget were retired by the operator on 2026-09-21.
+# Since Step G5 the shadow reports every legal, so the gadget column is live.
 _PRE_GADGET_ATTACK_WIDTH = 3   # only to NAME that refusal in `check_spaces`; nothing loads at it
+_AUTO_AIM_ATTACK_WIDTH = 5     # likewise, to name a flag mismatch
 
 
 def check_spaces(model, spec, cfg, *, label: str, spec_path="the spec", cfg_path="the config"):
@@ -94,6 +97,14 @@ def check_spaces(model, spec, cfg, *, label: str, spec_path="the spec", cfg_path
         if nvec == (want[0], _PRE_GADGET_ATTACK_WIDTH):
             why = (" It is a pre-gadget checkpoint (before SIM_OVERHAUL Step G3); those were "
                    "retired on 2026-09-21, so retrain rather than load it.")
+        elif nvec == (want[0], _AUTO_AIM_ATTACK_WIDTH) and not cfg.auto_aim:
+            why = (" It was trained with the auto-aimed attack (`action.auto_aim: true`, a 5-wide "
+                   "attack column) and the config has the flag off; the run's own train.yaml "
+                   "carries it under env_overrides.")
+        elif nvec[1] == _PRE_GADGET_ATTACK_WIDTH + 1 and cfg.auto_aim:
+            why = (" It was trained without the auto-aimed attack (a 4-wide attack column) and "
+                   "the config sets `action.auto_aim: true`; that flag belongs in a run's own "
+                   "env_overrides, not in the env config every run shares.")
         raise ValueError(f"{label} has action space {nvec}, config says {want}.{why}")
 
 
@@ -105,9 +116,10 @@ class Decision:
     **Idle is a bin, not an absence** -- `control/joystick.py` moves the contact back to the anchor
     for it and does not release, which is the rule the whole floating-joystick design turns on.
 
-    `attack` is `action[:, 1]`: 0 nothing, 1 attack, 2 super, 3 gadget. `legal` is the mask the
-    network was given, kept so telemetry can tell "the policy chose not to fire" from "the policy
-    could not."
+    `attack` is `action[:, 1]`: 0 nothing, 1 attack, 2 super, 3 gadget, and 4 the auto-aimed
+    attack for a run trained under `action.auto_aim`. `legal` is the mask the network was given
+    (one flag per attack value the run has), kept so telemetry can tell "the policy chose not to
+    fire" from "the policy could not."
     Those look identical in the action alone and mean completely different things when a live run
     goes quiet.
 
@@ -118,7 +130,7 @@ class Decision:
 
     move_bin: int
     attack: int
-    legal: tuple[bool, bool, bool, bool]
+    legal: tuple[bool, ...]
     move_legal: tuple[bool, ...] | None = None
 
     @property
@@ -204,8 +216,9 @@ class DeployedPolicy:
         `ShadowHero.attack_mask()`; `move_legal`, when given, is `MoveMask.legal`'s tuple, one
         flag per move bin with idle at index 0.
 
-        The mask is `[move (n_move_bins + 1), attack (4)]` flattened, which is what
-        `wrappers/sb3_vecenv.py:action_masks` hands `MaskablePPO` during training. The attack half
+        The mask is `[move (n_move_bins + 1), attack (4, or 5 under action.auto_aim)]`
+        flattened, which is what `wrappers/sb3_vecenv.py:action_masks` hands `MaskablePPO`
+        during training. The attack half
         comes from the shadow, which owns the hero's timers and ammo and already reproduces
         `action_mask`'s formula exactly. **Reimplementing that formula here would be a second copy
         of a rule that is only correct in one place.**
@@ -219,8 +232,9 @@ class DeployedPolicy:
         """
         legal = tuple(bool(v) for v in attack_legal)
         if len(legal) != self._n_attack:
-            raise ValueError(f"attack_legal must be (no_fire, attack, super, gadget), one per "
-                             f"attack column, got {attack_legal!r}")
+            raise ValueError(f"attack_legal must have one flag per attack value, "
+                             f"{self._n_attack} for this run (no_fire, attack, super, gadget"
+                             f"{', auto-aim' if self._n_attack > 4 else ''}), got {attack_legal!r}")
         if not legal[0]:
             # `no-fire` is unconditionally legal in `hero.action_mask` (`no_fire_ok = ones_like`).
             # An all-False row makes MaskablePPO's categorical distribution degenerate, which

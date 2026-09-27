@@ -40,6 +40,8 @@ _DIM_RESOLVERS = {
     "VH": lambda cfg: cfg.view_h,
     "VW": lambda cfg: cfg.view_w,
     "MOVE": lambda cfg: cfg.n_move_bins + 1,
+    # The attack column: 4 values, or 5 under `action.auto_aim` (value 4 = auto-aimed attack).
+    "ATTACK": lambda cfg: cfg.action_nvec[1],
     "K": lambda cfg: cfg.history_frames,
     "S": lambda cfg: cfg.n_enemies,          # tracker-style enemy slots: one per non-hero entity
     # The grid's channels: observation._N_BASE_CHANNELS (terrain and occupancy), then one
@@ -90,7 +92,7 @@ _ROWS: tuple[tuple, ...] = (
     ("hero.gadget_ready", ("N",), "bool", "bool", None, "Gadget is charged and legal to throw this tick; equals action_mask.attack[:, 3].", False, None),
     ("hero.gadget_charge_frac", ("N",), "float32", "fraction", (0.0, 1.0), "1 - gadget_cd / gadget_cooldown; 1.0 = charged, 0.0 for a kind without a gadget.", False, None),
     ("hero.attack_idle_t", ("N",), "float32", "seconds", (0.0, None), "Seconds since the hero last attacked (resets on attack only, not on damage).", False, None),
-    ("hero.invuln", ("N",), "bool", "bool", None, "invuln_t > 0 (dash i-frames).", False, None),
+    ("hero.invuln", ("N",), "bool", "bool", None, "invuln_t > 0. Always False since 2026-09-25: the dash grants no i-frames; the slot stays for shape compatibility.", False, None),
     ("hero.in_bush", ("N",), "bool", "bool", None, "Standing on a BUSH tile.", False, None),
     ("hero.in_zone", ("N",), "bool", "bool", None, "Outside the safe rect (in the damaging area).", False, None),
     ("hero.near_edge", ("N",), "bool", "bool", None, "The camera has stopped following the hero: |hero - cam| > camera.edge_flag_tiles on either axis (core/camera.py). Live: the player box's offset from its nominal screen anchor.", False, None),
@@ -104,7 +106,7 @@ _ROWS: tuple[tuple, ...] = (
     # ---- hist: the last K = history_frames decisions, newest first (Phase H) ------------
     ("hist.valid", ("N", "K"), "bool", "bool", None, "Slot k holds the decision k+1 back; every other hist field is 0 where this is False.", False, None),
     ("hist.move_onehot", ("N", "K", "MOVE"), "uint8", "onehot", (0, 1), "One-hot of the move bin chosen then (0 = idle).", False, None),
-    ("hist.attack_onehot", ("N", "K", 4), "uint8", "onehot", (0, 1), "One-hot of the attack chosen then: [no-fire, attack, super, gadget].", False, None),
+    ("hist.attack_onehot", ("N", "K", "ATTACK"), "uint8", "onehot", (0, 1), "One-hot of the attack chosen then: [no-fire, attack, super, gadget] plus [auto-aim] under action.auto_aim.", False, None),
     ("hist.hp", ("N", "K"), "float32", "hp", (0.0, None), "Hero HP then.", False, None),
     ("hist.ammo_frac", ("N", "K"), "float32", "fraction", (0.0, 1.0), "Hero ammo / max_ammo then.", False, None),
     ("hist.displacement", ("N", "K", 2), "float32", "tiles", None, "Hero position then minus hero position now.", False, None),
@@ -234,7 +236,7 @@ _ROWS: tuple[tuple, ...] = (
 
     # ---- action_mask -----------------------------------------------------------------------
     ("action_mask.move", ("N", "MOVE"), "bool", "bool", None, "Legal move bins (idle + n_move_bins directions); always all-True today.", False, None),
-    ("action_mask.attack", ("N", 4), "bool", "bool", None, "[no-fire, attack, super, gadget] legal for the hero this tick.", False, None),
+    ("action_mask.attack", ("N", "ATTACK"), "bool", "bool", None, "[no-fire, attack, super, gadget] legal for the hero this tick, plus [auto-aim] under action.auto_aim (legal exactly when attack is).", False, None),
 
     # ---- meta ------------------------------------------------------------------------------
     ("meta.map_id", ("N",), "int64", "index", (0, None), "Index into cfg.map_names for this env.", False, None),

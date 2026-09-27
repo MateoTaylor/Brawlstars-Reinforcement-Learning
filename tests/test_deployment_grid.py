@@ -289,8 +289,10 @@ def test_how_many_history_planes_exist_is_the_configs_history_frames():
 # ---------------------------------------------------------------------------
 
 # Seed 0 until the cube scatter (`cubes.box_scatter_*` in configs/default.yaml) started drawing from
-# the sim's generator every tick. On the shifted stream the crowded hero dies at decision 35, and the
-# comparison needs forty. Ten keeps it alive and exercises every plane; see the anti-vacuity counts.
+# the sim's generator every tick. On the shifted stream the crowded hero died at decision 35, and the
+# comparison needs forty; ten kept it alive. Since 2026-09-25 the test zeroes the bots' damage, so
+# survival no longer depends on the seed. Ten stays because it exercises every plane (seeds 0-3
+# leave box, pickup or in_zone thin); see the anti-vacuity counts.
 PARITY_SEED = 10
 
 
@@ -299,6 +301,12 @@ PARITY_SEED = 10
 def test_the_grid_matches_the_sim_channel_for_channel(spec_name):
     env = _sim_env(seed=PARITY_SEED)
     env.reset()
+    # The bots still aim and fire, but their hits deal nothing, so the hero lives through all forty
+    # decisions on any seed. The comparison is about where things are, not who survives, and a
+    # seeded death broke it twice: the cube scatter shifting the stream (above), then dashes that
+    # stop at walls (2026-09-25) walking the hero into two rifles firing point-blank.
+    # `stats.effective_damage` reads the multiplier on every hit and only a reset redraws it.
+    env.params.enemy_damage_mult.zero_()
     _crowd_the_hero(env)
     _break_the_crates_beside_the_hero(env)
     occ = _occupancy()
@@ -339,8 +347,8 @@ def test_the_grid_matches_the_sim_channel_for_channel(spec_name):
 
     # Anti-vacuity: agreeing on planes of zeros would prove nothing, and one lucky cell is barely
     # better, so this counts DECISIONS on which each plane was non-empty. Measured on this seed
-    # (2026-09-21): terrain and hero 40/40, box 30, pickup 33, enemy_revealed 37, in_zone 14,
-    # projectile 21, and for deploy4 enemy_hist1 16, enemy_hist2 14, enemy_hist3 12.
+    # with the bots harmless (2026-09-25): terrain, hero, enemy_revealed, in_zone and box 40/40,
+    # pickup 39, projectile 28, and for deploy4 enemy_hist1 39, enemy_hist2 38, enemy_hist3 37.
     thin = {ch: n for ch, n in seen.items() if n < 5}
     assert not thin, f"barely exercised: {thin} of 40 decisions (all: {seen})"
 

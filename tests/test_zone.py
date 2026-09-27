@@ -108,6 +108,38 @@ def test_first_shrink_at_exact_configured_time():
     assert abs(shrink_time - expected) < cfg.dt + 1e-3
 
 
+def test_the_run_jitters_each_envs_gas_schedule_and_redraws_it_at_reset():
+    """configs/train.yaml's run spec under its `run.randomization` overlay (the gas +/-10 %):
+    every env draws its own first-gas time and step period inside the range, the draws pass
+    `validate`, and a reset redraws them. The ranges come from the run's own nominal values, so
+    retuning the schedule moves this test with it."""
+    from brawl_sim.config import apply_randomization, load_randomization, resample_params, validate
+    from brawl_sim.training.builder import build_spec
+    from brawl_sim.training.config import load_train_config
+
+    repo = CONFIGS.parent
+    tcfg = load_train_config(CONFIGS / "train.yaml")
+    cfg = load_config(repo / tcfg.run.env_config, overrides=tcfg.run.env_overrides or None)
+    nominal = build_spec(tcfg)
+    spec = apply_randomization(nominal, load_randomization(repo / tcfg.run.randomization))
+    gen = torch.Generator(device="cpu")
+    gen.manual_seed(0)
+    params = build_params(cfg, n_envs=64, device="cpu", gen=gen, spec=spec)
+    validate(cfg, params)
+
+    start = float(nominal["zone"]["start_fraction"]) * cfg.max_episode_steps * cfg.dt
+    step = float(nominal["zone"]["step_seconds"])
+    for got, base in ((params.zone_start_time, start), (params.zone_step_seconds, step)):
+        assert 0.9 * base - 1e-4 <= float(got.min()) and float(got.max()) <= 1.1 * base + 1e-4
+        assert float(got.std()) > 0.0
+    assert not isinstance(spec["zone"]["tiles_per_step"], dict)
+
+    before = (params.zone_start_time.clone(), params.zone_step_seconds.clone())
+    resample_params(params, torch.ones(64, dtype=torch.bool), cfg, gen, spec)
+    assert not torch.equal(params.zone_start_time, before[0])
+    assert not torch.equal(params.zone_step_seconds, before[1])
+
+
 def test_shrink_moves_lo_and_hi_by_tiles_per_step():
     cfg, params, gen = _cfg_and_params(n_envs=1)
     state = _fresh_state(cfg)

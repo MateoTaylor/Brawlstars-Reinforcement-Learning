@@ -66,6 +66,7 @@ and the gap is named here rather than silently skipped.
 """
 from __future__ import annotations
 
+import math
 import time
 from collections import deque
 from dataclasses import dataclass
@@ -75,6 +76,7 @@ from pathlib import Path
 import numpy as np
 
 from brawl_sim.constants import Tile
+from brawl_sim.core.projectiles import BOX_RADIUS
 from brawl_vision.config import EMULATOR_HUD_MASK_PATH
 
 from .config import DeploymentConfig, resolve_rates
@@ -146,7 +148,8 @@ class TickRow:
     `move_bin` and `attack` are `-1` on a tick with no decision, which is a different thing from
     `0` -- idle is a bin the policy chose and a contact the loop moved. Telemetry that conflated
     them would make a stalled loop and a stationary agent look identical. On a decision row
-    `attack` is 0..3, and 3, the gadget, is not an attack to `scripts/audit_attack_cadence.py`.
+    `attack` is 0..3, or 4 (the auto-aimed attack) for a run trained under `action.auto_aim`;
+    3, the gadget, is not an attack to `scripts/audit_attack_cadence.py`, and 4 is.
     """
 
     index: int
@@ -273,6 +276,27 @@ def dash_reach_tiles(params: ShadowParams, *, kind: str = HERO_KIND,
     `GridSpec.load` reads that file for the view -- neither is a field the shadow needs, so
     neither is on `ShadowParams`, and a literal here would drift the moment the sim's changed.
     A randomized range for either raises for the reason `ShadowParams.load` gives."""
+    dash_radius, unit_radius = _reach_radii(kind, brawlers_path, env_config_path)
+    return float(params.dash_distance) + dash_radius + unit_radius
+
+
+def auto_aim_reach_tiles(params: ShadowParams, *, long_dash: bool = False, kind: str = HERO_KIND,
+                         brawlers_path=None, env_config_path=None) -> tuple[float, float]:
+    """`(enemy reach, crate reach)` in tiles for the auto-aimed attack (attack value 4), the
+    radii `hero.auto_aim_target` uses: the dash's distance (times `long_dash_multiplier` when
+    `long_dash` is charged) plus `dash_radius`, plus the target's body, `unit_radius` for an
+    enemy and `projectiles.BOX_RADIUS` for a crate. From the same files as `dash_reach_tiles`."""
+    dash_radius, unit_radius = _reach_radii(kind, brawlers_path, env_config_path)
+    distance = float(params.dash_distance)
+    if long_dash:
+        distance *= max(1.0, float(params.long_dash_multiplier))
+    base = distance + dash_radius
+    return base + unit_radius, base + float(BOX_RADIUS)
+
+
+def _reach_radii(kind: str, brawlers_path, env_config_path) -> tuple[float, float]:
+    """`(dash_radius, unit_radius)` for `kind`, read from `configs/brawlers.yaml` and
+    `entities.unit_radius` in `configs/default.yaml`."""
     import yaml
 
     brawlers = yaml.safe_load(Path(brawlers_path or _CONFIGS_DIR / "brawlers.yaml").read_text())
@@ -285,7 +309,7 @@ def dash_reach_tiles(params: ShadowParams, *, kind: str = HERO_KIND,
     for name, raw in (("dash_radius", dash_radius), ("unit_radius", unit_radius)):
         if isinstance(raw, (list, tuple, dict)):
             raise ValueError(f"{name} is a randomized range {raw!r}; deployment needs one value")
-    return float(params.dash_distance) + float(dash_radius) + float(unit_radius)
+    return float(dash_radius), float(unit_radius)
 
 
 def pin_thread_pools(cfg: DeploymentConfig) -> None:
@@ -489,12 +513,17 @@ class DeployLoop:
         self.assembler = policy.make_assembler()
         self.shadow = ShadowHero(ShadowParams.load(HERO_KIND), dt=self.sim.dt,
                                  n_move_bins=int(self.sim.n_move_bins),
-                                 desync_strikes=cfg.shadow_ammo_strikes)
+                                 desync_strikes=cfg.shadow_ammo_strikes,
+                                 auto_aim=bool(self.sim.auto_aim))
         # Telemetry only (`TickRow.enemy_in_reach`, Step A2): the cadence audit's "certainly
         # could have hit" radius, from the same configs the shadow and the sim read. The SAME
         # kind as the shadow's block: `ShadowParams` does not record which brawler it was loaded
         # for, so this is the one place both defaults are set.
         self.reach_tiles = dash_reach_tiles(self.shadow.p, kind=HERO_KIND)
+        # The auto-aimed attack's target radii (`_auto_aim`), uncharged and with the long dash
+        # charged, so the per-decision estimate reads no file.
+        self._aim_reach = {long: auto_aim_reach_tiles(self.shadow.p, long_dash=long, kind=HERO_KIND)
+                           for long in (False, True)}
         self.tracker = EntityTracker(n_slots=int(self.sim.n_entities) - 1)
         self.projectiles = ProjectileTracker()
         self.loot = LootMap()
@@ -852,8 +881,12 @@ class DeployLoop:
         # `act` returns what the shadow will actually MODEL -- `ATTACK_NONE` if its own mask
         # refuses. Pressing the policy's choice instead would model a shot the game never took,
         # which is the one error the shadow must never make. The aim is read AFTER `act`, which is
-        # what sets the move bin it is read from.
-        modelled = self.shadow.act(decision.move_bin, decision.attack)
+        # what sets the move bin it is read from. An auto-aimed attack (value 4) carries the
+        # loop's estimate of the game's own target, from the same tracks and crates the
+        # observation was built from; None means nothing in reach, and the shadow then dashes
+        # along the move bin as the game does.
+        aim = self._auto_aim(hero_pos, tracked.enemies) if self.shadow.auto_aim else None
+        modelled = self.shadow.act(decision.move_bin, decision.attack, aim=aim)
         self.controls.joystick.apply(decision.move_bin)
         self.controls.buttons.press(modelled, self.shadow.attack_bearing)
         self._last_decision = decision
@@ -874,6 +907,30 @@ class DeployLoop:
         # policy's pick, and a telemetry row that recorded the choice would show a shot the game
         # never saw.
         row.attack = modelled
+
+    def _auto_aim(self, hero_pos, enemies):
+        """`hero.auto_aim_target` on the deployment's inputs: the unit direction, in world tiles,
+        from the hero to the nearest enemy track or confirmed crate within the auto-aimed dash's
+        reach (`auto_aim_reach_tiles`, the long dash included when the shadow has it charged),
+        or None when nothing is in reach. Nearest by centre distance across both lists, as the
+        sim ranks them. Every track counts, coasting ones included: the sim ignores visibility
+        here on purpose (the lead wants the flag to reach an enemy out of view), and a track the
+        detector lost a few ticks ago is the closest thing this side has to one. What the game
+        actually picks can differ when it auto-aims at something the tracker never saw; the
+        dash direction is then wrong for one dash and the odometry corrects the position after."""
+        enemy_reach, crate_reach = self._aim_reach[bool(self.shadow.long_dash_ready)]
+        hx, hy = float(hero_pos[0]), float(hero_pos[1])
+        best = None
+        candidates = [(tr.pos, enemy_reach) for tr in enemies if tr is not None]
+        candidates += [(pos, crate_reach) for pos in self.loot.crates()]
+        for (x, y), reach in candidates:
+            d = math.hypot(float(x) - hx, float(y) - hy)
+            if d <= reach and d > 1e-6 and (best is None or d < best[0]):
+                best = (d, float(x), float(y))
+        if best is None:
+            return None
+        d, x, y = best
+        return ((x - hx) / d, (y - hy) / d)
 
     def _enemy_in_reach(self, hero_pos, enemies) -> bool:
         """`scripts/audit_attack_cadence.py`'s `enemy_in_reach` (Step A1.1), on the deployment's

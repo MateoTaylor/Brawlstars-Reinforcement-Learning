@@ -113,6 +113,24 @@ corridor whole now win. On the classifier's own maps it is neutral (F1 -0.001, ~
 recall), and those cells are where it disagrees with the labels' overhang rows rather than with
 the game. 0.1 sits on the plateau of every column; below it nothing more is gained.
 
+**The gap rule's doubt reaches `confidence` (since 2026-09-26), and through it `best`.** The rule
+shrinks a cell's vote MASS, and for its first four days `confidence` divided the winner's votes by
+that same shrunken mass, so the penalty cancelled out of the ratio exactly: a cell 30 views agreed
+was a one-wide passage held 3.0 votes instead of 30.0 and reported 1.000 either way. Ten times
+less evidence, reported as certainty, and no value of `gap_rule_weight` could have changed it --
+the weight divides out whatever it is. `views` now counts deposits unweighted and `confidence`
+divides by that, which is the same number on every cell the rule never touched and 0.1 on a cell
+it touched in every view. `occupancy_confidence_floor` then blanks cells under it to UNKNOWN,
+inside `best` so the deploy grid, the loop and the render cannot disagree about which cells the
+map believes. The locking share moved with it, for the same reason; `min_votes` did not, because
+it reads the mass and already made a pinched cell wait ten times as long.
+
+Note which way blanking moves a cell before raising that floor. The deploy grid reads UNKNOWN as
+FLOOR (measured, `brawl_deployment/perception/grid.py`), and the rule marks the pinched cell and
+both flanks -- the flanks being the walls. So the floor forgets probable walls alongside the
+improbable corridor between them, which is why it ships at 0.0 and wants the sweep below rather
+than a taste.
+
 **Never-observed cells stay UNKNOWN, and that is correct fog-of-war, not a gap to fill.** Whatever
 consumes this map must treat UNKNOWN as its own state: a policy that believes unexplored ground is
 walkable will walk into walls.
@@ -167,22 +185,31 @@ class OccupancyMap:
     width: int
     n_classes: int = len(CLASSES)
     votes: np.ndarray = field(default=None)
+    views: np.ndarray = field(default=None)         # UNWEIGHTED deposits per cell -- see below
     locked: np.ndarray = field(default=None)        # a report of the votes, never a reason to stop
     segment: int = 0
     segments_seen: int = 1
+    # Below this confidence a cell reports UNKNOWN instead of its argmax. Carried on the map rather
+    # than passed to `best()` so that every consumer -- the deploy grid, the loop's cell lookup and
+    # the offline render -- is held to one threshold by construction, and a caller cannot get a
+    # different map by forgetting an argument. `from_config` is what sets it.
+    confidence_floor: float = 0.0
 
     def __post_init__(self):
         if self.votes is None:
             # float, not int, since 2026-09-22: a vote cast under the one-wide-gap rule is a
             # fraction of one (`update`). Whole votes stay exact in float32 to 2**24.
             self.votes = np.zeros((self.height, self.width, self.n_classes), np.float32)
+        if self.views is None:
+            self.views = np.zeros((self.height, self.width), np.int32)
         if self.locked is None:
             self.locked = np.zeros((self.height, self.width), bool)
 
     @classmethod
     def from_config(cls, cfg: VisionConfig | None = None) -> "OccupancyMap":
         cfg = cfg or VisionConfig()
-        return cls(height=cfg.occupancy_grid_h, width=cfg.occupancy_grid_w)
+        return cls(height=cfg.occupancy_grid_h, width=cfg.occupancy_grid_w,
+                   confidence_floor=cfg.occupancy_confidence_floor)
 
     # -- reading -------------------------------------------------------------
 
@@ -200,19 +227,43 @@ class OccupancyMap:
         return self.votes.sum(axis=2) > 0
 
     def best(self) -> np.ndarray:
-        """(h, w) int8 of indices into `CLASSES`, `UNKNOWN` where never observed."""
+        """(h, w) int8 of indices into `CLASSES`, `UNKNOWN` where never observed -- or where
+        `confidence_floor` is set and the cell does not clear it.
+
+        The floor lives here, on the one call the deploy grid, the loop and the render all make, so
+        a cell the map does not believe reads UNKNOWN everywhere at once. Splitting it -- a floor in
+        the renderer and none in the grid -- would show a human a map the policy never saw.
+        """
         out = np.full((self.height, self.width), UNKNOWN, np.int8)
         seen = self.observed
         out[seen] = self.votes[seen].argmax(axis=1).astype(np.int8)
+        if self.confidence_floor > 0.0:
+            # `confidence` is 0 on unobserved cells, which are already UNKNOWN, so the floor can
+            # only ever take cells away from a class -- never add one.
+            out[self.confidence() < self.confidence_floor] = UNKNOWN
         return out
 
     def confidence(self) -> np.ndarray:
-        """Winning class's share of each cell's votes; 0 where unobserved."""
-        total = self.votes.sum(axis=2)
+        """Winning class's share of the views that could have voted; 0 where unobserved.
+
+        **Divided by `views`, not by the summed vote weight (since 2026-09-26).** Those are the
+        same number everywhere the one-wide-gap rule did not fire, so this is that rule's cells and
+        nowhere else. On them it is the whole point: the rule expresses doubt by shrinking a cell's
+        vote MASS, and a share cannot see that, because the shrink divides out of the ratio. A cell
+        30 views agreed was a one-wide passage carried 3.0 votes instead of 30.0 and still reported
+        1.000 -- ten times less evidence, reported as certainty. Dividing by the number of views
+        that actually looked keeps the mass in the answer:
+
+            views claiming a one-wide passage     0/30    5/30    15/30   25/30   30/30
+            vote mass                             30.0    25.5    16.5     7.5     3.0
+            share of mass (what this used to be)  1.000   1.000   1.000   1.000   1.000
+            share of views (what this is)         1.000   0.850   0.550   0.250   0.100
+
+        So a cell is certain when the views agree AND the map's own design rules allow what they
+        agree on, and `confidence_floor` can act on the difference.
+        """
         with np.errstate(invalid="ignore", divide="ignore"):
-            # Divide by the total itself, not max(total, 1): under the one-wide-gap rule a
-            # cell's votes can sum to less than one, and its winner's share is still a share.
-            return np.where(total > 0, self.votes.max(axis=2) / total, 0.0)
+            return np.where(self.views > 0, self.votes.max(axis=2) / self.views, 0.0)
 
     def to_chars(self) -> np.ndarray:
         """(h, w) of map-CSV legend characters, `?` where UNKNOWN -- the form a hand-verified
@@ -242,6 +293,7 @@ class OccupancyMap:
         unrelated maps, which is far worse than losing one.
         """
         self.votes[:] = 0
+        self.views[:] = 0
         self.locked[:] = False
         self.segment = segment
         self.segments_seen += 1
@@ -307,11 +359,18 @@ class OccupancyMap:
         pinched = one_wide_gaps(cells, allow)
         weight[pinched] = cfg.occupancy_gap_rule_weight
         np.add.at(self.votes[dst], (rr, cc, classes), weight[sub][target])
+        # One per cell that voted, whatever the vote was worth. This is the denominator
+        # `confidence` needs: the weight is the evidence, the count is how much there could
+        # have been, and only holding both makes the gap rule's penalty legible.
+        np.add.at(self.views[dst], (rr, cc), 1)
 
         # Only cells this frame touched can lock or release: nothing else got a new vote.
         v = self.votes[dst][rr, cc]
         total = v.sum(axis=1)
-        share = v.max(axis=1) / np.maximum(total, np.finfo(np.float32).tiny)
+        # The same share `confidence` reports, for the same reason -- otherwise a cell every view
+        # calls an impossible passage locks at share 1.0 and the map calls it settled. `min_votes`
+        # stays on the WEIGHTED mass, where it already made such a cell wait ten times as long.
+        share = v.max(axis=1) / np.maximum(self.views[dst][rr, cc], 1)
         was = self.locked[dst][rr, cc]
         # A lock holds until another class has the most votes, not until the share dips under
         # lock_ratio -- so `released_now` counts overturned cells rather than threshold flicker.

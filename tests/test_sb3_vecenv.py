@@ -333,3 +333,35 @@ def test_seed_reseeds_the_shared_generator():
 def test_env_is_wrapped_returns_false_batch_wide():
     venv = _make(n_envs=3)
     assert venv.env_is_wrapped(object) == [False, False, False]
+
+
+def test_the_auto_aim_flag_widens_the_flat_mask_to_22_and_the_head_with_it():
+    """`action.auto_aim` (2026-09-26): attack value 4. The flat mask is sum(action_nvec) = 22 and
+    its last column is the attack's; MaskablePPO builds a 22-logit head; a mask that leaves only
+    value 4 legal makes the policy pick it, the wrapper hands it to the sim and the dash is
+    taken (one ammo spent); and a rollout + update at this width runs."""
+    from sb3_contrib import MaskablePPO
+    from brawl_sim.wrappers.sb3_features import default_policy_kwargs
+
+    venv = _make(n_envs=2, overrides={"action": {"auto_aim": True}})
+    assert venv.cfg.action_nvec == (17, 5)
+    obs = venv.reset()
+    masks = venv.action_masks()
+    assert masks.shape == (2, sum(venv.cfg.action_nvec)) == (2, 22)
+    assert masks[:, 21].tolist() == masks[:, 18].tolist() == [True, True]
+
+    model = MaskablePPO("MultiInputPolicy", venv, n_steps=8, batch_size=16, device="cpu", seed=0,
+                        policy_kwargs=default_policy_kwargs(venv.agent_spec, venv.cfg))
+    assert model.action_space.nvec.tolist() == [17, 5]
+    assert model.policy.action_net.out_features == 22
+    only_auto = masks.copy()
+    only_auto[:, 17:] = [False, False, False, False, True]
+    action, _ = model.predict(obs, deterministic=True, action_masks=only_auto)
+    assert action[:, 1].tolist() == [4, 4]
+
+    venv.step_async(action)
+    venv.step_wait()
+    ammo = venv.env.env.state.ent_ammo[:, 0].tolist()
+    assert all(abs(a - 2.0) < 1e-4 for a in ammo), ammo
+    assert venv.action_masks()[:, 21].tolist() == [False, False]   # the cooldown, like column 18
+    model.learn(total_timesteps=32)

@@ -471,7 +471,12 @@ class RenderReport:
 
     def unknown_is_monotonic(self) -> bool:
         """Coverage must only grow. A rise means the world frame moved under the grid -- odometry
-        lost lock -- and it is the acceptance criterion a per-frame drift number cannot see."""
+        lost lock -- and it is the acceptance criterion a per-frame drift number cannot see.
+
+        Counted over cells never OBSERVED, which is what makes it an odometry criterion rather
+        than a classifier one. `best` would not do: since 2026-09-26 a confidence floor can return
+        a claimed cell to UNKNOWN without the grid having moved at all.
+        """
         vals = [u for _, u in self.unknown_curve]
         return all(b <= a for a, b in zip(vals, vals[1:]))
 
@@ -732,13 +737,18 @@ def render(source, plan: RectifyPlan, track: Track, path, *, classifier=None, de
                     occupancy.update(cells, r, reg, zone=zone, cfg=cfg)
                     report.classified += 1
                     map_base = render_map(occupancy, window, lut, scale)
-                    best = occupancy.best()
+                    # Cells never OBSERVED, not cells `best` calls UNKNOWN. Those parted ways on
+                    # 2026-09-26: `occupancy_confidence_floor` blanks a cell whose views turn out
+                    # to claim a one-wide passage, so a cell can go back to UNKNOWN with the world
+                    # frame perfectly still. This curve is an ODOMETRY criterion, so counting the
+                    # blanked ones would report the floor doing its job as odometry losing lock.
+                    unseen = ~occupancy.observed
                     # Sampled per CLASSIFICATION, not per written frame: this curve is the
                     # coverage-growth acceptance criterion, and padding it with held frames would
                     # only flatten it.
                     report.unknown_curve.append(
-                        (frame.t, int((best[window.row0:window.row1,
-                                            window.col0:window.col1] == UNKNOWN).sum())))
+                        (frame.t, int(unseen[window.row0:window.row1,
+                                             window.col0:window.col1].sum())))
                     report.outside_window = _outside(occupancy, window)
                 canvas = map_base.copy()
             else:

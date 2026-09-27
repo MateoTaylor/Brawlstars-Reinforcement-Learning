@@ -349,8 +349,21 @@ def movement(state, tgt, bank, params, cfg, gen):
     # --- universal terms, identical for every personality ---
     zone_dir, zone_w = shared.zone_contribution(state, cfg)
     avoid_dir, avoid_w = shared.zone_avoid_contribution(state, cfg)
-    box_dir, box_w = shared.box_contribution(state, cfg)
-    cube_dir, cube_w = shared.cube_contribution(state, cfg)
+    box_dir, box_w = shared.box_contribution(state, bank, cfg)
+    cube_dir, cube_w = shared.cube_contribution(state, bank, cfg)
+    # A retreating bot does not turn back for loot: RETREAT exists to get it out of a losing
+    # fight, and the cubes lying in that fight are exactly the ones it would turn back for.
+    # The crate pull is off there too: past the 8-tile enemy gate it turned a fleeing bot
+    # around on 0.60 of the decisions it was live (0.09 of retreat decisions, elite,
+    # 2026-09-25), and a bot that has just broken contact has no business walking six tiles
+    # to shoot a crate.
+    retreating = mode == int(Mode.RETREAT)
+    cube_w = torch.where(retreating, torch.zeros_like(cube_w), cube_w)
+    box_w = torch.where(retreating, torch.zeros_like(box_w), box_w)
+    # A cube on the ground comes before a crate. Summed, the two pulls aim between the two
+    # objects and the bot reaches neither; measured 2026-09-25 as cubes left lying next to the
+    # crates that dropped them once the pulls were strong enough to matter.
+    box_w = torch.where(cube_w > 0, torch.zeros_like(box_w), box_w)
 
     # HOLD_STILL has to mean STILL. The three optional pulls are suppressed for it -- otherwise a
     # camper in a bush would be dragged out by a loot box 9 tiles away, or nudged off its tile by
@@ -359,14 +372,23 @@ def movement(state, tgt, bank, params, cfg, gen):
     # the zone has actually swallowed leaves, personality notwithstanding.
     mobile = (mode != int(Mode.HOLD_STILL)).to(w.dtype)
 
+    # A loot pull REPLACES the personality's own steering; it never sums with it. Every term below
+    # is a direction that steering.combine normalises once, and seek/flee are raw `target - pos`,
+    # so a summed pull weighs weight x distance against them and any two pulls rest at a weighted
+    # midpoint: measured 2026-09-25, campers parked at crates they may not shoot and retreating
+    # bots walked back toward the enemy for a cube behind it. With the mode terms silenced the bot
+    # walks straight to the loot, and the gates in bots/policy (enemy distance, RETREAT above, the
+    # gas margin, a clear walk) decide when it may. The zone terms are never silenced.
+    own = 1.0 - ((box_w > 0) | (cube_w > 0)).to(w.dtype) * mobile
+
     move_dir = steering.combine(
-        (seek_dir, w[..., 0] * enemy_f),
-        (range_dir, w[..., 1] * enemy_f),
-        (strafe_dir, w[..., 2] * enemy_f),
-        (flee_dir, w[..., 3] * enemy_f),
-        (bush_dir, w[..., 4] * found_f),
-        (hunt_dir, w[..., 5] * hunt_f),
-        (wander_dir, w[..., 6]),
+        (seek_dir, w[..., 0] * enemy_f * own),
+        (range_dir, w[..., 1] * enemy_f * own),
+        (strafe_dir, w[..., 2] * enemy_f * own),
+        (flee_dir, w[..., 3] * enemy_f * own),
+        (bush_dir, w[..., 4] * found_f * own),
+        (hunt_dir, w[..., 5] * hunt_f * own),
+        (wander_dir, w[..., 6] * own),
         (zone_dir, zone_w),
         (avoid_dir, avoid_w * mobile),
         (box_dir, box_w * mobile),

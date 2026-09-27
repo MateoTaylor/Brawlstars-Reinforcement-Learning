@@ -138,6 +138,15 @@ class VisionConfig:
     # that looks pinched from every view would never be observed at all, and the deploy grid
     # reads UNKNOWN as FLOOR -- the wrong direction for a wall. 1.0 turns the rule off.
     occupancy_gap_rule_weight: float = 0.1
+    # Below this confidence `OccupancyMap.best` reports UNKNOWN rather than the winning class, for
+    # the deploy grid, the loop and the render alike. Its whole reason to exist is the gap rule
+    # above: since 2026-09-26 `confidence` divides the winner's votes by the number of views that
+    # could have voted, so a cell every view calls a one-wide passage reads 0.1 instead of 1.0, and
+    # this is the knob that acts on it. 0.0 disables the floor and is not the same as disabling the
+    # rule -- votes stay weighted, only the blanking stops. Never >= lock_ratio: at that point a
+    # cell two classes genuinely split would blank as well, which is a disagreeing cell, not an
+    # impossible one. configs/vision.yaml carries the sweep.
+    occupancy_confidence_floor: float = 0.0
 
     # --- classifier (Phase H) ------------------------------------------------------------
     # CPU by default, and this is a real choice rather than a placeholder: the GPU will be busy
@@ -350,6 +359,7 @@ _VISION_CONFIG_FIELDS = (
     ("occupancy.min_votes", "occupancy_min_votes", int),
     ("occupancy.lock_ratio", "occupancy_lock_ratio", float),
     ("occupancy.gap_rule_weight", "occupancy_gap_rule_weight", float),
+    ("occupancy.confidence_floor", "occupancy_confidence_floor", float),
     ("classifier.device", "classifier_device", str),
     ("detector.model", "detector_model", str),
     ("detector.conf", "detector_conf", float),
@@ -534,6 +544,15 @@ def validate(cfg: VisionConfig) -> None:
     if not 0.0 < cfg.occupancy_gap_rule_weight <= 1.0:
         raise ValueError(
             f"occupancy.gap_rule_weight must be in (0, 1], got {cfg.occupancy_gap_rule_weight}"
+        )
+    # 0.0 is the off switch, so the range is closed below. Bounded above by lock_ratio because the
+    # two answer the same question in opposite directions: above it, cells the map is willing to
+    # call locked would blank, and every disagreeing cell in the map goes with them.
+    if not 0.0 <= cfg.occupancy_confidence_floor < cfg.occupancy_lock_ratio:
+        raise ValueError(
+            f"occupancy.confidence_floor must be in [0, lock_ratio={cfg.occupancy_lock_ratio}) -- "
+            f"at or above it a cell whose views merely disagree blanks too, and the floor is for "
+            f"cells the map rules forbid. Got {cfg.occupancy_confidence_floor}"
         )
     if cfg.classifier_device not in ("cpu", "cuda"):
         raise ValueError(f"classifier.device must be 'cpu' or 'cuda', got {cfg.classifier_device!r}")

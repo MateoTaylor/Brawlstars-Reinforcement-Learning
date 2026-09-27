@@ -20,7 +20,8 @@ import yaml
 
 from brawl_sim.config import load_config
 from brawl_sim.env import BrawlVecEnv
-from brawl_deployment.control.buttons import ATTACK_FIRE, ATTACK_GADGET, ATTACK_NONE, ATTACK_SUPER
+from brawl_deployment.control.buttons import (ATTACK_AUTO, ATTACK_FIRE, ATTACK_GADGET, ATTACK_NONE,
+                                              ATTACK_SUPER)
 from brawl_deployment.perception.shadow import (
     AMMO_TOLERANCE, AMMO_TOLERANCE_UNPAINTED, DESYNC, DESYNC_GRACE_SECONDS, GRACE, NO_READ,
     OK, SUSPECT, ShadowHero, ShadowParams,
@@ -110,11 +111,14 @@ def test_a_kind_without_a_gadget_loads_as_a_kind_with_no_gadget(tmp_path):
 # parity with the sim
 # ---------------------------------------------------------------------------
 
-def _sim_env(action_repeat):
+def _sim_env(action_repeat, auto_aim=False):
     """One env, tiny map, zone off, bots unkillable. `autoreset=False` so an episode that somehow
-    ends is a visible assertion failure rather than a silent state reset mid-comparison."""
+    ends is a visible assertion failure rather than a silent state reset mid-comparison.
+    `auto_aim` turns on the fifth attack value (`action.auto_aim`)."""
     overrides = {name: dict(section) if isinstance(section, dict) else section
                  for name, section in TINY.items()}
+    if auto_aim:
+        overrides["action"] = {**overrides.get("action", {}), "auto_aim": True}
     # The preset's 300-tick episode truncates at decision 60 when action_repeat is 5, which is one
     # decision short of the script -- the cap is about keeping training rollouts small, not about
     # anything this test exercises.
@@ -358,12 +362,13 @@ def test_ammo_regen_resumes_the_tick_the_cooldown_clears():
     assert shadow.observe()["ammo"] > before
 
 
-def test_the_i_frames_outlast_the_dash_by_exactly_one_sub_tick():
-    """Both are seeded from `dash_duration: 0.30` on the same tick, and they do not end together.
-    `dash_t` is decremented in phase 8 of the tick that SET it; `invuln_t` waits for phase 2 of
-    the next one. So `dashing` reads true for six sub-ticks (0.30 s, its duration) and `invuln`
-    for seven. Verified against the sim by the parity test; pinned here because it is the kind of
-    off-by-one a rewrite would quietly round away."""
+def test_the_dash_grants_no_i_frames():
+    """Until 2026-09-25 `invuln_t` was seeded from `dash_duration: 0.30` beside `dash_t` and read
+    True for seven sub-ticks, one longer than `dashing` (`dash_t` is decremented in phase 8 of the
+    tick that SET it, `invuln_t` waited for phase 2 of the next). The lead removed the i-frames
+    from the sim: the live dash is an attack animation Mortis can be hit throughout. The shadow
+    seeds nothing, the flag never reads True, and `dashing` keeps its six sub-ticks (0.30 s).
+    Verified against the sim by the parity test."""
     shadow = _shadow()
     shadow.act(5, ATTACK_FIRE)
     dashing, invuln = [], []
@@ -372,7 +377,7 @@ def test_the_i_frames_outlast_the_dash_by_exactly_one_sub_tick():
         dashing.append(shadow.observe()["dashing"])
         invuln.append(shadow.observe()["invuln"])
     assert dashing == [True] * 6 + [False] * 4
-    assert invuln == [True] * 7 + [False] * 3
+    assert invuln == [False] * 10
     assert shadow.observe()["dash_dir"] == (0.0, 0.0)
 
 
@@ -906,9 +911,9 @@ def test_resync_takes_ammo_from_cv_and_reseeds_everything_else_to_not_ready():
     shadow = _shadow()
     shadow.advance(5.0)                        # long dash charged
     shadow.act(1, ATTACK_FIRE)
-    shadow.advance(0.05)                       # mid-dash, invulnerable, on cooldown
+    shadow.advance(0.05)                       # mid-dash, on cooldown
     shadow.set_super(_super(1.0, True))
-    assert shadow.observe()["dashing"] and shadow.observe()["invuln"]
+    assert shadow.observe()["dashing"]
 
     shadow.resync(_ammo(3.0))
     s = shadow.observe()
@@ -996,3 +1001,97 @@ def test_observe_covers_every_self_field_the_deploy_spec_asks_of_it(spec_path):
             continue
         assert field.startswith("hero."), field
         assert field.split(".", 1)[1] in keys, field
+
+
+# ---------------------------------------------------------------------------
+# the auto-aimed attack (action.auto_aim, attack value 4; the lead, 2026-09-26)
+# ---------------------------------------------------------------------------
+
+def test_the_auto_aim_flag_is_a_fifth_mask_column_equal_to_the_attacks():
+    """With `auto_aim` the mask has a fifth column that is the attack's own (the same ammo,
+    cooldown and dashing gates, as `hero.action_mask` builds it); without it the mask stays four
+    wide and a 4 is refused and models nothing, so a run trained before the flag is untouched."""
+    shadow = _shadow(auto_aim=True)
+    assert shadow.attack_mask() == (True, True, False, True, True)
+    shadow.act(1, ATTACK_FIRE)
+    shadow.advance(0.05)
+    assert shadow.attack_mask() == (True, False, False, True, False)
+
+    plain = _shadow()
+    assert plain.attack_mask() == (True, True, False, True)
+    assert plain.act(1, ATTACK_AUTO) == ATTACK_NONE
+    plain.advance(0.05)
+    assert plain.observe()["ammo"] == 3.0 and not plain.observe()["dashing"]
+
+
+def test_an_auto_aimed_attack_dashes_along_its_aim_and_costs_what_a_dash_costs():
+    """The aim the loop hands `act` is where the dash goes, not the move bin: bin 5 is +y, the
+    aim is -y, and the dash goes -y. The offset is normalised here, so a raw (dx, dy) serves.
+    Everything else is `_start_dash`'s: one ammo, the cooldown, the dash timer."""
+    shadow = _shadow(auto_aim=True)
+    assert shadow.act(5, ATTACK_AUTO, aim=(0.0, -3.0)) == ATTACK_AUTO
+    assert shadow.attack_bearing == pytest.approx(-math.pi / 2)
+    shadow.advance(0.05)
+    s = shadow.observe()
+    assert s["dash_dir"] == pytest.approx((0.0, -1.0), abs=1e-6)
+    assert s["dashing"] and s["ammo"] == 2.0 and shadow.attack_cd > 0
+
+
+def test_an_auto_aimed_attack_with_nothing_in_reach_dashes_like_value_one():
+    """`aim=None` is "nothing in reach": the dash follows the move bin, and on the idle bin the
+    facing, exactly as value 1 does (`env._attack_phase` falls back to the same rule). A zero
+    vector counts as None, so a degenerate estimate cannot NaN the direction."""
+    shadow = _shadow(auto_aim=True)
+    assert shadow.act(5, ATTACK_AUTO, aim=None) == ATTACK_AUTO
+    assert shadow.attack_bearing == pytest.approx(math.pi / 2)
+    shadow.advance(0.05)
+    assert shadow.observe()["dash_dir"] == pytest.approx((0.0, 1.0), abs=1e-6)
+
+    shadow = _shadow(auto_aim=True)
+    shadow.reset(facing=0.0)
+    assert shadow.act(0, ATTACK_AUTO, aim=(0.0, 0.0)) == ATTACK_AUTO
+    assert shadow._aim is None
+    shadow.advance(0.05)
+    assert shadow.observe()["dash_dir"] == pytest.approx((1.0, 0.0), abs=1e-6)
+
+
+def test_a_resync_drops_a_queued_auto_aim_with_its_attack():
+    """`resync` drops a queued attack (the gadget excepted) and the aim goes with it, so the next
+    plain attack cannot inherit a stale direction."""
+    shadow = _shadow(auto_aim=True)
+    shadow.act(5, ATTACK_AUTO, aim=(1.0, 0.0))
+    shadow.resync(_ammo(3.0))
+    assert shadow._pending_attack == ATTACK_NONE and shadow._aim is None
+    assert shadow.attack_bearing == pytest.approx(math.pi / 2)
+
+
+def test_the_shadows_auto_aimed_dash_matches_the_sims():
+    """One auto-aimed decision against a real `BrawlVecEnv` with the flag on: the sim's
+    `hero.auto_aim_target` picks the bot at hero + (2, 1.5) and `env._attack_phase` swaps that
+    direction in for the dash; the shadow is handed the same offset as `aim` and must dash the
+    same way, on the idle bin, with the attack's own fields agreeing exactly afterwards."""
+    env = _sim_env(1, auto_aim=True)
+    env.reset()
+    assert env.cfg.action_nvec == (17, 5)
+    st = env.state
+    st.ent_pos[0, 0] = torch.tensor([10.0, 10.0])
+    st.ent_pos[0, 1] = torch.tensor([12.0, 11.5])
+    st.ent_pos[0, 2:] = torch.tensor([1.0, 1.0])
+    st.box_alive.fill_(False)
+    shadow = _shadow(auto_aim=True)
+    shadow.reset(facing=float(st.ent_facing[0, 0]))
+    override = torch.zeros(1, env.cfg.n_entities, 2, dtype=torch.int64)
+    override[0, 0, 0] = -1
+
+    assert shadow.act(0, ATTACK_AUTO, aim=(2.0, 1.5)) == ATTACK_AUTO
+    obs, _, terminated, truncated, _ = env.step(torch.tensor([[0, 4]], dtype=torch.int64), override)
+    assert not bool(terminated[0]) and not bool(truncated[0])
+    shadow.advance(env.cfg.dt)
+
+    h, s = obs["hero"], shadow.observe()
+    assert s["dash_dir"] == pytest.approx((0.8, 0.6), abs=1e-6)
+    assert s["dash_dir"] == pytest.approx(tuple(st.ent_dash_dir[0, 0].tolist()), abs=1e-6)
+    for field in ("ammo", "attack_cd", "dash_t", "attack_idle_t"):
+        assert s[field] == float(h[field][0]), field
+    for flag in ("can_attack", "dashing", "long_dash_ready"):
+        assert s[flag] == bool(h[flag][0]), flag

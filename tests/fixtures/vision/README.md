@@ -16,6 +16,7 @@ this table that isn't imagery stays in version control:
 | `<clip>.truth.json` | **yes** | the path you actually walked, in tiles |
 | `<clip>.grid.csv` | **yes** | hand-verified terrain, in map-CSV legend — Phase I's acceptance compares its locked cells against this, reporting position and classification error separately |
 | `labels/*.json` | **yes** | per-cell training labels from `scripts/vision_label.py`; one string per grid row in the map-CSV legend, so a changed cell is one character in a diff |
+| `player_boxes_tracking.json` | **yes** | live detector player boxes recorded while the camera tracked the hero on five BlueStacks clips; pins `tracker.PLAYER_BOX_FROM_RING_TILES` (`tests/test_deployment_tracker.py`), provenance in its `about` field |
 
 The ground truth is the valuable half and it is small, diffable text. The clip is reproducible
 by re-recording; a hand-counted walked path is not.

@@ -362,15 +362,19 @@ def _check_spaces(model, venv, train_config: Path) -> None:
             "This config is not the one the model was trained with -- pass the right "
             "--train-config (the run directory's own archived train.yaml)."
         )
-    # The action space is code, not config: SIM_OVERHAUL Step G3 widened the attack column
-    # 3 -> 4 (gadget), so a checkpoint trained before it has a 3-wide attack head that no
-    # train.yaml can bring back. Without this the first `predict` dies on a 20-vs-21 mask shape.
+    # The attack column's width is mostly code: SIM_OVERHAUL Step G3 widened it 3 -> 4 (gadget),
+    # so a checkpoint trained before it has a 3-wide attack head that no train.yaml can bring
+    # back. The one config part is `action.auto_aim` (2026-09-26), a fifth value that a run's
+    # own train.yaml carries under env_overrides, which is why the env is built from THAT file.
+    # Without this the first `predict` dies on a 20-vs-21 (or 22) mask shape.
     if model.action_space != venv.action_space:
         raise SystemExit(
             f"action space mismatch: the model has {model.action_space} but this build of the "
-            f"sim has {venv.action_space}. The checkpoint predates an action-space change (the "
-            "attack column is [none, attack, super, gadget] since Step G3) and cannot be "
-            "watched with this code."
+            f"sim has {venv.action_space}. Either the checkpoint predates an action-space change "
+            "(the attack column is [none, attack, super, gadget] since Step G3) and cannot be "
+            "watched with this code, or --train-config is not the run's own: `action.auto_aim` "
+            "(a fifth value, [auto-aim]) is a per-run override in env_overrides, and the env "
+            "here is built from the train.yaml you passed."
         )
 
 

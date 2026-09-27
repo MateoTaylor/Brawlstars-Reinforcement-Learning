@@ -61,6 +61,13 @@ def _env(n_envs=1, seed=0):
     return env, cfg
 
 
+def _all_projectiles_on_screen(full, env_i=0) -> bool:
+    """False in a frame where the sim path and the live path disagree by decision (see
+    `_suppliers_from`): a live projectile the camera does not show."""
+    prj = full["projectiles"]
+    return bool((prj["in_view"][env_i] | ~prj["alive"][env_i]).all())
+
+
 class _Track:
     """What `EntityTracker` hands `assemble`: a world position, a velocity and `seen_now`."""
 
@@ -124,7 +131,12 @@ def _suppliers_from(full, cfg, spec, env_i=0, history=(), tracked=False):
         enemy_hp[slot] = float(at(ent["hp"])[i])
         enemy_bush[slot] = bool(at(ent["in_bush"])[i])
 
-    alive_p = at(prj["alive"]).nonzero().flatten().tolist()
+    # Only the projectiles the camera shows: the live `ProjectileTracker` has no track for an
+    # off-screen one (assemble._put_projectiles marks every track `in_view`). The sim path still
+    # RANKS off-screen projectiles into its 12 slots and blanks their rows (OBS_PARITY_TASKS.md
+    # C4, a quirk kept by decision), so in a frame with one alive the two paths lay their rows
+    # out differently; `_all_projectiles_on_screen` is how the parity tests skip those frames.
+    alive_p = (at(prj["alive"]) & at(prj["in_view"])).nonzero().flatten().tolist()
     projectiles = [(tuple(at(prj["rel_pos"])[j].tolist()), tuple(at(prj["vel"])[j].tolist()),
                     float(at(prj["time_to_closest"])[j])) for j in alive_p]
 
@@ -278,21 +290,28 @@ def test_assemble_reproduces_the_sims_own_agent_obs(spec_path):
 
     full = env.reset()
     gen = torch.Generator().manual_seed(0)
+    projectile_frames = 0
     for step in range(6):
         want = obs_select.build_agent_obs(full, spec, cfg, buffers)
         want = {k: v[0].clone().numpy() for k, v in want.items()}
         got = asm.assemble(**_suppliers_from(full, cfg, spec))
 
         assert got.keys() == want.keys()
+        comparable = _all_projectiles_on_screen(full)
         for name in want:
+            if name == "projectiles" and not comparable:
+                continue  # the kept ranking quirk; see _suppliers_from
             if name == "grid":
                 assert np.array_equal(got[name], want[name]), f"{name} differs at step {step}"
             else:
                 np.testing.assert_allclose(got[name], want[name], atol=1e-5,
                                            err_msg=f"{name} differs at step {step}")
+        if comparable and bool(full["projectiles"]["alive"][0].any()):
+            projectile_frames += 1
         action = torch.stack([torch.randint(0, cfg.n_move_bins + 1, (1,), generator=gen),
                               torch.randint(0, 2, (1,), generator=gen)], dim=1)
         full, *_ = env.step(action)
+    assert projectile_frames > 0, "no frame with live projectiles was compared"
 
 
 def test_parity_survives_a_frame_with_live_projectiles():
@@ -300,7 +319,11 @@ def test_parity_survives_a_frame_with_live_projectiles():
     takes the nearest 12 by `time_to_closest` out of `max_projectiles` slots, and deployment's
     live projectiles sit at slots 0..n-1 while the sim's sit wherever they were spawned. The
     selection has to be index-independent for that to be safe, which is why it is left to
-    `obs_select` on both sides -- this is the test that says it stayed there."""
+    `obs_select` on both sides -- this is the test that says it stayed there.
+
+    Frames with an off-screen live projectile are skipped: the sim ranks it into the 12 slots
+    and blanks its row (the quirk OBS_PARITY_TASKS.md C4 keeps by decision), while the tracker
+    never holds it, so the two paths differ there by design."""
     env, cfg = _env(n_envs=1, seed=3)
     asm = _assembler(SPECS[0], cfg)
     spec, buffers = asm.spec, asm.buffers
@@ -310,7 +333,7 @@ def test_parity_survives_a_frame_with_live_projectiles():
     seen = 0
     for _ in range(40):
         n_live = int(full["projectiles"]["alive"][0].sum())
-        if n_live:
+        if n_live and _all_projectiles_on_screen(full):
             seen = max(seen, n_live)
             want = obs_select.build_agent_obs(full, spec, cfg, buffers)["projectiles"][0].numpy()
             got = asm.assemble(**_suppliers_from(full, cfg, spec))["projectiles"]

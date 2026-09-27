@@ -13,8 +13,9 @@ import struct
 import numpy as np
 import pytest
 
-from brawl_deployment.control import (ATTACK_FIRE, ATTACK_GADGET, ATTACK_NONE, ATTACK_SUPER,
-                                      Buttons, Joystick, NullBackend, SLOT_MOVE, SLOT_TAP)
+from brawl_deployment.control import (ATTACK_AUTO, ATTACK_FIRE, ATTACK_GADGET, ATTACK_NONE,
+                                      ATTACK_SUPER, Buttons, Joystick, NullBackend, SLOT_MOVE,
+                                      SLOT_TAP)
 from brawl_deployment.control.adb import (DEVICE_FD, EVENT_STRUCTS, AdbTouchBackend,
                                           find_adb_serial)
 from brawl_deployment.capture import to_viewport
@@ -806,3 +807,23 @@ def test_a_missing_or_portless_config_raises_rather_than_guessing(tmp_path):
     empty.write_text('bst.feature.rooting="0"\n')
     with pytest.raises(ValueError, match="adb_port"):
         find_adb_serial(empty)
+
+
+def test_an_auto_aimed_attack_is_a_bare_tap_on_the_attack_button():
+    """Attack value 4 (`action.auto_aim`, 2026-09-26): the game aims a bare tap at the nearest
+    target by itself, which is exactly what the sim's value 4 models, so this is the second press
+    with no drag. Down on the attack point, the same origin as value 1, up on the next settle,
+    never a move, whatever bearing is passed; and no aim point, like the gadget."""
+    b = NullBackend()
+    btn = Buttons(b, attack=(1000.0, 500.0), super_=(3.0, 4.0), gadget=(1559.9, 901.1))
+    assert btn.origin(ATTACK_AUTO) == btn.origin(ATTACK_FIRE) == (1000.0, 500.0)
+    assert btn.press(ATTACK_AUTO, math.pi / 2)
+    assert b.log == [("down", SLOT_TAP, 1000.0, 500.0)]
+    assert btn.is_held
+    btn.settle()
+    assert b.log[1:] == [("up", SLOT_TAP)]
+    assert not btn.is_held and SLOT_TAP not in b.contacts
+    btn.settle()
+    assert len(b.log) == 2
+    with pytest.raises(ValueError, match="no aim point"):
+        btn.aim_point(ATTACK_AUTO, 0.0)

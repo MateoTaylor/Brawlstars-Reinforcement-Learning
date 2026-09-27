@@ -106,7 +106,16 @@ sim:
   action_repeat: 5
   action_latency_seconds: 0.001    # rounds to 0 ticks at 20 Hz; buffer is a pass-through
 
-action: {n_move_bins: 16, dash_on_idle: facing}
+action:
+  n_move_bins: 16
+  dash_on_idle: facing
+  # auto_aim adds a fifth attack value, 4 = auto-aimed attack: the dash goes straight at the
+  # nearest alive enemy or unbroken crate within the dash's reach (visibility ignored, so a
+  # policy that tracks an enemy out of frame can hit it) and along the move bin when nothing
+  # is in reach. It widens action_nvec, hist.attack_onehot and action_mask.attack, so it is
+  # `false` here and `true` only in a run's env_overrides: a run trained without it keeps
+  # loading. Live, value 4 is a bare tap on the attack button, which the game auto-aims.
+  auto_aim: false
 
 observation:
   include_world_grid: true
@@ -150,7 +159,12 @@ entities:
 # ~7.7 ms/step rather than ~15. Measured peaks in real play are far below the bound (35 under the
 # shipped archetype weights, 82 in an all-Shelly lobby), because bots need a target in range, are
 # staggered by decision_period_ticks, and die -- but the buffer must cover what CAN happen.
-limits: {max_projectiles: 192, max_boxes: 16, max_pickups: 32}
+# max_boxes 48 and max_pickups 64 since 2026-09-25, when boxes.n_boxes went to "every marked
+# spot" (below): the shipped maps mark 16 to 44 spots, and pickups must hold one cube per crate
+# plus one drop per corpse (at most 44 + 9). Both size the state's box and pickup tables only; the
+# agent sees crates and cubes through the grid's `box` and `pickup` channels, whose shape does not
+# depend on them, so every existing checkpoint still loads.
+limits: {max_projectiles: 192, max_boxes: 48, max_pickups: 64}
 
 # cubes/boxes: both cube numbers are now the real game's (Step E2). A power cube gives
 # +10% damage and a FLAT +400 max HP.
@@ -181,7 +195,13 @@ cubes:
   box_scatter_min_tiles: 0.3
   box_scatter_max_tiles: 1.8
 
-boxes: {n_boxes: 8, hp: 3000}
+# n_boxes is clamped to the map's marked spots (core/boxes.spawn_boxes), so 48 fills every spot on
+# every shipped map: 16 to 44 crates, 24.7 on average over the 14 training maps. Real showdown
+# maps carry 20 to 30 crates; the 8 this held until 2026-09-25 were a third of that, and with so
+# few the hero out-farmed the bots (its 1.9 cubes at 60 s beat the richest bot's 2.6) where the
+# live game hands the richest bot 7+. Measured with deploy5 at elite: filling the spots alone took
+# the hero from 1.9 to 4.0 cubes at 60 s and its win rate from 0.19 to 0.30.
+boxes: {n_boxes: 48, hp: 3000}
 
 # The zone deals a FRACTION of each entity's own max HP per second, not a flat HP/s. The
 # requirement is that nobody survives more than ~5 seconds inside it -- so 0.20, and it holds for

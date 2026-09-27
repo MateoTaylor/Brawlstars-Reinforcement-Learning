@@ -29,8 +29,13 @@ by prefix, not hardcoded to "projectiles" -- any per-entity group may set it, as
 prefix has a `<prefix>.time_to_closest` field to sort by (checked at load time). Selected slots
 beyond however many are actually alive are zero-padded (multiplied by the gathered `alive`
 mask) -- this happens unconditionally, independent of `fair`, since it's slot-padding, not
-fairness. **This is the one group shape that is NOT index-stable tick to tick** -- unlike every
-other group, a given output row is not "the same real entity" across steps.
+fairness. The ranking is over every alive occupant, on screen or not: under `fair` an off-screen
+projectile still takes one of the K slots and then has its row blanked by the fairness mask.
+That is a decision (OBS_PARITY_TASKS.md C4: the quirk is kept as noise in the same direction as
+the live detector's misses), not an oversight, and the live tracker, which never holds an
+off-screen projectile, fills its slots differently in exactly those frames. **This is the one
+group shape that is NOT index-stable tick to tick** -- unlike every other group, a given output
+row is not "the same real entity" across steps.
 
 **`slots: tracked` (OBS_PARITY_TASKS.md C9) orders an `entities.*` group by the sim's
 tracker-style slots** (`core/slots.py`, read from `full_obs["slots"]["entity"]`): output row k is

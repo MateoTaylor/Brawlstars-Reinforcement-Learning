@@ -226,22 +226,35 @@ def clip_views(clip, grids, plans, cfg, skip_s: float = SKIP_S):
             yield image, takers
 
 
-def score(grids, models, plans, cfg, occluders, log=print, gap_weights=None):
+def score(grids, models, plans, cfg, occluders, log=print, gap_weights=None,
+          confidence_floors=None):
     """`{model name: {clip: MapScore}}`. `models` is `{name: (TerrainClassifier, clips or None)}`,
     a model being scored only on the windows of `clips` when given. `occluders(image)` returns a
     `plan -> (rows, cols) bool` of the cells boxes cover.
 
     `gap_weights`, when given, builds every model's maps once per weight, each under
     `occupancy_gap_rule_weight` set to it, from the same predictions; the rows are then named
-    `<model> gap=<w>`. Without it the maps are built under `cfg` as it is."""
+    `<model> gap=<w>`. Without it the maps are built under `cfg` as it is.
+
+    `confidence_floors` costs nothing extra to sweep, and that is not an optimisation but the
+    shape of the thing: `occupancy_confidence_floor` is read by `OccupancyMap.best`, never by
+    `update`, so every floor reads the SAME accumulated map. One build, a floor set on it per
+    value, one `best` each. Note that a blanked cell leaves `MapScore.add`'s scored set entirely
+    (`best >= 0`), so a floor buys F1 and one-wide gaps by declining to answer -- read the `cov`
+    column of `_line` before believing either.
+    """
     by_clip = defaultdict(list)
     for g in grids:
         by_clip[g.clip].append(g)
     variants = ([(None, cfg)] if gap_weights is None else
                 [(w, replace(cfg, occupancy_gap_rule_weight=w)) for w in gap_weights])
+    floors = list(confidence_floors) if confidence_floors else [None]
 
-    def row(name, w):
+    def built(name, w):
         return name if w is None else f"{name} gap={w:g}"
+
+    def row(name, w, f):
+        return built(name, w) if f is None else f"{built(name, w)} floor={f:g}"
 
     out = defaultdict(lambda: defaultdict(MapScore))
     t0 = time.time()
@@ -250,7 +263,7 @@ def score(grids, models, plans, cfg, occluders, log=print, gap_weights=None):
         users = {n: m for n, (m, only) in models.items() if only is None or clip in only}
         if not users:
             continue
-        maps = {(row(n, w), g.frame): OccupancyMap.from_config(cfg)
+        maps = {(built(n, w), g.frame): OccupancyMap.from_config(cfg)
                 for n in users for w, _ in variants for g in gs}
         for image, takers in clip_views(clip, gs, plans, cfg):
             covered = occluders(image)
@@ -263,15 +276,19 @@ def score(grids, models, plans, cfg, occluders, log=print, gap_weights=None):
                 for name, model in users.items():
                     cells, _ = model.predict(rect, plan)
                     for w, vcfg in variants:
-                        maps[(row(name, w), g.frame)].update(cells, odo, plan, zone=zone,
-                                                             occluded=occluded, cfg=vcfg)
+                        maps[(built(name, w), g.frame)].update(cells, odo, plan, zone=zone,
+                                                               occluded=occluded, cfg=vcfg)
                 views += 1
         for g in gs:
             scored = observed_cells(plans[g.hud])
             for name in users:
                 for w, _ in variants:
-                    best = label_crop(maps[(row(name, w), g.frame)], plans[g.hud])
-                    out[row(name, w)][clip].add(g.as_class_index(), best, scored)
+                    m = maps[(built(name, w), g.frame)]
+                    for f in floors:
+                        # Set rather than rebuild: the votes do not depend on it.
+                        m.confidence_floor = cfg.occupancy_confidence_floor if f is None else f
+                        best = label_crop(m, plans[g.hud])
+                        out[row(name, w, f)][clip].add(g.as_class_index(), best, scored)
         log(f"  {clip}: {len(gs)} labels, {views} deposits so far, {time.time() - t0:.0f}s")
     return out
 
@@ -284,7 +301,10 @@ def _line(s: MapScore) -> str:
     b = s.blocking
     return (f"F1 {b.f1:.3f}  R {b.recall:.3f}  P {b.precision:.3f}  (n={b.tp + b.fn:5d})   "
             f"edge {s.edge.f1:.3f}  inner {s.inner.f1:.3f}   5-class {s.accuracy:.3f}   "
-            f"1-wide gaps {s.gaps_pred:3d} (labels {s.gaps_truth:3d})")
+            # `cov` is how many labelled cells the map answered at all. Every other number here is
+            # computed over exactly those, so a confidence_floor that blanks half the map reads as
+            # an improvement in all of them unless this column is read alongside.
+            f"cov {s.cells:5d}   1-wide gaps {s.gaps_pred:3d} (labels {s.gaps_truth:3d})")
 
 
 def _report(results, grids, plans_used, pools):
@@ -338,6 +358,11 @@ def main(argv=None) -> int:
     p.add_argument("--gap-weight", type=float, action="append", default=None, metavar="W",
                    help="build every map once per value of occupancy.gap_rule_weight given "
                         "(repeatable; 1.0 is the rule off), from the same predictions")
+    p.add_argument("--confidence-floor", type=float, action="append", default=None, metavar="F",
+                   help="read every map once per value of occupancy.confidence_floor given "
+                        "(repeatable; 0.0 is the floor off). Free to sweep -- the floor is read "
+                        "by best(), not by update(), so one build serves every value. Read the "
+                        "cov column: a floor also buys F1 by declining to answer")
     p.add_argument("--one-mask", default=None, choices=["phone", "emulator"],
                    help="score every label under this HUD mask instead of its own")
     p.add_argument("--epochs", type=int, default=200)
@@ -382,7 +407,8 @@ def main(argv=None) -> int:
             print(f"trained without {clip} in {time.time() - t0:.0f}s", flush=True)
 
     scored = [g for g in grids if args.clips is None or g.clip in args.clips]
-    results = score(scored, models, plans, cfg, _occluders(cfg), gap_weights=args.gap_weight)
+    results = score(scored, models, plans, cfg, _occluders(cfg), gap_weights=args.gap_weight,
+                    confidence_floors=args.confidence_floor)
     pools = {"kept checkpoints": [n for n, (_, only) in models.items()
                                   if only and not n.startswith("held out: ")],
              "trained now": [n for n in models if n.startswith("held out: ")]}

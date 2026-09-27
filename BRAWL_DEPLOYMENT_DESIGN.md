@@ -439,7 +439,9 @@ Action masking must be applied at inference the same way `MaskablePPO` saw it in
 super is not charged, bin 2 is masked out. `hero.action_mask` is the sim-side reference; the
 deployed equivalent reads super readiness off the HUD (§6.3). Since 2026-09-21 the mask is
 four wide: bin 3, the gadget, is masked for the 18 s cooldown after each throw, read from the
-shadow's own timer rather than the HUD (§6.3's table).
+shadow's own timer rather than the HUD (§6.3's table). Since 2026-09-26 it is five wide for a run
+trained under `action.auto_aim`, the fifth bit being the attack's own (the last paragraph of this
+section).
 
 **The gadget is the one bare tap (added 2026-09-21, SIM_OVERHAUL Step G5).** `attack == 3` goes
 down on the calibrated gadget centre, `Calibration.button("gadget")`, and lifts on the next
@@ -454,6 +456,24 @@ corrected 2026-09-22). The gate sits on `hypercharge`, the one disc in the clust
 presses. Step G6 confirmed that live on 2026-09-22 and measured why the separation is load-bearing
 rather than tidy: after one throw the gadget's own ring score sits under threshold
 for 5.0 s.
+
+**The auto-aimed attack is the other bare tap (added 2026-09-26, §9 entry 23).** Attack value 4
+exists for a run trained under `action.auto_aim`, which widens the attack column to five,
+`[none, attack, super, gadget, auto-aim]`; the flag is off in `configs/default.yaml` and on in
+`configs/train.yaml`'s `env_overrides`, so every run trained before it keeps four and loads
+unchanged. In the sim, value 4 is value 1's dash with the direction chosen for the policy:
+`hero.auto_aim_target` takes the nearest alive enemy or unbroken crate by centre distance within
+the dash's reach (`dash_distance`, times the long-dash multiplier when charged, plus `dash_radius`
+plus the target's body), with no visibility term, so an enemy just out of view is a target; with
+nothing in reach the dash follows the move bin, or `facing` when idle, as value 1 does. On the
+device it is a bare tap on the attack point, down on the decision tick and up on the next, no
+drag, because a bare tap is precisely what the game auto-aims. The shadow models the dash along
+the loop's own estimate of the game's target, `DeployLoop._auto_aim`: the nearest enemy track,
+coasting ones included, or confirmed crate within `auto_aim_reach_tiles`. Where the game picks
+something the tracker never saw, the modelled direction is wrong for one dash and the odometry
+corrects the position after it; the ammo, cooldown and dash timer are right either way.
+`Buttons.aim_point` refuses value 4 as it refuses the gadget, the mask's fifth bit is the
+attack's own, and `scripts/audit_attack_cadence.py` counts a 4 as an attack.
 
 ### 4.5 Calibration — BUILT 2026-09-08, see §6.14
 
@@ -1105,8 +1125,9 @@ assumed:
 - `core/hero.py:276` — `ent_facing = angle_of(dash_dir)` on a dash.
 - `core/hero.py:124` — `long_dash_ready` is "has this entity gone `long_dash_seconds` without
   attacking", i.e. a stopwatch on our own fire events.
-- `core/hero.py:114-115` — `ent_attack_cd` and `ent_invuln_t` are plain `-= dt` countdowns seeded
-  from per-kind constants.
+- `core/hero.py:114-115` — `ent_attack_cd` and `ent_invuln_t` are plain `-= dt` countdowns.
+  `ent_attack_cd` is seeded from per-kind constants; `ent_invuln_t` is seeded by nothing since
+  2026-09-25 (the dash grants no i-frames, §9 entry 22) and only ever counts down from zero.
 
 Every one of those is driven by the action stream we generate. So the deployment loop keeps a
 **shadow hero state**: the hero's own timer fields, ticked at `cfg.dt`, advanced by the actions we
@@ -1128,7 +1149,7 @@ issue, using the same `configs/brawlers.yaml` params the sim loads. Re-auditing 
 | `hero.dashing`, `dash_t`, `dash_dir` | **shadow** | Dash is triggered by our own attack; `dash_duration` is a kit constant. |
 | `hero.long_dash_ready`, `long_dash_frac` | **shadow** | Stopwatch since our last attack vs `long_dash_seconds`. |
 | `hero.gadget_ready`, `gadget_charge_frac` | **shadow** | Added 2026-09-21, SIM_OVERHAUL Step G5. Countdown from `gadget_cooldown` (18 s), charged at the gate and restarted by our own throw. Proprioception by design (SIM_OVERHAUL_PLAN.md S18), so no reader is built, and a canary resync leaves it alone: the ammo it compares says nothing about the gadget. |
-| `hero.invuln` | **shadow** | `-= dt` countdown, seeded by a DASH — not, as this row said before it was built, at spawn. `core/spawn.py` writes pos, hp, ammo, facing and alive and nothing else; `ent_invuln_t` has exactly one writer, `start_dash`, and `obs_schema` says so itself: "invuln_t > 0 (dash i-frames)". |
+| `hero.invuln` | **shadow** | Always False since 2026-09-25 (§9 entry 22): the dash grants no i-frames, so nothing seeds `ent_invuln_t` and the `-= dt` countdown only ever counts down from zero. Until then it was seeded by a DASH — not, as this row said before it was built, at spawn: `core/spawn.py` writes pos, hp, ammo, facing and alive and nothing else, and `start_dash` was the field's one writer. The slot stays for shape compatibility. |
 | `meta.time_frac` | wall clock | Seconds since the gate went true ÷ 150, **clamped to [0, 1]**. §9.6. |
 
 **Consequence: proprioception costs the `self` group nothing.** That removes what looked like the
@@ -1179,16 +1200,17 @@ promoted into them. Counting `x = max(0, x - 0.05)` down from Mortis's `attack_c
 takes **seven** ticks in float32 and **eight** in float64, where a residue of 4.2e-17 keeps it
 above zero for one more tick. A float64 shadow would hold `can_attack` false and block ammo regen
 for one sub-tick longer than the sim on every single attack — a 50 ms error, in the same direction,
-every time. What one dash actually looks like, all three confirmed equal to the sim's:
+every time. What one dash actually looks like, both confirmed equal to the sim's:
 
     sub-tick     1  2  3  4  5  6  7  8
     dashing      *  *  *  *  *  *  .  .     6 ticks -- exactly dash_duration
-    invuln       *  *  *  *  *  *  *  .     7 ticks -- one longer
     reload held  *  *  *  *  *  *  *  .     7 ticks -- exactly attack_cooldown
 
-The i-frames outlast the dash by one sub-tick because `dash_t` is decremented in phase 8 of the
-tick that set it while `invuln_t` waits for phase 2 of the next. Both are seeded from the same
-0.30. None of this is an artifact to round away — it is what the policy trained against.
+The reload hold outlasts the dash by one sub-tick because `dash_t` is decremented in phase 8 of
+the tick that set it while `attack_cd` waits for phase 2 of the next. None of this is an artifact
+to round away — it is what the policy trained against. (`invuln` had a row here until 2026-09-25,
+seeded from the same 0.30 and one tick longer than `dashing` by the same argument; the dash grants
+no i-frames now, §9 entry 22, and the flag never reads True.)
 
 **A nominal decision is not five sub-ticks unless you are careful.** `0.25 // 0.05` is **4**, not
 5: binary 0.05 sits a hair above a twentieth, so flooring a division silently drops one sub-tick
@@ -3666,10 +3688,15 @@ stopped agent is recoverable by hand; an agent mashing inputs into a menu is not
     following the hero, `|hero − cam| > camera.edge_flag_tiles` (2.0) on either axis. It is the
     only thing on screen that says "map edge"; the operator's test for it is that the hero must
     not waste time trying to run off the map. Live, `EntityTracker` measures the player box's
-    tile position against its nominal anchor (the viewport centre plus `HERO_ANCHOR_TILES`,
-    through the same rectify plan as every detection, so `origin_tile` cancels) and reports it as
-    `TrackerResult.hero_offset`. The assembler thresholds it only when the spec names the field,
-    and the loop logs `hero_offset_x/y` and `near_edge` per decision.
+    tile position against its nominal anchor (the viewport centre plus `HERO_ANCHOR_TILES` plus
+    `PLAYER_BOX_FROM_RING_TILES`, through the same rectify plan as every detection, so
+    `origin_tile` cancels) and reports it as `TrackerResult.hero_offset`. The assembler
+    thresholds it only when the spec names the field, and the loop logs `hero_offset_x/y` and
+    `near_edge` per decision. `PLAYER_BOX_FROM_RING_TILES` (−0.08, −0.78), added 2026-09-25, is
+    where the box's anchor sits relative to the ground ring while the camera follows the hero,
+    measured through the live path on five recordings; without it every tracking tick read 0.78
+    tiles north of nominal and the flag fired 1.2 tiles early to the north, 2.8 late to the south.
+    `HERO_ANCHOR_TILES` stays the ring's position, because the sim's `camera.quad` derives from it.
 
     **Tracked slots** (C8, C9). The sim's enemy rows follow the tracker's slot rule instead of
     entity index: two consecutive sightings to take the lowest free slot, held through three
@@ -3688,8 +3715,9 @@ stopped agent is recoverable by hand; an agent mashing inputs into a menu is not
 
     **The spec.** `configs/agent_obs_deploy5.yaml` is deploy4 plus `hero.near_edge` and
     `slots: tracked`: `self` 26 → 27 floats, the extractor 262 → 263, every other group
-    byte-identical (`tests/test_configs_files.py` pins both directions). `configs/train.yaml` and
-    `configs/deployment.yaml` stay on deploy4 until a deploy5 run exists (C12). Phase 2, timing
+    byte-identical (`tests/test_configs_files.py` pins both directions). `configs/train.yaml` still names
+    deploy4 (the run passes deploy5 with `--set`, below); `configs/deployment.yaml` names the
+    deploy5 run since 2026-09-25, after C12's offline gates passed. Phase 2, timing
     the zone schedule from the game, is Z1–Z4 of the same file.
 
     The run:
@@ -3697,6 +3725,243 @@ stopped agent is recoverable by hand; an agent mashing inputs into a menu is not
     ```
     .venv/Scripts/python.exe scripts/train.py --set run.name=mortis_deploy5 --set run.agent_obs=configs/agent_obs_deploy5.yaml
     ```
+
+20. **BUILT 2026-09-25 — the gas schedule timed from the game, trained at 1.3× its pace.**
+    Measured on eight recorded matches (`OBS_PARITY_TASKS.md` Z1, `scripts/probes/zone_probe.py`):
+    the first gas comes 19 s after the loop's gate (18.1–19.7 s), then each side advances one
+    tile every 6–7 s (0.14 tiles/s per side over nine clean east/west fronts), and the safe area
+    reaches 2 × 2 at about 200 s. The sim's default, first gas at 12 s and a tile every 1.5 s,
+    closes the map 4.4× too fast. The probe tells the gas advancing from the camera revealing it
+    with `GasMap.seen`, and times per-line fronts rather than bursts, because a soft gas edge
+    turns one advance into several partial bands. §10 item 9 stays as written: no burst period
+    was measurable.
+
+    **What trains.** The operator's call: 1.3× the game's pace, in an episode a little shorter
+    than a real match. `configs/train.yaml` `run.env_overrides` sets `sim.max_episode_steps: 3700`
+    (185 s) and `zone.step_seconds: 5.0`, and `start_fraction 0.08` then puts the first gas at
+    14.8 s. `configs/randomization.yaml` jitters both zone values ±10 % per env and per reset
+    (`run.randomization` names it); evaluation never applies it. `configs/default.yaml` is
+    unchanged on purpose.
+
+    **Live consequences.** None for the runs already trained. The loop reads no zone schedule,
+    and `DeployedPolicy` derives the `time_frac` denominator from each run's own recorded config
+    (entry 6's rule, unchanged), so deploy4 and deploy5 keep 150 s and a run trained on the new
+    recipe gets 185 s the same way. `zone.next_shrink_in` stays pinned (entries 14 and 15).
+
+21. **BUILT 2026-09-25 — the cube economy: every crate spot filled, bots that farm, and
+    `reward.cube_pickup` 1.0.** The operator's diagnosis: a live lobby's winner is a 7+ cube bot,
+    and the agent loses to it because it holds the zone edge instead of building cubes early. The
+    sim had that pressure backwards. Measured with deploy5's `best_model.zip` through
+    `TierEvaluator` under the next run's gas, 64 elite episodes per row on the CPU
+    (`scripts/probes/cube_economy_measure.py`; the first two rows need the pre-entry bot code,
+    which the probe cannot select):
+
+    | sim | win | mean rank | hero cubes at 60 s | richest bot at 60 s | richest bot 7+ at 60 s | killer's cubes at the hero's death | hero's share of cubes collected |
+    |---|---|---|---|---|---|---|---|
+    | as deploy5 trained: 8 crates, the old pulls | 0.19 | 3.33 | 1.86 | 2.62 | 0.08 | 1.02 | 0.317 |
+    | every spot filled (25.6 crates), the old pulls | 0.30 | 2.94 | 4.00 | 3.15 | 0.10 | 1.73 | 0.390 |
+    | built: every spot filled, farming bots | 0.17 | 3.27 | 3.93 | 7.39 | 0.48 | 4.32 | 0.156 |
+
+    Hard tier, same protocol, old sim to built: richest bot at 60 s 2.08 to 7.34 (7+ in 0.04 to
+    0.48 of matches), killer's cubes 1.48 to 8.88, win 0.56 to 0.56 with mean rank 1.67 to 1.00.
+
+    Two causes. The sim spawned 8 crates where real maps carry 20 to 30 (the shipped maps mark
+    16 to 44 spots, 24.7 on average over the 14 training maps), and the bot pulls were token: a
+    crate pulled at 10 tiles with weight 1.0 only with no target at all, a cube at 8 tiles with
+    weight 1.0 only with nobody within 6 tiles, which is never true where cubes drop. With 8
+    crates the hero out-farmed the bots (1.9 cubes at 60 s against the richest bot's 2.6) and
+    collected a third of everything picked up. Its win rate rose with its cubes at 60 s (0.17 at
+    0–1, 0.42 at 2–3, 0.57 at 4–6), which is the case for paying more for them.
+
+    **What was built.** `configs/default.yaml`: `boxes.n_boxes 48`, which `spawn_boxes` clamps to
+    the map's spots, so every marked spot holds a crate; `limits.max_boxes 48` and `max_pickups
+    64` to hold them. Shape-safe for every checkpoint: the agent sees crates and cubes only through
+    the grid channels (entry 18), whose shape does not depend on the slot counts.
+    `brawl_sim/bots/policy.py`: the crate pull reaches 20 tiles at weight 3.0 and an enemy target
+    farther than 8 tiles no longer stops it; the cube pull reaches 12 tiles at weight 4.0 with no
+    enemy gate; both are zeroed where the straight walk crosses a wall or water (`_walk_clear`, a
+    `terrain.march` on `bank.blocks_unit`: `resolve_move` has no pathfinding, and a pull through a
+    wall pinned the bot against it, 41 % of mobile bots' crate-pulled decisions stalled without
+    the gate against 17 % with it) and where the loot lies within a tile of the gas
+    (`_loot_is_safe`, needed once a pull outweighs zone escape); `targeting` adopts the crate
+    pseudo-target while the enemy target is outside attack range, so a bot shoots the crate beside
+    it instead of holding ammo on the walk in. `bots/personality.py`: the crate pull is dropped
+    wherever the cube pull is active, since summed they aim between the two objects and the bot
+    reaches neither. `configs/train.yaml`: `reward.cube_pickup` 0.5 to 1.0. The operator's
+    fallback, granting bots cubes on a clock as the match runs, was not needed and is not built.
+    Found on the way: `tests/test_boxes.py`'s fixture passed its `n_boxes` override to `cfg` but not
+    to the spec `build_params` reads, so every crate-count assertion had been passing off
+    `default.yaml`'s own 8; it now merges the overrides into both.
+
+    **Live consequences.** None for the runs already trained: the loop reads no crate count and
+    the grid is what it was. A run trained on this sim meets the live lobby's cube pressure for
+    the first time; deploy5's 0.17 at elite under it is the number that run has to beat.
+
+    **Cost.** Two extra (N,E) marches per tick (40 and 24 samples) and crate slots 16 to 48, small
+    next to the (N,E,E) visibility pass; the run's fps is the measure.
+
+22. **BUILT 2026-09-25 — the pre-run audit's fixes: loot pulls that replace the personality's
+    steering, a 5-tile crate shot, no dash i-frames, an intent-length throttle, and kill credit
+    through the gas.** A read of the whole sim before the post-deploy5 run, every claim measured
+    with deploy5's `best_model.zip` through `TierEvaluator` at elite under the 1.3× gas, 32
+    episodes per probe on the CPU (`scripts/probes/bot_pull_measure.py` and
+    `scripts/probes/kill_credit_measure.py`; entry 21's `cube_economy_measure.py` for the cube
+    rows). Eight findings went to the operator: five were fixed as decided below and three were
+    settled without a change.
+
+    **Loot pulls summed with the mode terms and froze bots.** `steering.seek` and `flee` return
+    raw `target - pos` and `combine` normalises once, so a summed pull weighed weight × distance
+    against the mode terms and any two pulls rested at a weighted midpoint. Entry 21's pulls
+    (3.0 × 20 tiles, 4.0 × 12) therefore dwarfed everything: campers parked at crates they may
+    not shoot (0.27 of camper time, the longest park 44 s; in a bush 0.60 of the time), engaged
+    bots (enemy target within 8 tiles) were cube-pulled on 0.27 of their decisions, a tenth of
+    those to a cube more than 8 tiles away, and a retreating bot with a cube behind its enemy
+    walked back toward it. Fixed in `bots/policy.py` and `bots/personality.py`: a pull is a unit
+    direction that REPLACES the personality's own steering (`own = 1 - loot_active`; the zone
+    terms are never silenced), and the gates decide when a bot may farm: the crate pull at 20
+    tiles × 3.0 with no enemy target within 8 tiles, the walk clear and the crate a tile inside
+    the gas; the cube pull at 12 tiles × 4.0 under the same 8-tile gate, except that a cube
+    within 2 tiles is grabbed whoever is near (a kill's drop lands there); both pulls are off in
+    RETREAT (with the crate pull live there, past the 8-tile gate, a fleeing bot turned around
+    on 0.60 of those decisions) and in HOLD_STILL; the crate pull is dropped under a live cube
+    pull; CAMPER is never pulled. The operator's rule for the shot: `targeting` adopts a crate
+    as a fire target only within `min(attack_range, 5)` tiles (`_BOX_TARGET_TILES`), never for
+    CAMPER — nearby crates, not every crate in range.
+
+    **The dash had 0.30 s of i-frames the game does not have.** Rule D18/N04, with no footage
+    behind it; the operator: the dash is an animation during which Mortis can be hit. Before the
+    fix 0.40 of all combat damage aimed at the hero landed inside dash i-frames, and because
+    `env._dash_phase` and `_projectile_phase` hand the raw `dmg_by` to the reward, the hero was
+    charged 1.14 per episode for damage it never took. `hero.start_dash` no longer seeds
+    `ent_invuln_t`; the field, the `hero.invuln` slot (always False, kept for shape; the schema
+    and docs/OBSERVATION.md say so), `iframes_block_zone` and `apply_damage`'s mask stay,
+    dormant, and the shadow (`perception/shadow.py`) never seeds `invuln_t` either. Section
+    6.3's countdown bullet, table row and sub-tick table are amended in place.
+
+    **HOLD_STILL bots coasted.** `all_bot_intents` EMA-smooths `move_dir` and `apply_movement`
+    renormalised it, so a zero intent decayed toward zero while the bot walked on at full speed
+    along its old heading: 0.47 of HOLD_STILL ticks moved at hard, about 6 tiles per coast, and
+    campers oscillated through their bushes. `apply_movement` now scales the speed by
+    `clamp(|move_dir|, max 1)`; the hero's unit or zero action is unchanged. After: HOLD_STILL
+    bots displaced more than a quarter tile over an agent step on 0.001 of 10 207 held decisions
+    at hard, 32 episodes (the 0.47 before is per tick, a coarser cut of the same behaviour);
+    deploy5 wins 0.28 at hard under the fixed bots against 0.56 under entry 21's.
+
+    **The gas stole kill credit.** `apply_damage` let the zone (phase 10) overwrite
+    `ent_last_hit_by` on an entity already at 0 HP, phases before `resolve_deaths` reads it, so
+    a bot the hero finished in the gas paid the gas. `took_damage` now requires `ent_hp > 0`.
+    One stolen hero kill in 32 elite episodes before; 0 of 20 credited kills after.
+
+    **Settled without a change.** Crates are walkable in the game too (the operator), so
+    `core/boxes.py` stays as it is and the dash keeps damaging every crate on its path. The
+    curriculum's forced advance at the stage cap stays: the operator wants progression only when
+    the hero earns it and set `advance_win_rate` 0.25 on every gated stage; the 75 M pin in
+    `tests/test_training.py` against the 100 M cap is the operator's to update. The three zone
+    observation differences (before the first shrink `hero_margin_local` is the distance to the
+    map edge in the sim and +10 on every side live; `zone_grid` paints off-map cells as gas from
+    tick 0 where the live plane is zeros until gas is seen; in the gas the sim negates the
+    crossed side and the live loop all four) are recorded here, not changed.
+
+    Before and after (deploy5 `best_model.zip`, elite, 32 episodes, 1.3× gas; "before" is
+    entry 21's bots with the summed pulls):
+
+    | measure | before | after |
+    |---|---|---|
+    | campers in a bush | 0.60 | 0.86 |
+    | camper time parked at a crate (longest park) | 0.27 (44 s) | 0.00 (1 s) |
+    | camper TO_BUSH decisions with a crate pull | 0.78 | 0.00 |
+    | engaged bots (enemy within 8 tiles) with a cube pull | 0.27 | 0.03 |
+    | of those, the cube more than 8 tiles away | 0.10 | 0.01 |
+    | cube-pulled retreat decisions moving toward the enemy | 0.28 | 0.00 |
+    | all retreat decisions moving toward the enemy | not measured | 0.00 |
+    | bots on an unbroken crate, pull live, no fire target | 0.025 | 0.000 |
+    | hero kills the gas took | 1 | 0 |
+    | hero combat damage inside dash i-frames | 0.40 | 0 |
+    | reward charged for blocked hits, per episode | 1.14 | 0 |
+    | deploy5 win rate | 0.25 | 0.06 |
+
+    The cube economy under the fixed bots (entry 21's probe and protocol, 64 elite episodes):
+    richest bot at 60 s 9.7 cubes (7.4 before), 7+ in 0.58 of matches (0.48), killer's cubes
+    4.5 (4.3), the hero's share of cubes 0.12 (0.16), deploy5 win 0.12 (0.17), median hero
+    life 37 s (87 s). deploy5's fall is expected and is not a regression of the sim: it learned
+    to dash through damage that now lands, and the bots reach their loot and keep fighting
+    instead of parking; the next run's own eval is the number that matters.
+
+    **Found on the way.** `tests/test_deployment_assemble.py`'s two parity tests had passed by
+    trajectory luck since C4: the sim ranks every alive projectile by `time_to_closest` and
+    blanks the off-screen ones under the fairness mask (the kept quirk, OBS_PARITY_TASKS.md C4),
+    while the live tracker never holds an off-screen projectile, so in a frame with one the two
+    paths lay their rows out differently. The fixed bots' trajectory reached such frames. The
+    fixture now supplies only on-screen projectiles and both tests skip the projectile group in
+    a frame where the sim holds an off-screen one (the six-step test asserting that at least one
+    frame compared); the sim is unchanged. Entry 21's "41 % of crate-pulled decisions stalled
+    without `_walk_clear`, 17 % with it" counted HUNT_BUSH wall stalls too: about a tenth of
+    crate-pulled decisions stalled, and the gate stays for those. The pull probe reads the
+    "pull live" shares where `bots/policy` produces the weights, before `personality.movement`
+    zeroes them for RETREAT, which is why its RETREAT rows are not zero while the move
+    direction is.
+
+    **Open, undecided, each small alone and none a training blocker.** Hunters wall-grind (no
+    pathfinding, `steering.avoid_walls` unused); trappers deadlock at a bush edge; same-tick
+    double death and same-tick pickup revive; the soft cube cap; bushes inside the zone-avoid
+    band; the max-cube bot pinned; `bots.fight_each_other` never read; the projectile tie order
+    among equal `time_to_closest`; the live loot plane's latency.
+
+    **Live consequences.** None for the runs already trained: the loop reads no bot code, and
+    `hero.invuln` keeps its column in deploy5's spec, now always False on both sides. A run
+    trained on this sim is the first that never had i-frames; the live Mortis never had them
+    either, so that column stops lying.
+
+    **Cost.** One `safe_norm` per movement tick and two RETREAT masks per bot decision, nothing
+    else on the hot path; the run's fps is the measure.
+
+23. **BUILT 2026-09-26 — the auto-aimed attack: attack value 4 under `action.auto_aim`, a dash
+    straight at the nearest enemy or crate in reach, in or out of view.** The lead's call: Mortis
+    has trouble aiming but must still be able to aim sometimes, so the aimed dash along the move
+    bin (value 1) stays and a second attack value is added beside it rather than replacing it;
+    the policy chooses, per decision, which of the two to use.
+
+    **The sim.** `cfg.action_nvec` is `(n_move_bins + 1, 5)` under the flag and
+    `(n_move_bins + 1, 4)` without it; `hist.attack_onehot` and `action_mask.attack` widen with
+    it (`obs_schema`'s `ATTACK` symbol), so the flag is structural: `false` in
+    `configs/default.yaml`, `true` in `configs/train.yaml`'s `env_overrides`, and a run trained
+    before it keeps four in its own frozen train.yaml, which is what `DeployedPolicy.from_run`
+    rebuilds the config from. `hero.decode_action` returns a fifth flag, `auto`, and folds a 4
+    into `fire`, so the ammo, cooldown, reveal, reward and audit paths are value 1's; only
+    `env._attack_phase` reads `auto`, swapping the hero's row of a separate `dash_dir` tensor
+    for `hero.auto_aim_target`'s direction before `hero.start_dash`. `move_dir` itself is never
+    touched, so the walk after the dash and the super still follow the bin. The target rule:
+    nearest by centre distance across alive enemies and unbroken crates, within
+    `dash_distance × long_dash_scale + dash_radius` plus the target's body (`unit_radius`, or the
+    crate's 0.5), visibility ignored on purpose; nothing in reach means no target, and the env
+    falls back to value 1's rule. "Cube" in the lead's brief is read as the crate: a dropped cube
+    is a pickup, not a thing an attack can hit. The mask's fifth column is the attack's own, and
+    `env._held` zeroes the whole attack column on sub-ticks 2..K, so one decision is still one
+    attack.
+
+    **The device.** Value 4 is a bare tap on the attack point (§4.4), the press the 2026-09-15
+    revision removed for value 1 because it let the game redirect a dash the policy had aimed;
+    for value 4 that redirect is the point. `ShadowHero.act(move, attack, aim=)` takes the loop's
+    estimate of the game's target, `DeployLoop._auto_aim`: the nearest enemy track (coasting ones
+    included, the closest thing this side has to an out-of-view enemy) or confirmed crate within
+    `auto_aim_reach_tiles`, the sim's radii read from the same files as `dash_reach_tiles`; None
+    means nothing in reach and the shadow dashes along the bin. The shadow's fifth mask bit is
+    the attack's, `check_spaces` names a flag mismatch in both directions, `TickRow.attack`
+    records the 4 and `scripts/audit_attack_cadence.py` counts it as an attack.
+
+    **What is not claimed.** The game's own priority between an enemy and a crate at equal
+    distance, and its exact reach, are unmeasured; the sim ranks by distance and uses the dash's
+    reach. A hidden target the game picks and the tracker never saw gives one wrong modelled
+    dash direction, corrected by the odometry afterwards. The reward's in-reach term still uses
+    visibility. `scripts/play_manual.py` has no key for value 4.
+
+    **Live consequences.** None for `runs/mortis_ppo-20260925-194025`, the deployment target
+    since 2026-09-26: its frozen train.yaml has no flag, so it loads at four and its shadow's
+    mask stays four wide. The next run trains on the five-wide space; deploy5's extractor takes
+    266 floats under the shipped overrides (263 before).
+
+    **Cost.** One `auto_aim_target` per sim tick, a gather over enemies and crates already in
+    memory; on the device, a loop over the tracks and crates per decision.
 
 ---
 

@@ -99,7 +99,11 @@ def test_apply_damage_hp_clamps_at_zero():
     assert state.ent_hp[0, 0].item() == 0.0
 
 
-def test_dashing_hero_takes_zero_combat_damage_but_full_zone_damage():
+def test_dashing_hero_takes_full_combat_and_zone_damage():
+    """The dash grants no i-frames (the lead, 2026-09-25: it is an attack animation Mortis can
+    be hit throughout). Until then `start_dash` seeded `ent_invuln_t` and this test asserted the
+    combat hit was zeroed. `apply_damage` still honours `ent_invuln_t` (the next test sets it by
+    hand); nothing in the sim seeds it any more."""
     cfg, params = _cfg_and_params()
     state = _fresh_state(cfg, params)
     tiles = _grid(20, 20)
@@ -113,20 +117,61 @@ def test_dashing_hero_takes_zero_combat_damage_but_full_zone_damage():
     move_dir = torch.zeros(1, cfg.n_entities, 2)
     move_dir[0, 0] = torch.tensor([1.0, 0.0])
     hero.start_dash(state, fire, move_dir, bank, params, cfg)
-    assert state.ent_invuln_t[0, 0].item() > 0.0  # sanity: dash grants invuln
+    assert state.ent_dash_t[0, 0].item() > 0.0     # sanity: the dash started...
+    assert state.ent_invuln_t[0, 0].item() == 0.0  # ...and granted nothing
 
     combat_dmg = torch.zeros(1, cfg.n_entities)
     combat_dmg[0, 0] = 500.0
     attacker = torch.full((1, cfg.n_entities), -1, dtype=torch.int64)
     attacker[0, 0] = 1
     combat.apply_damage(state, combat_dmg, int(DeathCause.COMBAT), attacker, params, cfg)
-    assert state.ent_hp[0, 0].item() == 1000.0  # untouched
+    assert state.ent_hp[0, 0].item() == 500.0  # hit mid-dash
+    assert state.ent_last_hit_by[0, 0].item() == 1
 
     zone_dmg = torch.zeros(1, cfg.n_entities)
     zone_dmg[0, 0] = 300.0
     zone_attacker = torch.full((1, cfg.n_entities), -1, dtype=torch.int64)
     combat.apply_damage(state, zone_dmg, int(DeathCause.ZONE), zone_attacker, params, cfg)
-    assert state.ent_hp[0, 0].item() == 700.0  # zone damage still applied
+    assert state.ent_hp[0, 0].item() == 200.0
+
+
+def test_the_gas_does_not_steal_the_finishers_credit():
+    """env.step applies every damage source of a tick (dash, projectiles, then the zone) before
+    one `resolve_deaths`. An entity the hero put at 0 HP is still `ent_alive` when the gas hits
+    it, and until 2026-09-25 that hit rewrote `ent_last_hit_by` to the zone sentinel: a bot
+    finished inside the gas was a zone death, no kill, no credit. Damage to an entity already at
+    0 HP records nothing now. The other order, a wounded entity the gas finishes, still reads as
+    a zone death."""
+    cfg, params = _cfg_and_params()
+    attacker = torch.full((1, cfg.n_entities), -1, dtype=torch.int64)
+    attacker[0, 1] = 0
+    zone_attacker = torch.full((1, cfg.n_entities), -1, dtype=torch.int64)
+    combat_dmg = torch.zeros(1, cfg.n_entities)
+    zone_dmg = torch.zeros(1, cfg.n_entities)
+    zone_dmg[0, 1] = 30.0
+
+    state = _fresh_state(cfg, params)
+    state.ent_hp[0, 1] = 100.0
+    combat_dmg[0, 1] = 150.0  # the hero finishes bot 1...
+    combat.apply_damage(state, combat_dmg, int(DeathCause.COMBAT), attacker, params, cfg)
+    assert state.ent_hp[0, 1].item() == 0.0 and bool(state.ent_alive[0, 1])
+    combat.apply_damage(state, zone_dmg, int(DeathCause.ZONE), zone_attacker, params, cfg)
+    assert state.ent_last_hit_by[0, 1].item() == 0       # ...and keeps the credit through the gas
+    assert state.ent_damage_taken[0, 1].item() == 150.0  # the gas recorded nothing
+    combat.resolve_deaths(state, cfg)
+    assert state.ent_death_cause[0, 1].item() == int(DeathCause.COMBAT)
+    assert state.ent_kills[0, 0].item() == 1
+
+    state = _fresh_state(cfg, params)
+    state.ent_hp[0, 1] = 100.0
+    combat_dmg[0, 1] = 80.0  # the hero only wounds bot 1...
+    combat.apply_damage(state, combat_dmg, int(DeathCause.COMBAT), attacker, params, cfg)
+    combat.apply_damage(state, zone_dmg, int(DeathCause.ZONE), zone_attacker, params, cfg)
+    assert state.ent_hp[0, 1].item() == 0.0
+    assert state.ent_last_hit_by[0, 1].item() == -1      # ...so the gas is the finisher
+    combat.resolve_deaths(state, cfg)
+    assert state.ent_death_cause[0, 1].item() == int(DeathCause.ZONE)
+    assert torch.all(state.ent_kills == 0)
 
 
 def test_iframes_block_zone_when_configured():

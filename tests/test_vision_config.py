@@ -166,6 +166,19 @@ def test_validate_rejects_a_gap_rule_weight_that_withholds_the_vote():
     validate(_cfg(occupancy_gap_rule_weight=1.0))
 
 
+def test_validate_bounds_the_confidence_floor_below_the_lock_ratio():
+    """The floor is for cells the map's design rules forbid, not for cells whose views merely
+    disagree. At or above `lock_ratio` it stops telling them apart: a cell the map is willing to
+    call locked would blank, and every genuinely contested cell blanks with it. 0.0 is the off
+    switch and stays legal."""
+    with pytest.raises(ValueError, match="confidence_floor"):
+        validate(_cfg(occupancy_confidence_floor=0.8, occupancy_lock_ratio=0.8))
+    with pytest.raises(ValueError, match="confidence_floor"):
+        validate(_cfg(occupancy_confidence_floor=-0.1))
+    validate(_cfg(occupancy_confidence_floor=0.0))
+    validate(_cfg(occupancy_confidence_floor=0.5, occupancy_lock_ratio=0.8))
+
+
 # ---------------------------------------------------------------------------
 # Phase 0 packaging invariants
 # ---------------------------------------------------------------------------

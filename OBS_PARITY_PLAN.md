@@ -1,6 +1,9 @@
 # Observation parity: the sim shows the hero only what the camera shows
 
-**Status: rev 3, 2026-09-24.** Nothing here is built. Both §6 decisions are made (the quad; camera
+**Status: rev 3, 2026-09-24; progress 2026-09-25.** Phase 1 is built (C1–C11) and its run
+finished: `mortis_deploy5` passed its offline gates and `configs/deployment.yaml` names it; the
+live session is the lead's. Phase 2 is measured (Z1) and configured for the next run (Z2 adapted,
+Z3); the retrain is Z4. Both §6 decisions are made (the quad; camera
 offset > 2 tiles). Both phases are split into delegable chunks in `OBS_PARITY_TASKS.md` (Phase 1:
 C1–C12 and P1; Phase 2: Z1–Z4), which is the file to build from; where the two disagree the tasks
 file wins (its header lists the three deliberate deviations).
@@ -321,6 +324,10 @@ finite difference.
 
 ## 4. Phase 2 — zone schedule timed from the game
 
+**Status:** measured 2026-09-24 (Z1); configured 2026-09-25 for the next run at 1.3× the game's
+pace in a 185 s episode, as a run setting in `configs/train.yaml` rather than in
+`configs/default.yaml` (Z2, adapted), with the ±10 % overlay; retrain pending (Z4).
+
 *Today.* `zone.start_fraction 0.08` (12 s), `step_seconds 1.5`, `tiles_per_step 1`, all fixed
 scalars, so the rect is a pure function of `time_frac` and the map size.
 
@@ -418,7 +425,10 @@ episodes): at this pace a 150 s episode truncates 30 % of matches before the end
 win can be paid, and a 240 s episode truncates none. So Z2 also needs a 240 s episode, set in the
 new run's recipe rather than in `configs/default.yaml` (old runs name that file by path and would
 silently get a 240 s live `time_frac`); with it, today's `start_fraction 0.08` already gives
-19.2 s. Table and knock-ons in `OBS_PARITY_TASKS.md`, pending decision 3.
+19.2 s. Table and knock-ons in `OBS_PARITY_TASKS.md`, pending decision 3. The lead's call
+(2026-09-25): train at 1.3× the game's pace in a 185 s episode instead, a little shorter than a
+real match (5.0 s per tile, first gas at 14.8 s); the episode-length check at that pace is in the
+tasks file's Status block.
 
 ## 5. Not in this plan
 

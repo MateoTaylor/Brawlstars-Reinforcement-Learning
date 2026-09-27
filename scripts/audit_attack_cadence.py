@@ -200,7 +200,9 @@ def _attacked(row: dict) -> bool:
     # the cooldown, so counting it keeps a super-happy policy from reading as over-conserving.
     # 3 = gadget (SIM_OVERHAUL Step G3) is NOT an attack: it has its own 18 s timer, shares no
     # cooldown and spends no ammo, so a gadget decision is an attack opportunity that was passed up.
-    return row["attack_col"] in (1, 2)
+    # 4 = the auto-aimed dash (`action.auto_aim`, 2026-09-26): the same dash as 1 with a
+    # different direction, so it counts like 1.
+    return row["attack_col"] in (1, 2, 4)
 
 
 def _share(numerator: int, denominator: int) -> float | None:

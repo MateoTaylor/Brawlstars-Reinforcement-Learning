@@ -88,6 +88,12 @@ class EnvConfig:
     action_latency_seconds: float = 0.001
     n_move_bins: int = 16
     dash_on_idle: str = "facing"
+    # A fifth attack value, 4 = auto-aimed attack (the lead, 2026-09-26): the dash goes at the
+    # nearest alive enemy or unbroken crate within the dash's reach, visibility ignored, and
+    # along the move bin (or `facing`) when nothing is in reach. STRUCTURAL: it widens
+    # `action_nvec`, `hist.attack_onehot` and the action mask, so it is a per-run setting in
+    # train.yaml's `env_overrides` and every run trained before it keeps `false`.
+    auto_aim: bool = False
     obs_include_world_grid: bool = True
     obs_include_privileged: bool = True
     # --- observation history (SIM_OVERHAUL_PLAN.md Phase H). The sim keeps the last
@@ -142,10 +148,10 @@ class EnvConfig:
     @property
     def action_nvec(self) -> tuple[int, int]:
         """(move bins + idle, attack). The attack dimension is 4-valued: 0 = nothing, 1 = attack,
-        2 = super (Step D2), 3 = gadget (SIM_OVERHAUL_PLAN.md Step G3, decision S7). Widened
-        rather than joined by a third dimension so the action stays (N,2) -- see
-        core/hero.action_mask."""
-        return (self.n_move_bins + 1, 4)
+        2 = super (Step D2), 3 = gadget (SIM_OVERHAUL_PLAN.md Step G3, decision S7), and 5-valued
+        under `action.auto_aim` with 4 = auto-aimed attack (2026-09-26). Widened rather than
+        joined by a third dimension so the action stays (N,2) -- see core/hero.action_mask."""
+        return (self.n_move_bins + 1, 5 if self.auto_aim else 4)
 
     @property
     def ray_steps(self) -> int:
@@ -286,6 +292,7 @@ _ENV_CONFIG_FIELDS = (
     ("sim.action_latency_seconds", "action_latency_seconds", float),
     ("action.n_move_bins", "n_move_bins", int),
     ("action.dash_on_idle", "dash_on_idle", str),
+    ("action.auto_aim", "auto_aim", bool),
     ("observation.include_world_grid", "obs_include_world_grid", bool),
     ("observation.include_privileged", "obs_include_privileged", bool),
     ("observation.history_frames", "history_frames", int),
@@ -660,6 +667,22 @@ def attack_ray_tiles(spec: dict) -> float:
     )
 
 
+def dash_ray_tiles(spec: dict) -> float:
+    """A STATIC upper bound (in tiles) on how far any dash can go: `dash_distance` times the long
+    dash's `long_dash_multiplier` (floored at 1, as `hero.long_dash_scale` floors it), across
+    every kind and every value its randomization range can produce. Budgets `hero.start_dash`'s
+    body march (`terrain.body_travel`), which otherwise pays the full `cfg.ray_steps` circle
+    tests for a dash of at most 5.34 tiles. Same spec-derived, host-sync-free construction as
+    `cone_ray_tiles`; the curriculum's tier multipliers never touch dash stats.
+    """
+    return max(
+        (_spec_upper(spec.get(kind, {}).get("dash_distance", 0))
+         * max(1.0, _spec_upper(spec.get(kind, {}).get("long_dash_multiplier", 1.0)))
+         for kind in KIND_YAML_NAMES),
+        default=0.0,
+    )
+
+
 class SimParams:
     """Per-env numerics. Every field is a tensor with a leading (N,) dim, even when the
     config value is a scalar -- this keeps downstream code uniform (N08). Per-kind fields are
@@ -681,7 +704,7 @@ class SimParams:
     from cannot change mid-run.
     """
 
-    SCALAR_FIELDS = ("cone_ray_tiles", "attack_ray_tiles")
+    SCALAR_FIELDS = ("cone_ray_tiles", "attack_ray_tiles", "dash_ray_tiles")
 
     __slots__ = (
         tuple(attr for attr, _, _ in PER_KIND_FIELDS)
@@ -738,6 +761,7 @@ def _resolve_all(cfg: EnvConfig, n_envs: int, device, gen: torch.Generator, spec
     # cannot change mid-episode, so there is nothing to resample).
     params.cone_ray_tiles = cone_ray_tiles(spec)
     params.attack_ray_tiles = attack_ray_tiles(spec)
+    params.dash_ray_tiles = dash_ray_tiles(spec)
 
     return params
 

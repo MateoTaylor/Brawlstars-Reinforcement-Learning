@@ -111,14 +111,12 @@ def test_final_observation_holds_the_pre_reset_state_not_the_post_reset_one():
 # ---- randomization: a ranged param varies across envs and resamples on reset via the public API --
 
 def test_randomized_param_varies_across_envs_and_resamples_on_reset():
-    """configs/randomization.yaml ships with every line commented out (its own docstring: a
-    template to uncomment from, not a default). load_randomization(RANDOMIZATION_YAML) on the
-    real file returns {} -- correct, but useless for this test. Uncommenting one of its own
-    real lines by hand (matching tests/test_configs_files.py's own established approach for
-    the same file) proves the end-to-end path works without asserting on a moving/absent
-    default."""
+    """configs/randomization.yaml ships with only the gas jitter active; its per-kind stat lines
+    are commented examples, so the real file cannot show one varying. One of those example lines,
+    written out by hand (matching tests/test_configs_files.py's own established approach for the
+    same file), proves the end-to-end path works without asserting on a moving default."""
     cfg = load_config(CONFIGS_DEFAULT, overrides=CONFIGS_TINY)
-    assert load_randomization(RANDOMIZATION_YAML) == {}  # documents the "ships empty" fact above
+    assert "entities.enemy_hp_mult" not in load_randomization(RANDOMIZATION_YAML)  # see above
     randomization = {"entities.enemy_hp_mult": {"low": 0.8, "high": 1.25, "mode": "additive"}}
 
     env = BrawlVecEnv(cfg, n_envs=64, device="cpu", seed=0, randomization=randomization, verbose=False)

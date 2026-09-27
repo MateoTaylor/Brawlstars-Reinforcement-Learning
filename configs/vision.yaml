@@ -128,6 +128,32 @@ occupancy:                # Phase I
   # cell is never observed and the deploy grid reads UNKNOWN as FLOOR. 1.0 disables the rule.
   # MEASURED 2026-09-22 -- see the sweep table in occupancy.py's docstring.
   gap_rule_weight: 0.1
+  # Below this confidence a cell reports UNKNOWN instead of its winning class -- in the deploy
+  # grid, in the loop's cell lookup and in the offline render alike, because the floor lives in
+  # `OccupancyMap.best` where all three meet. This is what makes the gap rule above visible
+  # rather than merely present: since 2026-09-26 `confidence` divides the winner's votes by the
+  # number of views that could have voted, so a cell every view calls a one-wide passage reads
+  # 0.1 where it used to read 1.0.
+  #
+  # Mind which direction blanking moves a cell. The deploy grid reads UNKNOWN as FLOOR (see the
+  # measured section in brawl_deployment/perception/grid.py), so blanking a cell the classifier
+  # called FLOOR changes nothing there, while blanking one it called WALL makes the policy read
+  # walkable. The gap rule marks the pinched cell AND both its flanks, and the flanks are the
+  # walls -- so a floor above 0 is a decision to forget probable walls around an improbable
+  # corridor, not just to hide the corridor.
+  #
+  # 0.0 = off, and NOT the same as gap_rule_weight: 1.0 -- votes stay weighted either way.
+  #
+  # PROVISIONAL 2026-09-26, chosen from the arithmetic rather than a sweep. With gap_rule_weight
+  # 0.1 a cell pinched in k of its n views reads 1 - 0.9*(k/n), so this blanks exactly the cells
+  # a MAJORITY of views call impossible: 0.5 <=> k/n > 5/9. Transient pinches (motion blur, a
+  # sprite's overhang on one frame) stay, persistent ones go.
+  #
+  # NOT yet measured against the labels, and `vision_score_map.py --confidence-floor` cannot
+  # settle it on its own: a blanked cell leaves MapScore's scored set, so every floor above 0
+  # buys F1 and a lower gap count by declining to answer. Pricing it honestly needs the scorer to
+  # substitute FLOOR for UNKNOWN the way the deploy grid does, which it does not do yet.
+  confidence_floor: 0.5
 
 classifier:               # Phase H
   # MEASURED 2026-09-08 and moved, which is what the previous comment here asked for. It read:

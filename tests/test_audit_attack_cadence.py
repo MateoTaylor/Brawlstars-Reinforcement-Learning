@@ -406,3 +406,16 @@ def test_deployment_rates_come_from_the_repo_configs_from_any_cwd(tmp_path, monk
 
     monkeypatch.chdir(tmp_path)
     assert deployment_rates() == (3, 5, 0.25)
+
+
+def test_an_auto_aimed_dash_is_counted_as_an_attack():
+    """Attack-column value 4 (`action.auto_aim`, 2026-09-26) is the same dash as value 1 with the
+    direction chosen for the policy: it spends the ammo and takes the cooldown, so it counts;
+    the gadget between them still does not."""
+    def row(step, col):
+        return {"env": 0, "step_count": step, "can_attack": True, "attack_cd": 0.0, "dash_t": 0.0,
+                "ammo": 3.0, "long_dash_ready": False, "attack_idle_t": 0.0, "attack_col": col,
+                "enemy_in_reach": True}
+    s = summarize([row(0, 4), row(5, 3), row(10, 1), row(15, 0)])
+    assert s["utilization"] == {"value": pytest.approx(2 / 4), "n_opportunities": 4, "n_taken": 2}
+    assert s["interval_hist"] == {10: 1}

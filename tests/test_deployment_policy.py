@@ -326,7 +326,12 @@ def test_the_real_checkpoint_loads_and_decides_from_an_assembled_observation(run
 
     The zone group comes from the real `ZoneEstimator`, not a hand-written dict. A dict written here
     carried both margin names while the estimator produced one, which is how this test passed for a
-    deploy3 run that could not make its first live decision."""
+    deploy3 run that could not make its first live decision.
+
+    `hero_offset` is passed the way the loop passes `tracked.hero_offset`, drifting past
+    `camera.edge_flag_tiles` over the 30 frames so both values of `hero.near_edge` are assembled.
+    deploy5 reads that field and `assemble` refuses to build it without the offset; this test
+    only met deploy5 once its first checkpoint was written (2026-09-25)."""
     from brawl_deployment.perception.grid import GasMap
     from brawl_deployment.perception.zone import ZoneEstimator
 
@@ -374,6 +379,7 @@ def test_the_real_checkpoint_loads_and_decides_from_an_assembled_observation(run
             history=(),
             grid=rng.integers(0, 2, (len(asm._grid_channels), pol.cfg.view_h, pol.cfg.view_w),
                               dtype=np.uint8),
+            hero_offset=(0.1 * i, 0.0),
         )
         d = pol.act(obs, (True, True, False, False))   # super and gadget masked off throughout
         assert isinstance(d, Decision)
@@ -381,3 +387,47 @@ def test_the_real_checkpoint_loads_and_decides_from_an_assembled_observation(run
         assert d.attack in (0, ATTACK_FIRE)
         supers += d.attack == ATTACK_SUPER
     assert supers == 0
+
+
+# ---- the auto-aimed attack (action.auto_aim, 2026-09-26) --------------------------------------
+
+def test_the_auto_aim_flag_is_the_runs_own_and_the_widths_must_agree():
+    """`action.auto_aim` widens the attack column 4 -> 5. A run trained with it loads under a
+    config that has it (`from_run` builds that config from the run's own train.yaml, overrides
+    included); either mismatch is refused, and the message names the flag rather than leaving
+    "5 != 4" to be decoded at the console."""
+    plain = load_config(CONFIGS)
+    flagged = load_config(CONFIGS, overrides={"action": {"auto_aim": True}})
+    assert tuple(flagged.action_nvec) == (17, 5)
+    spec = obs_select.load_agent_spec(SPEC, plain)
+    spec_f = obs_select.load_agent_spec(SPEC, flagged)
+
+    check_spaces(_StubModel(space=obs_select.agent_space(spec_f, flagged), nvec=(17, 5)),
+                 spec_f, flagged, label="ok")
+    with pytest.raises(ValueError, match="trained without the auto-aimed attack"):
+        check_spaces(_StubModel(space=obs_select.agent_space(spec_f, flagged), nvec=(17, 4)),
+                     spec_f, flagged, label="old")
+    with pytest.raises(ValueError, match="trained with the auto-aimed attack"):
+        check_spaces(_StubModel(space=obs_select.agent_space(spec, plain), nvec=(17, 5)),
+                     spec, plain, label="new")
+
+
+def test_act_builds_a_22_wide_mask_for_a_run_trained_with_auto_aim():
+    """Five legals in, a 22-wide mask out, laid out as `wrappers/sb3_vecenv.py` laid it out in
+    training; the fifth flag is the auto-aimed attack's and the decision carries value 4. Four
+    legals are refused for this run, as five are for a 4-wide one."""
+    cfg = load_config(CONFIGS, overrides={"action": {"auto_aim": True}})
+    spec = obs_select.load_agent_spec(SPEC, cfg)
+    pol = DeployedPolicy(_StubModel((3, 4), nvec=(17, 5)), spec, cfg)
+    obs = {k: np.zeros(v.shape, v.dtype) for k, v in
+           obs_select.agent_space(spec, cfg).spaces.items()}
+    d = pol.act(obs, (True, True, False, True, True))
+    mask = pol.model.seen["mask"]
+    assert mask.shape == (1, 22)
+    assert mask[0, :17].all()
+    assert list(mask[0, 17:]) == [True, True, False, True, True]
+    assert d.attack == 4 and d.legal == (True, True, False, True, True)
+    with pytest.raises(ValueError, match="one flag per attack value"):
+        pol.act(obs, (True, True, False, True))
+    with pytest.raises(ValueError, match="one flag per attack value"):
+        _policy().act(obs, (True, True, False, True, True))

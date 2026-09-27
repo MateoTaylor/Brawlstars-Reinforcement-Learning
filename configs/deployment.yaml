@@ -29,7 +29,15 @@ run:
   # Repointed 2026-09-22 (SIM_OVERHAUL I5). It named the deploy3 run, which is pre-gadget AND was
   # deleted, so a live run would have failed on a missing path and the pre-flight test SKIPPED
   # rather than failing -- see test_deployment_policy.py's dangling-pointer guard.
-  dir: runs/mortis_deploy4-20260921-185945
+  # Repointed 2026-09-25 to deploy5 (OBS_PARITY_TASKS.md C12: its offline gates passed). deploy5
+  # is the first spec that reads `hero.near_edge`, which needs the tracker's player-box offset
+  # (`tracker.PLAYER_BOX_FROM_RING_TILES`) that landed the same day. deploy4 stays playable with
+  # `--run mortis_deploy4-20260921-185945`.
+  # Repointed 2026-09-26 to mortis_ppo, the first run trained on the audited sim (design 9.22:
+  # no dash i-frames, bots that farm, the 1.3x gas). It ended in the expert stage with every
+  # advance forced at the 100M cap; final eval 0.23 at hard, 0.05 at elite, 300 episodes per
+  # tier. deploy5 stays playable with `--run mortis_deploy5`.
+  dir: runs/mortis_ppo-20260925-194025
   checkpoint: best_model.zip
 
 policy:

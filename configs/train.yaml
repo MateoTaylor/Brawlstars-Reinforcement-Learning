@@ -14,8 +14,9 @@
 # DECISION = 5 sim ticks = 0.25s of game time. Every "timesteps"/"steps" number in THIS file is
 # therefore in decisions, and every one of them was divided by 5 when action_repeat went 1 -> 5
 # so the run covers the same amount of simulated game time as before. `sim.max_episode_steps`
-# (3000) stays in SIM TICKS and is the one number that is NOT in this unit -- an episode is 600
-# decisions long. See configs/default.yaml's `sim.action_repeat` comment.
+# (3700 in `env_overrides` below; 3000 in default.yaml) stays in SIM TICKS and is the one number
+# that is NOT in this unit -- an episode here is at most 740 decisions long. See
+# configs/default.yaml's `sim.action_repeat` comment.
 # ---------------------------------------------------------------------------------------------
 
 run:
@@ -23,7 +24,7 @@ run:
   seed: 0
   device: cuda                  # cuda | cpu
   out_dir: runs                 # runs/<name>/{best,checkpoints,tb,train.yaml,curriculum.json}
-  total_timesteps: 450_000_000   # decisions; = 300M sim ticks, the pre-action_repeat budget
+  total_timesteps: 600_000_000   # decisions; = 300M sim ticks, the pre-action_repeat budget
   n_envs: 4096                   # SB3 boundary cost grows with this; 128-1024 is the sane band
   algo: maskable_ppo            # maskable_ppo (uses action_masks) | ppo
 
@@ -41,9 +42,12 @@ run:
   #                                                           (the deployed one) reproduces
   # deploy and deploy2 cannot see cubes, so they also need `--set reward.cube_pickup=0` (below).
   # Each is a different observation width, so none of them is a checkpoint swap.
-  agent_obs: configs/agent_obs_deploy4.yaml
-  randomization: null           # e.g. configs/randomization.yaml -- per-env stat jitter, applied
-                                # on top of (and independently of) the curriculum below
+  agent_obs: configs/agent_obs_deploy5.yaml
+  # Per-env jitter, redrawn at every reset and applied on top of (and independently of) the
+  # curriculum below. The shipped file jitters only the gas schedule, +/-10 % around the values in
+  # `env_overrides` (OBS_PARITY_PLAN.md section 4). Evaluation never applies it: TierEvaluator
+  # builds its env without it, so eval/ scores are at the nominal schedule. null turns it off.
+  randomization: configs/randomization.yaml
   # Nested dict deep-merged onto env_config, e.g.
   #   entities: {n_enemies: 6}
   #   sim: {max_episode_steps: 3000}
@@ -75,10 +79,32 @@ run:
       maps: [open, bushy, skull_creek, feast_or_famine, scorched_stone, island_invasion,
              broken_wall, stone_fort, twin_ponds, cross_creek, narrow_pass,
              dry_gulch, thorn_field, reed_marsh]
+    # THE GAS SCHEDULE AND THE EPISODE LENGTH (OBS_PARITY_TASKS.md pending decision 3, the lead's
+    # call 2026-09-25). Measured from footage (Z1): the game's first gas comes 19 s after the
+    # match starts, then advances one tile per side every ~6.5 s and reaches 2x2 at about 200 s.
+    # default.yaml's 12 s and 1.5 s per tile close the map 4.4x too fast. This run trains at 1.3x
+    # the game's pace, a little shorter than a real match: 5.0 s per tile in a 185 s episode, where
+    # default.yaml's `start_fraction 0.08` puts the first gas at 14.8 s (19 / 1.3 = 14.6).
+    #
+    # The episode length lives HERE, never in default.yaml: runs name default.yaml by path and
+    # brawl_deployment/policy.py rebuilds the live `time_frac` denominator from it plus the run's
+    # own overrides, so editing the default would silently stretch deploy4's and deploy5's live
+    # 150 s. A run started from this file records its 185 s in its own train.yaml. Keep it a
+    # multiple of action_repeat (5).
+    sim:
+      max_episode_steps: 3700     # sim ticks: 185 s, 740 decisions
+    zone:
+      step_seconds: 5.0
+    # The auto-aimed attack (attack value 4, 2026-09-26): the policy may dash straight at the
+    # nearest enemy or crate in reach without aiming, in or out of view, or keep aiming along
+    # the move bin with value 1. Structural (a 5-wide attack column), so it lives here and a
+    # run trained before it keeps default.yaml's `false` in its own frozen train.yaml.
+    action:
+      auto_aim: true
 
   info_mode: episode            # minimal | episode | full. "episode" is the MINIMUM the
                                 # curriculum needs -- it is what carries info["outcome"].
-  checkpoint_every_steps: 5_000_000   # decisions; 0 disables periodic checkpoints. 1/20th the
+  checkpoint_every_steps: 10_000_000   # decisions; 0 disables periodic checkpoints. 1/20th the
                                        # save frequency of the old 200k -- best_model.zip (eval
                                        # callback) and the LR/clip schedules (function of
                                        # total_timesteps) are unaffected by this value.
@@ -95,7 +121,7 @@ ppo:
   ent_coef: 0.005
   vf_coef: 0.5
   max_grad_norm: 0.5
-  target_kl: 0.02               # e.g. 0.02 to early-stop an epoch that moves the policy too far
+  target_kl: 0.025               # e.g. 0.02 to early-stop an epoch that moves the policy too far
   normalize_advantage: true
 
 # Both schedules are functions of SB3's `progress_remaining` (1.0 at the first step -> 0.0 at
@@ -103,12 +129,12 @@ ppo:
 learning_rate:
   schedule: linear
   initial: 2.0e-4
-  final: 1.0e-5
+  final: 5.0e-5
 
 clip_range:
   schedule: linear
   initial: 0.2
-  final: 0.05
+  final: 0.1
 
 policy:
   cnn_output_dim: 160           # BrawlFeaturesExtractor: conv stack over the uint8 grid group
@@ -153,7 +179,12 @@ reward:
   # meet: brawl_sim/training/builder.check_reward_is_observable refuses to build a run that pays
   # this term under a spec that cannot see pickups. Retraining on agent_obs_deploy.yaml or
   # agent_obs_deploy2.yaml therefore needs `--set reward.cube_pickup=0`, and the error says so.
-  cube_pickup: 0.5              # x power cubes the hero collected this tick -- see above
+  # 0.7 since 2026-09-25 (was 0.5): the early game is where cubes are built, and deploy5 learned
+  # to hold the zone edge instead. With every crate spot filled and bots that farm (bots/policy.py
+  # loot constants) the lobby's richest bot holds 7+ cubes by 60 s in half of all matches, and the
+  # hero's win rate at 60 s went 0.17 with 0-1 cubes, 0.42 with 2-3, 0.57 with 4-6. Cubes are
+  # conserved, so the term is bounded by what is on the map, about 25 plus what kills drop.
+  cube_pickup: 0.7              # x power cubes the hero collected this tick -- see above
   survive_per_step: 0.0       # flat, every tick the hero is alive
   in_zone_per_step: -0.05       # flat, every tick the hero is outside the safe rect
   # ADDED 2026-09-21 (SIM_OVERHAUL_PLAN.md §9 R2, operator-approved). x attacks and supers the hero
@@ -180,7 +211,7 @@ reward:
 # Cost PER EVALUATOR -- and with `eval.holdout_maps` set (it is, below) there are TWO, so every
 # figure in this block is paid twice; see the COST note on holdout_maps. One evaluator is
 # one rollout of `len(tiers) * episodes_per_tier` envs, ALL RUN IN PARALLEL, bounded by
-# sim.max_episode_steps ticks (3000) -- that tick cap does NOT scale with episodes_per_tier, since
+# sim.max_episode_steps ticks (3700 with this file's override) -- that tick cap does NOT scale with episodes_per_tier, since
 # raising it only widens the batch, not the number of sequential rounds. This env is built ONCE
 # and held in VRAM for the whole run (TierEvaluator is eager, not rebuilt per eval) -- a permanent
 # memory cost, not just a slower periodic eval. Re-measured 2026-09-21 on an RTX 5070 Ti (17.1GB)
@@ -191,21 +222,21 @@ reward:
 #
 # Worth knowing: `every_timesteps` counts SB3 timesteps, which advance by n_envs (4096) per
 # DECISION -- so 3_000_000 training timesteps is only ~732 decisions (~3660 sim ticks) of training
-# progress. Each eval call can take up to cfg.max_agent_steps (600) decisions of its OWN
+# progress. Each eval call can take up to cfg.max_agent_steps (740 here) decisions of its OWN
 # (separate, wider) batch to finish. Those are different batches ticking independently, but in
 # wall-clock terms a single eval can take longer than the training that happens between two evals,
 # especially early on before episodes end quickly.
 eval:
   enabled: true
-  every_timesteps: 5_000_000      # decisions; = the pre-action_repeat 15M sim ticks. An eval
+  every_timesteps: 20_000_000      # decisions; = the pre-action_repeat 15M sim ticks. An eval
                                   # is TWO rollouts, training maps then holdout_maps below.
                                   # MEASURED 2026-09-21, RTX 5070 Ti, 6 tiers x 300 (1800 envs
                                   # per rollout), untrained policy: 49.3 s and 49.4 s, each
                                   # done in ~200 decisions at ~245 ms per decision. A rollout
                                   # ends when its longest first episode does, bounded by
-                                  # cfg.max_agent_steps (600) decisions, so ~147 s at most.
-                                  # One eval: ~100 s now, up to ~5 min once the policy
-                                  # survives to the time cap. ~92 evals over 450M decisions:
+                                  # cfg.max_agent_steps (740 at the 185 s episode above)
+                                  # decisions, so ~180 s at most. One eval: ~100 s early, up
+                                  # to ~6 min once the policy survives to the time cap. ~92 evals over 450M decisions:
                                   # ~2.5 h to ~7.5 h of the run.
   episodes_per_tier: 300
   tiers: []                     # empty = every tier under curriculum.tiers below
@@ -266,7 +297,7 @@ curriculum:
   min_episodes_at_stage: 2000   # floor before a stage may advance; must not exceed the window
   demote_win_rate: null         # keep null: the first episodes to finish at a new stage are the
                                 # short ones, i.e. early deaths, so a fresh window starts low
-  max_timesteps_at_stage: 75_000_000   # force-advance a stalled stage, so the run always reaches
+  max_timesteps_at_stage: 125_000_000   # force-advance a stalled stage, so the run always reaches
                                        # elite: worst case it gets there at 300M of 450M
 
   # Multipliers on the brawlers.yaml base value, applied to bot kinds only (never the hero).
@@ -366,16 +397,16 @@ curriculum:
   stages:
     - name: hard_intro          # where the old walk's fourth stage was
       tier_weights: {medium: 0.3, hard: 0.7}
-      advance_win_rate: 0.35
+      advance_win_rate: 0.15
     - name: veteran_intro
       tier_weights: {hard: 0.6, veteran: 0.4}
-      advance_win_rate: 0.35
+      advance_win_rate: 0.15
     - name: veteran
       tier_weights: {hard: 0.3, veteran: 0.5, expert: 0.2}
-      advance_win_rate: 0.35
+      advance_win_rate: 0.15
     - name: expert
       tier_weights: {hard: 0.1, veteran: 0.3, expert: 0.4, elite: 0.2}
-      advance_win_rate: 0.35
+      advance_win_rate: 0.15
     - name: elite               # terminal; 10% hard is the old terminal's anti-overfitting share
       tier_weights: {hard: 0.1, veteran: 0.15, expert: 0.25, elite: 0.5}
       advance_win_rate: null

@@ -336,13 +336,13 @@ class BrawlVecEnv:
         just no longer has these 15 calls written out inline."""
         effective_action = self._pop_action_buffer(action)
         regen_healed = self._tick_timers()
-        hero_move_dir, hero_fire, hero_super, hero_gadget = self._decode(effective_action)
+        hero_move_dir, hero_fire, hero_super, hero_gadget, hero_auto = self._decode(effective_action)
         move_dir, fire, super_fire, gadget_fire, aim_dir, aim_point, vis = self._bot_phase(
             hero_move_dir, hero_fire, hero_super, hero_gadget)
         move_dir, fire = self._override_phase(move_dir, fire, override)
 
         dmg_by_melee, melee_healed, attack_in_reach = self._attack_phase(
-            move_dir, fire, super_fire, aim_dir, aim_point, gadget_fire, vis)
+            move_dir, fire, super_fire, aim_dir, aim_point, gadget_fire, vis, hero_auto=hero_auto)
         self._movement_phase(move_dir)
         dmg_by_dash = self._dash_phase()
         dmg_by_proj, super_healed, proj_charge_hit = self._projectile_phase()
@@ -594,8 +594,14 @@ class BrawlVecEnv:
     # -- Section 4 phase 6 --
     def _attack_phase(self, move_dir: torch.Tensor, fire: torch.Tensor,
                       super_fire: torch.Tensor, aim_dir: torch.Tensor, aim_point: torch.Tensor,
-                      gadget_fire: torch.Tensor, vis: torch.Tensor):
+                      gadget_fire: torch.Tensor, vis: torch.Tensor,
+                      hero_auto: torch.Tensor | None = None):
         """consume ammo; START DASH (clip path now); spawn volleys; throw gadgets; melee hitscan.
+
+        `hero_auto` is the (N,) bool `hero.decode_action` returns for attack value 4 (the
+        auto-aimed attack, `cfg.auto_aim`); `None` means no row asked for it, which is what the
+        direct callers in tests pass by omission. It only changes the HERO's dash direction, see
+        the swap before `hero.start_dash` below; `fire` already carries the attack itself.
 
         `gadget_fire` is (N,E) bool and `vis` the fair (N,E,E) visibility `_bot_phase` computed
         this tick (Step G3) -- the gadget spinner homes on the nearest enemy its thrower can SEE.
@@ -657,7 +663,21 @@ class BrawlVecEnv:
             state.ent_alive[:, 1:] & vis[:, 0, 1:] & (enemy_dist <= hero_reach.unsqueeze(-1))
         ).any(dim=-1)
 
-        hero.start_dash(state, fire, move_dir, bank, params, cfg)
+        # The auto-aimed attack (attack value 4, `cfg.auto_aim`; the lead, 2026-09-26): on the
+        # rows that asked for it AND have a target in reach, the hero's dash goes straight at
+        # `hero.auto_aim_target`'s nearest enemy-or-crate instead of along the move bin; with
+        # nothing in reach the row keeps the ordinary rule below (move bin, or facing when
+        # idle), like a bare tap in the game with nothing near. A SEPARATE tensor for the dash:
+        # `move_dir` is read again by `spawn_supers` and by `_movement_phase`, and the hero's
+        # walk must not bend toward the target.
+        dash_dir = move_dir
+        if hero_auto is not None and cfg.auto_aim:
+            auto_dir, has_target = hero.auto_aim_target(state, params, cfg)
+            swap = (hero_auto & has_target).unsqueeze(-1)                       # (N,1)
+            hero_dir = torch.where(swap, auto_dir, move_dir[:, 0])
+            dash_dir = torch.cat([hero_dir.unsqueeze(1), move_dir[:, 1:]], dim=1)
+
+        hero.start_dash(state, fire, dash_dir, bank, params, cfg)
 
         # Attacking breaks concealment (Step 41). `perception.reveal_after_attack` has been a
         # SimParams field since Step 3 and is read by bots/perception.visibility, but nothing ever
