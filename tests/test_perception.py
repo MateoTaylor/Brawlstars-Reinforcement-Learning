@@ -121,7 +121,7 @@ def test_wall_never_blocks_visibility_but_blocks_raw_los():
 
 
 def test_target_los_matches_the_raw_los_column_it_replaced():
-    """bot_overhaul.md Step A2: the bot phase swapped an (N,E,E) `raw_los` -- of which
+    """The bot phase swapped an (N,E,E) `raw_los` -- of which
     bots/policy.targeting read exactly one column -- for an (N,E) `target_los`. This pins that
     they agree on every row whose answer is actually consumed.
 
@@ -263,16 +263,6 @@ def test_select_target_drops_a_target_that_walks_out_of_sight():
     assert state.ent_target[0, 1].item() == -1  # dropped, not held
 
 
-# ---- team_id --------------------------------------------------------------------
-
-def test_team_id_matches_kind():
-    cfg, params = _cfg_and_params()
-    state = _fresh_state(cfg, params)
-    tid = perception.team_id(state.ent_kind, cfg)
-    assert torch.equal(tid, state.ent_kind)
-    assert tid is not state.ent_kind  # defensive clone, not an alias
-
-
 # ---- select_target (acceptance: no oscillation) -----------------------------
 
 def test_select_target_picks_nearest_visible():
@@ -343,43 +333,6 @@ def test_select_target_no_candidate_gives_negative_one():
     assert state.ent_target[0, 0].item() == -1
 
 
-# ---- incoming_threat --------------------------------------------------------------
-
-def test_incoming_threat_points_away_from_approaching_projectile():
-    cfg, params = _cfg_and_params()
-    state = _fresh_state(cfg, params)
-    state.ent_pos[0, 0] = torch.tensor([10.0, 10.0])
-
-    state.prj_alive[0, 0] = True
-    state.prj_owner[0, 0] = 1  # not entity 0
-    state.prj_pos[0, 0] = torch.tensor([5.0, 10.0])
-    state.prj_vel[0, 0] = torch.tensor([1.0, 0.0])  # heading straight at entity 0
-
-    threat = perception.incoming_threat(state, params, cfg)
-    assert threat[0, 0, 0].item() > 0.0  # points from the projectile (west) toward the hero (east)
-
-
-def test_incoming_threat_ignores_own_projectiles():
-    cfg, params = _cfg_and_params()
-    state = _fresh_state(cfg, params)
-    state.ent_pos[0, 0] = torch.tensor([10.0, 10.0])
-    state.prj_alive[0, 0] = True
-    state.prj_owner[0, 0] = 0  # entity 0's own shot
-    state.prj_pos[0, 0] = torch.tensor([5.0, 10.0])
-    state.prj_vel[0, 0] = torch.tensor([1.0, 0.0])
-
-    threat = perception.incoming_threat(state, params, cfg)
-    assert torch.allclose(threat[0, 0], torch.zeros(2))
-
-
-def test_incoming_threat_no_projectiles_is_zero():
-    cfg, params = _cfg_and_params()
-    state = _fresh_state(cfg, params)
-    threat = perception.incoming_threat(state, params, cfg)
-    assert torch.allclose(threat, torch.zeros_like(threat))
-    assert not torch.any(torch.isnan(threat))
-
-
 # ---- nearest_alive --------------------------------------------------------------
 
 def test_nearest_alive_basic():
@@ -400,7 +353,7 @@ def test_nearest_alive_skips_dead_points():
     assert abs(dist[0, 0].item() - 2.0) < 1e-4
 
 
-# ---- in_zone / nearest_safe_point --------------------------------------------------
+# ---- in_zone -----------------------------------------------------------------------
 
 def test_in_zone_outside_rect_is_true():
     zone_lo = torch.tensor([[5.0, 5.0]])
@@ -409,22 +362,6 @@ def test_in_zone_outside_rect_is_true():
     outside = torch.tensor([[20.0, 10.0]])
     assert not bool(perception.in_zone(inside, zone_lo, zone_hi)[0])
     assert bool(perception.in_zone(outside, zone_lo, zone_hi)[0])
-
-
-def test_nearest_safe_point_clamps_into_rect():
-    zone_lo = torch.tensor([[5.0, 5.0]])
-    zone_hi = torch.tensor([[15.0, 15.0]])
-    pos = torch.tensor([[20.0, 2.0]])
-    nearest = perception.nearest_safe_point(pos, zone_lo, zone_hi)
-    assert torch.allclose(nearest, torch.tensor([[15.0, 5.0]]))
-
-
-def test_nearest_safe_point_inside_rect_is_unchanged():
-    zone_lo = torch.tensor([[5.0, 5.0]])
-    zone_hi = torch.tensor([[15.0, 15.0]])
-    pos = torch.tensor([[10.0, 12.0]])
-    nearest = perception.nearest_safe_point(pos, zone_lo, zone_hi)
-    assert torch.allclose(nearest, pos)
 
 
 # ---- zone_clearance -----------------------------------------------------------------
@@ -636,16 +573,13 @@ def test_batched_smoke():
     vis = perception.visibility(state, bank, params, cfg)
     los = perception.raw_los(state, bank, cfg)
     perception.select_target(state, vis, params, cfg)
-    threat = perception.incoming_threat(state, params, cfg)
 
     assert vis.shape == (4, cfg.n_entities, cfg.n_entities)
     assert los.shape == (4, cfg.n_entities, cfg.n_entities)
     assert state.ent_target.shape == (4, cfg.n_entities)
-    assert threat.shape == (4, cfg.n_entities, 2)
-    assert not torch.any(torch.isnan(threat))
 
 
-# ---- select_target: hero focus (SIM_OVERHAUL_PLAN.md Step B2) ---------------------------------
+# ---- select_target: hero focus ----------------------------------------------------------------
 #
 # Every case pins a literal target slot for a bot observer (slot 1) on a 40x40 map with THREE
 # entities, so no zero-initialized extra entity sits at (0,0) inside the 14-tile bot sight limit.

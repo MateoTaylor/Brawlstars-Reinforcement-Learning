@@ -1,84 +1,18 @@
-"""BotIntent, the building blocks every archetype (Steps 17-20) shares, and the dispatcher
-that combines their outputs by kind (`all_bot_intents`, Step 21). See BRAWL_SIM_BUILD_PLAN.md
-Steps 17-20's shared preamble, whose "Shared rules" paragraph names this file as home for both.
+"""The bot phase's shared layer: `all_bot_intents`, the per-tick entry point env._bot_phase calls,
+and the pieces bots/combat_rules.py (how a bot SHOOTS, by kind) and bots/personality.py (how it
+MOVES, by personality) share: `BotIntent`, `Targeting`/`targeting()` (the effective aim target,
+once per tick), `fire_gate`, the zone and loot (direction, weight) contributions for
+`steering.combine`, and small gather/zone helpers.
 
-**Step 41 split combat from movement.** An archetype (`Kind`) now decides only how an entity
-SHOOTS -- `combat()` in bots/combat_rules.py, returning fire/aim only -- and a personality
-(`Person`, drawn independently per entity per reset) decides how it MOVES, in
-bots/personality.py. Before this split, movement flavor was baked into each archetype's
-`policy()`, which had two consequences worth recording:
-  - Every archetype with no visible target converged on the SAME place (melee patrolled to the
-    zone rect's center; artillery hugged cover; sniper/rifle held range on nobody), so a lobby of
-    bots reliably collapsed into one scrum. An agent could farm that by sitting in a bush and
-    letting the scrum resolve itself -- the exact degenerate policy this rewrite exists to break.
-  - Movement is also where all the expensive work lives (tile scans, LOS probes), and computing
-    it per-archetype meant paying for it 4x and throwing 3 away. It is now computed ONCE for all
-    (N,E) entities regardless of archetype or personality.
+`targeting()` also resolves the loot-box PSEUDO-TARGET (`cfg.bots_attack_boxes`), which is what
+makes the user's rule "rush attacks lootboxes" real. Boxes go through the same bundle, so every
+kind's fire rule applies to them unchanged (a cone swinger still needs the box inside its cone).
 
-**Step E1 then collapsed the four archetype modules into one.** Fire/aim used to be computed by
-four separate `combat()` functions -- one per Kind, each run over all (N,E) entities with three of
-the four results discarded -- and is now a single data-driven rule reading five per-kind fields off
-SimParams (bots/combat_rules.py). Nothing about WHEN each brawler shoots changed; what changed is
-that adding a sixth costs a configs/brawlers.yaml block instead of a fifth Python module and three
-edits in this file.
-
-Shared rules implemented here:
-  - `BotIntent`: the (N,E)-batched return value of `all_bot_intents`.
-  - `Targeting` / `targeting()`: one bundle carrying the effective aim target, its distance, and
-    physical LOS to it, computed ONCE per tick (`raw_los` used to be computed twice -- once by
-    the sniper rule and again by the rifle rule -- for the same answer). Since Step A2 that LOS
-    is `perception.target_los`, an (N,E) per-entity ray, rather than the (N,E,E) all-pairs matrix
-    this file used to build and then read a single column out of. It also resolves the loot-box
-    PSEUDO-TARGET: with `cfg.bots_attack_boxes`, an entity with no visible enemy adopts the
-    nearest in-range box as its aim target, which is what makes the user-specified "rush attacks
-    lootboxes" real. Feeding it through the same bundle rather than special-casing it means every
-    archetype's existing fire logic applies to boxes unchanged -- melee still needs the box inside
-    its swing cone, artillery still needs no LOS to it, rifle still holds fire past
-    `fire_range_fraction` of its range.
-  - `fire_gate`: `alive & ammo>=1 & attack_cd<=0 & react_t<=0 & has_target & dist<=attack_range`.
-    bots/combat_rules ANDs each kind's own conditions on top (LOS, range fraction, swing cone,
-    lateral hold). AIM is not here: after Step E1 there is exactly one caller, and its three aim
-    models share a `geo.lead_target` solve that splitting them across two modules would run
-    twice.
-  - `zone_contribution` / `zone_avoid_contribution` / `box_contribution` / `cube_contribution`:
-    (direction, weight) pairs ready to hand straight to `steering.combine`. Universal -- they
-    apply to every archetype AND every personality.
-  - `Targeting.desired_range`: each archetype's preferred engagement distance, consumed only by
-    the movement layer (bots/personality.py's RANGE mode). Was `RANGE_FRACTION_BY_KIND`, a Python
-    tuple indexed by Kind carrying an `assert len(...) == N_KINDS`; Step E1 made it the per-kind
-    `desired_range_fraction` param, so a sixth brawler no longer trips that assert. Since
-    2026-09-21 it is capped at `Targeting.fire_reach`, which the movement layer also uses as the
-    seek edge, so no KITE bot holds or parks with its target outside its own fire range.
-
-Two decisions filled in beyond the plan's literal text:
-  - `bots_avoid_zone` gates `zone_contribution` the same way `bots_break_boxes` /
-    `bots_collect_cubes` gate their contributions. The Steps 17-20 preamble's "zone escape
-    weight 3.0 when in_zone" line doesn't repeat the toggle name the way the box/cube lines do,
-    but D14 lists fleeing the zone as toggleable exactly like the other two, and EnvConfig
-    already carries `bots_avoid_zone` for it (Step 3) -- the omission reads as brevity, not an
-    intentional exception.
-  - `zone_contribution` treats a degenerate zone rect (`zone_hi <= zone_lo` on either axis) as
-    "no zone active" rather than trusting `state.zone_lo`/`zone_hi` outright. Before
-    `core/zone.py`'s `init_zone` (Step 23) ever runs, those fields sit at `allocate()`'s
-    zero-init -- (0,0)-(0,0) -- which is a zero-area rect, not the full-map "everything is
-    safe" rect a real reset will produce. Guarding on rect area keeps every archetype's zone
-    steering well-defined today and costs nothing once Step 23 lands (a freshly-reset env's
-    zone_lo/zone_hi legitimately spans the whole map, which independently yields `in_zone`
-    False everywhere too).
-  - Box/cube approach weights were 1.0 until 2026-09-25, matching the personality-neutral
-    baseline `seek` weight (the plan gives an exact weight for zone escape, 3.0, but not for
-    these two). They are now 3.0 and 4.0 because a bot that only farmed when nothing else
-    pulled it never caught up with the live game's bots. Both pulls are UNIT directions, and
-    bots/personality.movement silences the personality's own steering terms while one is
-    active, so the weights only ever compete with the zone terms. The first version of the
-    stronger pulls returned `steering.seek`'s raw `target - pos` and was summed with the mode
-    terms; `steering.combine` normalises once, so a pull weighed weight x distance and any two
-    summed pulls rested at a weighted midpoint -- campers parked at crates they may not shoot,
-    retreating bots walked back toward the enemy for a cube behind it. See the constants below
-    and `box_contribution` / `cube_contribution` for the gates that make the pulls safe.
-  - `strafe_sign` moved here from the melee archetype once Step 20 (rifle) needed the identical
-    alternating-by-slot pattern -- promoted on second use, same as `projectiles.alloc_slots`/
-    `_set_scalar`/`_set_vec2` were promoted for `combat.py` to reuse in Step 14.
+Loot pulls (user decision, 2026-09-25): the crate and cube pulls are UNIT directions that REPLACE
+the personality's steering (bots/personality.movement), so their weights only compete with the
+zone terms. They need no enemy target within _LOOT_ENEMY_FAR_TILES (a cube at the feet is
+exempt), a clear walk, and loot out of the gas; they are off in RETREAT and HOLD_STILL, never pull
+a CAMPER to a crate, and a bot shoots a crate only within _BOX_TARGET_TILES.
 """
 from dataclasses import dataclass
 
@@ -91,15 +25,12 @@ from ..core import terrain
 from . import perception
 from . import steering
 
-# Loot farming (2026-09-25). Live bots farm: a lobby's richest bot holds 7+ cubes by mid-match.
-# At the old pulls (10 tiles and 1.0 for crates, 8 tiles, 1.0 and no enemy within 6 tiles for
-# cubes) the richest sim bot held about 3 at 60 s even with every crate spot filled, and the hero
-# collected 39 % of all cubes picked up. These values, with the walk and zone gates below and the
-# cube-first rule in bots/personality.movement, were measured with deploy5 at elite under the
-# 1.3x gas: richest bot 7.4 at 60 s, 7+ in half the matches. See box_contribution.
+# Loot farming (user decision, 2026-09-25). Live bots farm: a lobby's richest bot holds 7+ cubes
+# by mid-match. These pulls, with the walk and zone gates below and the cube-first rule in
+# bots/personality.movement, are sized to reproduce that (measurements: BRAWL_SIM_DESIGN.md §7).
 _BOX_APPROACH_RADIUS = 20.0
 _BOX_APPROACH_WEIGHT = 3.0
-_BOX_TARGET_TILES = 5.0         # a bot SHOOTS a crate only this close (the lead, 2026-09-25):
+_BOX_TARGET_TILES = 5.0         # a bot SHOOTS a crate only this close (user decision, 2026-09-25):
                                 # live bots break the crate beside them, not one across the map
 _LOOT_ENEMY_FAR_TILES = 8.0     # an enemy target farther than this does not stop a loot pull
 _CUBE_COLLECT_RADIUS = 12.0
@@ -108,32 +39,31 @@ _CUBE_AT_FEET_TILES = 2.0       # a cube this close is grabbed whoever is near (
 _LOOT_ZONE_MARGIN_TILES = 1.0   # loot this close to the gas, or in it, pulls no one
 _ZONE_ESCAPE_WEIGHT = 3.0
 _ZONE_AVOID_WEIGHT = 2.0
-# SIM_OVERHAUL_PLAN.md Step B3.2: bounds on the KITE hold-distance multiplier 1 / aggression.
+# Bounds on the KITE hold-distance multiplier 1 / aggression (see targeting).
 _HOLD_SCALE_MIN = 0.6
 _HOLD_SCALE_MAX = 1.4
 
 @dataclass
 class BotIntent:
-    move_dir: torch.Tensor    # (N,E,2) unnormalized
+    move_dir: torch.Tensor    # (N,E,2) length <= 1 (EMA-smoothed; the length is a speed throttle)
     fire: torch.Tensor        # (N,E) bool
-    # (N,E) bool -- fire this entity's SUPER. All-False today: no bot kind sets
-    # `super_charge_hits`, so `hero.super_ready` is False for every one of them. The field exists
-    # so that giving a bot a super is a brawlers.yaml block plus a decision in its combat rule,
-    # rather than re-plumbing env._bot_phase -> _attack_phase (bot_overhaul.md D2).
+    # (N,E) bool -- fire this entity's SUPER. All-False: no bot kind has a super
+    # (`super_charge_hits` 0). The field keeps env._bot_phase -> _attack_phase plumbed, so a bot
+    # super needs a brawlers.yaml block and a combat-rule decision, not new plumbing.
     super_fire: torch.Tensor
     aim_dir: torch.Tensor     # (N,E,2) unit
     aim_point: torch.Tensor   # (N,E,2)
-    mode: torch.Tensor        # (N,E) i64 personality.Mode -- diagnostics/rendering only
+    mode: torch.Tensor        # (N,E) i64 personality.Mode -- diagnostics only
 
 
 @dataclass
 class Targeting:
     """One tick's resolved aim target for every (N,E) entity. `has_enemy`/`enemy_*` describe the
     visible ENTITY target (state.ent_target, sticky, chosen by perception.select_target);
-    `pos`/`vel`/`dist`/`los`/`has_target` describe the EFFECTIVE aim target, which is that enemy
-    when there is one within attack range and otherwise the nearest in-range loot box (`is_box`).
-    Movement steers off `has_enemy`/`enemy_pos` -- a bot does not chase a box the way it chases
-    a player, it just shoots one it happens to be standing near -- while fire/aim use the
+    `pos`/`vel`/`dist`/`los`/`has_target` describe the EFFECTIVE aim target: that enemy, or the
+    nearest crate (`is_box`) within min(attack_range, _BOX_TARGET_TILES) when the bot has no
+    enemy inside its attack range (never for a CAMPER). Enemy-relative movement steers off
+    `has_enemy`/`enemy_pos`, the crate pull is box_contribution's, and fire/aim use the
     effective target."""
     idx: torch.Tensor          # (N,E) i64 entity index, clamped; meaningless where ~has_enemy
     has_enemy: torch.Tensor    # (N,E) bool
@@ -146,7 +76,7 @@ class Targeting:
     is_box: torch.Tensor       # (N,E) bool
     los: torch.Tensor          # (N,E) bool physical wall LOS to the effective target
     seen_by_other: torch.Tensor  # (N,E) bool -- does ANY other entity see me? (Camper's gate)
-    desired_range: torch.Tensor  # (N,E) archetype's preferred distance, in tiles, <= fire_reach
+    desired_range: torch.Tensor  # (N,E) kind's preferred distance, in tiles, <= fire_reach
     fire_reach: torch.Tensor     # (N,E) tiles: fire_range_fraction (0 read as 1.0) x attack_range
 
 
@@ -173,8 +103,8 @@ def gather_rows(source: torch.Tensor, idx: torch.Tensor) -> torch.Tensor:
 
 def target_info(state):
     """Returns (target_idx_safe, has_target, target_pos, target_vel) -- ent_target clamped to
-    a valid (if meaningless where invalid) index, plus its gathered position/velocity. Every
-    archetype needs this; callers gate on has_target before trusting target_pos/target_vel."""
+    a valid (if meaningless where invalid) index, plus its gathered position/velocity. Callers
+    gate on has_target before trusting target_pos/target_vel."""
     has_target = state.ent_target >= 0
     target_idx_safe = torch.clamp(state.ent_target, min=0)
     target_pos = gather_rows(state.ent_pos, target_idx_safe)
@@ -183,30 +113,18 @@ def target_info(state):
 
 
 def targeting(state, vis: torch.Tensor, los: torch.Tensor, bank, params, cfg) -> Targeting:
-    """Resolves every (N,E) entity's effective aim target. Reads `state.ent_target` -- so
-    perception.select_target must already have run this tick -- plus `vis`, the dense (N,E,E)
-    bush-only visibility matrix, and `los`, an **(N,E)** per-entity physical LOS to that entity's
-    own target (bots/perception.target_los; walls-only, see bots/perception.py's module docstring
-    on why visibility and LOS are different questions).
+    """Resolves every (N,E) entity's effective aim target. Reads `state.ent_target` (so
+    perception.select_target must already have run this tick), `vis` (the (N,E,E) bush-only
+    visibility) and `los` (the **(N,E)** wall LOS to each entity's own target,
+    bots/perception.target_los).
 
-    **`los` used to be the full (N,E,E) `raw_los` matrix, of which this function read exactly one
-    column** (`torch.gather(los, 2, idx)` -- LOS to the entity's own target) and discarded the
-    rest. Step A2 pushed that gather up into `target_los`, which computes only the (N,E) rays that
-    were ever going to be read.
-
-    The loot-box pseudo-target is gated on `cfg.bots_attack_boxes` AND on the personality: a
-    CAMPER shoots nothing it isn't already committed to (its whole behavior is to stay hidden),
-    so it never adopts a box. Every other personality does, which is what stops the hero from
-    having uncontested access to every cube on the map -- previously bots only ever broke boxes by
-    accident, with stray shots aimed at each other, since fire_gate has always required an ENTITY
-    target.
-
-    Since 2026-09-25 an enemy target OUTSIDE the bot's own attack range does not block the box:
-    the bot could not have fired at that enemy this tick anyway (fire_gate's `dist <=
-    attack_range`), so it shoots the crate it is standing next to instead of holding its ammo
-    while it walks. "Next to" is literal: the crate must be within _BOX_TARGET_TILES (or the
-    attack range, if shorter). `has_enemy`/`enemy_pos` are unchanged, so movement still closes
-    on the enemy."""
+    The loot-box pseudo-target needs `cfg.bots_attack_boxes` and is never adopted by a CAMPER
+    (its whole behavior is to stay hidden); every other personality adopts one, so the hero does
+    not get uncontested access to every cube on the map. An enemy target OUTSIDE the bot's own
+    attack range does not block the box: the bot could not have fired at it this tick anyway
+    (fire_gate's `dist <= attack_range`), so it shoots the crate beside it instead of holding its
+    ammo while it walks. `has_enemy`/`enemy_pos` are unchanged, so movement still closes on the
+    enemy."""
     idx, has_enemy, enemy_pos, enemy_vel = target_info(state)
     E = state.ent_pos.shape[1]
     device = state.ent_pos.device
@@ -218,19 +136,17 @@ def targeting(state, vis: torch.Tensor, los: torch.Tensor, bank, params, cfg) ->
     seen_by_other = (vis & not_self).any(dim=1)
 
     attack_range = stats.gather_kind(params.attack_range, state.ent_kind)
-    # Step B3.2: the KITE hold distance scales by clamp(1 / aggression, 0.6, 1.4) -- an aggressive
-    # kiter holds closer, a timid one farther. `aggression_of` reads 0 as 1.0, so a partial spec
-    # without the key holds exactly `desired_range_fraction * attack_range` as before.
+    # The KITE hold distance scales by clamp(1 / aggression, 0.6, 1.4): an aggressive kiter holds
+    # closer, a timid one farther. `aggression_of` reads 0 as 1.0, so a spec without the key holds
+    # exactly `desired_range_fraction * attack_range`.
     hold_scale = torch.clamp(
         1.0 / stats.aggression_of(state.ent_kind, params), _HOLD_SCALE_MIN, _HOLD_SCALE_MAX,
     )
-    # ... and never past the bot's own fire reach (operator, 2026-09-21): uncapped, 1.4 x 6.8 put
-    # an easy Brock's hold at 9.52 tiles against an 8.0-tile rocket. The reach is
-    # combat_rules.combat's own `range_ok` bound, so the cap and the fire gate cannot disagree about
-    # where a bot can shoot. bots/personality.py passes the same reach to steering.maintain_range
-    # as the SEEK edge, because that edge is where an approaching kiter parks, and hold +
-    # RANGE_DEADBAND was outside the reach for every easy and medium kind, the hard Brock, Shelly
-    # and Buzz, and Edgar at every tier.
+    # ... and never past the bot's own fire reach (user decision, 2026-09-21). The reach is
+    # combat_rules.combat's own `range_ok` bound, so the cap and the fire gate cannot disagree
+    # about where a bot can shoot. bots/personality.movement passes the same reach to
+    # steering.maintain_range as the SEEK edge, because that edge is where an approaching kiter
+    # parks.
     fire_fraction = stats.gather_kind(params.fire_range_fraction, state.ent_kind)
     fire_reach = torch.where(fire_fraction > 0, fire_fraction,
                              torch.ones_like(fire_fraction)) * attack_range
@@ -242,9 +158,7 @@ def targeting(state, vis: torch.Tensor, los: torch.Tensor, bank, params, cfg) ->
         # range test rejects it -- no separate "does this env have any boxes left" check needed.
         #
         # A crate is a target only within _BOX_TARGET_TILES, or the bot's own attack range if
-        # that is shorter (the lead, 2026-09-25). At full range a Brock shot every crate within 8
-        # tiles, and with an enemy in sight 43 % of the crate shots were fired at crates the bot
-        # was not even walking to; the live bots break the crate beside them.
+        # that is shorter (user decision, 2026-09-25): live bots break the crate beside them.
         enemy_far = has_enemy & (geo.dist(state.ent_pos, enemy_pos) > attack_range)
         crate_reach = torch.clamp(attack_range, max=_BOX_TARGET_TILES)
         is_box = (
@@ -262,8 +176,8 @@ def targeting(state, vis: torch.Tensor, los: torch.Tensor, bank, params, cfg) ->
     # (bots/perception.target_los), and a box gets its own single (N,E) march.
     #
     # The box march is bounded by `params.attack_ray_tiles` for the same reason
-    # combat.melee_hitscan bounds its cone march (Step A1): a box further away than the shooter's
-    # own attack_range is rejected by fire_gate's `dist <= attack_range` term, so a shortened ray
+    # combat.melee_hitscan bounds its cone march: a box further away than the shooter's own
+    # attack_range is rejected by fire_gate's `dist <= attack_range` term, so a shortened ray
     # giving that box a wrong LOS answer cannot change any fire decision.
     los_enemy = los
     if cfg.bots_attack_boxes:
@@ -288,7 +202,7 @@ def targeting(state, vis: torch.Tensor, los: torch.Tensor, bank, params, cfg) ->
 
 def fire_gate(state, target_dist: torch.Tensor, has_target: torch.Tensor, attack_range: torch.Tensor) -> torch.Tensor:
     """(N,E) bool: alive & ammo>=1 & attack_cd<=0 & react_t<=0 & has_target & dist<=range.
-    Decision-period gating (Step 21) is layered on top by the dispatcher, not here."""
+    Decision-period gating is layered on top by all_bot_intents, not here."""
     return (
         state.ent_alive & (state.ent_ammo >= 1.0) & (state.ent_attack_cd <= 0)
         & (state.ent_react_t <= 0) & has_target & (target_dist <= attack_range)
@@ -298,8 +212,8 @@ def fire_gate(state, target_dist: torch.Tensor, has_target: torch.Tensor, attack
 def zone_rect(state):
     """(zone_lo (N,1,2), zone_hi (N,1,2), rect_active (N,1) bool) -- the safe rect, shaped to
     broadcast against per-entity (N,E,...) tensors, plus the degenerate-rect guard every consumer
-    needs (see module docstring on why trusting state.zone_lo/zone_hi outright is wrong before
-    core/zone.init_zone has run)."""
+    needs: until core/zone.init_zone runs, state.zone_lo/zone_hi sit at allocate()'s zero-init,
+    a zero-area rect that means "no zone active", not "the whole map is lethal"."""
     zone_lo = state.zone_lo.unsqueeze(1)
     zone_hi = state.zone_hi.unsqueeze(1)
     rect_active = (zone_hi[..., 0] > zone_lo[..., 0]) & (zone_hi[..., 1] > zone_lo[..., 1])
@@ -318,8 +232,7 @@ def zone_clearance(state, cfg) -> torch.Tensor:
 
 def zone_contribution(state, cfg):
     """(direction, weight): steering.escape_zone toward the safe rect, weight 3.0 exactly
-    where perception.in_zone is True (and the rect is non-degenerate -- see module
-    docstring), else 0."""
+    where perception.in_zone is True (and the rect is non-degenerate -- see zone_rect), else 0."""
     zero_dir = torch.zeros_like(state.ent_pos)
     zero_w = torch.zeros_like(state.ent_pos[..., 0])
     if not cfg.bots_avoid_zone:
@@ -337,15 +250,10 @@ def zone_avoid_contribution(state, cfg):
     within `cfg.bots_zone_avoid_tiles` of the safe rect's edge, ramping linearly from 0 at that
     margin to _ZONE_AVOID_WEIGHT at the boundary itself.
 
-    This is the "bots avoid the green zone and do not walk into it" rule. `zone_contribution` on
-    its own cannot express it: escape_zone is identically zero everywhere INSIDE the rect, so it
-    only ever reacts once a bot is already taking damage. The two compose -- avoid keeps bots off
-    the edge, escape drags them back if they end up over it anyway (which the zone SHRINKING onto
-    a stationary bot still does, no matter how well it steers).
-
-    Directed at the rect's center rather than straight away from the nearest edge: both are
-    inward, and the center is always a valid destination even for an entity near a corner, where
-    "away from the nearest edge" is ambiguous."""
+    This is the "bots avoid the green zone and do not walk into it" rule (user's rule):
+    escape_zone is zero everywhere INSIDE the rect, so `zone_contribution` alone only reacts once
+    a bot is already taking damage. Aimed at the rect's center, which is inward and well-defined
+    even near a corner, where "away from the nearest edge" is ambiguous."""
     zero_dir = torch.zeros_like(state.ent_pos)
     zero_w = torch.zeros_like(state.ent_pos[..., 0])
     if not cfg.bots_avoid_zone or cfg.bots_zone_avoid_tiles <= 0:
@@ -367,10 +275,7 @@ def _walk_clear(state, bank, cfg, target_pos: torch.Tensor, max_tiles: float) ->
     """(N,E) bool: the straight line from each entity to `target_pos` crosses no unit-blocking
     tile (wall or water). The loot pulls need it because bot movement has no pathfinding:
     terrain.resolve_move slides along a wall one axis at a time, so a pull aimed through a wall
-    pins the bot against it. Measured 2026-09-25 at the farming weights: about a tenth of mobile
-    bots' crate-pulled decisions ground against a wall without this gate. (The first measurement
-    read 41 % -> 17 %, but that proxy also counted HUNT_BUSH bots grinding toward a waypoint
-    behind a wall, which this gate does not touch; hunters have no pathfinding either.)
+    pins the bot against it.
 
     `max_tiles` is march's ray budget. Both callers pass their own pull radius and zero every
     pull farther than that, so the shortened ray never decides an answer that is used."""
@@ -400,8 +305,7 @@ def box_contribution(state, bank, cfg):
     of the gas (`_loot_is_safe`).
 
     Campers are out because `targeting` never lets one shoot a crate: pulled anyway, a camper
-    looking for a bush parked beside a crate it could not break (27 % of camper time within 1.5
-    tiles of a crate, measured 2026-09-25 with the raw-vector pull; 4 % before it).
+    looking for a bush would park beside a crate it cannot break.
 
     bots/personality.movement drops this pull wherever cube_contribution is pulling (a cube on
     the ground comes first) and silences the personality's own steering while either pull is
@@ -433,11 +337,9 @@ def cube_contribution(state, bank, cfg):
     enemy target is within _LOOT_ENEMY_FAR_TILES or the cube is within _CUBE_AT_FEET_TILES.
 
     The at-feet exception is how the cubes a kill drops get collected: they land where the
-    fight was, and the next enemy is usually in sight. Farther cubes wait for the fight to end.
-    The first strong version had no enemy gate at all and, summed with the mode terms, walked
-    engaged bots away from their target 40 % of the time and retreating bots back toward it
-    (41 % of retreat ticks; 5 % without a pull). bots/personality.movement also drops this pull
-    in RETREAT outright."""
+    fight was, and the next enemy is usually in sight. Farther cubes wait for the fight to end,
+    since a pull toward them would walk an engaged bot away from its target.
+    bots/personality.movement also drops this pull in RETREAT outright."""
     zero_dir = torch.zeros_like(state.ent_pos)
     zero_w = torch.zeros_like(state.ent_pos[..., 0])
     if not cfg.bots_collect_cubes:
@@ -461,33 +363,31 @@ def cube_contribution(state, bank, cfg):
 def all_bot_intents(state, vis, bank, params, cfg, gen) -> BotIntent:
     """MUTATES: ent_target (via perception.select_target), ent_move_smooth, and -- via
     bots/personality.movement -- ent_wander_dir/ent_wander_t/ent_hunt_seen/ent_hunt_t. Returns a
-    freshly selected/smoothed BotIntent -- see BRAWL_SIM_BUILD_PLAN.md Step 21, as amended by
-    Step 41's combat/movement split (module docstring).
+    freshly selected/smoothed BotIntent.
 
     1. perception.select_target, then the once-per-tick shared queries: `target_los` (N,E) and
        `targeting` (which resolves the loot-box pseudo-target on top of it).
     2. FIRE/AIM: one call to bots/combat_rules.combat, which resolves every kind's rule from
-       per-kind params in a single pass over all (N,E) entities (Step E1 -- this used to be four
-       `combat()` calls with three of the four results thrown away).
+       per-kind params in a single pass over all (N,E) entities.
     3. MOVEMENT: bots/personality.movement computes move_dir once for all (N,E), selecting
-       per-entity behavior off ent_person. Nothing archetype-specific happens here anymore.
+       per-entity behavior off ent_person.
     4. Personality fire veto: CAMPER holds fire until something can actually see it, unless
-       its kind's `aggression` is 1.25 or more (Step B3.3).
+       its kind's `aggression` is 1.25 or more.
     5. Decision period gates FIRE only (discrete: this tick must be entity `e`'s turn to
        reconsider firing -- `(step_count + e) % decision_period == 0`, staggering entities so
        they don't all decide in lockstep); reaction delay low-passes MOVEMENT only (continuous
-       EMA into the persistent ent_move_smooth field via rate = clamp(dt/reaction_delay, 0, 1)
-       -- these are the two different per-archetype-difficulty mechanisms D19 lists
-       (`decision_period_ticks` vs `reaction_delay`), so they get two different treatments
-       rather than one gating both. ent_move_smooth (not the raw per-tick selection) is the
-       actual returned move_dir, per the plan text.
+       EMA into the persistent ent_move_smooth field via rate = clamp(dt/reaction_delay, 0, 1)).
+       They are two different per-kind difficulty knobs (`decision_period_ticks` vs
+       `reaction_delay`), so they get two different treatments rather than one gating both.
+       ent_move_smooth (not the raw per-tick selection) is the returned move_dir, and its length
+       is movement.apply_movement's speed throttle, so a bot that stops decelerates over the
+       reaction delay instead of coasting at full speed (user decision, 2026-09-25).
     6. Zero fire/move_dir/aim_dir/aim_point for entity 0 (the hero) and all dead entities,
-       applied to the OUTPUT only, after decision-period gating and move-smoothing -- matching
-       the plan's own step ordering. ent_move_smooth's underlying STATE for entity 0 / dead
-       entities is left un-zeroed (it keeps tracking whatever garbage intent got selected for it
-       -- see bots/combat_rules.py's docstring on why that garbage is harmless):
+       applied to the OUTPUT only, after decision-period gating and move-smoothing.
+       ent_move_smooth's underlying STATE for entity 0 / dead entities is left un-zeroed (it
+       keeps tracking whatever garbage intent got selected for it, which is harmless):
        movement.apply_movement already multiplicatively masks out `~alive` entities via its own
-       `active` gate, and the hero's movement comes from decode_action (Step 11), never from
+       `active` gate, and the hero's movement comes from hero.decode_action, never from
        ent_move_smooth at all.
     """
     # Lazy, not module-level: both do `from . import policy as shared` to reach BotIntent /
@@ -497,23 +397,22 @@ def all_bot_intents(state, vis, bank, params, cfg, gen) -> BotIntent:
     from . import combat_rules, personality
 
     # Bots act on a SIGHT-LIMITED view of `vis`, never on `vis` itself -- see
-    # perception.bot_visibility for the measurements that made this necessary. `vis` stays
-    # unclipped for the hero's observation, which env.py builds separately.
+    # perception.bot_visibility for why. `vis` stays unclipped for the hero's observation, which
+    # env.py builds separately.
     bot_vis = perception.bot_visibility(state, vis, cfg)
     perception.select_target(state, bot_vis, params, cfg)
 
     E = state.ent_pos.shape[1]
     device = state.ent_pos.device
 
-    # (N,E) rays to each entity's own target -- NOT the (N,E,E) raw_los matrix this used to build
-    # and then read one column of. See perception.target_los (Step A2).
+    # (N,E): LOS from each entity to its own target only (perception.target_los).
     los = perception.target_los(state, bank, cfg)
     tgt = targeting(state, bot_vis, los, bank, params, cfg)
 
     fire, aim_dir, aim_point = combat_rules.combat(state, tgt, bank, params, cfg, gen)
 
     move_dir, mode = personality.movement(state, tgt, bank, params, cfg, gen)
-    # Step B3.3: the CAMPER veto lifts at aggression >= 1.25 (0 read as 1.0 by the helper).
+    # The CAMPER veto lifts at aggression >= 1.25 (0 read as 1.0 by the helper).
     aggression = stats.aggression_of(state.ent_kind, params)
     fire = fire & personality.fire_allowed(state, tgt, aggression, cfg)
 

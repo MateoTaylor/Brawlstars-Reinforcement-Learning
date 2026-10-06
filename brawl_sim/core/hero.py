@@ -1,24 +1,12 @@
-"""Hero action decoding and the kind-agnostic dash mechanic. See BRAWL_SIM_BUILD_PLAN.md
-Step 11.
+"""Hero action decoding, per-entity timers, the ability predicates (long dash, super, gadget) and
+the kind-agnostic dash.
 
-Note on dash_t ownership: Section 4's tick order lists dash_t among the timers "advanced" in
-phase 2, but this step's own advance_dash docstring also decrements it in phase 8 ("dash_t -=
-dt"). Doing both would double-decrement every continuing dash (it'd travel half the intended
-clipped_distance before dash_t hits 0), which contradicts start_dash's
-dash_speed = clipped_distance / dash_duration contract. tick_timers does NOT touch dash_t;
-advance_dash is its sole owner, since that's where the paired "decrement, then clean up on
-completion" logic lives.
+dash_t is owned by advance_dash alone: tick_timers does not decrement it, since doing both would
+halve every dash against start_dash's `dash_speed = clipped_distance / dash_duration`.
 
-Note on ent_out_of_combat_t direction: despite sitting alongside the other countdown timers in
-both Section 4's phase-2 listing and this step's own MUTATES line, "time since combat" is
-a stopwatch, not a countdown -- it pairs with SimParams.regen_delay (Step 14's apply_regen:
-"has it been at least regen_delay seconds since I was last in a fight"), which only makes sense
-against an incrementing value reset to 0 by combat. It counts UP here, not down.
-
-**Two things reset it, and both are elsewhere:** taking damage (combat.apply_damage) and
-ATTACKING (env.py's `_attack_phase`). It was named `ent_no_damage_t` while only the first
-existed; regen that a player could out-heal while still shooting is not "out of combat" regen,
-so the attack reset came with the field's new name.
+ent_out_of_combat_t is a stopwatch counting UP, not a countdown: regen waits for it to reach
+`regen_delay` (combat.apply_regen). Taking damage (combat.apply_damage) and any offensive action
+-- attack, super or gadget (env._attack_phase) -- reset it to 0.
 """
 import torch
 
@@ -29,8 +17,8 @@ from . import terrain
 _EPS = 1e-6
 # The attack column's values (config.EnvConfig.action_nvec): one column, one value.
 ATTACK_NONE, ATTACK_FIRE, ATTACK_SUPER, ATTACK_GADGET, ATTACK_AUTO = 0, 1, 2, 3, 4
-# A crate's collision radius, projectiles.BOX_RADIUS restated here so this module keeps its
-# import list (projectiles is downstream of hero); tests pin the two equal.
+# A crate's collision radius: projectiles.BOX_RADIUS restated so this module need not import
+# projectiles. tests/test_hero.py pins this copy at 0.5; keep the two equal.
 _BOX_RADIUS = 0.5
 # How far a clipped dash stops short of the contact `terrain.body_travel` finds, so float32
 # rounding across advance_dash's increments cannot carry the body into the wall. See start_dash.
@@ -38,20 +26,15 @@ _WALL_CLEARANCE = 1e-3
 
 
 def action_mask(state, params, cfg) -> dict:
-    """Hero-only (entity index 0). {"move": (N,17) bool, "attack": (N,4) bool}, the attack half
-    (N,5) under `cfg.auto_aim`.
+    """Hero-only (entity index 0). {"move": (N, n_move_bins + 1) bool, "attack": (N,4) bool}, the
+    attack half (N,5) under `cfg.auto_aim`.
 
-    The attack column is `[no-fire, attack, SUPER, GADGET]` (Step D2 / bot_overhaul.md D1 for the
-    super; SIM_OVERHAUL_PLAN.md Step G3 / S7 for the gadget), plus `[AUTO]` under
-    `action.auto_aim` (the lead, 2026-09-26): an attack whose dash is aimed for the policy, at
-    the nearest enemy or crate in reach (`auto_aim_target`). It is legal exactly when the plain
-    attack is -- the same ammo, cooldown and no-dashing gates, since it is the same dash with a
-    different direction. Widening the existing dimension rather than adding a third keeps
-    `action.shape == (N,2)`, so every wrapper, `act_buf`, and `env._held`'s fire-clearing keep
-    working untouched -- the super, the gadget and the auto-aim are distinct VALUES in the
-    attack column, not new columns, which is why one decision still means at most one attack
-    attempt for any of them. The price is that a gadget and a dash cannot share one decision
-    (plan §8).
+    The attack column is `[no-fire, attack, SUPER, GADGET]`, plus `[AUTO]` under
+    `action.auto_aim` (user decision, 2026-09-26): an attack whose dash is aimed for the policy
+    at the nearest enemy or crate in reach (`auto_aim_target`), legal exactly when the plain
+    attack is. These are VALUES of one column, not new columns, so `action.shape` stays (N,2) for
+    every wrapper, `act_buf` and `env._held`, and one decision is at most one attack attempt --
+    which is why a gadget and a dash cannot share one decision.
     """
     hero_alive = state.ent_alive[:, 0]
     hero_ammo = state.ent_ammo[:, 0]
@@ -66,9 +49,8 @@ def action_mask(state, params, cfg) -> dict:
     # A super costs CHARGE, not ammo -- an empty clip must not block it. It shares the cooldown and
     # the no-dashing rule, so it cannot be used to sidestep either.
     super_ok = ready & super_ready(state, params)[:, 0]
-    # The gadget is a separate button on its own timer (S8): deliberately NOT ANDed with `ready`,
-    # so it is legal mid-dash, during the attack cooldown and on an empty clip -- the game lets a
-    # gadget go in all three.
+    # The gadget is a separate button on its own timer: deliberately NOT ANDed with `ready`, so it
+    # is legal mid-dash, during the attack cooldown and on an empty clip, as in the game.
     gadget_ok = gadget_ready(state, params)[:, 0]
     no_fire_ok = torch.ones_like(fire_ok)
     columns = [no_fire_ok, fire_ok, super_ok, gadget_ok]
@@ -88,12 +70,10 @@ def decode_action(action: torch.Tensor, state, params, cfg):
     the mask, so an illegal request of any kind is a silent no-op rather than an error. The
     values are mutually exclusive by construction -- one column, one value.
 
-    `fire` is True for BOTH attack values (1 and 4): everything downstream that means "the hero
+    `fire` is True for BOTH attack values (1 and 4), so everything downstream that means "the hero
     dashed" (ammo, cooldown, reveal, the reward's in-reach term, the cadence audit) is one code
-    path. `auto` is the refinement that only `env._attack_phase` reads, to swap the dash's
-    direction for `auto_aim_target`'s before `start_dash`. Without the flag the mask has no
-    fifth column and `auto` is all-False; a 4 in the column is then a no-op, like any other
-    illegal value."""
+    path. `auto` is read only by `env._attack_phase`, to swap in `auto_aim_target`'s direction
+    before `start_dash`. Without the flag `auto` is all-False and a 4 is an illegal no-op."""
     move_bin = action[:, 0]
     is_idle = move_bin == 0
     dirs = geo.dir_from_bin(torch.clamp(move_bin - 1, min=0), cfg.n_move_bins)
@@ -115,29 +95,15 @@ def decode_action(action: torch.Tensor, state, params, cfg):
 
 def tick_timers(state, params, cfg) -> None:
     """MUTATES: ent_ammo, ent_attack_cd, ent_gadget_cd, ent_invuln_t, ent_reveal_t, ent_react_t,
-    ent_out_of_combat_t (NOT ent_dash_t -- see module docstring). ammo += dt/reload_seconds
-    clamped to max_ammo, EXCEPT while attack_cd is running; countdowns clamp at 0;
-    ent_out_of_combat_t counts up instead (see module docstring).
+    ent_out_of_combat_t, ent_attack_idle_t (NOT ent_dash_t -- see module docstring). Countdowns
+    clamp at 0; the two stopwatches count up.
 
-    **Firing pauses the reload for `attack_cooldown` seconds (Step C1 / bot_overhaul.md D7).**
-    `attack_cooldown` now does double duty: for its duration you can neither attack (already
-    enforced by `_attack_phase`'s `can_attack`, `action_mask`'s `fire_ok`, and
-    `policy.fire_gate`) nor accrue ammo. That makes sustained fire `attack_cooldown +
-    reload_seconds` per shot rather than `reload_seconds`, which is the whole point: a 5-shot
-    Buzz sweep costs a full second of not reloading, and a brawler that empties its clip is out of
-    the fight for the sum of both.
-
-    This replaced a much larger design (an `attack_anim_seconds` param plus an `ent_attack_anim_t`
-    state field modelling "I am mid-attack"). `ent_attack_cd` already WAS that timer -- it exists,
-    is already set by every attack source (`_attack_phase` for ranged/melee, `start_dash` for
-    dashes), and is already decremented right here -- so the entire mechanic is the one gate below.
-
-    Two ordering notes:
-      - The gate is read BEFORE the decrement, so a cooldown of `k * dt` blocks exactly `k` ticks.
-      - This runs in phase 2 and attacks resolve in phase 6, so on the tick an entity fires it has
-        already banked one tick (0.05 s) of reload before its own shot stops it. Same shape as the
-        one-tick leakage `combat.apply_regen` documents and accepts, and far cheaper than
-        reordering the tick for it.
+    Ammo (+dt/reload_seconds, clamped to max_ammo) accrues only while attack_cd is 0, so firing
+    pauses the reload for `attack_cooldown` and sustained fire costs `attack_cooldown +
+    reload_seconds` per shot. The gate is read BEFORE the decrement, so a cooldown of `k * dt`
+    blocks exactly `k` ticks. This runs in phase 2, before attacks resolve in phase 6, so the
+    tick an entity fires still banks one tick of reload -- a one-tick leak accepted as cheaper
+    than reordering the tick.
     """
     reload_seconds = stats.gather_kind(params.reload_seconds, state.ent_kind)
     max_ammo = stats.gather_kind(params.max_ammo, state.ent_kind)
@@ -146,35 +112,33 @@ def tick_timers(state, params, cfg) -> None:
     gain = torch.where(reloading, cfg.dt / reload_seconds, torch.zeros_like(reload_seconds))
     state.ent_ammo.copy_(torch.clamp(state.ent_ammo + gain, max=max_ammo))
     state.ent_attack_cd.copy_(torch.clamp(state.ent_attack_cd - cfg.dt, min=0))
-    # The gadget cooldown (Phase G) is independent of attack_cd: firing the gadget neither pauses
-    # the reload nor is blocked by the dash -- it is a separate button on its own timer.
+    # The gadget cooldown is independent of attack_cd: firing the gadget neither pauses the reload
+    # nor is blocked by the dash -- it is a separate button on its own timer.
     state.ent_gadget_cd.copy_(torch.clamp(state.ent_gadget_cd - cfg.dt, min=0))
     state.ent_invuln_t.copy_(torch.clamp(state.ent_invuln_t - cfg.dt, min=0))
     state.ent_reveal_t.copy_(torch.clamp(state.ent_reveal_t - cfg.dt, min=0))
     state.ent_react_t.copy_(torch.clamp(state.ent_react_t - cfg.dt, min=0))
-    state.ent_out_of_combat_t.copy_(state.ent_out_of_combat_t + cfg.dt)  # stopwatch, not a countdown
-    # Also a stopwatch. Reset ONLY by attacking (env._attack_phase), never by taking damage --
-    # see the field's own note in core/state.py for why that distinction is load-bearing.
+    state.ent_out_of_combat_t.copy_(state.ent_out_of_combat_t + cfg.dt)  # stopwatch, counts up
+    # Also a stopwatch, reset ONLY by an attack or super (env._attack_phase) -- never by taking
+    # damage or the gadget; see the field's note in core/state.py.
     state.ent_attack_idle_t.copy_(state.ent_attack_idle_t + cfg.dt)
 
 
 def long_dash_ready(state, params) -> torch.Tensor:
     """(N,E) bool -- has this entity gone `long_dash_seconds` without attacking, so its next dash
-    reaches `long_dash_multiplier` times as far? (Step D1 / CHARACTER_DETAILS: Mortis.)
+    reaches `long_dash_multiplier` times as far? (CHARACTER_DETAILS.md: Mortis.)
 
-    False for any kind that does not configure the ability (`long_dash_seconds` resolves to 0),
-    which is every kind but the hero.
+    False for any kind that does not configure the ability (`long_dash_seconds` resolves to 0):
+    gated on the threshold being set, not on a huge threshold never being reached.
     """
     threshold = stats.gather_kind(params.long_dash_seconds, state.ent_kind)
     return (threshold > 0) & (state.ent_attack_idle_t >= threshold)
 
 
 def long_dash_charge_frac(state, params) -> torch.Tensor:
-    """(N,E) f32 in [0,1] -- progress toward the long dash. 1.0 means ready.
-
-    The observation carries this CONTINUOUS value alongside the boolean, because a policy can plan
-    against "0.8 charged, hold off attacking for one more second" in a way it cannot against a flag
-    that stays 0 until it snaps to 1. Zero for kinds without the ability.
+    """(N,E) f32 in [0,1] -- progress toward the long dash. 1.0 means ready; zero for kinds
+    without the ability. The observation carries it beside the boolean so a policy can plan
+    against "0.8 charged, hold off attacking a second longer".
     """
     threshold = stats.gather_kind(params.long_dash_seconds, state.ent_kind)
     frac = state.ent_attack_idle_t / torch.clamp(threshold, min=_EPS)
@@ -193,7 +157,7 @@ def has_super(state, params) -> torch.Tensor:
     """(N,E) bool -- does this entity's KIND have a super at all? (`super_charge_hits > 0`.)
 
     Every super predicate is gated on this rather than on "is this entity slot 0", so a bot super
-    is a `configs/brawlers.yaml` block rather than a plumbing change (Step D2)."""
+    is a `configs/brawlers.yaml` block rather than a plumbing change."""
     return stats.gather_kind(params.super_charge_hits, state.ent_kind) > 0
 
 
@@ -204,9 +168,9 @@ def super_ready(state, params) -> torch.Tensor:
 
 
 def super_charge_frac(state, params) -> torch.Tensor:
-    """(N,E) f32 in [0,1] -- progress toward the super. The observation carries this alongside the
-    boolean for the same reason `long_dash_frac` does: a flag alone gives a policy no gradient to
-    climb, while a fraction alone hides the moment the ability actually becomes available."""
+    """(N,E) f32 in [0,1] -- progress toward the super. The observation carries it beside the
+    boolean, as with `long_dash_charge_frac`: a flag alone gives a policy nothing to plan
+    against, while a fraction alone hides the moment the ability becomes available."""
     needed = stats.gather_kind(params.super_charge_hits, state.ent_kind).to(torch.float32)
     frac = state.ent_super_charge.to(torch.float32) / torch.clamp(needed, min=_EPS)
     return torch.where(needed > 0, torch.clamp(frac, max=1.0), torch.zeros_like(frac))
@@ -216,10 +180,9 @@ def add_super_charge(state, hits: torch.Tensor, params) -> None:
     """MUTATES: ent_super_charge. `hits` is (N,E) -- how many qualifying hits each entity landed
     this tick. Clamped at `super_charge_hits`, so charge never banks past full.
 
-    Only hits on living PLAYERS count. Boxes are excluded by the caller (env._bookkeeping), which
-    is the whole reason charge is accumulated from the attacker x victim damage matrix rather than
-    from a simpler "did I deal damage" flag -- box damage flows through a different path and would
-    otherwise let a hero farm his super off crates."""
+    Only hits on living PLAYERS count. The caller (env._bookkeeping) derives `hits` from the
+    attacker x victim damage matrix rather than a "did I deal damage" flag because box damage
+    flows through a different path, and would otherwise let a hero farm his super off crates."""
     needed = stats.gather_kind(params.super_charge_hits, state.ent_kind).to(state.ent_super_charge.dtype)
     charged = state.ent_super_charge + hits.to(state.ent_super_charge.dtype)
     state.ent_super_charge.copy_(torch.where(has_super(state, params), torch.minimum(charged, needed), state.ent_super_charge))
@@ -227,11 +190,11 @@ def add_super_charge(state, hits: torch.Tensor, params) -> None:
 
 def gadget_ready(state, params) -> torch.Tensor:
     """(N,E) bool -- may this entity throw its gadget right now? `alive & gadget_cd <= 0 & the
-    kind HAS a gadget` and nothing else (S8): not ammo, not `attack_cd`, not `dash_t`.
+    kind HAS a gadget` and nothing else: not ammo, not `attack_cd`, not `dash_t`.
 
     The one definition shared by `action_mask` (the hero's legality column) and
     `env._attack_phase`'s safety net, so the two cannot drift. Every bot kind resolves
-    `gadget_cooldown` to 0 (Step G1), which is what keeps a bot from ever firing one."""
+    `gadget_cooldown` to 0, which is what keeps a bot from ever firing one."""
     cooldown = stats.gather_kind(params.gadget_cooldown, state.ent_kind)
     return state.ent_alive & (state.ent_gadget_cd <= 0) & (cooldown > 0)
 
@@ -240,48 +203,41 @@ def gadget_charge_frac(state, params) -> torch.Tensor:
     """(N,E) f32 in [0,1] -- progress back to a charged gadget, `1 - gadget_cd / gadget_cooldown`:
     0.0 on the tick it is thrown, 1.0 once the timer has run out, and 0.0 for any kind without a
     gadget (`gadget_cooldown` 0, which is every bot kind). The observation pairs it with
-    `gadget_ready` for the reason `super_charge_frac` gives (SIM_OVERHAUL_PLAN.md Step G4).
+    `gadget_ready` for the reason `super_charge_frac` gives.
 
-    No `alive` term, like `super_charge_frac`: a dead hero still reads its timer's progress, and
-    only `gadget_ready` goes False. The clamp only makes the declared range exact: `gadget_cd`
-    already stays inside [0, gadget_cooldown], since `tick_timers` floors it at 0, a throw writes
-    exactly `gadget_cooldown`, and `state.check_invariants` checks both ends."""
+    No `alive` term, like `super_charge_frac`: a dead hero still reads its timer's progress. The
+    clamp only makes the declared range exact (`state.check_invariants` bounds `gadget_cd`)."""
     cooldown = stats.gather_kind(params.gadget_cooldown, state.ent_kind)
     frac = 1.0 - state.ent_gadget_cd / torch.clamp(cooldown, min=_EPS)
     return torch.where(cooldown > 0, torch.clamp(frac, 0.0, 1.0), torch.zeros_like(frac))
 
 
 def gadget_target(state, vis: torch.Tensor, params, bank, cfg):
-    """Where each entity's gadget spinner would fly THIS tick (SIM_OVERHAUL_PLAN.md Step G2,
-    substep G2.1). Returns `(dir (N,E,2) f32 unit vectors, travel (N,E) f32 tiles)`. Pure --
-    mutates nothing; `env._attack_phase` (Step G3) feeds the pair into `projectiles.spawn_gadget`
-    for the entities that actually fire.
+    """Where each entity's gadget spinner would fly THIS tick: `(dir (N,E,2) f32 unit vectors,
+    travel (N,E) f32 tiles)`. Pure; `env._attack_phase` feeds the pair into
+    `projectiles.spawn_gadget` for the entities that fire.
 
     `vis` is the FAIR `(N,E,E)` visibility (`bots/perception.visibility`: `vis[n,e,j]` = e sees
-    j). For the hero row that is exactly the `enemy_revealed` mask the observation grid draws, so
-    the spinner never homes on something the agent cannot see (S10): a bushed, unrevealed enemy
-    one tile away is skipped in favour of a revealed one two tiles away, and with nothing revealed
-    at all it flies `gadget_range` straight along the entity's facing. The same facing fallback
-    covers a revealed enemy standing ON the thrower (zero vector, no direction to normalize), so
-    `dir` is a unit vector on every row; `travel` is 0 there and the spinner detonates in place.
+    j): bush concealment only, NOT the camera window the observation's `enemy_revealed` plane
+    also applies (`core/camera.hero_view`), so the hero's spinner can aim at an unconcealed enemy
+    that is off-camera. A bushed, unrevealed enemy is skipped for a revealed one further away.
+    With nothing revealed it flies `gadget_range` along the facing; a revealed enemy standing ON
+    the thrower takes the facing too, with travel 0 (it detonates in place), so `dir` is a unit
+    vector on every row.
 
-    Computed for every entity, read for the hero. Bots have `gadget_range 0` and never fire one
-    (Step G1), so their rows are travel-0 noise that nothing consumes; masking them out would cost
-    the same tensor ops it saved.
+    Computed for every entity, read for the hero: bots have `gadget_range 0` and never fire one,
+    and masking their rows out would cost the tensor ops it saved.
 
     `travel` is `min(gadget_range, distance to the nearest revealed enemy)` -- it lands ON a close
-    enemy rather than overshooting -- then clipped against `blocks_proj` with the same march
-    `step_projectiles` runs per projectile. The spinner is an ARTILLERY shell that is NOT stopped
-    in flight, so this pre-clip is the only thing that keeps it from landing (and blasting) on the
-    far side of a wall it was thrown at.
+    enemy -- then clipped against `blocks_proj`. The spinner is an ARTILLERY shell, not stopped in
+    flight, so this pre-clip is the only thing that keeps it from landing (and blasting) on the
+    far side of a wall.
     """
     N, E = state.ent_kind.shape
     device = state.ent_pos.device
 
-    # (N,E,E): e's candidate targets j. `vis` already excludes dead observers and dead targets
-    # when it comes from perception.visibility; the alive AND is re-applied so a hand-built or
-    # stale mask cannot aim at a corpse, and the diagonal is removed so nobody targets themselves
-    # (vis[n,e,e] is True for every living e).
+    # (N,E,E): e's candidate targets j. The alive AND is re-applied so a hand-built or stale `vis`
+    # cannot aim at a corpse; the diagonal goes because vis[n,e,e] is True for every living e.
     eye = torch.eye(E, dtype=torch.bool, device=device).unsqueeze(0)
     revealed = vis & state.ent_alive.unsqueeze(1) & ~eye
 
@@ -290,7 +246,7 @@ def gadget_target(state, vis: torch.Tensor, params, bank, cfg):
     dist = geo.safe_norm(diff, dim=-1)                                # (N,E,E)
     dist_eff = torch.where(revealed, dist, torch.full_like(dist, float("inf")))
     nearest = torch.argmin(dist_eff, dim=-1)                          # (N,E) i64
-    has = revealed.any(dim=-1)                                        # (N,E) -- tensor op, no host sync
+    has = revealed.any(dim=-1)                                        # (N,E), no host sync
 
     to_vec = diff.gather(2, nearest.view(N, E, 1, 1).expand(N, E, 1, 2)).squeeze(2)  # (N,E,2)
     nearest_dist = dist.gather(2, nearest.unsqueeze(-1)).squeeze(-1)                 # (N,E)
@@ -304,17 +260,11 @@ def gadget_target(state, vis: torch.Tensor, params, bank, cfg):
     gadget_range = stats.gather_kind(params.gadget_range, state.ent_kind)
     travel = torch.where(has, torch.minimum(gadget_range, nearest_dist), gadget_range)
 
-    # Wall clip. `march` samples every `los_step_tiles` and reports the first BLOCKED sample, so
-    # `hit_t` is at or past the true wall face, never before it; landing one full sample short of
-    # it is the same back-off `step_projectiles` applies, and it guarantees the
-    # landing point (which `spawn_gadget` turns into `prj_target`, the detonation point) is on
-    # the thrower's side of the wall. `hit_pos == pos + hit_t * dir` exactly, so the plan's
-    # `|hit_pos - los_step * dir - pos|` is `hit_t - los_step` wherever `hit_t >= los_step`; the
-    # clamp covers the one case the norm gets wrong -- an entity standing closer than one sample
-    # to a wall, where the endpoint sample itself is the hit and the norm would come back as a
-    # positive distance in the WRONG direction. Default ray budget: `gadget_range` is a per-kind
-    # tensor, and march's budget must be a Python scalar (see its docstring), so this pays the
-    # full `cfg.ray_steps` over an (N,E) grid.
+    # Wall clip. `march` reports the first BLOCKED sample, at or past the true wall face, so
+    # landing one sample (`los_step_tiles`) short of `hit_t` -- the back-off `step_projectiles`
+    # applies -- keeps the detonation point (`prj_target`) on the thrower's side. The clamp covers
+    # an entity closer than one sample to the wall. `gadget_range` is a per-kind tensor and march's
+    # budget must be a Python scalar, so this pays the full `cfg.ray_steps` over an (N,E) grid.
     hit, _, hit_t = terrain.march(bank.blocks_proj, state.map_id, state.ent_pos, direction, travel, cfg)
     clipped = torch.clamp(hit_t - cfg.los_step_tiles, min=0.0)
     travel = torch.where(hit, torch.minimum(clipped, travel), travel)
@@ -327,21 +277,15 @@ def auto_aim_target(state, params, cfg):
     f32 unit vectors, has_target (N,) bool)`. Pure. `env._attack_phase` swaps it in for the
     hero's dash direction on the rows whose action asked for it.
 
-    The target is the nearest alive enemy or unbroken crate within the dash's reach -- the
-    dash's current distance (the long-dash multiplier included, since `start_dash` applies it
-    to this same dash) plus `dash_radius` plus the target's body: `unit_radius` for an enemy,
-    the crate's `_BOX_RADIUS` for a crate. Nearest by centre distance across BOTH lists; the
-    lead asked for "the nearest enemy player OR cube in range" and named no priority between
-    them. Visibility is deliberately NOT consulted: the lead wants the flag to work on enemies
-    out of view, so a policy that tracks one off-screen (its `enemy_hist` planes, the last
-    known slot) can dash at it, which mirrors the game, whose bare tap auto-aims at the
-    nearest target whether the player can see it or not.
+    The target is the nearest (by centre distance) alive enemy or unbroken crate within reach:
+    the dash's current distance (long-dash multiplier included, as `start_dash` applies it) plus
+    `dash_radius` plus the target's body (`unit_radius`, or `_BOX_RADIUS` for a crate). No
+    priority between enemies and crates, and no visibility check, so a policy tracking an enemy
+    off-screen can dash at it, as the game's bare tap does (user decision, 2026-09-26).
 
-    With nothing in reach `has_target` is False and `direction` is the facing, the fallback the
-    caller replaces with the ordinary rule (the move bin, or the facing when idle), the same as
-    a bare tap in the game with nothing near: the dash still goes, in the walking direction.
-    A target coincident with the hero (distance below `_EPS`) has no direction either and
-    counts as no target, `gadget_target`'s convention.
+    With nothing in reach, or only a target coincident with the hero, `has_target` is False and
+    `direction` is the facing; the caller then keeps the ordinary dash direction (the move bin,
+    or the facing when idle), so the dash still goes.
     """
     hero_pos = state.ent_pos[:, 0]                                    # (N,2)
     dash_distance = stats.gather_kind(params.dash_distance, state.ent_kind)[:, 0]
@@ -361,9 +305,44 @@ def auto_aim_target(state, params, cfg):
     diff = torch.cat([enemy_diff, box_diff], dim=1)                   # (N,E-1+B,2)
     dist = torch.cat([enemy_dist, box_dist], dim=1)
     ok = torch.cat([enemy_ok, box_ok], dim=1)
+    return _aim_at_nearest(state, diff, dist, ok)
+
+
+def super_aim_target(state, params, cfg):
+    """Where the hero's IDLE super (attack value 2 on move bin 0) points this tick: `(direction
+    (N,2) f32 unit vectors, has_target (N,) bool)`. Pure. `env._attack_phase` aims the hero's bolt
+    with it on the rows whose move bin is idle; a super fired while moving follows the move bin.
+
+    The game's tap-to-fire (user decision, 2026-09-30): the nearest (by centre distance) alive
+    enemy within the bolt's reach, `super_range + super_radius + unit_radius`, the farthest centre
+    its straight flight can touch. `auto_aim_target`'s rule with the super's reach and without
+    crates, which the bolt passes through without damaging; no visibility term, as there. The
+    long dash does not stretch it.
+
+    With no enemy in reach, or the nearest one coincident with the hero, `has_target` is False
+    and `direction` is the facing, the idle dash's rule, so the bolt still flies: an idle bin's
+    `move_dir` is (0, 0), and `projectiles.spawn_supers` launches a bolt along a zero aim that
+    never moves and never expires.
+    """
+    hero_pos = state.ent_pos[:, 0]                                    # (N,2)
+    super_range = stats.gather_kind(params.super_range, state.ent_kind)[:, 0]
+    super_radius = stats.gather_kind(params.super_radius, state.ent_kind)[:, 0]
+
+    diff = state.ent_pos[:, 1:] - hero_pos.unsqueeze(1)               # (N,E-1,2)
+    dist = geo.safe_norm(diff, dim=-1)                                # (N,E-1)
+    reach = (super_range + super_radius + params.unit_radius).unsqueeze(-1)
+    ok = state.ent_alive[:, 1:] & (dist <= reach)
+    return _aim_at_nearest(state, diff, dist, ok)
+
+
+def _aim_at_nearest(state, diff, dist, ok):
+    """The shared tail of `auto_aim_target` and `super_aim_target`: `(direction (N,2), has_target
+    (N,))` toward the nearest candidate that `ok` (N,M) admits. `diff` (N,M,2) runs from the hero
+    to each candidate and `dist` (N,M) is its length. A row whose nearest candidate is coincident
+    with the hero, or that has none, gets no target and the hero's facing."""
     dist_eff = torch.where(ok, dist, torch.full_like(dist, float("inf")))
     nearest = torch.argmin(dist_eff, dim=-1)                          # (N,)
-    N = hero_pos.shape[0]
+    N = diff.shape[0]
     to_vec = diff.gather(1, nearest.view(N, 1, 1).expand(N, 1, 2)).squeeze(1)  # (N,2)
     nearest_dist = dist.gather(1, nearest.unsqueeze(-1)).squeeze(-1)           # (N,)
 
@@ -374,18 +353,14 @@ def auto_aim_target(state, params, cfg):
 
 
 def start_dash(state, fire: torch.Tensor, move_dir: torch.Tensor, bank, params, cfg) -> None:
-    """fire: (N,E) bool, move_dir: (N,E,2) f32 -- kind-agnostic, gated on dash_distance[kind] >
-    0, so melee lunges and Mortis's Super can reuse this later (Step 11).
+    """fire: (N,E) bool, move_dir: (N,E,2) f32 -- kind-agnostic, gated on dash_distance[kind] > 0.
 
     MUTATES: ent_ammo, ent_attack_cd, ent_dash_t, ent_dash_dir, ent_dash_speed, ent_dash_hits,
     ent_facing, ent_shots_fired.
 
-    The dash grants NO invulnerability (the lead, 2026-09-25: it is an attack animation, and
-    Mortis can be hit throughout it). Until then this seeded `ent_invuln_t = dash_duration`, and
-    combat.apply_damage zeroed every combat hit on him for the seven ticks it took to expire:
-    40 % of all combat damage aimed at the hero landed in those frames, measured with deploy5 at
-    elite. Nothing seeds `ent_invuln_t` any more; the field stays, so `hero.invuln` keeps its
-    slot in every observation spec and reads False.
+    The dash grants NO invulnerability (user decision, 2026-09-25: it is an attack animation, and
+    Mortis can be hit throughout it). Nothing seeds `ent_invuln_t`; the field stays so
+    `hero.invuln` keeps its slot in every observation spec, reading False.
     """
     E = state.ent_kind.shape[1]
 
@@ -393,14 +368,10 @@ def start_dash(state, fire: torch.Tensor, move_dir: torch.Tensor, bank, params, 
     dash_duration = stats.gather_kind(params.dash_duration, state.ent_kind)
     attack_cooldown = stats.gather_kind(params.attack_cooldown, state.ent_kind)
 
-    # LONG DASH (Step D1). After `long_dash_seconds` without attacking, the next dash covers
-    # `long_dash_multiplier` times its normal distance. `dash_duration` is deliberately NOT
-    # scaled, so a long dash is also genuinely FASTER (5.34 tiles in 0.30 s instead of 2.67) --
-    # that is what the real ability feels like, and everything downstream is distance-agnostic:
-    # the body clip below and `dash_speed = clipped / duration`.
-    #
-    # Gated on `long_dash_seconds > 0` so a kind without the ability can never trigger it, rather
-    # than relying on a huge threshold never being reached.
+    # LONG DASH: after `long_dash_seconds` without attacking, the next dash covers
+    # `long_dash_multiplier` times its distance. `dash_duration` is deliberately NOT scaled, so a
+    # long dash is also faster, as in the game; the body clip and `dash_speed = clipped /
+    # duration` below are distance-agnostic.
     dash_distance = dash_distance * long_dash_scale(state, params)
 
     move_is_zero = (move_dir[..., 0] == 0) & (move_dir[..., 1] == 0)
@@ -411,23 +382,13 @@ def start_dash(state, fire: torch.Tensor, move_dir: torch.Tensor, bank, params, 
     facing_vec = geo.from_angle(state.ent_facing)
     dash_dir = torch.where(move_is_zero.unsqueeze(-1), facing_vec, move_dir)
 
-    # **The dash stops where the BODY first touches a wall** (OBS_PARITY_TASKS.md, pending
-    # decision 1; the lead's call 2026-09-25: walls stop momentum, they do not redirect it).
-    #
-    # What traps an entity is its body overlapping a wall: `terrain.circle_blocked` probes all 8
-    # compass points, so an overlapping circle is blocked in EVERY direction, including away, and
-    # `movement.resolve_move` rejects every step until the next dash. This clip used to march the
-    # CENTRE against `blocks_unit` and back the landing off by `los_step_tiles + unit_radius`
-    # along the dash line. That clears the body head-on only: beside a wall the perpendicular
-    # clearance is the back-off times the sine of the angle to the face, so shallow dashes landed
-    # the 0.4-tile body inside the wall (12 % of wall-meeting dashes at 60 degrees, 57 % at 30,
-    # 100 % at 10), and every wedge the wall-push probe found began with one.
-    #
-    # `terrain.body_travel` runs that same `circle_blocked` test along the line and stops at the
-    # first contact, so a glancing dash ends where it meets the wall instead of sliding along it,
-    # and the landing is always a point walking can leave. `_WALL_CLEARANCE` keeps it a millitile
-    # short of the contact. The march is budgeted by `params.dash_ray_tiles`, the spec's longest
-    # possible dash, rather than the full `cfg.ray_steps`.
+    # The dash stops where the BODY first touches a wall, with no slide along it (user's rule,
+    # 2026-09-25: walls stop momentum, they do not redirect it). `terrain.body_travel` runs
+    # `circle_blocked` along the line, so the landing is always a point walking can leave: a body
+    # overlapping a wall is blocked in every direction, and `movement.resolve_move` would reject
+    # every step. Clipping only the CENTRE line would clear the body head-on but not beside a
+    # wall. `_WALL_CLEARANCE` keeps it a millitile short of the contact; the march is budgeted by
+    # `params.dash_ray_tiles`, the spec's longest possible dash, not the full `cfg.ray_steps`.
     radius = params.unit_radius.unsqueeze(-1)  # (N,1), broadcasts against (N,E)
     clipped_distance = terrain.body_travel(
         bank.blocks_unit, state.map_id, state.ent_pos, dash_dir, dash_distance, radius, cfg,
@@ -448,31 +409,19 @@ def start_dash(state, fire: torch.Tensor, move_dir: torch.Tensor, bank, params, 
 
 
 def advance_dash(state, params, cfg):
-    """MUTATES: ent_pos, ent_vel, ent_dash_t, ent_dash_hits. Returns (dmg_ent (N,E), dmg_by
-    (N,E,E), dmg_box (N,B)) -- reported here, applied by combat.apply_damage (Step 14), same
-    pattern as projectile damage."""
+    """MUTATES: ent_pos, ent_vel, ent_dash_t, ent_dash_dir, ent_dash_speed, ent_dash_hits.
+    Returns (dmg_ent (N,E), dmg_by (N,E,E), dmg_box (N,B)) -- reported here, applied by
+    combat.apply_damage, the same pattern as projectile damage."""
     E = state.ent_kind.shape[1]
     is_dashing = state.ent_dash_t > 0
 
     dash_radius = stats.gather_kind(params.dash_radius, state.ent_kind)
 
-    # The last tick of a dash advances only the time that is actually LEFT, not a full dt.
-    #
-    # Without this every dash overshot by one whole tick. `dash_speed` is
-    # `clipped_distance / dash_duration`, so travelling for a 7th tick when the duration only
-    # covers 6 stretches the dash to 7/6 = 1.167x its configured distance -- and it happened on
-    # every dash, because `dash_duration: 0.30` is not exactly representable: after six
-    # subtractions of dt it leaves 1.19e-8 seconds, which is still `> 0`, so `is_dashing` was True
-    # for one more tick.
-    #
-    # That is a correctness bug rather than a cosmetic one, because `start_dash` clips the dash
-    # at the body's first contact with terrain specifically to GUARANTEE the body never lands
-    # inside a wall. Overshooting the clipped distance by 16.7% carries it past that contact, and
-    # there the entity is stuck -- `movement.resolve_move` rejects every escape step whose whole
-    # circle is not clear.
-    # Found by tests/test_hero.py::test_a_charged_dash_into_a_wall_still_lands_the_body_clear_of_it
-    # (Step D1 doubled the dash distance, which doubled the absolute overshoot and made it
-    # reproducible against a wall).
+    # The last tick advances only the time LEFT, not a full dt. A `dash_duration` such as 0.30 is
+    # not a float32-exact multiple of dt, so ~1e-8 s survives its last full tick; a whole extra
+    # tick would stretch the dash (7/6x) past start_dash's body clip and into the wall, where
+    # `movement.resolve_move` rejects every escape step. Pinned by tests/test_hero.py::
+    # test_a_charged_dash_into_a_wall_still_lands_the_body_clear_of_it.
     step_seconds = torch.clamp(state.ent_dash_t, max=cfg.dt)
     delta = state.ent_dash_dir * (state.ent_dash_speed * step_seconds).unsqueeze(-1)
     old_pos = state.ent_pos

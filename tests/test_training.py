@@ -21,7 +21,7 @@ from brawl_sim.constants import N_KINDS
 from brawl_sim.env import BrawlVecEnv
 from brawl_sim.training import schedules
 from brawl_sim.training.config import (
-    TIER_FIELDS, CurriculumConfig, CurriculumStage, DifficultyTier, RewardConfig, RunConfig,
+    TIER_FIELDS, CurriculumConfig, CurriculumStage, DifficultyTier, RewardConfig,
     ScheduleConfig, load_train_config, parse_overrides,
 )
 from brawl_sim.training.curriculum import CurriculumManager
@@ -92,24 +92,25 @@ def test_shipped_tiers_are_listed_weakest_to_strongest(tcfg):
 
 
 def test_shipped_elite_tier_is_the_operator_spec(tcfg):
-    """1.5x health and damage and no more (SIM_OVERHAUL S1, 2026-09-18; was 2x / 1.75x), with the
-    difficulty carried by accuracy, aggression and hero focus instead. Asked for, not tuned."""
+    """1.5x health and damage and no more (BRAWL_SIM_DESIGN.md §11, 2026-09-18; was 2x / 1.75x), with
+    the difficulty carried by accuracy, aggression and hero focus instead. Asked for, not tuned."""
     elite = tcfg.curriculum.tiers["elite"]
     assert (elite.hp, elite.damage) == (1.5, 1.5)
     assert (elite.aim_noise, elite.reaction_delay) == (0.20, 0.30)
     assert (elite.aggression, elite.hero_focus) == (1.7, 1.7)
     assert elite.lead_target >= 1.0
     assert list(tcfg.curriculum.tiers)[-1] == "elite", "elite is the strongest tier"
-    # S1's other half: every lower tier sits at or below the 1.5x cap.
+    # The other half: every lower tier sits at or below the 1.5x cap.
     for tier in tcfg.curriculum.tiers.values():
         assert tier.hp <= 1.5 and tier.damage <= 1.5, f"{tier.name!r} is past the 1.5x cap"
 
 
 def test_shipped_tier_table_is_the_plan_table(tcfg):
-    """Every row of SIM_OVERHAUL_PLAN.md Step B4's table, as literals. Column order: aim_noise,
-    reaction_delay, lead_target, decision_period, move_speed, hp, damage, aggression, hero_focus."""
+    """The shipped tier table as literals, so a retune is a deliberate edit here too. Column order:
+    aim_noise, reaction_delay, lead_target, decision_period, move_speed, hp, damage, aggression,
+    hero_focus."""
     table = {
-        "easy":    (3.0, 2.2,  0.25, 2.0,  0.90, 0.75, 0.70, 0.6, 0.0),
+        "easy":    (2.5, 2.2,  0.25, 2.0,  0.90, 0.75, 0.70, 0.6, 0.0),
         "medium":  (1.8, 1.6,  0.60, 1.5,  0.95, 0.90, 0.85, 0.8, 0.4),
         "hard":    (1.0, 1.0,  1.0,  1.0,  1.0,  1.0,  1.0,  1.0, 1.0),
         "veteran": (0.6, 0.6,  1.0,  1.0,  1.0,  1.15, 1.15, 1.2, 1.3),
@@ -121,30 +122,29 @@ def test_shipped_tier_table_is_the_plan_table(tcfg):
         t = tcfg.curriculum.tiers[name]
         got = (t.aim_noise, t.reaction_delay, t.lead_target, t.decision_period, t.move_speed,
                t.hp, t.damage, t.aggression, t.hero_focus)
-        assert got == row, f"tier {name!r} is {got}, the plan's row is {row}"
+        assert got == row, f"tier {name!r} is {got}, the pinned row is {row}"
 
 
 def test_shipped_stage_walk_is_the_plan_walk(tcfg):
-    """Step B4's other half: "the CONTENT of a tier changed, not the walk". Stage names, every
-    mixture, the 0.35 gates, the 2000-episode window and the 75M cap, as literals.
+    """The shipped walk as literals: stage names, every mixture, the 0.15 gates, the 2000-episode
+    window and the 125M cap.
 
     The two structural tests around this one (thresholds non-decreasing, shares never falling)
     read every expectation off the loaded config, so a bumped gate or weight that keeps the walk
     monotone passes both. These ARE tuning knobs: a deliberate retune edits this table in the same
-    change, exactly as it edits the tier table above. What this stops is an accidental one, while
-    the tiers block of the same file is being edited."""
+    change, exactly as it edits the tier table above. What this stops is an accidental one."""
     curriculum = tcfg.curriculum
     walk = [(s.name, s.tier_weights, s.advance_win_rate) for s in curriculum.stages]
     assert walk == [
-        ("hard_intro",    {"medium": 0.3, "hard": 0.7}, 0.35),
-        ("veteran_intro", {"hard": 0.6, "veteran": 0.4}, 0.35),
-        ("veteran",       {"hard": 0.3, "veteran": 0.5, "expert": 0.2}, 0.35),
-        ("expert",        {"hard": 0.1, "veteran": 0.3, "expert": 0.4, "elite": 0.2}, 0.35),
+        ("hard_intro",    {"medium": 0.3, "hard": 0.7}, 0.15),
+        ("veteran_intro", {"hard": 0.6, "veteran": 0.4}, 0.15),
+        ("veteran",       {"hard": 0.3, "veteran": 0.5, "expert": 0.2}, 0.15),
+        ("expert",        {"hard": 0.1, "veteran": 0.3, "expert": 0.4, "elite": 0.2}, 0.15),
         ("elite",         {"hard": 0.1, "veteran": 0.15, "expert": 0.25, "elite": 0.5}, None),
     ]
     assert curriculum.enabled is True
     assert (curriculum.window_episodes, curriculum.min_episodes_at_stage) == (2000, 2000)
-    assert curriculum.max_timesteps_at_stage == 75_000_000
+    assert curriculum.max_timesteps_at_stage == 125_000_000
     assert curriculum.demote_win_rate is None
 
 
@@ -321,6 +321,7 @@ def _reward_inputs(n=4, device="cpu"):
         "in_zone_ticks": torch.zeros(n, dtype=torch.int32, device=device),
         "n_ticks": torch.ones(n, dtype=torch.int32, device=device),
         "attack_in_reach_tick": torch.zeros(n, dtype=torch.int32, device=device),
+        "gadget_hit_tick": torch.zeros(n, dtype=torch.int32, device=device),
     }
     return obs, info
 
@@ -1275,7 +1276,7 @@ def test_eval_callback_fires_once_per_interval_not_once_per_overshoot(tmp_path):
     assert calls == [1000, 1100], f"expected two evals, got {calls}"
 
 
-# ---- gadget throws per episode (SIM_OVERHAUL_STEPS.md Step I2) --------------------------------
+# ---- gadget throws per episode ----------------------------------------------------------------
 
 class _GadgetOnceModel(_StubModel):
     """Throws the gadget on the first decision it is asked for, then idles."""
@@ -1351,13 +1352,17 @@ def test_evaluator_counts_a_gadget_only_where_legal_and_only_in_the_first_episod
 
 
 # ---------------------------------------------------------------------------
-# map-overfitting eval: training maps vs holdout maps (SIM_OVERHAUL M4)
+# map-overfitting eval: training maps vs holdout maps
 # ---------------------------------------------------------------------------
 
 TRAINING_MAPS = (
     "open", "bushy", "skull_creek", "feast_or_famine", "scorched_stone", "island_invasion",
     "broken_wall", "stone_fort", "twin_ponds", "cross_creek", "narrow_pass",
     "dry_gulch", "thorn_field", "reed_marsh",
+    "hot_maze", "ghost_point", "shadow_spirits", "crescent_lakes", "twisting_vines",
+    "pond_maze", "canal_maze", "picket_maze", "lagoon_ring", "square_lakes", "bush_halo",
+    "bramble_ponds", "bramble_bend", "bramble_stars", "moon_gate", "half_moon", "moon_pools",
+    "vine_springs", "vine_canal", "vine_hollow",
 )
 HOLDOUT_MAPS = ("split_river", "hollow_ring")
 
@@ -1378,8 +1383,8 @@ def _holdout_tcfg(episodes_per_tier=2, tiers=("easy", "hard"), world=None, holdo
 
 
 def test_an_override_list_replaces_the_base_list():
-    """The fourteen-map rotation only works if `world.maps` in an override REPLACES
-    configs/default.yaml's sixteen. A merge that unioned lists would quietly put the holdout
+    """The thirty-four-map rotation only works if `world.maps` in an override REPLACES
+    configs/default.yaml's thirty-six. A merge that unioned lists would quietly put the holdout
     maps back into training. Both merges on the path are pinned: train.yaml's own, and the one
     `load_config` applies to `run.env_overrides`."""
     merged = deep_merge({"world": {"maps": ["a", "b", "c"], "map_h": 60}},
@@ -1391,12 +1396,12 @@ def test_an_override_list_replaces_the_base_list():
     assert cfg.map_names == ("bushy", "open")
 
 
-def test_shipped_config_trains_on_fourteen_maps_and_holds_out_two(tcfg):
+def test_shipped_config_trains_on_thirty_four_maps_and_holds_out_two(tcfg):
     from brawl_sim.training.builder import build_spec
 
     training = resolved_training_maps(tcfg.run)
     assert training == TRAINING_MAPS
-    assert len(training) == 14
+    assert len(training) == 34
     assert tcfg.eval.holdout_maps == ("split_river", "hollow_ring")
     assert tcfg.eval.has_holdout
     assert not set(training) & set(tcfg.eval.holdout_maps)
@@ -1404,10 +1409,10 @@ def test_shipped_config_trains_on_fourteen_maps_and_holds_out_two(tcfg):
     # the SimParams view of the same overrides agrees with the EnvConfig view
     assert tuple(build_spec(tcfg)["world"]["maps"]) == TRAINING_MAPS
 
-    # and together they are exactly the sim's sixteen: nothing was dropped by accident
-    sixteen = load_config(REPO_ROOT / "configs" / "default.yaml").map_names
-    assert len(sixteen) == 16
-    assert set(training) | set(tcfg.eval.holdout_maps) == set(sixteen)
+    # and together they are exactly the sim's thirty-six: nothing was dropped by accident
+    loaded = load_config(REPO_ROOT / "configs" / "default.yaml").map_names
+    assert len(loaded) == 36
+    assert set(training) | set(tcfg.eval.holdout_maps) == set(loaded)
 
 
 def test_a_holdout_map_that_is_also_trained_on_is_rejected(tcfg):
@@ -1415,10 +1420,10 @@ def test_a_holdout_map_that_is_also_trained_on_is_rejected(tcfg):
         load_train_config(TRAIN_CONFIG, overrides={"eval": {"holdout_maps": ["split_river", "open"]}})
 
     # What counts is the RESOLVED rotation, not what train.yaml happens to list: strip the
-    # fourteen-map override and the env falls back to default.yaml's sixteen, holdouts included.
-    from brawl_sim.training.config import with_overrides
+    # thirty-four-map override and the env falls back to default.yaml's thirty-six, holdouts included.
+    from brawl_sim.training.config import validate_train_config
     with pytest.raises(ValueError, match=r"\['split_river', 'hollow_ring'\] are also in the training"):
-        with_overrides(tcfg, run=replace(tcfg.run, env_overrides={}))
+        validate_train_config(replace(tcfg, run=replace(tcfg.run, env_overrides={})))
 
 
 def test_a_config_without_the_rotation_override_cannot_hold_maps_out(tmp_path):
@@ -1458,11 +1463,11 @@ def test_a_holdout_map_of_the_wrong_size_is_rejected_at_load():
     it -- but it is 20x20. Left to the evaluator it failed only when the holdout env was built."""
     with pytest.raises(ValueError, match=r"'blank' cannot be loaded into this run's 60x60 world"):
         load_train_config(TRAIN_CONFIG, overrides={"eval": {"holdout_maps": ["blank"]}})
-    # with_overrides re-validates too, so a test or --smoke shrink cannot slip one in either
-    from brawl_sim.training.config import with_overrides
+    # the same check guards a config edited after it was loaded
+    from brawl_sim.training.config import validate_train_config
     tcfg = load_train_config(TRAIN_CONFIG)
     with pytest.raises(ValueError, match="map is 20x20, cfg expects 60x60"):
-        with_overrides(tcfg, eval=replace(tcfg.eval, holdout_maps=("hollow_ring", "blank")))
+        validate_train_config(replace(tcfg, eval=replace(tcfg.eval, holdout_maps=("hollow_ring", "blank"))))
 
 
 @pytest.mark.parametrize("value", [None, []])
@@ -1532,13 +1537,13 @@ def test_skipping_the_holdout_check_skips_nothing_else(tmp_path):
     with pytest.raises(ValueError, match="eval.tiers names undefined tier"):
         load_train_config(TRAIN_CONFIG, overrides={"eval": {"tiers": ["nightmare"]}},
                           check_holdout=False)
-    # the default is the strict one, and `with_overrides` has no way to opt out
-    from brawl_sim.training.config import with_overrides
+    # the default is the strict one
+    from brawl_sim.training.config import validate_train_config
     loose = load_train_config(TRAIN_CONFIG, check_holdout=False,
                               overrides={"eval": {"holdout_maps": ["split_river", "open"]}})
     assert loose.eval.holdout_maps == ("split_river", "open")
     with pytest.raises(ValueError, match=r"holdout_maps \['open'\] are also in the training"):
-        with_overrides(loose, run=replace(loose.run, n_envs=loose.run.n_envs))
+        validate_train_config(loose)
 
 
 def test_holdout_evaluator_env_holds_only_the_holdout_maps():
@@ -1812,7 +1817,7 @@ def test_watch_can_pin_a_map_the_run_held_out():
 def test_a_saved_watch_match_replays_over_the_map_it_was_played_on(tmp_path, monkeypatch):
     """A frame stores `map_id`, an index into the RECORDING env's map list, and the viewer CLI
     builds its bank from configs/default.yaml unless given a preset. Once a run's rotation is
-    not default.yaml's (configs/train.yaml: fourteen maps, another order) a bare replay draws the
+    not default.yaml's (configs/train.yaml: thirty-four maps, another order) a bare replay draws the
     wrong terrain. Pinned on a SHIFTED index: narrow_pass is map 1 here, where default.yaml has
     bushy -- on `open` (0 in both) the bug is invisible."""
     pytest.importorskip("matplotlib")
@@ -1960,13 +1965,13 @@ def test_train_script_builds_the_evaluators_before_the_run_directory(tmp_path, m
 
 # ---- SB3's image heuristic must not transpose the grid ------------------------------------------
 
-def _tiny_run_tcfg():
-    return load_train_config(TRAIN_CONFIG, overrides={
+def _tiny_run_tcfg(extra=None):
+    return load_train_config(TRAIN_CONFIG, overrides=deep_merge({
         "run": {"device": "cpu", "n_envs": 8, "tensorboard": False,
                 "env_overrides": yaml.safe_load(DEBUG_TINY.read_text())},
         "ppo": {"n_steps": 16, "batch_size": 32},
         "eval": {"holdout_maps": None},
-    })
+    }, extra or {}))
 
 
 def test_the_model_sees_the_grid_channels_first_as_the_env_builds_it():
@@ -2001,6 +2006,83 @@ def test_a_resumed_model_keeps_the_grid_channels_first(tmp_path):
     assert loaded.get_vec_normalize_env() is not None, "the statistics branch did not run"
     assert loaded.observation_space["grid"].shape == (13, 10, 14)
     assert loaded.get_env().observation_space["grid"].shape == (13, 10, 14)
+
+
+def test_a_resumed_run_saves_the_statistics_it_trained_through(tmp_path):
+    """A resume trains through the VecNormalize `_resume` restores, not the fresh one build_run
+    made. Until 2026-09-27 train.py saved the fresh one as final_vecnormalize.pkl, so the 450M
+    run's continuation left count 1e-4 and var 1 where the model had trained against ~46, and a
+    resume of its final_model.zip would have restarted the reward scaling."""
+    import scripts.train as train_script
+    from brawl_sim.training.builder import build_run
+    from stable_baselines3.common.running_mean_std import RunningMeanStd
+    from stable_baselines3.common.vec_env import VecNormalize
+
+    tcfg = _tiny_run_tcfg()
+    model, venv, _ = build_run(tcfg)
+    model.save(tmp_path / "model.zip")
+    venv.ret_rms.count, venv.ret_rms.var = 4.5e8, np.array(45.8)    # a long run's statistics...
+    venv.save(str(tmp_path / "vecnormalize.pkl"))
+    venv.ret_rms = RunningMeanStd(shape=())                         # ...and a fresh build's
+    loaded = train_script._resume(model, venv, tcfg, tmp_path / "model.zip", None, tmp_path)
+
+    run_dir = tmp_path / "resumed"
+    run_dir.mkdir()
+    train_script._save_final(loaded, run_dir)
+    saved = VecNormalize.load(str(run_dir / "final_vecnormalize.pkl"), venv.venv)
+    assert saved.ret_rms.count == pytest.approx(4.5e8)
+    assert float(saved.ret_rms.var) == pytest.approx(45.8)
+
+
+def test_restart_schedules_runs_the_config_schedules_over_the_resumed_steps_only(tmp_path):
+    """A resume keeps the checkpoint's schedules on SB3's whole-model progress; that is why a
+    100M extension of the 450M model starts at 7.7e-5 whatever train.yaml says. With
+    `restart_schedules` the config's schedules span the resumed steps alone: 768 done, 256 more
+    as two rollouts of 128, so the two updates land halfway through the linear 5e-5 -> 1e-5 and
+    at its end. The rates are read off the optimizer, so SB3's own progress count is what's
+    checked, not this file's arithmetic."""
+    import scripts.train as train_script
+    from brawl_sim.training.builder import build_run
+
+    tcfg = _tiny_run_tcfg()
+    model, venv, _ = build_run(tcfg)
+    model.num_timesteps = 768
+    model.learning_rate = schedules.constant_schedule(1.234e-4)     # the checkpoint's own
+    model.save(tmp_path / "model.zip")
+    venv.save(str(tmp_path / "vecnormalize.pkl"))
+    fine_tune = _tiny_run_tcfg({
+        "run": {"total_timesteps": 256},
+        "learning_rate": {"schedule": "linear", "initial": 5e-5, "final": 1e-5},
+        "clip_range": {"schedule": "linear", "initial": 0.15, "final": 0.1},
+    })
+
+    kept = train_script._resume(model, venv, fine_tune, tmp_path / "model.zip", None, tmp_path)
+    assert kept.lr_schedule(0.25) == kept.lr_schedule(0.0) == pytest.approx(1.234e-4)
+
+    restarted = train_script._resume(model, venv, fine_tune, tmp_path / "model.zip", None,
+                                     tmp_path, restart_schedules=True)
+    assert restarted.clip_range(0.25) == pytest.approx(0.15)
+    assert restarted.clip_range(0.0) == pytest.approx(0.1)
+    rates, train = [], restarted.train
+
+    def recording_train():
+        train()
+        rates.append(restarted.policy.optimizer.param_groups[0]["lr"])
+
+    restarted.train = recording_train
+    restarted.learn(total_timesteps=256, reset_num_timesteps=False)
+    del restarted.train     # it holds the model itself, which save() would try to pickle
+    assert rates == pytest.approx([3e-5, 1e-5])
+
+    # A crash at 896 is recovered by a plain resume of the remaining 128: the checkpoint carries
+    # the squeezed schedule, so it continues from the halfway rate instead of starting over.
+    restarted.num_timesteps = 896
+    (tmp_path / "crashed").mkdir()
+    restarted.save(tmp_path / "crashed" / "model.zip")
+    recovered = train_script._resume(model, venv, _tiny_run_tcfg({"run": {"total_timesteps": 128}}),
+                                     tmp_path / "crashed" / "model.zip", None, tmp_path)
+    assert recovered.lr_schedule(128 / 1024) == pytest.approx(3e-5)
+    assert recovered.lr_schedule(0.0) == pytest.approx(1e-5)
 
 
 @pytest.mark.slow

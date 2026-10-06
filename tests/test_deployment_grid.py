@@ -579,7 +579,7 @@ def _plane(b: GridBuilder, grid: np.ndarray, channel: str) -> np.ndarray:
 
 
 def test_a_past_enemy_lands_in_the_cell_the_sims_scatter_puts_it():
-    """SIM_OVERHAUL_STEPS.md H4.3's verify. The sim's rings are written by hand so every cut is
+    """The sim's rings are written by hand so every cut is
     placed on purpose: a fractional hero, sightings a hair either side of the radius on both
     axes, one by an enemy dead NOW (seen then, so still drawn), and a third slot of garbage
     behind `hist_valid`, which the deployed side sees as a history one decision shorter."""

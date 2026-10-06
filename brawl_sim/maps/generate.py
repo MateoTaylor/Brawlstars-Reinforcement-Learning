@@ -1,5 +1,5 @@
-"""Procedural Solo Showdown maps (SIM_OVERHAUL_PLAN.md Step M2). Library half; `scripts/gen_maps.py`
-is the CLI and `tests/test_map_generate.py` pins every primitive.
+"""Procedural Solo Showdown maps. Library half; `scripts/gen_maps.py` is the CLI and
+`tests/test_map_generate.py` pins every primitive.
 
 Not a hot path: plain Python + numpy on a 60x60 char grid, run once per map at authoring time.
 Deterministic in `(seed, family, symmetry)` -- every random draw comes from one
@@ -10,12 +10,14 @@ Pipeline (`generate`):
 1. border ring of `#`; for the water-border family a 2-tile `~` moat `Family.moat_inset` tiles in,
    with a floor rim outside it and four 3-tile gaps (two drawn, two mirrored, off-centre);
 2. centre feature on point-symmetric maps (2x2 wall + 4 bush, a small pond, or an open cross kept
-   clear of everything else);
+   clear of everything else); the five screenshot families run their `LAYOUTS` pass here
+   instead, which lays the reference map's skeleton (maze rings, a lake ring, vines);
 3. stamps drawn in one half of the map and written together with their mirror
-   (`mirror_point` for 180-degree symmetry, `mirror_lr` for left-right): wall clusters, ponds and
-   channels until the family's wall and water shares are met, then bush patches until the bush
-   share is met -- solid stamps keep a 2-cell margin from each other and the border so no 1-wide
-   corridor can exist, bush is allowed to touch anything and merge into fields;
+   (`mirror_point` for 180-degree symmetry, `mirror_lr` for left-right): wall stamps, ponds and
+   channels until the family's wall and water shares are met (water first on the screenshot
+   families), then bush patches until the bush share is met -- solid stamps keep a 2-cell margin
+   from each other and the border so no 1-wide corridor can exist, bush is allowed to touch
+   anything and merge into fields;
 4. repair: punch a 2-tile gap in any straight interior wall run longer than 8, fill 1-wide dead
    ends with whatever blocks them, carve the shortest path between the two largest passable
    components until there is one;
@@ -50,13 +52,11 @@ N_SPAWNS = 16
 SPAWN_INSET = 7          # the square ring the spawns sit on, tiles in from the border (+-1 jitter)
 MAX_WALL_RUN = 8         # README: "no long solid barriers"
 MOAT_GAP = 3
-POCKET_RADIUS = 6        # plan: BFS radius 6 from every floor cell ...
+POCKET_RADIUS = 6        # a BFS of this radius from every floor cell ...
 # ... must reach >= 24 of the 85 cells an open field offers (0.28), scaled by what is in bounds
-# so a corner cell is judged against its 28. The plan said 40 (0.47); measured on generated maps
-# that rejected every 2-wide lane between two features (a channel two rows below the moat, two
-# clusters a margin apart) -- reach 26 -- and the reference maps are full of exactly those.
-# 0.28 still rejects what the README means by a pocket: a 2x3 notch reaches ~20 (0.24), a
-# dead-end lane ~15 (0.18).
+# so a corner cell is judged against its 28. 0.28 passes a 2-wide lane between two features
+# (reach 26; the reference maps are full of them) and rejects what the README means by a
+# pocket: a 2x3 notch reaches ~20 (0.24), a dead-end lane ~15 (0.18).
 POCKET_MIN_REACH = 24
 POCKET_OPEN_FIELD = 85
 BUSH_SPREAD_MIN = 0.80   # a bush cell in >= 80% of the hunt cells
@@ -69,10 +69,11 @@ STAMP_MARGIN = 2         # cells of floor kept around every solid stamp (and fro
 
 @dataclass(frozen=True)
 class Family:
-    """Style bands from SIM_OVERHAUL_PLAN.md Step M2: interior shares (rows/cols 1..58, so 3364
-    cells; the moat counts as water) and crate counts. `count` is how many of the ten maps M3
-    draws from this family; `symmetry` is the default and `generate(..., symmetry=)` overrides it
-    (the standard family ships five point-symmetric maps and one mirror map)."""
+    """Style bands: interior shares (rows/cols 1..58, so 3364 cells; the moat counts as water)
+    and crate counts. `count` is how many shipped maps come from this family (the ten generated
+    maps, then three per screenshot family); `symmetry` is the default and
+    `generate(..., symmetry=)` overrides it (the standard family ships five point-symmetric maps
+    and one mirror map)."""
     name: str
     count: int
     wall: tuple[float, float]
@@ -81,6 +82,12 @@ class Family:
     boxes: tuple[int, int]
     symmetry: str = POINT
     moat_inset: int = 0  # 0 = no moat; otherwise the moat's outer edge is this many tiles in
+    # For the screenshot families: `layout` names the LAYOUTS pass that lays the reference map's
+    # skeleton in place of the centre feature, and `wall_mix` weights the WALL_STAMPS the wall
+    # pass fills the band with. A one-entry mix draws nothing extra, which keeps the four
+    # original families' shipped seeds byte-identical.
+    layout: str = ""
+    wall_mix: tuple[tuple[str, float], ...] = (("cluster", 1.0),)
 
 
 FAMILIES: dict[str, Family] = {
@@ -88,10 +95,25 @@ FAMILIES: dict[str, Family] = {
     "open": Family("open", 1, (0.04, 0.06), (0.12, 0.18), (0.00, 0.03), (16, 24)),
     "dense": Family("dense", 1, (0.08, 0.12), (0.32, 0.38), (0.02, 0.05), (24, 36), symmetry=MIRROR),
     # The moat is drawn 4 tiles in: a 3-wide floor rim outside it, water at rows/cols 4-5, the
-    # island from 6. Flush against the border the plan's four gaps would lead nowhere; a rim
+    # island from 6. Flush against the border the four gaps would lead nowhere; a rim
     # narrower than 3 fails the pocket check by construction. The moat alone is ~11% water.
     "water_border": Family("water_border", 2, (0.06, 0.10), (0.20, 0.28), (0.12, 0.20), (20, 32),
                            moat_inset=4),
+    # One family per map transcribed from a screenshot (README "The five screenshot maps");
+    # bands sit around the transcription's own shares. All five are mirror maps: these maps must
+    # be symmetric across at least one axis, and a 180-degree turn has none. Most of
+    # each layout is drawn in one quarter and reflected across both axes, and the rest is stamped
+    # with the family's symmetry, so `--symmetry point` works too.
+    "maze": Family("maze", 3, (0.10, 0.15), (0.08, 0.14), (0.01, 0.03), (22, 32), symmetry=MIRROR,
+                   layout="rings", wall_mix=(("fence", 0.5), ("stub", 0.5))),
+    "lake_ring": Family("lake_ring", 3, (0.07, 0.11), (0.13, 0.19), (0.06, 0.10), (16, 26),
+                        symmetry=MIRROR, layout="lake_ring", wall_mix=(("stub", 0.5), ("cluster", 0.5))),
+    "branches": Family("branches", 3, (0.10, 0.14), (0.07, 0.12), (0.01, 0.03), (20, 28),
+                       symmetry=MIRROR, layout="branches", wall_mix=(("branch", 0.8), ("stub", 0.2))),
+    "crescent": Family("crescent", 3, (0.07, 0.11), (0.10, 0.16), (0.07, 0.11), (18, 26),
+                       symmetry=MIRROR, layout="crescent", wall_mix=(("stub", 0.6), ("cluster", 0.4))),
+    "vines": Family("vines", 3, (0.06, 0.10), (0.17, 0.24), (0.02, 0.05), (20, 28), symmetry=MIRROR,
+                    layout="vines", wall_mix=(("stub", 0.5), ("cluster", 0.5))),
 }
 
 
@@ -186,8 +208,8 @@ def add_moat(grid: np.ndarray, rng: random.Random, inset: int, symmetry: str = P
 
 def wall_cluster(rng: random.Random, anchor: tuple[int, int]) -> dict[tuple[int, int], str]:
     """A 2x2..4x6 rectangle (either orientation), optionally an L (a 2-wide, 2-3 long arm off one
-    end of a side at least 5 long, so the inside corner is >= 3 wide and never a notch -- T stems
-    were tried and their 2-wide notches are pockets by the check below), and a 1-tile bush skirt
+    end of a side at least 5 long, so the inside corner is >= 3 wide and never a notch -- not a T,
+    whose stem leaves 2-wide notches that are pockets by the check below), and a 1-tile bush skirt
     on one or two random sides -- the "wall with grass attached" motif of every reference
     screenshot."""
     r0, c0 = anchor
@@ -217,9 +239,9 @@ def wall_cluster(rng: random.Random, anchor: tuple[int, int]) -> dict[tuple[int,
 
 
 def pond(rng: random.Random, centre: tuple[int, int], radius: int | None = None,
-         rim: bool = True) -> dict[tuple[int, int], str]:
+         rim: bool = True, full_rim: bool = False) -> dict[tuple[int, int], str]:
     """A filled ellipse of water with semi-axes 2..4 (`radius` pins both), and a 1-tile bush rim
-    along a random half of its perimeter."""
+    along a random half of its perimeter (all of it with `full_rim`)."""
     cr, cc = centre
     a = radius if radius is not None else rng.randint(2, 4)
     b = radius if radius is not None else rng.randint(2, 4)
@@ -235,15 +257,15 @@ def pond(rng: random.Random, centre: tuple[int, int], radius: int | None = None,
                 if (nr, nc) in cells:
                     continue
                 angle = (np.arctan2(nr - cr, nc - cc) - arc0) % (2 * np.pi)
-                if angle <= np.pi:
+                if full_rim or angle <= np.pi:
                     cells[(nr, nc)] = BUSH
     return cells
 
 
 def channel(rng: random.Random, start: tuple[int, int]) -> dict[tuple[int, int], str]:
-    """A 1-2 wide water strip 6-12 long, straight or with one right-angle bend. (The plan allowed
-    14; a 14-long strip a lane away from the moat or another feature is right at the pocket
-    check's edge, 12 is not.)"""
+    """A 1-2 wide water strip 6-12 long, straight or with one right-angle bend. (Not 14: a 14-long
+    strip a lane away from the moat or another feature is right at the pocket check's edge, 12 is
+    not.)"""
     r, c = start
     width = rng.randint(1, 2)
     length = rng.randint(6, 12)
@@ -316,6 +338,247 @@ def centre_feature(rng: random.Random, size: int = SIZE) -> tuple[dict[tuple[int
             if abs(r - m + 0.5) < 2.5 or abs(c - m + 0.5) < 2.5:
                 reserved.add((r, c))
     return {}, reserved
+
+
+def _orient(rng: random.Random, shape: dict[tuple[int, int], str],
+            anchor: tuple[int, int]) -> dict[tuple[int, int], str]:
+    """`shape` ({(dr, dc): char} drawn round (0, 0)) under a random one of its 8 rotations and
+    reflections, moved to `anchor`."""
+    turns, flip = rng.randrange(4), rng.random() < 0.5
+    cells = {}
+    for (dr, dc), ch in shape.items():
+        if flip:
+            dc = -dc
+        for _ in range(turns):
+            dr, dc = dc, -dr
+        cells[(anchor[0] + dr, anchor[1] + dc)] = ch
+    return cells
+
+
+def wall_stub(rng: random.Random, anchor: tuple[int, int]) -> dict[tuple[int, int], str]:
+    """A small wall with no skirt, the cacti, posts and fence pieces the screenshot maps scatter
+    over open floor: one tile, a 2-3 long bar either way, a 2x2 block, or a 1-wide L."""
+    r0, c0 = anchor
+    kind = rng.randrange(4)
+    if kind == 0:
+        return {anchor: WALL}
+    if kind == 1:
+        n = rng.randint(2, 3)
+        if rng.random() < 0.5:
+            return {(r0, c0 + i): WALL for i in range(n)}
+        return {(r0 + i, c0): WALL for i in range(n)}
+    if kind == 2:
+        return {(r0 + dr, c0 + dc): WALL for dr in (0, 1) for dc in (0, 1)}
+    return _orient(rng, {(0, 0): WALL, (0, 1): WALL, (1, 0): WALL}, anchor)
+
+
+def branch_cluster(rng: random.Random, anchor: tuple[int, int]) -> dict[tuple[int, int], str]:
+    """Shadow Spirits' antlers: a 1-wide wall trunk 4-7 long with a 1-wide branch of 2-3 off one
+    end at a right angle and, half the time, a second off the other end turning the other way
+    (a Z; turning the same way would make a C, whose bay is a pocket), with a 2x2 bush clump in
+    the crook of each branch."""
+    length = rng.randint(4, 7)
+    shape = {(i, 0): WALL for i in range(length)}
+    ends = [(length - 1, 1)] + ([(0, -1)] if rng.random() < 0.5 else [])
+    for row, side in ends:
+        for k in range(1, rng.randint(2, 3) + 1):
+            shape[(row, side * k)] = WALL
+        inward = -1 if row > 0 else 1  # the crook is on the trunk's side of the branch
+        for dr in (1, 2):
+            for dc in (1, 2):
+                shape.setdefault((row + inward * dr, side * dc), BUSH)
+    return _orient(rng, shape, anchor)
+
+
+def fence_line(rng: random.Random, anchor: tuple[int, int]) -> dict[tuple[int, int], str]:
+    """A 1-wide straight wall 4-8 long either way, the fence pieces that make Hot Maze's
+    corridors."""
+    r0, c0 = anchor
+    n = rng.randint(4, MAX_WALL_RUN)
+    if rng.random() < 0.5:
+        return {(r0, c0 + i): WALL for i in range(n)}
+    return {(r0 + i, c0): WALL for i in range(n)}
+
+
+WALL_STAMPS = {"cluster": wall_cluster, "stub": wall_stub, "branch": branch_cluster, "fence": fence_line}
+
+
+# ---- layouts (the screenshot families) ---------------------------------------------------------
+# Each lays one reference map's skeleton on a fresh builder before the wall / water / bush passes
+# run. Shapes are drawn in the top-left quarter and reflected across both axes by `quad`, except
+# where a note says otherwise, and every layout is stamped with the family's own symmetry on top.
+# Solid pieces keep the same >= 2 passable cells from each other and the border that
+# STAMP_MARGIN gives the passes; bush may touch anything.
+
+
+def quad(cells: dict[tuple[int, int], str], size: int = SIZE) -> dict[tuple[int, int], str]:
+    """`cells` plus their reflections across both axes, a shape every symmetry here keeps."""
+    out = {}
+    for (r, c), ch in cells.items():
+        for cell in ((r, c), (r, size - 1 - c), (size - 1 - r, c), (size - 1 - r, size - 1 - c)):
+            out[cell] = ch
+    return out
+
+
+def ring_path(inset: int, size: int = SIZE) -> list[tuple[int, int]]:
+    """The top-left quarter of the square ring through row/col `inset`, as a path from the
+    vertical axis round the corner to the horizontal one. It stops 2 cells short of each axis,
+    so the reflected ring opens 4 wide in the middle of every side."""
+    mid = size // 2 - 1
+    return [(inset, c) for c in range(mid - 2, inset - 1, -1)] + [(r, inset) for r in range(inset + 1, mid - 1)]
+
+
+def border_path(size: int = SIZE) -> list[tuple[int, int]]:
+    """The top-left quarter of the ring just inside the border (row/col 1), axis to axis."""
+    mid = size // 2 - 1
+    return [(1, c) for c in range(mid, 0, -1)] + [(r, 1) for r in range(2, mid + 1)]
+
+
+def broken_line(rng: random.Random, path, ch: str, run=(4, MAX_WALL_RUN), gap=(3, 4)) -> dict[tuple[int, int], str]:
+    """`path` cut into runs of `ch` separated by gaps, starting 0-2 cells in."""
+    cells, i = {}, rng.randint(0, 2)
+    while i < len(path):
+        n = rng.randint(*run)
+        for cell in path[i:i + n]:
+            cells[cell] = ch
+        i += n + rng.randint(*gap)
+    return cells
+
+
+def annulus(centre: tuple[float, float], inner: float, outer: float, ch: str, keep=None,
+            size: int = SIZE) -> dict[tuple[int, int], str]:
+    """Cells more than `inner` and at most `outer` from a float `centre` ((29.5, 29.5) is the
+    map's), filtered by `keep(dr, dc)` when given. A negative `inner` gives a filled disc."""
+    cr, cc = centre
+    cells = {}
+    for r in range(size):
+        for c in range(size):
+            dr, dc = r - cr, c - cc
+            if inner < np.hypot(dr, dc) <= outer and (keep is None or keep(dr, dc)):
+                cells[(r, c)] = ch
+    return cells
+
+
+def _layout_rings(b: "_Builder") -> None:
+    """Hot Maze: two square rings of 1-wide wall, an outer one 8-10 tiles in and an inner one
+    20-22 in round the centre court, cut into runs of 5-8 with 2-3 wide gaps, a bush plus in
+    the court (arms 4 wide, 8-12 long) and a broken bush band just inside the border -- the
+    fences leave bush patches too little floor to reach every hunt cell on their own."""
+    cells = broken_line(b.rng, border_path(b.size), BUSH, run=(5, 10), gap=(3, 5))
+    for inset in (b.rng.randint(8, 10), b.rng.randint(20, 22)):
+        cells.update(broken_line(b.rng, ring_path(inset, b.size), WALL, run=(5, MAX_WALL_RUN), gap=(2, 3)))
+    m = (b.size - 1) / 2
+    arm = b.rng.randint(3, 5) + 0.5
+    for r in range(b.size):
+        for c in range(b.size):
+            dr, dc = abs(r - m), abs(c - m)
+            if (dr <= arm and dc <= 1.5) or (dc <= arm and dr <= 1.5):
+                cells[(r, c)] = BUSH
+    stamp(b.grid, quad(cells, b.size), b.symmetry)
+
+
+def _layout_lake_ring(b: "_Builder") -> None:
+    """Ghost Point: a broken bush band just inside the border, and eight 2-wide lakes on the
+    square ring 10-12 tiles in, an L in each corner (arms 5-7) and a bar across the middle of
+    each side (8-12 long), all rimmed with bush on the side facing the centre, round a small
+    bush-ringed pond in the middle."""
+    rng, size = b.rng, b.size
+    mid = size // 2 - 1
+    inset, arm, bar = rng.randint(10, 12), rng.randint(5, 7), rng.randint(4, 6)
+    water = {}
+    for k in (0, 1):
+        for i in range(arm):
+            water[(inset + k, inset + i)] = WATER
+            water[(inset + i, inset + k)] = WATER
+        for i in range(bar):
+            water[(inset + k, mid - i)] = WATER
+            water[(mid - i, inset + k)] = WATER
+    cells = dict(water)
+    for r, c in water:
+        for n in ((r + 1, c), (r, c + 1)):
+            if n not in water and n[0] <= mid and n[1] <= mid:  # a rim cell past an axis would
+                cells[n] = BUSH                                  # reflect onto the lake itself
+    cells.update(broken_line(rng, border_path(size), BUSH, run=(5, 10), gap=(3, 5)))
+    m = (size - 1) / 2
+    cells.update(annulus((m, m), 2.0, 3.2, BUSH, size=size))
+    cells.update(annulus((m, m), -1.0, 2.0, WATER, size=size))
+    stamp(b.grid, quad(cells, size), b.symmetry)
+
+
+def _layout_branches(b: "_Builder") -> None:
+    """Shadow Spirits: a broken bush band just inside the border and a 2-wide lake bar 10-14 long
+    across the vertical axis, 4-8 rows below the centre (not reflected top to bottom; a point
+    map gets its turned copy above the centre from `stamp`)."""
+    rng, size = b.rng, b.size
+    mid = size // 2 - 1
+    cells = quad(broken_line(rng, border_path(size), BUSH, run=(5, 10), gap=(3, 5)), size)
+    row, half = mid + rng.randint(4, 8), rng.randint(5, 7)
+    for r in (row, row + 1):
+        for c in range(mid + 1 - half, mid + 1 + half):
+            cells[(r, c)] = WATER
+    stamp(b.grid, cells, b.symmetry)
+
+
+def _layout_crescent(b: "_Builder") -> None:
+    """The fifth screenshot map: two 2-wide water crescents facing each other round a centre
+    arena (a ring of radius 6-7 split by 4 or 6 wide openings, on the vertical axis or the
+    horizontal one) with bush along their backs, and a pond in a full bush ring 11-15 tiles in
+    from each corner."""
+    rng, size = b.rng, b.size
+    m = (size - 1) / 2
+    radius, gap = rng.randint(6, 7), rng.choice((2.0, 3.0))
+    if rng.random() < 0.5:
+        keep = lambda dr, dc: abs(dc) > gap  # noqa: E731 -- openings top and bottom
+    else:
+        keep = lambda dr, dc: abs(dr) > gap  # noqa: E731 -- openings left and right
+    cells = annulus((m, m), radius, radius + 1, BUSH, keep, size)
+    cells.update(annulus((m, m), radius - 2, radius, WATER, keep, size))
+    corner = rng.randint(11, 15)
+    cells.update(pond(rng, (corner, corner), radius=rng.randint(2, 3), full_rim=True))
+    stamp(b.grid, quad(cells, size), b.symmetry)
+
+
+def _layout_vines(b: "_Builder") -> None:
+    """Twisting Vines: three bush rivers from the top border to the bottom one. The middle one is
+    2-6 wide, symmetric about both axes, with a 2-wide water stripe 3-5 long on the axis. The
+    side one's centre wanders a column every 2-4 rows between cols 6 and 14, 3 or 5 wide, with
+    2x2 and 3x2 water pockets sunk into its edges every 7-11 rows; it is drawn full height and
+    only `stamp` copies it, so a mirror map gets it on the right and a point map gets it turned."""
+    rng, size = b.rng, b.size
+    mid = size // 2 - 1
+    middle, half = {}, rng.randint(1, 3)
+    for r in range(1, mid + 1):
+        if rng.random() < 0.3:
+            half = min(3, max(1, half + rng.choice((-1, 1))))
+        for c in range(mid + 1 - half, mid + 1):
+            middle[(r, c)] = BUSH
+    top = rng.randint(3, mid - 6)  # one stripe per half: two could stop a row apart, a 1-wide gap
+    for r in range(top, top + rng.randint(3, 5)):
+        middle[(r, mid)] = WATER
+    side, cols, halves = {}, {}, {}
+    col, half, step = rng.randint(8, 12), rng.randint(1, 2), 0
+    for r in range(1, size - 1):
+        if step == 0:
+            col = min(14, max(6, col + rng.choice((-1, 1))))
+            if rng.random() < 0.3:
+                half = 3 - half
+            step = rng.randint(2, 4)
+        step -= 1
+        cols[r], halves[r] = col, half
+        for c in range(col - half, col + half + 1):
+            side[(r, c)] = BUSH
+    r = rng.randint(3, 8)
+    while r < size - 5:
+        edge = cols[r] - halves[r] if rng.random() < 0.5 else cols[r] + halves[r] - 1
+        for rr in range(r, r + rng.randint(2, 3)):
+            side[(rr, edge)] = side[(rr, edge + 1)] = WATER
+        r += rng.randint(7, 11)
+    stamp(b.grid, quad(middle, size), b.symmetry)
+    stamp(b.grid, side, b.symmetry)
+
+
+LAYOUTS = {"rings": _layout_rings, "lake_ring": _layout_lake_ring, "branches": _layout_branches,
+           "crescent": _layout_crescent, "vines": _layout_vines}
 
 
 # ---- repair -----------------------------------------------------------------------------------
@@ -508,8 +771,9 @@ def _open_field_capacity(size: int, radius: int) -> np.ndarray:
 
 def pocket_fractions(grid: np.ndarray, radius: int = POCKET_RADIUS) -> np.ndarray:
     """(H, W) float: reach / open-field capacity for every passable cell, 1.0 elsewhere -- so
-    `.min()` is the worst pocket on the map. The plan's ">= 40 of 85" becomes >= 0.47 of what is
-    geometrically in bounds, which is the same test away from the border and a fair one at it."""
+    `.min()` is the worst pocket on the map. `check` wants it >= POCKET_MIN_REACH /
+    POCKET_OPEN_FIELD (0.28) of what is geometrically in bounds, which is the plain reach test
+    away from the border and a fair one at it."""
     passable = np.isin(grid, list(PASSABLE))
     counts = reach_counts(passable, radius)
     capacity = _open_field_capacity(grid.shape[0], radius)
@@ -602,6 +866,10 @@ class _Builder:
         self.size = size
         self.grid = new_grid(size)
         self.reserved: set[tuple[int, int]] = set()
+        # What a stamp's margin ring may hold. A layout lays bush before any stamp is drawn, and
+        # bush is walkable, so it still leaves >= 2 passable cells between two solids; the four
+        # original families keep floor-only, which is what their shipped seeds were drawn under.
+        self.margin_ok = frozenset((FLOOR, BUSH)) if family.layout else frozenset((FLOOR,))
         inner_lo, inner_hi = 1, size - 2
         if family.moat_inset:
             add_moat(self.grid, self.rng, family.moat_inset, symmetry)
@@ -647,7 +915,7 @@ class _Builder:
                         # the border, moat or any earlier stamp, not a reserved centre cell.
                         if n in other or not (0 <= n[0] < self.size and 0 <= n[1] < self.size):
                             return False
-                        if self.grid[n] != FLOOR or n in self.reserved:
+                        if self.grid[n] not in self.margin_ok or n in self.reserved:
                             return False
         return True
 
@@ -687,13 +955,25 @@ class _Builder:
                 for dc in range(-STAMP_MARGIN, STAMP_MARGIN + 1):
                     self.reserved.add((r + dr, c + dc))
 
+    def _wall_stamp(self, anchor) -> dict[tuple[int, int], str]:
+        """One stamp from the family's `wall_mix`; a one-entry mix spends no draw on the pick."""
+        mix = self.family.wall_mix
+        kind = mix[0][0]
+        if len(mix) > 1:
+            x = self.rng.random()
+            for kind, weight in mix:
+                if x < weight:
+                    break
+                x -= weight
+        return WALL_STAMPS[kind](self.rng, anchor)
+
     def walls(self) -> None:
         want = self._cells_for(self._target(self.family.wall))
         hi = self._cells_for(self.family.wall[1])
         stalls = 0
         while self._count(WALL) < want and stalls < 12:
             snapshot = self.grid.copy()
-            written = self._place(lambda a: wall_cluster(self.rng, a), STAMP_MARGIN)
+            written = self._place(self._wall_stamp, STAMP_MARGIN)
             if self._count(WALL) > hi:
                 # too big a bite: the band is the contract, so give the last one back
                 self.grid = snapshot
@@ -802,9 +1082,14 @@ class _Builder:
         want_half = self.rng.randint((lo + 1) // 2, hi // 2)
         spawns = list(zip(*np.nonzero(self.grid == SPAWN)))
         spots: list[tuple[int, int]] = []
+        # The border ring counts as cover, so every edge cell looks sheltered and crates would
+        # line the edge, which no screenshot shows. The screenshot families keep them 3 tiles in;
+        # the four original families' seeds were drawn without the rule (0 changes nothing).
+        edge = 3 if self.family.layout else 0
 
         def free(cell):
             return (self._is_floor(cell) or (self._in_inner(cell) and self.grid[cell] == BUSH)) \
+                and min(cell[0], cell[1], self.size - 1 - cell[0], self.size - 1 - cell[1]) >= edge \
                 and all(max(abs(cell[0] - s[0]), abs(cell[1] - s[1])) >= 2 for s in spawns) \
                 and all(max(abs(cell[0] - x[0]), abs(cell[1] - x[1])) >= 3 for x in spots)
 
@@ -832,9 +1117,15 @@ class _Builder:
             placed += len(cells)
 
     def build(self) -> np.ndarray:
-        self.centre()
-        self.walls()
-        self.water()
+        if self.family.layout:
+            LAYOUTS[self.family.layout](self)
+            # Water first: a pond needs a 9x9 hole and the stub-heavy wall mixes leave none.
+            self.water()
+            self.walls()
+        else:
+            self.centre()
+            self.walls()
+            self.water()
         self.bushes()
         repair(self.grid, self.symmetry)
         self.spawns()
@@ -846,7 +1137,8 @@ def generate(seed: int, family: str | Family, symmetry: str | None = None,
              max_attempts: int = 200) -> tuple[np.ndarray, dict]:
     """The map for the first seed in `seed, seed+1, ...` that passes `check`, with its stats.
     `stats["seed"]` is that seed -- `generate(stats["seed"], ...)` reproduces the grid at once --
-    and `stats["rejected"]` lists `(seed, reasons)` for the ones that failed, for the README."""
+    and `stats["rejected"]` lists `(seed, reasons)` for the ones that failed (`scripts/gen_maps.py`
+    prints them; a rejected seed is simply never shipped)."""
     fam = FAMILIES[family] if isinstance(family, str) else family
     sym = symmetry or fam.symmetry
     rejected = []
@@ -867,11 +1159,6 @@ def generate(seed: int, family: str | Family, symmetry: str | None = None,
 
 def to_csv(grid: np.ndarray) -> str:
     return "\n".join(",".join(row) for row in grid.tolist()) + "\n"
-
-
-def from_csv(text: str) -> np.ndarray:
-    rows = [line.split(",") for line in text.strip("\n").split("\n") if line]
-    return np.array(rows, dtype="<U1")
 
 
 def render(grid: np.ndarray) -> str:

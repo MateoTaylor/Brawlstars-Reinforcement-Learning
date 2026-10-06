@@ -1,27 +1,11 @@
 """Damage application, melee hit detection, death resolution, cube drops/pickups, and regen.
-See BRAWL_SIM_BUILD_PLAN.md Step 14.
 
-Death-cause bookkeeping note: resolve_deaths needs to know whether a kill was COMBAT or ZONE
-(SimState has no separate "pending cause" field for this). ent_last_hit_by already exists for
-kill-credit, so apply_damage's `attacker` argument doubles as the cause signal: callers pass
-a valid entity index for combat sources and the sentinel -1 for zone damage (which has no
-attacker). resolve_deaths then derives ent_death_cause purely from whether ent_last_hit_by is
-the sentinel at the moment of death -- no extra field needed.
+Death cause has no field of its own: apply_damage's `attacker` doubles as the cause signal -- an
+entity index for combat sources, the sentinel -1 for zone damage -- and resolve_deaths derives
+ent_death_cause from whether ent_last_hit_by is the sentinel at the moment of death.
 
-Slot allocation note: drop_cubes_on_death needs the exact same collision-free "find a free
-slot" scheme Step 13 built for projectiles (pku_alive stands in for prj_alive). Rather than
-duplicate alloc_slots/_set_scalar/_set_vec2, this reuses them directly from .projectiles --
-they're algorithm-generic, not projectile-specific, despite the module they live in.
-
-Retroactive fix (found while building Step 22, core/boxes.py): Step 22's own text states boxes
-"take damage from projectiles, AoE, melee cones, and the dash" as an already-true property.
-Dash (Step 11's advance_dash) and projectiles (Step 13's step_projectiles) already computed
-box damage; melee_hitscan did not -- there was nothing to hit yet when Step 14 was written, so
-the gap was invisible until boxes actually started spawning. melee_hitscan now also returns
-dmg_box (N,B), computed with the exact same in-cone + physical-LOS pattern already used for
-units, checked against box_pos/box_alive instead. This changes melee_hitscan's return
-signature from (dmg_ent, dmg_by) to (dmg_ent, dmg_by, dmg_box) -- every call site (tests, and
-the melee archetype's docstring reference, now bots/combat_rules.py) has been updated to match.
+drop_cubes_on_death reuses projectiles.alloc_slots/_set_scalar/_set_vec2 (pku_alive standing in
+for prj_alive): they are algorithm-generic despite the module they live in.
 """
 import torch
 
@@ -39,18 +23,18 @@ def apply_damage(state, dmg: torch.Tensor, cause: int, attacker: torch.Tensor, p
     call -- callers invoke this once per damage source (dash, melee, projectiles, zone), never
     mixing causes within one call. MUTATES: ent_hp, ent_damage_taken, ent_last_hit_by,
     ent_out_of_combat_t. Where invuln_t > 0, COMBAT damage is zeroed; ZONE damage is not, unless
-    cfg.iframes_block_zone (default false)."""
+    cfg.iframes_block_zone (default false). Nothing seeds ent_invuln_t (the dash has no
+    i-frames), so this gate is dormant."""
     blocked = state.ent_invuln_t > 0
     if int(cause) == int(DeathCause.ZONE) and not cfg.iframes_block_zone:
         effective_dmg = dmg
     else:
         effective_dmg = torch.where(blocked, torch.zeros_like(dmg), dmg)
 
-    # An entity already at 0 HP is dead in everything but the bookkeeping: `resolve_deaths` runs
-    # once, after every damage source of the tick, so a later source must not overwrite the
-    # finisher's credit in `ent_last_hit_by`. The gas is the one that did (phase 10, after the
-    # dash and projectile phases; `zone.zone_damage` hits every alive entity outside the rect),
-    # so a bot the hero finished in the gas counted as a zone death: no kill reward, no credit.
+    # An entity already at 0 HP is dead in everything but the bookkeeping (`resolve_deaths` runs
+    # once, after every damage source of the tick), so a later source must not overwrite the
+    # finisher's `ent_last_hit_by`: the gas (phase 10, after the dash and projectile phases)
+    # cannot steal kill credit (user decision, 2026-09-25).
     took_damage = (effective_dmg > 0) & state.ent_alive & (state.ent_hp > 0)
 
     state.ent_hp.copy_(torch.clamp(state.ent_hp - effective_dmg, min=0))
@@ -61,19 +45,15 @@ def apply_damage(state, dmg: torch.Tensor, cause: int, attacker: torch.Tensor, p
 
 def apply_heal(state, heal: torch.Tensor) -> torch.Tensor:
     """heal: (N,E) HP to restore. MUTATES: ent_hp, clamped to ent_max_hp. Returns the (N,E) HP
-    ACTUALLY restored -- requested heal minus whatever the alive gate and the max-HP clamp threw
-    away, so a full-HP entity "healing" for 5000 returns 0. That is the number reward shaping
-    prices (`training/reward.py`'s `hp_healed`, via `info["hp_healed_tick"]`); crediting the
-    requested amount instead would pay a topped-up hero for lifesteal that healed nothing.
+    ACTUALLY restored after the alive gate and the max-HP clamp -- the number reward shaping
+    prices (`training/reward.py`'s `hp_healed`, via `info["hp_healed_tick"]`), so a topped-up
+    hero is not paid for lifesteal that healed nothing.
 
-    Combat healing (Step D2's super lifesteal) as opposed to `apply_regen`'s out-of-combat trickle,
-    and deliberately a separate function: regen is gated on a stopwatch and a config toggle, while
-    this is an immediate consequence of landing a hit.
+    Combat healing (super and melee lifesteal), separate from `apply_regen`'s out-of-combat
+    trickle, which is gated on a stopwatch and a config toggle.
 
-    **Gated on `ent_alive`, which is not optional.** Healing a corpse would leave it with
-    `ent_hp > 0` while `ent_alive` is False -- a state `core.state.check_invariants` explicitly
-    rejects ("a dead entity has nonzero hp"), and one that `resolve_deaths` would never clean up,
-    since it only ever kills entities that are still alive.
+    The `ent_alive` gate is not optional: a healed corpse would have `ent_hp > 0` while dead, a
+    state `state.check_invariants` rejects and `resolve_deaths` never cleans up.
     """
     alive_heal = torch.where(state.ent_alive, heal, torch.zeros_like(heal))
     new_hp = torch.clamp(state.ent_hp + alive_heal, max=state.ent_max_hp)
@@ -86,30 +66,19 @@ def melee_lifesteal(state, dmg_by: torch.Tensor, params) -> torch.Tensor:
     """(N,E) HP each attacker should be healed for, off the melee damage it landed on PLAYERS this
     tick. `dmg_by` is `melee_hitscan`'s (N,E,E) attacker x victim matrix.
 
-    Computes; does NOT apply. Same contract as `melee_hitscan` and `projectiles.step_projectiles`
-    -- the caller commits it through `apply_heal`, which owns the alive gate and the max-HP clamp
-    and reports what actually landed.
+    Computes; does NOT apply: the caller commits it through `apply_heal`, which owns the alive
+    gate and the max-HP clamp. Boxes are excluded structurally (`melee_hitscan` returns box damage
+    separately): healing off a crate would be a free full heal on every map.
 
-    **Boxes are excluded structurally, not by a flag**: this reads only the entity matrix, and
-    `melee_hitscan` returns box damage as a separate `dmg_box`. Edgar healing off a loot box would
-    hand him a free full heal on every map, since boxes do not fight back.
+    I-frames are re-applied because `apply_damage` masks only its own summed copy, never `dmg_by`;
+    without this, lifesteal would pay for damage an invulnerable victim never took. Nothing seeds
+    `ent_invuln_t` (the dash has no i-frames), so the mask is dormant. Reading it after
+    `apply_damage` (as `env._attack_phase` does) is safe: that function writes neither
+    `ent_invuln_t` nor `ent_alive`.
 
-    **I-frames are re-applied here rather than inherited.** `dmg_by` is raw cone output; it is
-    `apply_damage` that zeroes damage against an entity with `ent_invuln_t > 0`, and it does that
-    to its own summed (N,E) copy, leaving `dmg_by` untouched. Lifesteal read straight off `dmg_by`
-    would therefore pay Edgar for swinging into a dashing Mortis -- damage the victim never took.
-    Mirrored explicitly (rather than by having `apply_damage` hand back a masked matrix) because
-    the mask is one line and the alternative is widening a signature four other call sites use to
-    carry a value only this one wants.
-
-    Reading `ent_invuln_t` AFTER `apply_damage` has run is safe and is what `env._attack_phase`
-    does: nothing in `apply_damage` writes `ent_invuln_t` or `ent_alive`, so the value is the same
-    one it gated on.
-
-    OVERKILL COUNTS. A 1080-damage hit on a victim with 100 HP left heals off the full 1080, which
-    is what `ent_damage_taken` and `ent_damage_dealt` already record for the same blow -- the
-    accounting stays consistent, and the alternative (clamping to the victim's remaining HP) would
-    make lifesteal quietly worse the closer Edgar is to finishing a kill.
+    OVERKILL COUNTS: a 1080 hit on a 100-HP victim heals off the full 1080, matching what
+    `ent_damage_taken`/`ent_damage_dealt` record; clamping would weaken lifesteal the closer Edgar
+    is to a kill.
     """
     fraction = stats.gather_kind(params.melee_lifesteal_fraction, state.ent_kind)  # (N,E) attacker
     blocked = (state.ent_invuln_t > 0).unsqueeze(1)  # (N,1,E) over the VICTIM axis
@@ -119,13 +88,10 @@ def melee_lifesteal(state, dmg_by: torch.Tensor, params) -> torch.Tensor:
 
 def dominant_attacker(dmg_by: torch.Tensor) -> torch.Tensor:
     """dmg_by: (N,E,E) attacker x victim. Returns (N,E) i64: the attacker dealing the MOST
-    damage to each victim this tick, or `_NO_ATTACKER` (-1) where nobody dealt any. Filled in
-    for Step 29 (`env.py`): `apply_damage`'s own `attacker` parameter is one index per victim,
-    but melee's wide cone, converging projectiles from different owners, or two simultaneous
-    dashers can all land damage on the same victim in the same tick -- some single-attacker
-    resolution rule is unavoidable for `ent_last_hit_by`/kill credit, and "whoever hit hardest"
-    is the least arbitrary of the reasonable options. Used identically for all three combat
-    damage sources (melee, dash, projectiles) by `env.py`'s attack/dash/projectile phases."""
+    damage to each victim this tick, or `_NO_ATTACKER` (-1) where nobody dealt any.
+    `apply_damage` takes one attacker per victim, but a wide cone, converging projectiles or two
+    dashers can all hit one victim in the same tick; "whoever hit hardest" is the least arbitrary
+    rule for `ent_last_hit_by`/kill credit. Used for melee, dash and projectile damage alike."""
     max_dmg, attacker_idx = dmg_by.max(dim=1)
     return torch.where(max_dmg > 0, attacker_idx, torch.full_like(attacker_idx, _NO_ATTACKER))
 
@@ -133,15 +99,11 @@ def dominant_attacker(dmg_by: torch.Tensor) -> torch.Tensor:
 def melee_hitscan(state, fire_mask: torch.Tensor, bank, params, cfg, cone_dir: torch.Tensor | None = None):
     """Returns (dmg_ent (N,E), dmg_by (N,E,E), dmg_box (N,B)). All live entities/boxes within
     attack_range, inside attack_arc_rad of the cone centre, with a clear physical path
-    (terrain.line_of_sight via blocks_proj -- walls only, Notice 4). No single-target
-    restriction: a wide arc can hit several entities (and boxes) in the same swing (unlike
-    projectiles, this step's spec doesn't ask for an earliest-wins rule here).
+    (terrain.line_of_sight via blocks_proj -- walls only). No single-target restriction: unlike
+    a projectile, a wide arc can hit several entities (and boxes) in the same swing.
 
-    `cone_dir` (N,E) is the angle the cone is centred on. `None` means `state.ent_facing`, which is
-    what every caller wanted before Step C2 and is still what a single-swing melee does. The
-    argument exists for SWEPT melee (Buzz): his one attack is five cones fired at five different
-    angles across `attack_cooldown`, so the centre is no longer simply "where he is looking" --
-    see core/melee_sweep.py, which computes it.
+    `cone_dir` (N,E) is the angle the cone is centred on; `None` means `state.ent_facing`, a
+    single-swing melee. Swept melee passes each sub-swing's angle (core/melee_sweep.py).
     """
     E = state.ent_pos.shape[1]
     B = state.box_pos.shape[1]
@@ -162,16 +124,11 @@ def melee_hitscan(state, fire_mask: torch.Tensor, bank, params, cfg, cone_dir: t
 
     in_cone = geo.point_in_cone(victim, origin, facing, radius, half_angle)  # (N,E,E)
 
-    # `params.cone_ray_tiles` caps the LOS march at the longest a CONE can possibly reach (3.0
-    # tiles today) instead of the full cfg.ray_steps budget (24 tiles / 48 samples), which is what
-    # this dense (N,E,E) march used to pay every single tick. Measured 4.15 -> 1.95 ms/tick at
-    # n_envs=1024 (bot_overhaul.md Step A1).
-    #
-    # This makes `los` WRONG for pairs further apart than the budget -- a wall 10 tiles away is
-    # simply never sampled, so those pairs come back "clear". That is sound here and only here:
-    # `los` is used in exactly one place, ANDed with `in_cone`, and `point_in_cone` already
-    # requires the victim within `attack_range` <= cone_ray_tiles. Every pair whose LOS answer
-    # changed is a pair `in_cone` was already False for, so `can_hit` is bit-identical.
+    # `params.cone_ray_tiles` caps this dense (N,E,E) LOS march at the longest a CONE can reach
+    # instead of the full cfg.ray_steps budget. That makes `los` WRONG for pairs further apart
+    # than the budget (a far wall is never sampled), which is sound only because `los` is used
+    # once, ANDed with `in_cone`, and `point_in_cone` already requires the victim within
+    # `attack_range` <= cone_ray_tiles, so `can_hit` is bit-identical.
     # tests/test_combat.py::test_melee_los_budget_matches_full_budget_ray pins that equality.
     origin_b = state.ent_pos.unsqueeze(2).expand(-1, -1, E, -1)
     victim_b = state.ent_pos.unsqueeze(1).expand(-1, E, -1, -1)
@@ -295,22 +252,17 @@ def collect_pickups(state, params, cfg):
 
 def apply_regen(state, params, cfg) -> torch.Tensor:
     """MUTATES: ent_hp. No-op when disabled. Returns the (N,E) HP actually restored this tick
-    (zeros when disabled), on the same "what the clamp let through" contract as `apply_heal` --
-    both feed `info["hp_healed_tick"]`, and an entity already at max HP must not be paid for a
-    regen tick that added nothing.
+    (zeros when disabled), on `apply_heal`'s "what the clamp let through" contract -- both feed
+    `info["hp_healed_tick"]`.
 
-    Heals `regen_fraction_per_second` of the entity's OWN max HP per second, once it has been out
-    of combat (no damage taken AND no attack made -- see ent_out_of_combat_t) for `regen_delay`
-    seconds. A fraction rather than the flat per-second amount this used to take: the real mechanic
-    is proportional, so a flat rate would make a 2000-HP brawler heal in a third of the time a
-    6000-HP one does, and would make every power cube collected (which raises max_hp) *lengthen*
-    the time to top up rather than leave it unchanged.
+    Heals `regen_fraction_per_second` of the entity's OWN max HP per second once it has been out
+    of combat (no damage taken AND no offensive action -- see ent_out_of_combat_t) for
+    `regen_delay` seconds. A fraction, as in the game: a flat rate would top small brawlers up
+    faster and make every power cube (which raises max_hp) lengthen the top-up.
 
-    Runs in tick phase 2, BEFORE this tick's attack phase resolves. An entity that fires this tick
-    therefore banks one tick of regen (0.05s worth, ~1% of max HP at the defaults) before its own
-    attack zeroes the stopwatch. Deliberate: phase 2 is also where a fatal hit must not be
-    un-fatal-ed by a regen tick that hasn't seen it yet (see env.py's `_tick_timers`), and that
-    ordering matters far more than one tick of leakage.
+    Runs in tick phase 2, BEFORE this tick's attack phase, so an entity that fires this tick banks
+    one tick of regen before its attack zeroes the stopwatch. Deliberate: a fatal hit later in the
+    tick can then never be undone by a regen tick that has not seen it (env._tick_timers).
     """
     if not cfg.regen_enabled:
         return torch.zeros_like(state.ent_hp)

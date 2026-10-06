@@ -1,14 +1,9 @@
 """Bot PERSONALITIES: what a bot does with its movement, drawn per entity per reset and
-orthogonal to its archetype. See BRAWL_SIM_BUILD_PLAN.md Step 41.
+orthogonal to its kind (which only decides how it shoots, bots/combat_rules.py).
 
-**Why this exists.** Before Step 41, movement flavor was baked into each of the four archetype
-policies, and all four had the same failure: with no visible target they converged. Melee steered
-at the zone rect's center, artillery hid behind walls, sniper/rifle held range on a target they
-didn't have. Nothing in the game ever went looking for a player it couldn't see. An agent that
-sat in a bush at the edge of the map therefore beat a 9-bot lobby by declining to participate:
-the bots gathered in the middle, ground each other down, and the agent walked out at the end.
-This module replaces "movement follows from your weapon" with "movement follows from your
-personality", and two of the five personalities exist specifically to punish that policy.
+Movement follows personality, not weapon, so bots with no visible target spread out or go
+looking instead of converging into one scrum that an agent can sit out in a bush; HUNTER and
+TRAPPER exist to punish exactly that policy.
 
 **The five personalities** (constants.Person; weights in configs/default.yaml's
 `bots.personality_weights`):
@@ -17,33 +12,29 @@ personality", and two of the five personalities exist specifically to punish tha
             even when idle, until the shrinking zone gets within `bots_camper_zone_flee_tiles`.
   - HUNTER  engages what it can see, and otherwise SWEEPS THE MAP for what it can't -- walking to
             the nearest BUSH WAYPOINT (maps/loader.bush_waypoints) it has not visited yet, tracked
-            per entity as a bitmask in `ent_hunt_seen`. This is the direct counter to a hidden
-            agent, and it is the one personality whose first implementation measurably did not
-            work: see bush_waypoints' docstring for why "nearest unsearched bush TILE" produced a
-            hunter that shuffled around its spawn instead of searching anything.
+            per entity as a bitmask in `ent_hunt_seen`. The direct counter to a hidden agent.
   - TRAPPER CAMPER's cover discipline with RUSH's trigger discipline: holds a bush and shoots
             anything in range from it, but drifts bush-to-bush (via the same waypoint machinery
             HUNTER uses) while nothing is visible, so its ambush spots don't go stale.
-  - KITE    works the open map holding its archetype's own ideal range
-            (bots/policy.RANGE_FRACTION_BY_KIND) from whatever it can see.
+  - KITE    works the open map holding its kind's ideal range (bots/policy.targeting's
+            `desired_range`, capped at its fire reach) from whatever it can see.
 
-**Rules that hold for every personality**, per the same specification:
+**Rules that hold for every personality** (the user's specification):
   - Nobody walks into the green zone. bots/policy.zone_avoid_contribution pushes inward from
     `bots_zone_avoid_tiles` out, before any damage is taken; zone_contribution drags anyone the
     zone has already swallowed back out. Bush search itself also refuses to target a bush whose
     own zone clearance is below `bots_camper_zone_flee_tiles`, so no bot ever walks toward cover
     that is about to become lethal.
   - A personality that wants a bush and cannot find a safe one behaves as RUSH instead
-    (`~scan.found` below). This is not a rare fallback: two of the three default maps (`walled`,
-    and tests' `blank`) contain no bush tiles at all, and `open` has 62 out of 3600.
-  - With nothing visible, everyone reverts to randomized exploration rather than a shared
-    destination, so bots spread out and can wander into an ambush the AGENT has set. CAMPER is
-    the one deliberate exception (its stay-put rule is more specific and is what makes it a real
-    threat that has to be cleared); TRAPPER relocates between bushes rather than into the open.
+    (`~scan.found` below). Not a rare fallback: the scan is local (`bots_bush_search_tiles`).
+  - With nothing visible, bots explore or sweep rather than head for a shared destination, so
+    they spread out and can wander into an ambush the AGENT has set. CAMPER is the one deliberate
+    exception (its stay-put rule is what makes it a real threat that has to be cleared); TRAPPER
+    relocates between bushes rather than into the open.
 
 **Structure.** Behavior is resolved in two stages, which is what keeps this batched and cheap:
 `_select_mode` maps (personality, world state) to one of seven `Mode`s, then a single
-(N_MODES, N_TERMS) constant weight table is gathered by mode to produce every steering weight at
+(N_MODES, 7) constant weight table is gathered by mode to produce every steering weight at
 once. Adding a personality means adding rows to `_select_mode`, not a new steering pass -- the
 expensive shared work (one local bush scan, one waypoint query, one wander advance) is paid once
 for all (N,E) entities regardless of how many distinct personalities are in play.
@@ -65,20 +56,16 @@ _EPS = 1e-6
 _WANDER_LOOKAHEAD_TILES = 2.5
 
 # Public: tests assert against these, and they are the two numbers most worth tuning by hand.
-# RANGE_DEADBAND replaces the per-archetype deadbands Steps 17/18/20 each carried separately
-# (sniper 1.5, artillery 2.0, rifle 2.0) -- after the split, "how sloppy is range-keeping" is a
-# property of the KITE behavior, not of the weapon, and only the ideal DISTANCE stays per-archetype
-# (the `desired_range_fraction` param). The band's far edge is capped at the bot's fire reach
+# RANGE_DEADBAND is a property of the KITE behavior, not the weapon; only the ideal distance is
+# per kind (`desired_range_fraction`). The band's far edge is capped at the bot's fire reach
 # (`movement`'s maintain_range call), since that edge is where an approaching kiter parks.
 RANGE_DEADBAND = 1.5
 RETREAT_HP_FRACTION = 0.35
-# SIM_OVERHAUL_PLAN.md Step B3: `aggression` (per kind, gathered per entity by
-# core/stats.aggression_of, which is where 0 is read as 1.0) enters the personality layer in
-# exactly three places and nowhere else -- the HUNTER/KITE retreat threshold (`_select_mode`), the
-# CAMPER fire veto (`fire_allowed`) and the KITE hold distance (bots/policy.targeting). The retreat
-# threshold is RETREAT_HP_FRACTION / a clamped to this band, so the elite tier's 1.7 retreats below
-# ~21% and the easy tier's 0.6 below ~58%; a camper at or above CAMPER_FIRE_ON_SIGHT_AGGRESSION
-# fires on sight instead of waiting to be seen. _MODE_WEIGHTS deliberately stays a constant table.
+# `aggression` (per kind, gathered per entity by core/stats.aggression_of, which reads 0 as 1.0)
+# enters the personality layer in exactly three places: the HUNTER/KITE retreat threshold
+# (`_select_mode`: RETREAT_HP_FRACTION / aggression, clamped to this band), the CAMPER fire veto
+# (`fire_allowed`) and the KITE hold distance (bots/policy.targeting). _MODE_WEIGHTS stays a
+# constant table.
 RETREAT_HP_FRACTION_MIN = 0.05
 RETREAT_HP_FRACTION_MAX = 0.90
 CAMPER_FIRE_ON_SIGHT_AGGRESSION = 1.25
@@ -89,11 +76,11 @@ class Mode(IntEnum):
     disposition; a Mode is what that disposition resolves to given what the entity can currently
     see -- several personalities share Modes (RUSH and HUNTER both CLOSE on a visible enemy;
     HUNTER and TRAPPER both HUNT_BUSH when idle), which is exactly why the steering weights are
-    keyed off Mode rather than off Person. Surfaced on BotIntent.mode for rendering/diagnostics
-    only; nothing in the simulation reads it back."""
+    keyed off Mode rather than off Person. Surfaced on BotIntent.mode for diagnostics only;
+    nothing in the simulation reads it back."""
     WANDER = 0      # explore at random; nothing worth reacting to
     CLOSE = 1       # take ground toward the enemy
-    HOLD_RANGE = 2  # sit at the archetype's ideal distance and orbit
+    HOLD_RANGE = 2  # sit at the kind's ideal distance and orbit
     HOLD_STILL = 3  # do not move at all (in cover)
     TO_BUSH = 4     # walk to the nearest safe bush
     HUNT_BUSH = 5   # walk to the nearest safe bush not already searched
@@ -102,11 +89,8 @@ class Mode(IntEnum):
 
 N_MODES = len(Mode)
 
-# Steering terms, in the column order of _MODE_WEIGHTS below.
-_TERMS = ("seek", "range", "strafe", "flee", "bush", "hunt", "wander")
-N_TERMS = len(_TERMS)
-
-# (N_MODES, N_TERMS). The small `wander` component in TO_BUSH/HUNT_BUSH is deliberate: it
+# (N_MODES, 7): one column per steering term, in the order seek, range, strafe, flee, bush, hunt,
+# wander. The small `wander` component in TO_BUSH/HUNT_BUSH is deliberate: it
 # decorrelates two bots that picked the same bush so they take different paths to it, and it is
 # the "with some variance" the specification asks for. HOLD_STILL is all-zero on purpose --
 # steering.combine's normalize maps an all-zero sum to the zero vector (not NaN), and
@@ -125,9 +109,8 @@ _WEIGHT_TABLE_CACHE: dict = {}
 
 
 def _weight_table(device) -> torch.Tensor:
-    """(N_MODES, N_TERMS) f32, built once per device. Gathering this by mode gives every steering
-    weight for every entity in ONE indexing op, instead of a torch.where chain per (mode, term)
-    pair -- 7 kernels rather than ~50."""
+    """(N_MODES, 7) f32, built once per device. Gathering it by mode gives every steering weight
+    for every entity in one indexing op instead of a torch.where chain per (mode, term) pair."""
     cached = _WEIGHT_TABLE_CACHE.get(device)
     if cached is None:
         cached = torch.stack([
@@ -228,8 +211,8 @@ def _select_mode(state, tgt, scan, hunt, in_bush_now, clearance, aggression, cfg
     test can assert one entity's mode directly.
 
     `aggression` is the (N,E) per-entity value from core/stats.aggression_of (0 already read as
-    1.0). Its only use here is the HUNTER/KITE retreat threshold (Step B3.1): `RETREAT_HP_FRACTION
-    / aggression`, clamped to [RETREAT_HP_FRACTION_MIN, RETREAT_HP_FRACTION_MAX] so a tier can
+    1.0). Its only use here is the HUNTER/KITE retreat threshold: `RETREAT_HP_FRACTION /
+    aggression`, clamped to [RETREAT_HP_FRACTION_MIN, RETREAT_HP_FRACTION_MAX] so a tier can
     never produce a bot that retreats at full HP or one that fights to the last hit point.
 
     Reads `state.ent_person` as the source of truth. `cfg.bots_personalities` is NOT consulted
@@ -242,13 +225,13 @@ def _select_mode(state, tgt, scan, hunt, in_bush_now, clearance, aggression, cfg
         RETREAT_HP_FRACTION / aggression, RETREAT_HP_FRACTION_MIN, RETREAT_HP_FRACTION_MAX,
     )
     low_hp = hp_frac < retreat_below
-    # The specification's "unless the green zone is 2 or less squares away".
+    # "Unless the green zone is 2 or less squares away" (user's rule).
     zone_pressed = clearance <= cfg.bots_camper_zone_flee_tiles
 
     def mode(m):
         return torch.full_like(person, int(m))
 
-    # RUSH, and the fallback every bush personality uses when no safe bush is reachable.
+    # RUSH, and CAMPER/TRAPPER's fallback when no safe bush is in scan range (user's rule).
     rushlike = torch.where(has_enemy, mode(Mode.CLOSE), mode(Mode.WANDER))
 
     # CAMPER: hold the bush through everything short of the zone arriving. Deliberately holds
@@ -258,9 +241,9 @@ def _select_mode(state, tgt, scan, hunt, in_bush_now, clearance, aggression, cfg
     camper = torch.where(zone_pressed, mode(Mode.TO_BUSH), camper)
     camper = torch.where(scan.found, camper, rushlike)
 
-    # HUNTER: fight what it sees, sweep for what it doesn't. Falls through to WANDER only when the
-    # map has no bush waypoints at all (blank.csv, walled.csv) -- a hunter that has swept
-    # everywhere gets its mask reset by advance_hunt instead of giving up.
+    # HUNTER: fight what it sees, sweep for what it doesn't. Falls through to WANDER when no
+    # waypoint is usable (the map has none, or the zone margin excludes them all); a hunter that
+    # has swept everywhere gets its mask reset by advance_hunt instead of giving up.
     hunter = torch.where(hunt.found, mode(Mode.HUNT_BUSH), mode(Mode.WANDER))
     hunter = torch.where(
         has_enemy, torch.where(low_hp, mode(Mode.RETREAT), mode(Mode.CLOSE)), hunter,
@@ -300,7 +283,7 @@ def movement(state, tgt, bank, params, cfg, gen):
 
     Computed for ALL (N,E) entities in one pass -- including entity 0, whose result
     bots/policy.all_bot_intents discards (the hero moves via hero.decode_action). Same
-    compute-for-everyone-select-later discipline as the archetype combat functions.
+    compute-for-everyone-select-later discipline as bots/combat_rules.combat.
     """
     pos = state.ent_pos
     E = pos.shape[1]
@@ -321,8 +304,7 @@ def movement(state, tgt, bank, params, cfg, gen):
     clearance = shared.zone_clearance(state, cfg)
     wander_dir = advance_wander(state, bank, cfg, gen)
 
-    # Step B3.1: gathered once here, 0 read as 1.0 inside the helper; the retreat threshold
-    # below divides by it.
+    # Gathered once here (0 read as 1.0 inside the helper); the retreat threshold divides by it.
     aggression = stats.aggression_of(state.ent_kind, params)
     mode = _select_mode(state, tgt, scan, hunt, in_bush_now, clearance, aggression, cfg)
     advance_hunt(state, hunt, mode, cfg)
@@ -341,7 +323,7 @@ def movement(state, tgt, bank, params, cfg, gen):
     hunt_dir = steering.seek(pos, hunt.pos)
 
     # --- weights: one gather, then mask each term by whether its target actually exists ---
-    w = _weight_table(pos.device)[mode]  # (N,E,N_TERMS)
+    w = _weight_table(pos.device)[mode]  # (N,E,7)
     enemy_f = tgt.has_enemy.to(w.dtype)
     found_f = scan.found.to(w.dtype)
     hunt_f = hunt.found.to(w.dtype)
@@ -351,34 +333,28 @@ def movement(state, tgt, bank, params, cfg, gen):
     avoid_dir, avoid_w = shared.zone_avoid_contribution(state, cfg)
     box_dir, box_w = shared.box_contribution(state, bank, cfg)
     cube_dir, cube_w = shared.cube_contribution(state, bank, cfg)
-    # A retreating bot does not turn back for loot: RETREAT exists to get it out of a losing
-    # fight, and the cubes lying in that fight are exactly the ones it would turn back for.
-    # The crate pull is off there too: past the 8-tile enemy gate it turned a fleeing bot
-    # around on 0.60 of the decisions it was live (0.09 of retreat decisions, elite,
-    # 2026-09-25), and a bot that has just broken contact has no business walking six tiles
-    # to shoot a crate.
+    # Loot pulls are off in RETREAT (user decision, 2026-09-25; HOLD_STILL via `mobile` below):
+    # a bot leaving a losing fight does not turn back for the cubes lying in it, or walk back to
+    # shoot a crate.
     retreating = mode == int(Mode.RETREAT)
     cube_w = torch.where(retreating, torch.zeros_like(cube_w), cube_w)
     box_w = torch.where(retreating, torch.zeros_like(box_w), box_w)
-    # A cube on the ground comes before a crate. Summed, the two pulls aim between the two
-    # objects and the bot reaches neither; measured 2026-09-25 as cubes left lying next to the
-    # crates that dropped them once the pulls were strong enough to matter.
+    # A cube on the ground comes before a crate: summed, the two pulls aim between the objects
+    # and the bot reaches neither.
     box_w = torch.where(cube_w > 0, torch.zeros_like(box_w), box_w)
 
-    # HOLD_STILL has to mean STILL. The three optional pulls are suppressed for it -- otherwise a
-    # camper in a bush would be dragged out by a loot box 9 tiles away, or nudged off its tile by
-    # zone avoidance while still perfectly safe, and its "does not leave the bush until the zone
-    # is 2 tiles out" contract would be quietly false. zone_contribution is NOT suppressed: a bot
-    # the zone has actually swallowed leaves, personality notwithstanding.
+    # HOLD_STILL has to mean STILL. The three optional pulls (zone avoidance, crate, cube) are
+    # suppressed for it -- otherwise a bot holding a bush would be dragged out by a loot pull, or
+    # nudged off its tile by zone avoidance while still perfectly safe, and the "does not leave
+    # the bush until the zone is 2 tiles out" contract would be quietly false. zone_contribution
+    # is NOT suppressed: a bot the zone has actually swallowed leaves, personality notwithstanding.
     mobile = (mode != int(Mode.HOLD_STILL)).to(w.dtype)
 
-    # A loot pull REPLACES the personality's own steering; it never sums with it. Every term below
-    # is a direction that steering.combine normalises once, and seek/flee are raw `target - pos`,
-    # so a summed pull weighs weight x distance against them and any two pulls rest at a weighted
-    # midpoint: measured 2026-09-25, campers parked at crates they may not shoot and retreating
-    # bots walked back toward the enemy for a cube behind it. With the mode terms silenced the bot
-    # walks straight to the loot, and the gates in bots/policy (enemy distance, RETREAT above, the
-    # gas margin, a clear walk) decide when it may. The zone terms are never silenced.
+    # A loot pull REPLACES the personality's own steering, never sums with it (user decision,
+    # 2026-09-25): seek/flee are raw `target - pos` and steering.combine normalises once, so a
+    # summed pull would weigh weight x distance against them and two pulls would rest at a
+    # weighted midpoint. The gates in bots/policy (enemy distance, the gas margin, a clear walk)
+    # and RETREAT above decide when a pull may act. The zone terms are never silenced.
     own = 1.0 - ((box_w > 0) | (cube_w > 0)).to(w.dtype) * mobile
 
     move_dir = steering.combine(
@@ -398,23 +374,20 @@ def movement(state, tgt, bank, params, cfg, gen):
 
 
 def fire_allowed(state, tgt, aggression, cfg) -> torch.Tensor:
-    """(N,E) bool, ANDed onto every archetype's fire decision by
-    bots/policy.all_bot_intents.
+    """(N,E) bool, ANDed onto every kind's fire decision by bots/policy.all_bot_intents.
 
-    Only CAMPER restricts anything: "makes no attacks unless the other player can see it". Keyed
-    off `tgt.seen_by_other` (does ANY other entity currently see me) rather than off the camper's
-    own target specifically, because the target-specific version has a hole -- a camper being shot
-    by A while its sticky target is a nearer, non-looking B would sit there and take it. A camper
-    that has been spotted fights back, whoever spotted it.
+    Only CAMPER restricts anything: "makes no attacks unless the other player can see it" (user's
+    rule). Keyed off `tgt.seen_by_other` (does ANY other entity currently see me) rather than off
+    the camper's own target, because the target-specific version has a hole: a camper shot by A
+    while its sticky target is a nearer, non-looking B would sit there and take it.
 
-    Note how this composes with `perception.reveal_after_attack`: firing sets the camper's own
-    reveal timer, so the shot that breaks its cover also keeps it broken for a second afterward.
-    A camper cannot fire from concealment and stay concealed.
+    Composes with `params.reveal_after_attack` (config `perception.reveal_after_attack`, applied
+    in env._attack_phase): firing sets the camper's own reveal timer, so the shot that breaks its
+    cover keeps it broken afterward. A camper cannot fire from concealment and stay concealed.
 
-    Step B3.3: the veto also needs `aggression < CAMPER_FIRE_ON_SIGHT_AGGRESSION` (1.25). At or
-    above it a camper fires on sight -- the aggressive tiers' campers are ambushers, not
-    passive furniture. `aggression` is the (N,E) value from core/stats.aggression_of (0 already
-    read as 1.0), the same tensor bots/policy.all_bot_intents hands the movement layer."""
+    The veto also needs `aggression < CAMPER_FIRE_ON_SIGHT_AGGRESSION`: at or above it a camper
+    fires on sight, so the aggressive tiers' campers are ambushers, not furniture. `aggression` is
+    the (N,E) value from core/stats.aggression_of (0 already read as 1.0)."""
     patient = aggression < CAMPER_FIRE_ON_SIGHT_AGGRESSION
     silent = (state.ent_person == int(Person.CAMPER)) & ~tgt.seen_by_other & patient
     return ~silent

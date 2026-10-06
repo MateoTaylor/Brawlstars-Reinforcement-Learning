@@ -1,34 +1,30 @@
 """ReplayViewer: an interactive matplotlib replay of one scripts/record_rollout.py rollout.npz.
-See BRAWL_SIM_BUILD_PLAN.md Step 38 / Notice 3 -- matplotlib, not pygame (pygame ships no
-Windows wheel past cp313, this project's only interpreter is cp314; render/ascii.py, Step 37,
-was never affected by that constraint).
+matplotlib, not pygame: pygame ships no Windows wheel past cp313, and this project's only
+interpreter is cp314.
 
-**Same optional-extra-keys contract as render/ascii.py (Step 37).** `frames` (a dict of
-`(steps, ...)` numpy arrays, one array per `core.state.snapshot()` field, exactly what
+**Same optional-extra-keys contract as render/ascii.py.** `frames` (a dict of `(steps, ...)`
+numpy arrays, one array per `core.state.snapshot()` field, exactly what
 `scripts/record_rollout.py.record_rollout()` returns / `np.load(...)` gives back) only strictly
 needs the required `SimState` fields to construct and play. `revealed_to_hero`/`los_to_hero`
 missing just means the reveal overlay never lights up (the 'v' toggle still exists, it has
 nothing to show); `unit_radius` missing falls back to `_DEFAULT_RADIUS`. The status-line title
-text is produced by `render.ascii.status_line` -- the SAME function `render_ascii` itself calls
--- so the two renderers report identical HP/ammo/cubes/dash text for a given frame by
-construction, not by keeping two copies in sync by hand.
+text comes from `render.ascii.status_line`, the same function `render_ascii` calls, so the two
+renderers report identical HP/ammo/cubes/dash text for a frame by construction.
 
 **Reveal overlay semantics ('v' toggle):** a bright ring appears on entity `e` iff
 `los_to_hero[e]` (no WALL between the hero and `e`, `bots.perception.raw_los`) is True AND
 `revealed_to_hero[e]` (`bots.perception.visibility`) is False -- i.e. bush-hiding is the ONLY
 reason the hero can't currently target/see it. An entity that's simply not `los_to_hero` (wall
-in the way) is never ringed: per Notice 4, walls never hide anything from this game's fixed
-bird's-eye camera, so there is nothing to visually call out there. Ground truth is always drawn
-regardless of the ring -- this viewer shows full information, unlike `render_ascii`'s
-`mode="agent"`; the ring only ANNOTATES why the hero's own obs would consider an entity hidden.
+in the way) is never ringed: walls never hide anything from this game's fixed bird's-eye
+camera, so there is nothing to call out there. Ground truth is always drawn regardless of the
+ring -- this viewer shows full information, unlike `render_ascii`'s `mode="agent"`; the ring
+only ANNOTATES why the hero's own obs would consider an entity hidden.
 
 **Entities get dedicated per-slot artists (Circle body, HP-bar Rectangle pair, ammo Text,
 reveal-ring Circle), one fixed set per `n_entities` slot, updated in place every frame.** Boxes,
-pickups, and projectiles instead share one (or one-per-kind) `Axes.scatter`/PathCollection,
-per the plan. The split follows directly from what each needs: entity annotations (HP/ammo/
-dash/reveal) are inherently per-instance and `n_entities` is small (`1 + n_enemies`, no
-perf concern going through individual artists); boxes/pickups/projectiles are larger,
-visually-homogeneous populations where the plan explicitly calls for shared scatter collections.
+pickups, and projectiles instead share one (or one-per-kind) `Axes.scatter`/PathCollection:
+entity annotations (HP/ammo/dash/reveal) are per-instance and `n_entities` is small
+(`1 + n_enemies`), while boxes/pickups/projectiles are larger, visually homogeneous populations.
 
 **PNG sprites are optional, resolved once at construction, and never mixed with their fallback
 on the same artist.** See `render/assets/README.md` for exact filenames/sizing. Every entity
@@ -38,18 +34,14 @@ the 'g' pan toggle like everything else here); per frame, whichever one currentl
 for that Kind/category is shown and the other is hidden. A missing PNG is the expected steady
 state, not a degraded one -- nothing needs the assets directory populated to run correctly.
 
-**Blitting and the 'g' world/view pan toggle don't mix cleanly, and this is a deliberate,
-documented tradeoff rather than a bug.** `FuncAnimation(blit=True)` caches ONE static background
-snapshot and only re-draws the artists an `_advance` call returns on top of it -- exactly the
-plan's "update artist data in place... do not call ax.clear()/re-plot every frame" performance
-note, and it's what gets 20 fps in the default "world" camera (static full-map limits). But 'g'
-mode pans the camera to a hero-centered `view_w x view_h` crop every frame, which changes what
-the cached background itself should look like -- blit alone can't express that. So `_draw_frame`
-calls `self.fig.canvas.draw()` (a full, non-blit redraw, which also happens to refresh
-FuncAnimation's blit background cache via the `draw_event` it emits) whenever `crop_to_view` is
-on. Net effect: the default world camera hits the 20 fps blit target from the acceptance bar;
-panned "view" mode is correct but slower. `render_ascii`'s `"view"` mode has no such tradeoff
-since it re-renders text unconditionally every call.
+**Blitting and the 'g' world/view pan toggle don't mix, by design.** `FuncAnimation(blit=True)`
+caches ONE static background snapshot and only re-draws the artists an `_advance` call returns
+on top of it, which is why every artist is updated in place rather than re-plotted each frame.
+But 'g' mode pans the camera to a hero-centered `view_w x view_h` crop every frame, which
+changes the cached background itself -- blit alone can't express that. So `_draw_frame` calls
+`self.fig.canvas.draw()` (a full, non-blit redraw, which also refreshes FuncAnimation's blit
+background cache via the `draw_event` it emits) whenever `crop_to_view` is on: the default
+world camera stays on the fast blit path, the panned "view" mode is correct but slower.
 
 Key bindings (bound in `show()`; also reachable directly via `on_key(event)` for tests that
 don't want to drive a real event loop): space=pause/resume, left/right=scrub one frame,
@@ -115,10 +107,8 @@ def _load_sprite(path: Path):
 # Ordered by Tile's int value (0..N_TILES-1) so the ListedColormap index matches the tile-id
 # grid directly -- same convention as render/ascii.py's _TERRAIN_CHAR table.
 #
-# PUBLIC because brawl_vision's terrain overlay renders its perceived occupancy grid in these
-# exact colours: a perceived grid and a simulated one drawn from the same palette are comparable
-# by eye, which is most of the point of building the overlay. Promoted on second use, the same
-# move already made on core/zone.current_dps and core/observation.compute_rank.
+# PUBLIC because scripts/map_label.py and scripts/vision_label.py paint their label grids in
+# these colours; brawl_vision's terrain overlay keeps its own (brawl_vision/terrain/palette.py).
 TILE_COLORS = {
     Tile.FLOOR: "#d9d2b8", Tile.WALL: "#3b3b3b", Tile.BUSH: "#3f7a34",
     Tile.WATER: "#3a78c2", Tile.FENCE: "#8a6a3a", Tile.SPAWN: "#d9d2b8", Tile.BOX: "#d9d2b8",
@@ -225,12 +215,10 @@ class ReplayViewer:
             for kind, color in _PROJ_COLOR.items() if kind != Proj.SUPER_BOLT
         }
 
-        # HAZARD-class projectiles (Brock's lingering sphere, Step C3b) are drawn as translucent
-        # circles at their real `prj_aoe` radius rather than as scatter dots. A dot would be
-        # actively misleading: the thing that matters when watching a rollout is the GROUND it
-        # denies, and a 0.75-tile sphere rendered as a 15-point marker looks like a stray bullet
-        # sitting still. One patch per projectile slot, preallocated and hidden, matching how
-        # every other per-slot artist pool here works.
+        # HAZARD-class projectiles (Brock's lingering sphere) are drawn as translucent circles at
+        # their real `prj_aoe` radius rather than as scatter dots: what matters is the GROUND it
+        # denies, and a 0.75-tile sphere drawn as a 15-point marker looks like a stray bullet
+        # sitting still. One patch per projectile slot, preallocated and hidden.
         self.hazard_circles = [
             plt.Circle((0.0, 0.0), 0.0, facecolor=_HAZARD_COLOR, edgecolor=_HAZARD_EDGE,
                         alpha=_HAZARD_ALPHA, zorder=2, visible=False)
@@ -255,7 +243,7 @@ class ReplayViewer:
             self.ax.add_patch(circle)
 
         # Boxes/pickups only get a sprite artist pool when their one shared PNG actually exists
-        # -- otherwise the scatter collections above are the whole story, unchanged from before.
+        # -- otherwise the scatter collections above are the whole story.
         self.n_boxes = self.frames["box_pos"].shape[1]
         self.box_sprites = []
         if self._box_sprite_img is not None:
@@ -298,9 +286,8 @@ class ReplayViewer:
             text = self.ax.text(0, 0, "", fontsize=6, ha="center", va="center", color="white", zorder=6)
             self.ammo_text.append(text)
 
-            # Dashing used to be shown as the body Circle's own edge, but that cue needs to
-            # render on top of a sprite too now -- pulled out into its own ring so it composes
-            # with either visual instead of only working in the circle-fallback path.
+            # The dash cue is its own ring, not the body Circle's edge, so it also shows on top
+            # of a sprite.
             dash = Circle((0, 0), _DEFAULT_RADIUS, fill=False, edgecolor=_DASH_RING_COLOR,
                            linewidth=2.0, zorder=4, visible=False)
             self.ax.add_patch(dash)

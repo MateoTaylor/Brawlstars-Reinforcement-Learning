@@ -1,6 +1,6 @@
-"""End-to-end integration tests spanning multiple modules. See BRAWL_SIM_BUILD_PLAN.md Step 41.
+"""End-to-end integration tests spanning multiple modules.
 
-**Not every bullet in Step 41's own list gets a NEW test here.** Three of the eleven (autoreset
+**Not every integration property gets a NEW test here.** Three of the eleven (autoreset
 boundary, dash-overrides-walk, the SB3 terminal_observation/TimeLimit.truncated/episode
 contract) already have thorough, dedicated coverage elsewhere (`tests/test_autoreset.py`,
 `tests/test_env.py::test_dashing_tick_shows_only_dash_displacement_not_walk` +
@@ -12,8 +12,7 @@ determinism/isolation/config-override tests too), but does not re-derive
 `test_autoreset.py`'s full per-env-isolation matrix. The other seven bullets (determinism,
 isolation, randomization end-to-end, fairness gating via the REAL shipped `configs/
 agent_obs.yaml`, exhaustive privileged-field isolation, combined config overrides, sync-free
-native stepping) had real, documented gaps against genuine multi-module/end-to-end coverage --
-see BRAWL_SIM_BUILD_PLAN.md Step 41's implementation notes for the specific gap each one closes.
+native stepping) had real gaps against genuine multi-module/end-to-end coverage.
 """
 import dataclasses
 

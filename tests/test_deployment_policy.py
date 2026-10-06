@@ -16,7 +16,7 @@ import yaml
 
 from brawl_sim.config import load_config
 from brawl_sim.core import obs_select
-from brawl_deployment.policy import ATTACK_FIRE, ATTACK_SUPER, DeployedPolicy, Decision, check_spaces
+from brawl_deployment.policy import ATTACK_SUPER, DeployedPolicy, Decision, check_spaces
 
 RUN = "runs/mortis_deploy-20260907-041522"
 SPEC = "configs/agent_obs_deploy.yaml"
@@ -133,7 +133,7 @@ def test_a_checkpoint_whose_observation_does_not_match_the_spec_is_refused():
 
 
 def test_a_checkpoint_with_the_wrong_action_space_is_refused():
-    """A two-valued attack column is the pre-super action space (`bot_overhaul.md` D1). A
+    """A two-valued attack column is the pre-super action space. A
     checkpoint from before that widening has an observation the current spec still matches, so
     this is the only check that catches it."""
     cfg = load_config(CONFIGS)
@@ -149,7 +149,7 @@ def test_a_checkpoint_with_the_wrong_action_space_is_refused():
 
 
 def test_a_pre_gadget_checkpoint_is_refused():
-    """SIM_OVERHAUL Step G3 widened the sim's attack column 3 -> 4. Deployment briefly kept loading
+    """The gadget widened the sim's attack column 3 -> 4. Deployment briefly kept loading
     the 3-wide checkpoints trained before it; the operator retired them on 2026-09-21, so `(17, 3)`
     is now one more stale action space, and the error names the reason and the remedy."""
     cfg = load_config(CONFIGS)
@@ -172,7 +172,7 @@ def test_the_mask_handed_to_the_network_is_the_sims_own_layout():
     `action_masks()` produced on every training step. A different split here would mask the wrong
     dimension while remaining exactly the right width, which no shape check catches.
 
-    The fourth attack column is the gadget (SIM_OVERHAUL Step G3). Since Step G5 it is the
+    The fourth attack column is the gadget. Since 2026-09-21 it is the
     shadow's fourth legal, passed through like the other three. Two calls with different tuples,
     so a column stuck at an earlier call's value, or at a constant, would show."""
     pol = _policy()
@@ -215,8 +215,7 @@ def test_an_all_illegal_attack_column_is_rejected_rather_than_producing_nan():
     MaskablePPO's response to one is a degenerate categorical -- NaN logits, not an exception --
     so it has to be caught before `predict`.
 
-    A tuple of the wrong width is refused by name, the shadow's three-wide one from before
-    Step G5 included."""
+    A tuple of the wrong width is refused by name, the pre-gadget three-wide one included."""
     pol = _policy()
     obs = {k: np.zeros(v.shape, v.dtype) for k, v in
            obs_select.agent_space(pol.spec, pol.cfg).spaces.items()}
@@ -324,22 +323,17 @@ def test_the_real_checkpoint_loads_and_decides_from_an_assembled_observation(run
     `assemble`'s output is exactly what `predict` accepts, with no reshaping in between, and that
     a masked-off super or gadget is never chosen over 30 varied frames.
 
-    The zone group comes from the real `ZoneEstimator`, not a hand-written dict. A dict written here
-    carried both margin names while the estimator produced one, which is how this test passed for a
-    deploy3 run that could not make its first live decision.
-
-    `hero_offset` is passed the way the loop passes `tracked.hero_offset`, drifting past
-    `camera.edge_flag_tiles` over the 30 frames so both values of `hero.near_edge` are assembled.
-    deploy5 reads that field and `assemble` refuses to build it without the offset; this test
-    only met deploy5 once its first checkpoint was written (2026-09-25)."""
+    The mask carries one flag per attack value the run has: 4, or 5 for a run trained under
+    `action.auto_aim`, whose auto-aimed attack stays legal here. The zone group comes from the
+    real `ZoneEstimator`, not a hand-written dict that could name fields the estimator does not
+    produce. `hero_offset` is passed the way the loop passes `tracked.hero_offset`, drifting past
+    `camera.edge_flag_tiles` over the 30 frames so both values of `hero.near_edge` are assembled."""
     from brawl_deployment.perception.grid import GasMap
     from brawl_deployment.perception.zone import ZoneEstimator
 
     if not __import__("pathlib").Path(f"{run}/best_model.zip").exists():
-        # A DANGLING CONFIG POINTER is not the same as a machine without the artifact, and
-        # conflating them is how `deployment.yaml` sat on a deleted deploy3 run until 2026-09-22
-        # with this test green. Only `DEPLOYED_RUN` is held to it: the other parameters are
-        # historical constants and a machine that no longer has them is just a machine.
+        # A dangling config pointer is not the same as a machine without the artifact: only
+        # `DEPLOYED_RUN` must exist. The other parameters are runs this machine may not have.
         assert run != DEPLOYED_RUN, (
             f"configs/deployment.yaml names {run}, which has no best_model.zip. A live run would "
             f"fail on the missing path; repoint `run.dir` rather than letting this skip.")
@@ -347,9 +341,8 @@ def test_the_real_checkpoint_loads_and_decides_from_an_assembled_observation(run
     try:
         pol = DeployedPolicy.from_run(run)
     except ValueError as err:
-        # Every run trained before SIM_OVERHAUL Step G3 is refused by design since the operator
-        # retired them (2026-09-21) and is to be deleted, so a machine that still holds one skips
-        # it by name. Only THAT refusal: any other load failure still fails this test.
+        # Pre-gadget runs are refused by design, so a machine that still holds one skips it by
+        # name. Only THAT refusal: any other load failure still fails this test.
         if "pre-gadget checkpoint" not in str(err):
             raise
         pytest.skip(f"{run} is a retired pre-gadget checkpoint; delete it")
@@ -366,6 +359,9 @@ def test_the_real_checkpoint_loads_and_decides_from_an_assembled_observation(run
                   "super_ready": False, "super_charge_frac": 0.4,
                   "gadget_ready": False, "gadget_charge_frac": 0.5}
     rng = np.random.default_rng(0)
+    # Super and gadget masked off throughout; everything else the run has stays legal.
+    legal = (True, True, False, False) + (True,) * (int(pol.cfg.action_nvec[1]) - 4)
+    allowed = [value for value, ok in enumerate(legal) if ok]
     supers = 0
     for i in range(30):
         obs = asm.assemble(
@@ -381,10 +377,10 @@ def test_the_real_checkpoint_loads_and_decides_from_an_assembled_observation(run
                               dtype=np.uint8),
             hero_offset=(0.1 * i, 0.0),
         )
-        d = pol.act(obs, (True, True, False, False))   # super and gadget masked off throughout
+        d = pol.act(obs, legal)
         assert isinstance(d, Decision)
         assert 0 <= d.move_bin <= pol.cfg.n_move_bins
-        assert d.attack in (0, ATTACK_FIRE)
+        assert d.attack in allowed
         supers += d.attack == ATTACK_SUPER
     assert supers == 0
 

@@ -34,7 +34,7 @@ def test_is_a_vecenv_subclass_and_constructs_cleanly():
     venv = _make()
     assert isinstance(venv, VecEnv)
     assert venv.num_envs == 6
-    # 4-valued attack dim (0 = nothing, 1 = attack, 2 = super, 3 = gadget -- Step G3); the
+    # 4-valued attack dim (0 = nothing, 1 = attack, 2 = super, 3 = gadget); the
     # SB3 action space must track EnvConfig.action_nvec exactly or MaskablePPO's
     # mask width and the env's own mask disagree.
     assert venv.action_space.nvec.tolist() == list(venv.cfg.action_nvec)
@@ -46,7 +46,7 @@ def test_vec_monitor_wraps_cleanly():
     registration EnvSpec, read by VecMonitor as `venv.spec.id`) -- BrawlSB3VecEnv's own
     AgentObsSpec must live under a different name (`agent_spec`), or VecMonitor.__init__
     crashes with `AttributeError: 'AgentObsSpec' object has no attribute 'id'`. Caught by an
-    actual MaskablePPO integration smoke test, not by any of the acceptance criteria above."""
+    actual MaskablePPO integration smoke test, not by any of the tests above."""
     from stable_baselines3.common.vec_env import VecMonitor
     venv = _make(n_envs=3)
     assert getattr(venv, "spec", None) is None
@@ -186,16 +186,16 @@ def test_action_masks_matches_full_obs_action_mask_bit_for_bit():
     assert np.array_equal(venv.action_masks(), expected)
     # The flat mask must be exactly sum(action_nvec) wide -- MaskablePPO slices it by
     # nvec, so any disagreement silently misaligns the attack mask against the move bins.
-    # Step D2 widened the attack dim 2 -> 3 (19 -> 20), Step G3 3 -> 4 (20 -> 21).
+    # 17 move bins + 4 attack values = 21.
     assert venv.action_masks().shape == (5, sum(venv.cfg.action_nvec))
     assert venv.action_masks().shape == (5, 21)
     assert venv.action_masks().dtype == np.bool_
 
 
 def test_maskable_ppo_builds_a_21_logit_head_and_its_gadget_pick_reaches_the_sim():
-    """SIM_OVERHAUL Step G3.3's criterion, "MaskablePPO builds against the widened space", with
+    """The criterion "MaskablePPO builds against the widened space", with
     literals. tests/test_training.py's smoke run trains against whatever width the env reports
-    and asserts nothing about it, so it would pass unchanged at (17, 3) (Step G3 review); this is
+    and asserts nothing about it, so it would pass unchanged at (17, 3); this is
     the same build -- `MultiInputPolicy` + `default_policy_kwargs` -- pinned where the width is.
 
     Then the column is driven end to end through SB3: a mask that leaves only the gadget legal
@@ -316,7 +316,7 @@ def test_env_method_and_render_raise_not_implemented():
 def test_seed_reseeds_the_shared_generator():
     """`seed()` honors a single seed by reseeding the one shared `torch.Generator`, rather than
     raising as it originally did. The refusal was defensible (there genuinely are no independent
-    per-sub-env seeds here) but it broke the plan's own recommended entry point: SB3's
+    per-sub-env seeds here) but it broke a standard entry point: SB3's
     `BaseAlgorithm.set_random_seed` calls `env.seed(seed)` unconditionally whenever a model is
     built with `seed=`, so `MaskablePPO(..., seed=0)` could not be constructed against this env
     at all. Returning `[seed] * num_envs` satisfies the `VecEnv` contract; the repeated value is

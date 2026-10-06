@@ -3,7 +3,7 @@
     python scripts/deploy_calibrate.py                  # every job, report only
     python scripts/deploy_calibrate.py --write          # ...and store the re-fitted buttons
     python scripts/deploy_calibrate.py --jobs tap       # just the one you care about
-    python scripts/deploy_calibrate.py --probe-gadget   # G6.1: does the gate survive a gadget tap?
+    python scripts/deploy_calibrate.py --probe-gadget   # does the gate survive a gadget tap?
 
 **This is the script the friendly battle is for** (BRAWL_DEPLOYMENT_DESIGN.md 10.11). Three
 questions cannot be answered anywhere else, and Training Grounds gave a wrong answer to all three:
@@ -38,11 +38,11 @@ match is fine and expected; the point is that every action is one whose conseque
 Nothing is written unless `--write` is passed, and then only the blocks this run measured -- the
 joystick's saturation radius was measured by hand in 4.3 and no script here can reproduce it.
 
-**`--probe-gadget` is a separate run with its own protocol** (SIM_OVERHAUL_STEPS.md Step G6.1).
+**`--probe-gadget` is a separate run with its own protocol.**
 The probe waits for the gate like every job, scores every calibrated disc on every perception
 tick for 2 s, taps the gadget ONCE (the policy's own bare tap, interlocked on the gate), and
 keeps scoring for 20 s: the 18 s recharge and 2 s of the charged button coming back. It writes
-runs/audit/gadget_anchor_trace.json (`--trace-out`) and prints G6.2's verdict: KEEP, CHANGE or
+runs/audit/gadget_anchor_trace.json (`--trace-out`) and prints its verdict: KEEP, CHANGE or
 INCONCLUSIVE. It runs alone: no `--jobs`, no `--write`.
 
 It asks TWO questions about TWO different discs, which is the correction of 2026-09-22. Did the tap
@@ -369,7 +369,7 @@ def job_move(rig, args) -> dict:
 JOB_FUNCS = {"buttons": job_buttons, "tap": job_tap, "super": job_super, "move": job_move}
 
 
-# --- the gadget anchor probe (SIM_OVERHAUL_STEPS.md Step G6.1) ------------------------------
+# --- the gadget anchor probe ----------------------------------------------------------------
 
 # Seconds scored before the tap, as the baseline every drop is read against, and after it.
 PROBE_PRE_ROLL_S = 2.0
@@ -496,8 +496,8 @@ def record_gadget_trace(grab, check_window, gates, buttons, *, gate_name: str,
         row["t"] = round(row["t"] - ref, 4)
     cal = gate.cal
     return {
-        "what": "SIM_OVERHAUL_STEPS.md Step G6.1: every calibrated button's ring score on "
-                "every perception tick, before and after one gadget tap",
+        "what": "every calibrated button's ring score on every perception tick, before and "
+                "after one gadget tap",
         "tick_hz": round(1.0 / tick_seconds, 6),
         "pre_roll_ticks": pre_roll_ticks,
         "record_ticks": record_ticks,
@@ -535,14 +535,14 @@ def _runs(flags) -> list[int]:
 
 
 def summarize_trace(trace: dict) -> dict:
-    """What G6.2 needs from a trace: numbers per anchor, the 2-of-3 vote, and a verdict. Pure, so
+    """A trace's numbers per anchor, the 2-of-3 vote, and a verdict. Pure, so
     a stored trace can be summarized again after the match.
 
     **A tick where EVERY anchor reads under threshold is common-mode:** the controls are gone
     (the hero died, the match ended) or something covered all three at once, and neither is the
     gadget's doing. Common-mode ticks count toward no anchor's dips or floor, and a gate exit on
     one is a true exit. A FALSE exit is a gate going out of match while some other button still
-    reads above threshold, which is the failure G6 exists to catch. `covered_s` is the last
+    reads above threshold, which is the failure this probe exists to catch. `covered_s` is the last
     post-tap time the controls were still up.
 
     The tap tick counts as pre-tap: its frame was grabbed before the press went down.
@@ -613,7 +613,7 @@ def summarize_trace(trace: dict) -> dict:
 
 
 def _verdict(trace: dict, s: dict) -> tuple[str, str]:
-    """G6.2's rule, applied: KEEP when the gate anchor never dips, CHANGE when it does, and
+    """KEEP when the gate anchor never dips, CHANGE when it does, and
     INCONCLUSIVE whenever the trace cannot tell.
 
     The colour check and the dip check read DIFFERENT anchors on purpose. `TAPPED_ANCHOR` is the
@@ -644,7 +644,7 @@ def _verdict(trace: dict, s: dict) -> tuple[str, str]:
     if g["ticks_under"] == 0:
         return "KEEP", (
             f"the {gate} never read under {thr:g} while the other buttons were up, through "
-            f"t=+{s['covered_s']:.1f} s. G6.2: keep the anchor and cite this trace in "
+            f"t=+{s['covered_s']:.1f} s. Keep the anchor and cite this trace in "
             f"match_gate._comment.")
     if g["false_exits"]:
         gate_text = f"its gate EXITED at t=+{g['false_exits'][0]:.2f} s while the match went on"
@@ -663,8 +663,8 @@ def _verdict(trace: dict, s: dict) -> tuple[str, str]:
                  else "held throughout")
     return "CHANGE", (
         f"the {gate} read under {thr:g} on {g['ticks_under']} post-tap tick(s), longest run "
-        f"{g['longest_under']} ({g['longest_under'] / hz:.2f} s), and {gate_text}. G6.2: "
-        f"re-anchor or vote. {alt} The 2-of-3 vote {vote_text}.")
+        f"{g['longest_under']} ({g['longest_under'] / hz:.2f} s), and {gate_text}. "
+        f"Re-anchor or vote. {alt} The 2-of-3 vote {vote_text}.")
 
 
 def format_summary(s: dict) -> list[str]:
@@ -695,7 +695,7 @@ def format_summary(s: dict) -> list[str]:
 
 
 def probe_gadget(rig, cfg, args) -> dict:
-    """G6.1 on the live rig: a gate per button, one tap, the trace written. Returns the trace."""
+    """The probe on the live rig: a gate per button, one tap, the trace written. Returns the trace."""
     gate_name = rig.cal.gate_anchor
     image = rig.grab().image
     gates, refined = {gate_name: rig.match}, {gate_name: rig.gate_refine_score}
@@ -767,8 +767,8 @@ def main(argv=None) -> int:
     ap.add_argument("--write", action="store_true",
                     help="store the measured blocks into data/control_calibration.json")
     ap.add_argument("--probe-gadget", action="store_true",
-                    help="SIM_OVERHAUL_STEPS.md G6.1: tap the gadget once and record every "
-                         "button's ring score for 20 s. Runs alone")
+                    help="tap the gadget once and record every button's ring score for 20 s. "
+                         "Runs alone")
     ap.add_argument("--trace-out", default=str(PROBE_TRACE_PATH),
                     help="where --probe-gadget writes its trace")
     args = ap.parse_args(argv)

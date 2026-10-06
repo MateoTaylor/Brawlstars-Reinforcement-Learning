@@ -152,7 +152,7 @@ def _hp_that_survives_exactly_one_zone_tick(env) -> float:
     """HP high enough to live through one sub-tick in the zone and die on the next.
 
     Derived, not hardcoded. This was `60.0`, chosen when the zone dealt a flat
-    `dps * dt = 1000 * 0.05 = 50` per tick. Step B3 made the rate a FRACTION of max HP, so it is
+    `dps * dt = 1000 * 0.05 = 50` per tick. The rate became a FRACTION of max HP, so it is
     now `0.20 * 8000 * 0.05 = 80` per tick for the hero -- and 60 HP stopped surviving the first
     sub-tick at all, which silently destroyed the scenario these two tests are built on (the hero
     must WIN on sub-tick 1 and only then be killed). Both failed on the latched-outcome assertion,
@@ -270,14 +270,15 @@ def test_shipped_cooldowns_are_at_least_one_decision_window():
     """No brawler may fire more than once per agent decision, so the agent always gets a say
     between its own shots and an enemy's shots always arrive with a dodgeable gap.
 
-    **Rewritten in Step C1 (bot_overhaul.md D7), and one of its three original assertions was
-    deleted rather than re-valued.** It used to require `0.30 <= cooldown <= 0.50` and, crucially,
-    `cooldown < reload_seconds` -- the latter justified in configs/brawlers.yaml as "this costs no
-    sustained DPS, because ammo regen is still the binding constraint". That is now false BY
-    DESIGN: `attack_cooldown` also pauses the reload (core/hero.tick_timers), so sustained fire is
-    `attack_cooldown + reload_seconds` and the cooldown deliberately does cap it. Keeping that
-    assertion would have pinned a philosophy the design moved away from -- and it was numerically
-    false for Buzz anyway (1.00 cooldown vs 1.00 reload).
+    **Rewritten when `attack_cooldown` began pausing the reload (BRAWL_SIM_DESIGN.md §5), and one of
+    its three original assertions was deleted rather than re-valued.** It used to require
+    `0.30 <= cooldown <= 0.50` and, crucially, `cooldown < reload_seconds` -- the latter justified
+    in configs/brawlers.yaml as "this costs no sustained DPS, because ammo regen is still the
+    binding constraint". That is now false BY DESIGN: `attack_cooldown` also pauses the reload
+    (core/hero.tick_timers), so sustained fire is `attack_cooldown + reload_seconds` and the
+    cooldown deliberately does cap it. Keeping that assertion would have pinned a philosophy the
+    design moved away from -- and it was numerically false for Buzz anyway (1.00 cooldown vs 1.00
+    reload).
 
     What survives is the invariant that never depended on the philosophy: a cooldown is at least
     one decision long. `>=` rather than `>`, because the 0.25 s floor is exactly `agent_dt` -- and
@@ -295,7 +296,7 @@ def test_shipped_cooldowns_are_at_least_one_decision_window():
 
 
 def test_shipped_cooldown_floor_is_honoured():
-    """D7's "always a minimum of 1/4 second" -- the floor is a stated requirement, not an accident
+    """The 0.25 s floor (BRAWL_SIM_DESIGN.md §2) is a stated requirement, not an accident
     of the current numbers, so it gets its own assertion."""
     spec = yaml.safe_load(open("configs/brawlers.yaml").read())
     for name, brawler in spec.items():

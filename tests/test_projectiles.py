@@ -1,3 +1,5 @@
+import copy
+import math
 from pathlib import Path
 
 import pytest
@@ -8,6 +10,7 @@ from brawl_sim.config import load_config, build_params
 from brawl_sim.constants import Kind, Proj, ProjClass, Tile, TILE_BLOCKS_PROJ
 from brawl_sim.core import projectiles as proj
 from brawl_sim.core import stats
+from brawl_sim.core import terrain
 from brawl_sim.core.state import allocate
 
 CONFIGS = Path(__file__).resolve().parent.parent / "configs"
@@ -31,10 +34,10 @@ def _bank_from_grid(tiles):
     return _FakeBank(blocks_proj=TILE_BLOCKS_PROJ[tiles].unsqueeze(0))
 
 
-def _cfg_and_params(n_envs=1, map_h=20, map_w=20, max_projectiles=16):
+def _cfg_and_params(n_envs=1, map_h=20, map_w=20, max_projectiles=16, max_boxes=8):
     cfg = load_config(CONFIGS / "default.yaml", overrides={
         "world": {"map_h": map_h, "map_w": map_w},
-        "limits": {"max_projectiles": max_projectiles, "max_boxes": 8, "max_pickups": 8},
+        "limits": {"max_projectiles": max_projectiles, "max_boxes": max_boxes, "max_pickups": 8},
     })
     spec = {
         **yaml.safe_load((CONFIGS / "default.yaml").read_text()),
@@ -127,7 +130,7 @@ def test_alloc_slots_batched_across_envs_independent():
 def _live(state, cls=None):
     """Live projectile slots, optionally of one ProjClass.
 
-    Step C3b means "the shot is over" no longer implies "no slots are alive": Brock's rocket
+    "The shot is over" does not imply "no slots are alive": Brock's rocket
     leaves a HAZARD-class sphere behind wherever it dies. Tests about the ROCKET must therefore
     say which class they mean rather than asserting on the whole buffer."""
     alive = state.prj_alive[0]
@@ -179,7 +182,7 @@ def test_rifle_volley_occupies_one_slot_per_pellet():
     damage = stats.effective_damage(kind, state.ent_cubes, params)
 
     proj.spawn_volley(state, fire_mask, origin, aim_dir, aim_point, kind, damage, params, cfg)
-    # One slot per pellet, whatever proj_count currently is (3 for Bo, 5 for Shelly after B2).
+    # One slot per pellet, whatever proj_count currently is (5 for Shelly).
     assert int(state.prj_alive.sum()) == int(params.proj_count[0, int(Kind.BOT_RIFLE)])
 
     alive_idx = torch.nonzero(state.prj_alive[0], as_tuple=True)[0]
@@ -206,9 +209,8 @@ def test_symmetric_fan_matches_expected_offsets():
     angles = torch.sort(torch.atan2(state.prj_vel[0, alive_idx, 1], state.prj_vel[0, alive_idx, 0])).values
     spread = params.proj_spread_rad[0, int(Kind.BOT_RIFLE)].item()
     n = int(params.proj_count[0, int(Kind.BOT_RIFLE)])
-    # Evenly spaced across the FULL span, symmetric about aim_dir. Was written out as the literal
-    # 3-element [-s/2, 0, +s/2]; linspace is the same statement for any odd or even count, which
-    # is what let Step B2's move to 5 pellets be a config change rather than a test rewrite.
+    # Evenly spaced across the FULL span, symmetric about aim_dir. linspace is the same statement
+    # for any odd or even count, so a new pellet count is a config change, not a test rewrite.
     expected = torch.linspace(-spread / 2, spread / 2, n)
     assert torch.allclose(angles, expected, atol=1e-4)
 
@@ -236,9 +238,8 @@ def test_simultaneous_volleys_never_collide_in_allocation():
     state = _fresh_state(cfg)
     state.ent_kind[0, 1] = int(Kind.BOT_RIFLE)
     state.ent_kind[0, 2] = int(Kind.BOT_RIFLE)
-    # Read the volley width off params rather than pinning it: Step B2 took Shelly from 3 pellets
-    # to 5, and this test is about ALLOCATION (two shooters must never claim the same slot), not
-    # about how wide the fan happens to be.
+    # Read the volley width off params rather than pinning it: this test is about ALLOCATION (two
+    # shooters must never claim the same slot), not about how wide the fan happens to be.
     n = int(params.proj_count[0, int(Kind.BOT_RIFLE)])
     assert n > 1, "this test needs a multi-projectile kind to be meaningful"
 
@@ -329,18 +330,18 @@ def test_bolt_dies_at_wall():
         proj.step_projectiles(state, bank, params, cfg)
 
     # The ROCKET is gone. A hazard sphere may remain in its place (Brock leaves one
-    # wherever his rocket dies, Step C3b) -- that is a different class and a different
+    # wherever his rocket dies) -- that is a different class and a different
     # mechanic, so this assertion is about the PROJECTILE-class slot only.
     assert _live(state, ProjClass.PROJECTILE) == 0
 
 
 def test_bolt_over_water_reaches_far_side():
-    """Water blocks units but not projectiles (Notice 4).
+    """Water blocks units but not projectiles.
 
     Start position, finish line and tick budget are all DERIVED from the shooter's own stats. They
     were hardcoded (spawn x=5.0, finish x>13.0, 100 ticks), which silently assumed
-    `attack_range = 8.67`: a bolt fired from 5.0 expires at exactly 5.0 + range, so when Step B1
-    moved Brock's range to 8.0 the bolt died at exactly 13.0 and the strict `> 13.0` failed by
+    `attack_range = 8.67`: a bolt fired from 5.0 expires at exactly 5.0 + range, so when Brock's
+    range moved to 8.0 the bolt died at exactly 13.0 and the strict `> 13.0` failed by
     0.0 -- a range change reading as a water-passability bug.
     """
     cfg, params = _cfg_and_params(map_h=20, map_w=20)
@@ -358,7 +359,7 @@ def test_bolt_over_water_reaches_far_side():
         f"derived start x={start_x:.2f} is not on the near side of the water column; "
         f"attack_range={attack_range} no longer suits this 20x20 fixture"
     )
-    # Enough ticks to fly the full range, plus slack. proj_speed dropped 14.0 -> 5.33 in B1, which
+    # Enough ticks to fly the full range, plus slack. proj_speed once dropped 14.0 -> 5.33, which
     # nearly tripled the flight time -- a fixed budget would have been the next thing to rot.
     max_ticks = int(attack_range / (proj_speed * cfg.dt)) + 20
 
@@ -395,7 +396,7 @@ def test_unit_collision_deals_damage_and_kills_projectile():
 
     assert total_dmg[0, 0].item() > 0.0
     # The ROCKET is gone. A hazard sphere may remain in its place (Brock leaves one
-    # wherever his rocket dies, Step C3b) -- that is a different class and a different
+    # wherever his rocket dies) -- that is a different class and a different
     # mechanic, so this assertion is about the PROJECTILE-class slot only.
     assert _live(state, ProjClass.PROJECTILE) == 0
 
@@ -466,7 +467,7 @@ def test_box_collision_deals_damage_and_kills_projectile():
 
     assert total_box_dmg > 0.0
     # The ROCKET is gone. A hazard sphere may remain in its place (Brock leaves one
-    # wherever his rocket dies, Step C3b) -- that is a different class and a different
+    # wherever his rocket dies) -- that is a different class and a different
     # mechanic, so this assertion is about the PROJECTILE-class slot only.
     assert _live(state, ProjClass.PROJECTILE) == 0
 
@@ -488,7 +489,7 @@ def test_expiry_at_max_range_with_nothing_hit():
         proj.step_projectiles(state, bank, params, cfg)
 
     # The ROCKET is gone. A hazard sphere may remain in its place (Brock leaves one
-    # wherever his rocket dies, Step C3b) -- that is a different class and a different
+    # wherever his rocket dies) -- that is a different class and a different
     # mechanic, so this assertion is about the PROJECTILE-class slot only.
     assert _live(state, ProjClass.PROJECTILE) == 0
 
@@ -605,9 +606,8 @@ def test_detonation_splits_into_four_axis_aligned_half_damage_shards():
 
     # One shard per world axis, each carrying split_distance tiles of travel.
     #
-    # Shard speed is DERIVED from split_distance / split_seconds as of Step C4, not read from
-    # proj_speed (which now only describes a kind's ordinary shots). This read `proj_speed`
-    # directly and so silently asserted the pre-C4 rule.
+    # Shard speed is DERIVED from split_distance / split_seconds, not read from proj_speed
+    # (which only describes a kind's ordinary shots).
     split_distance = params.split_distance[0, int(Kind.BOT_ARTILLERY)].item()
     split_seconds = params.split_seconds[0, int(Kind.BOT_ARTILLERY)].item()
     speed = (split_distance / split_seconds if split_seconds > 0
@@ -618,7 +618,7 @@ def test_detonation_splits_into_four_axis_aligned_half_damage_shards():
 
 
 def test_shards_finish_their_path_in_split_seconds():
-    """Step C4: CHARACTER_DETAILS specifies the arms by DURATION ("~0.5 s to finish their paths"),
+    """CHARACTER_DETAILS specifies the arms by DURATION ("~0.5 s to finish their paths"),
     so that duration -- not the derived speed -- is what this pins."""
     cfg, params = _cfg_and_params(map_h=20, map_w=20)
     state = _fresh_state(cfg)
@@ -711,7 +711,7 @@ def test_non_lobbed_expiry_never_splits():
         proj.step_projectiles(state, bank, params, cfg)
 
     # The ROCKET is gone. A hazard sphere may remain in its place (Brock leaves one
-    # wherever his rocket dies, Step C3b) -- that is a different class and a different
+    # wherever his rocket dies) -- that is a different class and a different
     # mechanic, so this assertion is about the PROJECTILE-class slot only.
     assert _live(state, ProjClass.PROJECTILE) == 0
 
@@ -742,7 +742,7 @@ def test_lobbed_shell_ignores_walls_in_flight():
     assert torch.any(state.prj_alive)  # still flying, unaffected by the wall
 
 
-# ---- HAZARD class: Brock's lingering sphere (Step C3b) ----------------------------
+# ---- HAZARD class: Brock's lingering sphere ---------------------------------------
 
 def _hazard_fixture(max_projectiles=16):
     cfg, params = _cfg_and_params(map_h=30, map_w=30, max_projectiles=max_projectiles)
@@ -800,8 +800,8 @@ def test_rocket_leaves_a_hazard_that_ticks_twice_then_vanishes():
 
 
 def test_hazard_never_damages_its_own_owner():
-    """D4. The shooter standing in his own sphere takes nothing from it -- unlike an artillery
-    detonation, which can still catch its thrower (pre-existing behavior, deliberately unchanged)."""
+    """The shooter standing in his own sphere takes nothing from it -- unlike an artillery
+    detonation, which can still catch its thrower."""
     cfg, params, tiles = _hazard_fixture()
     # Hero far away; the rocket expires at max range and drops a sphere the SHOOTER walks into.
     state, _total, _events = _fire_rocket_and_settle(cfg, params, tiles, hero_at=(28.0, 28.0), ticks=1)
@@ -829,7 +829,7 @@ def test_hazard_never_damages_its_own_owner():
 
 
 def test_hazard_ignores_walls():
-    """D5: it is a patch of ground, not a shot, so line of sight is irrelevant."""
+    """A sphere is a patch of ground, not a shot, so line of sight is irrelevant."""
     cfg, params, tiles = _hazard_fixture()
     tiles[15, 10] = Tile.WALL  # between shooter and where the hero stands
     _state, total, _events = _fire_rocket_and_settle(cfg, params, tiles, hero_at=(9.6, 15.4))
@@ -837,7 +837,7 @@ def test_hazard_ignores_walls():
 
 
 def test_two_hazards_stack():
-    """D4: two overlapping spheres deal both their ticks, 1392 per tick."""
+    """Two overlapping spheres deal both their ticks, 1392 per tick."""
     cfg, params, tiles = _hazard_fixture()
     state = _fresh_state(cfg)
     bank = _bank_from_grid(tiles)
@@ -909,7 +909,7 @@ def test_a_kind_without_on_hit_area_leaves_nothing():
             break
 
 
-# ---- gadget spinner (Step G2.2 / G2.3 / G2.4) ----------------------------------------------
+# ---- gadget spinner ------------------------------------------------------------------------
 
 def _spawn_spinner(state, cfg, params, origin, direction, travel, owner=0):
     """One gadget spinner from `owner` at `origin`, flying `travel` tiles along `direction`."""
@@ -973,7 +973,7 @@ def test_spawn_gadget_with_zero_travel_still_writes_a_slot_that_detonates_on_tic
 
 
 def test_spinner_blast_at_the_owners_feet_deals_0_to_the_owner():
-    """S11: no self-damage, by KIND -- compare the Grom test right below."""
+    """No self-damage, by KIND -- compare the Grom test right below."""
     cfg, params = _cfg_and_params(map_h=20, map_w=20)
     state = _fresh_state(cfg)
     bank = _bank_from_grid(_grid(20, 20))
@@ -991,7 +991,7 @@ def test_spinner_blast_at_the_owners_feet_deals_0_to_the_owner():
 
 
 def test_grom_shell_at_the_owners_feet_still_hits_the_owner():
-    """D4 is unchanged by G2.3: artillery self-detonation is decided per kind, and Grom is not
+    """Artillery self-detonation is decided per kind, and Grom is not
     the spinner. 2080 is BOT_ARTILLERY base_damage at 0 cubes and enemy_damage_mult 1.0."""
     cfg, params = _cfg_and_params(map_h=20, map_w=20)
     state = _fresh_state(cfg)
@@ -1006,11 +1006,11 @@ def test_grom_shell_at_the_owners_feet_still_hits_the_owner():
 
     assert dmg_ent[0, 1].item() == 2080.0
     assert dmg_by[0, 1, 1].item() == 2080.0
-    assert bool(charge_hit[0, 1, 1])  # and it even charges: nothing about D4 changed
+    assert bool(charge_hit[0, 1, 1])  # and it even charges
 
 
 def test_charge_hit_excludes_the_spinner_but_keeps_artillery():
-    """G2.4 / S12: `charge_hit` is `dmg_by > 0` minus the gadget. Two blasts in the air: the
+    """`charge_hit` is `dmg_by > 0` minus the gadget. Two blasts in the air: the
     spinner on bot 1 (damage yes, charge no) and a Grom shell on the hero (both yes). Bot 1 stands
     2.0 tiles from the hero on the diagonal: at the spinner's max range, outside Grom's 0.6-tile
     blast, and off the axes his 1.2-tile shards fly along, so his shell charges exactly once."""
@@ -1068,3 +1068,220 @@ def test_charge_hit_keeps_an_ordinary_volley():
 
     assert hit_dmg == 2320.0
     assert hit_charge
+
+
+# ---- the fast paths against their dense references ---------------------------------------------
+
+_STATE_FIELDS = ("prj_pos", "prj_vel", "prj_target", "prj_dist_left", "prj_damage", "prj_radius",
+                 "prj_aoe", "prj_age", "prj_owner", "prj_kind", "prj_class", "prj_pierce",
+                 "prj_alive", "prj_hits")
+_STEP_OUTPUTS = ("dmg_ent", "dmg_by", "dmg_box", "heal_ent", "charge_hit")
+
+
+def _busy_state(cfg, params, n_envs, gen):
+    """A crowded mid-match projectile buffer on a wall-heavy map: every class, piercing and not,
+    shells landing and spheres firing this tick, many slots near boxes and some on the border
+    tiles, boxes on distinct tile centres (as spawn_boxes places them). Every stat stays inside
+    the spec's own bounds, which is the range the budgets are derived for. Damage is whole
+    numbers, so sums agree exactly in any order and a comparison can use torch.equal."""
+    H, W = cfg.map_h, cfg.map_w
+    N, P, B, E = n_envs, cfg.max_projectiles, cfg.max_boxes, cfg.n_entities
+    rand = lambda *shape: torch.rand(*shape, generator=gen)  # noqa: E731
+
+    tiles = _grid(H, W)
+    walls = rand(H, W) < 0.18
+    walls[0, :] = walls[-1, :] = walls[:, 0] = walls[:, -1] = False
+    tiles[walls] = int(Tile.WALL)
+
+    wh = torch.tensor([float(W), float(H)])
+    state = _fresh_state(cfg, n_envs=N)
+    state.ent_kind[:, 1:] = torch.randint(1, len(Kind), (N, E - 1), generator=gen)
+    state.ent_pos.copy_(1.5 + rand(N, E, 2) * (wh - 3.0))
+    state.ent_alive.copy_(rand(N, E) < 0.85)
+    state.ent_max_hp.fill_(1e9)
+    state.ent_hp.fill_(1e9)
+
+    interior = torch.stack([torch.randperm((H - 2) * (W - 2), generator=gen)[:B] for _ in range(N)])
+    box_tile = torch.stack([interior % (W - 2) + 1, interior // (W - 2) + 1], dim=-1)
+    state.box_pos.copy_(box_tile.to(torch.float32) + 0.5)
+    state.box_alive.copy_(rand(N, B) < 0.8)
+    state.box_max_hp.fill_(1e9)
+    state.box_hp.fill_(1e9)
+
+    cls = torch.full((N, P), int(ProjClass.PROJECTILE), dtype=torch.int64)
+    roll = rand(N, P)
+    cls[roll > 0.55] = int(ProjClass.ARTILLERY)
+    cls[roll > 0.85] = int(ProjClass.HAZARD)
+    projectile = cls == int(ProjClass.PROJECTILE)
+    pierce = projectile & (rand(N, P) < 0.15)
+
+    near_box = state.box_pos.gather(1, torch.randint(0, B, (N, P, 1), generator=gen).expand(N, P, 2))
+    pos = torch.where((rand(N, P) < 0.6).unsqueeze(-1), near_box + (rand(N, P, 2) - 0.5) * 3.0,
+                      rand(N, P, 2) * wh)
+    pos = torch.minimum(pos, wh - 0.01).clamp(min=0.01)
+
+    # The fastest a wall or a box can stop is the budget's own bound; a super or a shell may go
+    # faster (neither is stopped, so neither is covered by it).
+    stoppable = projectile & ~pierce
+    speed = torch.where(stoppable, rand(N, P) * params.shot_step_tiles / cfg.dt, rand(N, P) * 20.0)
+    angle = rand(N, P) * 6.2831853
+    vel = torch.stack([torch.cos(angle), torch.sin(angle)], dim=-1) * speed.unsqueeze(-1)
+    hazard = cls == int(ProjClass.HAZARD)
+    vel[hazard] = 0.0
+    # Half the shells land this tick: their target sits within one tick's travel ahead.
+    ahead = torch.where((rand(N, P) < 0.5).unsqueeze(-1), vel * cfg.dt * rand(N, P, 1), vel * 3.0)
+    target = torch.where((cls == int(ProjClass.ARTILLERY)).unsqueeze(-1), pos + ahead, rand(N, P, 2) * wh)
+
+    widest_shot = float(params.proj_radius.max())
+    widest_blast = max(float(params.aoe_radius.max()), float(params.gadget_radius.max()),
+                       float(params.on_hit_area_radius.max()))
+    state.prj_pos.copy_(pos)
+    state.prj_vel.copy_(vel)
+    state.prj_target.copy_(torch.minimum(target, wh - 0.5).clamp(min=0.5))
+    state.prj_dist_left.copy_(rand(N, P) * 6.0)
+    state.prj_damage.copy_(torch.randint(1, 3000, (N, P), generator=gen).to(torch.float32))
+    state.prj_radius.copy_(rand(N, P) * widest_shot)
+    state.prj_aoe.copy_(torch.where(cls == int(ProjClass.PROJECTILE), torch.zeros(N, P), rand(N, P) * widest_blast))
+    # Spheres sit a hair under an interval multiple, so plenty fire this tick.
+    state.prj_age.copy_(torch.where(hazard, 2.0 - rand(N, P) * cfg.dt, rand(N, P) * 5.0))
+    state.prj_owner.copy_(torch.randint(0, E, (N, P), generator=gen))
+    state.prj_kind.copy_(torch.randint(1, len(Proj), (N, P), generator=gen))
+    state.prj_class.copy_(cls)
+    state.prj_pierce.copy_(pierce)
+    state.prj_alive.copy_(rand(N, P) < 0.7)
+    state.prj_hits.copy_(rand(N, P, E) < 0.1)
+    return state, _bank_from_grid(tiles)
+
+
+def _step_both(state, bank, params, cfg, **reference):
+    """step_projectiles on two copies of `state`: as configured, and with `reference`'s params
+    overrides. Returns ((outputs, state), (outputs, state))."""
+    got_state, want_state = copy.deepcopy(state), copy.deepcopy(state)
+    got = proj.step_projectiles(got_state, bank, params, cfg)
+    saved = {name: getattr(params, name) for name in reference}
+    for name, value in reference.items():
+        setattr(params, name, value)
+    try:
+        want = proj.step_projectiles(want_state, bank, params, cfg)
+    finally:
+        for name, value in saved.items():
+            setattr(params, name, value)
+    return (got, got_state), (want, want_state)
+
+
+def _assert_same_step(got, want, label):
+    (got_out, got_state), (want_out, want_state) = got, want
+    for name, a, b in zip(_STEP_OUTPUTS, got_out, want_out):
+        assert torch.equal(a, b), f"{label}: {name} differs"
+    for name in _STATE_FIELDS:
+        assert torch.equal(getattr(got_state, name), getattr(want_state, name)), f"{label}: {name} differs"
+
+
+def test_projectile_wall_march_budget_matches_full_ray():
+    """step_projectiles marches walls for `params.shot_step_tiles` instead of
+    the full `cfg.max_ray_tiles`. That is only sound because no slot whose `wall_hit` is read moves
+    further than the budget in one tick, so this pins that the whole tick -- damage, kills, splits,
+    spheres, every prj_ field -- matches the full ray on a wall-heavy map."""
+    cfg, params = _cfg_and_params(n_envs=4, max_projectiles=64, max_boxes=24)
+    assert terrain.ray_steps_for(params.shot_step_tiles, cfg) < cfg.ray_steps, (
+        "the budget is not shorter than the full ray -- no saving, and this test passes vacuously")
+
+    gen = torch.Generator().manual_seed(0)
+    for trial in range(12):
+        state, bank = _busy_state(cfg, params, 4, gen)
+        got, want = _step_both(state, bank, params, cfg, shot_step_tiles=cfg.max_ray_tiles)
+        _assert_same_step(got, want, f"trial {trial}")
+
+
+def test_box_candidates_match_testing_every_box():
+    """step_projectiles tests each slot against the boxes on the 3x3 tiles
+    around it (the `_box_grid` lookup), not all B. Pinned against the every-box fallback, which a
+    reach wider than the map forces, over crowded states where plenty of shots hit boxes, shells
+    and spheres catch them, and some slots sit on the border tiles (out-of-map neighbours)."""
+    cfg, params = _cfg_and_params(n_envs=4, max_projectiles=64, max_boxes=24)
+    cells = math.ceil(params.box_reach_tiles)
+    assert (2 * cells + 1) ** 2 < cfg.max_boxes, "the grid path never runs -- this test proves nothing"
+
+    gen = torch.Generator().manual_seed(1)
+    hits = 0
+    for trial in range(12):
+        state, bank = _busy_state(cfg, params, 4, gen)
+        got, want = _step_both(state, bank, params, cfg, box_reach_tiles=float(cfg.map_w + cfg.map_h))
+        _assert_same_step(got, want, f"trial {trial}")
+        hits += int((want[0][2] > 0).sum())
+    assert hits > 50, f"only {hits} damaged boxes across all trials -- the states are too quiet to pin anything"
+
+
+def _spawn_splits_reference(state, detonate, det_pos, params, cfg):
+    """`_spawn_splits`' assignment as it was before the slot-side rewrite: alloc_slots' (N,P,K)
+    claims, each written to its slot (a spare column takes the claims that did not land). The old
+    code wrote through `_write_slots`, whose `old + (new - old)` can land one ulp off the value;
+    this writes the value itself, as the new code does, so the comparison can be exact."""
+    N, P = state.prj_pos.shape[:2]
+    E = state.ent_pos.shape[1]
+    K = proj.MAX_SPLITS
+    owner_kind = torch.gather(state.ent_kind, 1, torch.clamp(state.prj_owner, min=0, max=E - 1))
+    split_distance = stats.gather_kind(params.split_distance, owner_kind)
+    split_fraction = stats.gather_kind(params.split_damage_fraction, owner_kind)
+    split_count = torch.clamp(stats.gather_kind(params.split_count, owner_kind), 0, K)
+    split_seconds = stats.gather_kind(params.split_seconds, owner_kind)
+    shard_speed = torch.where(split_seconds > 0, split_distance / torch.clamp(split_seconds, min=proj._EPS),
+                              stats.gather_kind(params.proj_speed, owner_kind))
+    splits = detonate & (split_distance > 0) & (split_fraction > 0) & (split_count > 0)
+    demand = torch.where(splits, split_count, torch.zeros_like(split_count))
+    idx, ok = proj.alloc_slots(state.prj_alive, demand, K)
+
+    dirs = proj._split_dir_table(det_pos.device)[split_count]  # (N,P,K,2)
+    rim = state.prj_aoe + params.unit_radius.view(N, 1) + state.prj_radius + proj._EPS
+    start = det_pos.unsqueeze(2) + dirs * rim.view(N, P, 1, 1)
+    margin = cfg.los_step_tiles
+    start = torch.stack([torch.clamp(start[..., 0], margin, cfg.map_w - margin),
+                         torch.clamp(start[..., 1], margin, cfg.map_h - margin)], dim=-1)
+    per_shell = lambda t: t.unsqueeze(-1).expand(N, P, K)  # noqa: E731
+    new = {
+        "prj_pos": start, "prj_vel": dirs * shard_speed.view(N, P, 1, 1), "prj_target": start,
+        "prj_dist_left": per_shell(split_distance), "prj_damage": per_shell(state.prj_damage * split_fraction),
+        "prj_radius": per_shell(state.prj_radius), "prj_aoe": torch.zeros(N, P, K),
+        "prj_age": torch.zeros(N, P, K), "prj_owner": per_shell(state.prj_owner),
+        "prj_kind": per_shell(state.prj_kind),
+        "prj_class": torch.full((N, P, K), int(ProjClass.PROJECTILE), dtype=torch.int64),
+        "prj_pierce": torch.zeros(N, P, K, dtype=torch.bool), "prj_alive": torch.ones(N, P, K, dtype=torch.bool),
+    }
+    slot = torch.where(ok, idx, P).reshape(N, P * K)
+    for name, values in new.items():
+        field = getattr(state, name)
+        flat = values.reshape(N, P * K, *field.shape[2:]).to(field.dtype)
+        index = slot if field.dim() == 2 else slot.unsqueeze(-1).expand(N, P * K, field.shape[-1])
+        spare = torch.cat([field, field[:, :1]], dim=1).scatter_(1, index, flat)
+        field.copy_(spare[:, :P])
+
+
+def test_spawn_splits_matches_alloc_slots_assignment():
+    """_spawn_splits finds each free slot's shard from the slot side instead
+    of scattering alloc_slots' (N,P,K) claims. Pinned against the claim-side reference over busy
+    buffers -- Grom and Spike shells detonating side by side, freed slots reused, and buffers too
+    full for every shard (the tail must drop exactly as alloc_slots drops it)."""
+    cfg, params = _cfg_and_params(n_envs=6, max_projectiles=48)
+    N, P, E = 6, cfg.max_projectiles, cfg.n_entities
+    gen = torch.Generator().manual_seed(2)
+    landed = dropped = 0
+    splitters = torch.tensor([int(Kind.BOT_ARTILLERY), int(Kind.BOT_SPIKE)])
+    for trial, occupancy in enumerate((0.1, 0.3, 0.5, 0.7, 0.85, 0.95) * 2):
+        state, _ = _busy_state(cfg, params, N, gen)
+        # Every bot a splitter, so shells from both rings detonate together (the hero's split nothing).
+        state.ent_kind[:, 1:] = splitters[torch.randint(0, 2, (N, E - 1), generator=gen)]
+        state.prj_alive.copy_(torch.rand(N, P, generator=gen) < occupancy)
+        detonate = ~state.prj_alive & (torch.rand(N, P, generator=gen) < 0.5)
+        det_pos = torch.rand(N, P, 2, generator=gen) * cfg.map_w
+
+        got, want = copy.deepcopy(state), copy.deepcopy(state)
+        proj._spawn_splits(got, detonate, det_pos, params, cfg)
+        _spawn_splits_reference(want, detonate, det_pos, params, cfg)
+        for name in _STATE_FIELDS:
+            assert torch.equal(getattr(got, name), getattr(want, name)), f"trial {trial}: {name} differs"
+
+        new = int(want.prj_alive.sum() - state.prj_alive.sum())
+        demand = torch.where(detonate, stats.gather_kind(params.split_count, torch.gather(state.ent_kind, 1, state.prj_owner)), 0)
+        landed += new
+        dropped += int(demand.sum()) - new
+    assert landed > 100 and dropped > 100, (landed, dropped)

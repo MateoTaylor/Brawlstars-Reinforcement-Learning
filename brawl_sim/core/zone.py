@@ -1,13 +1,9 @@
 """The shrinking safe-zone rect: init, per-tick shrink schedule, damage, and the reusable grid
-rasterizer for the observation's `in_zone` channel. See BRAWL_SIM_BUILD_PLAN.md Step 23.
+rasterizer for the observation's `in_zone` channel.
 
-`_outside_rect` duplicates bots/perception.in_zone's predicate (a two-line comparison) rather
-than importing it: core/ modules never depend on bots/ (the dependency runs one way, bots/
-already imports core/ freely) -- perception.py existed before this module and independently
-needed the same check for D14's "bots flee the zone" (Step 15), but keeping core/ free of any
-bots/ import is worth the two-line duplication rather than entangling the module graph or
-relocating perception.in_zone's existing, already-tested public call sites over one predicate
-this small.
+`_outside_rect` duplicates bots/perception.in_zone's two-line predicate rather than importing it:
+core/ never imports bots/ (the dependency runs one way), and one predicate this small is not
+worth breaking that.
 """
 import torch
 
@@ -71,13 +67,15 @@ def mark_seen(state, cam: torch.Tensor, cfg) -> None:
     """MUTATES zone_seen: latches True for every env whose screen shows gas right now, i.e.
     the zone has shrunk at least once (`zone_step > 0`) and the camera window's bounding box
     around `cam` ((N,2), `core/camera.camera_centre`) crosses the safe rect on any side. The
-    box rather than the trapezoid, by decision: gas is an axis-aligned rect, so the box only
+    box rather than the trapezoid on purpose: gas is an axis-aligned rect, so the box only
     over-counts the window's two cut corners. No-op when cfg.zone_enabled is False, so
     `zone.active` stays 0 all episode.
 
     Runs once per decision from `env._build_observation`, before `build_obs` reads `zone_seen`
-    into `zone.active` (OBS_PARITY_TASKS.md C5). Live, ZoneEstimator.active latches the same
-    way, on the first gas the sticky GasMap holds."""
+    into `zone.active`. The sim rule: once set it stays set, cleared only by an episode reset.
+    The live counterpart, brawl_deployment/perception/zone.py `ZoneEstimator.active`, latches the
+    same way: set by the first gas its GasMap holds, kept through odometry segment changes (which
+    empty that map), cleared only when a match starts."""
     if not cfg.zone_enabled:
         return
     lo, hi = camera.window_bbox(cfg, cam.device, cam.dtype)          # (2,), (2,)
@@ -90,14 +88,9 @@ def current_fraction(state, params) -> torch.Tensor:
     """(N,) f32 -- the FRACTION OF MAX HP the zone deals per second right now, escalating with
     each shrink (`zone_hp_fraction + zone_fraction_growth * zone_step`).
 
-    **This replaced a flat HP/s rate in Step B3, and the change is a change of SHAPE, not of
-    magnitude.** The requirement (bot_overhaul.md D15) is that nothing survives more than ~5
-    seconds in the zone -- which has to hold for a 6000 HP Brock and for a fully cube-stacked
-    34000 HP Buzz alike. A flat rate cannot express that: at the old `dps: 1000` a base-HP Buzz
-    lasted 10s and a cubed one lasted 34s, so power cubes bought zone tankiness and the player who
-    most needed pushing out of the zone could ignore it longest. A fraction of max HP gives every
-    body the same countdown, and it is also what the real game does -- `configs/default.yaml`
-    already flagged the flat rate as a known divergence of shape.
+    A fraction of max HP, not a flat HP/s rate, so every body gets the same countdown in the gas
+    whatever its HP or cubes -- a flat rate lets power cubes buy zone tankiness. It is also what
+    the real game does; configs/default.yaml's `zone` block has the numbers.
     """
     growth = params.zone_fraction_growth * state.zone_step.to(params.zone_hp_fraction.dtype)
     return params.zone_hp_fraction + growth
@@ -106,11 +99,10 @@ def current_fraction(state, params) -> torch.Tensor:
 def current_dps(state, params) -> torch.Tensor:
     """(N,) f32 -- the zone's current damage rate **for the hero specifically**, in HP/s.
 
-    Since Step B3 the zone's rate is proportional, so there is no single HP/s figure that
-    describes it any more -- every entity takes a different amount. This exists for
-    `obs["zone"]["dps"]`, whose contract is one `(N,)` float, and resolving it against the hero's
-    own max HP is both the shape that field needs and the number actually useful to the agent
-    ("how fast does the zone kill ME"), rather than a rate abstracted away from any body.
+    The zone's rate is proportional, so no single HP/s figure describes it -- every entity takes a
+    different amount. This exists for `obs["zone"]["dps"]`, whose contract is one `(N,)` float;
+    resolving it against the hero's own max HP gives that shape and the number the agent can use
+    ("how fast does the zone kill ME").
     """
     return current_fraction(state, params) * state.ent_max_hp[:, 0]
 
@@ -142,7 +134,7 @@ def zone_grid(state, cfg, out_h: int, out_w: int, origin) -> torch.Tensor:
     [zone_lo, zone_hi] ("in the zone", the damaging area). `origin`: (N,2) f32 (or anything
     broadcastable to it) tile-space (x, y) of the grid's column-0/row-0 corner. Reused for both
     the observation's world grid (origin=(0,0), out_h/out_w = map_h/map_w) and its egocentric
-    view grid (origin = that env's view-crop top-left tile, Step 25) -- the same rasterization
+    view grid (origin = that env's view-crop top-left tile) -- the same rasterization
     either way, just a different window."""
     N = state.zone_lo.shape[0]
     device = state.zone_lo.device

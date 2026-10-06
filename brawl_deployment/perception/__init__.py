@@ -15,6 +15,10 @@ supplies the occupancy map's occlusion masks, for crates and for brawler sprites
 odometry frame. The loop hands every consumer odometry shifted onto it, so the grid's cells are
 the game's tiles, and a re-lock resets them all as a new odometry segment would.
 
+`localize` replaces it when the deployment names a map (`known_map`, a hand-labelled layout):
+`MapLocalizer` finds the camera on the label and hands out the MAP frame, and `KnownTerrain` gives
+the grid the label in place of the occupancy map (KNOWN_MAP_LOCALIZATION_PLAN.md).
+
 `grid` is the last stage before assembly: it crops the accumulated terrain map and scatters the
 tracks into the hero-centred planes the observation's `grid` group wants (6.2). Everything
 it places was produced upstream, so its whole contract is placement -- matching
@@ -30,7 +34,9 @@ hero's own timers from the actions we issue, which is where the whole `self` gro
 observation fields and a consumer of CV, which is what this subpackage is.
 """
 from .grid import GasMap, GridBuilder, GridSpec
+from .known_map import KnownMap, KnownTerrain
 from .lattice import LatticePhase, LatticeResult
+from .localize import MapLocalizer, MapResult
 from .loot import (Loot, LootMap, LootResult, box_occlusion, crate_occlusion,
                    require_loot_classes)
 from .projectiles import Projectile, ProjectileResult, ProjectileTracker
@@ -42,6 +48,7 @@ __all__ = ["EntityTracker", "Track", "TrackerResult",
            "Projectile", "ProjectileResult", "ProjectileTracker",
            "Loot", "LootMap", "LootResult", "box_occlusion", "crate_occlusion",
            "require_loot_classes", "LatticePhase", "LatticeResult",
+           "KnownMap", "KnownTerrain", "MapLocalizer", "MapResult",
            "ShadowHero", "ShadowParams", "Desync",
            "GridBuilder", "GridSpec", "GasMap",
            "ZoneEstimator"]

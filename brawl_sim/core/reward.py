@@ -1,13 +1,9 @@
-"""Reward functions. See BRAWL_SIM_BUILD_PLAN.md Step 28.
-
-D09/N05: the simulator itself always returns zero reward (`ZeroReward`, wired as `env.py`'s
-default `reward_fn`, Step 29). Anything real gets computed at the SB3 adapter boundary (Step
-33) from `obs` (Step 25) + `info` (Step 27) -- both already carry everything any reward
-function could need (positions, HP, kills, damage attribution, rank, termination cause, ...),
-so **no reward requires touching the simulator itself**. `RewardFn` is a `typing.Protocol`
-(structural, not an ABC) specifically so a reward function can be a plain function, a lambda, or
-any callable with the right signature -- no inheritance, no boilerplate, and `BrawlVecEnv`/
-`BrawlSB3VecEnv` (Steps 29/33) can accept and call it with zero knowledge of its concrete type.
+"""Reward functions. The simulator itself returns zero reward: `ZeroReward` is `BrawlVecEnv`'s
+default `reward_fn`. A real reward (training/reward.ShapedReward) is a `reward_fn` over `obs` +
+`info`, which already carry everything one needs, so **no reward requires touching the
+simulator**. `BrawlSB3VecEnv` (and wrappers/gym_single.py) installs it on the env, whose
+`_observe` calls it once per decision. `RewardFn` is a structural `typing.Protocol`, so any
+callable with the right signature works: a plain function, a lambda, a class.
 """
 from typing import Protocol, runtime_checkable
 
@@ -20,12 +16,9 @@ class RewardFn(Protocol):
 
 
 class ZeroReward:
-    """Default `RewardFn` (D09/N05). Always returns zeros, `(N,) float32`, on whatever device
-    `info` is on. Preallocates that zeros tensor once per distinct `(n_envs, device)` pair seen
-    and returns the SAME tensor object on every subsequent call for that pair -- "allocates
-    nothing per step" after the first call for a given shape/device, matching every other
-    hot-path buffer in this codebase. The returned tensor is shared across calls: callers must
-    treat it as read-only (mutating it in place would corrupt every future step's "reward")."""
+    """Default `RewardFn`: zeros, `(N,) float32`, on `info`'s device. The tensor is allocated
+    when `(n_envs, device)` changes and the SAME object is returned on every other call, so
+    callers must treat it as read-only (an in-place write would corrupt every later reward)."""
 
     def __init__(self) -> None:
         self._cache_key: tuple | None = None
@@ -42,16 +35,15 @@ class ZeroReward:
 
 
 class ExampleReward:
-    """NOT tuned, NOT recommended -- a syntactically valid worked example showing how to read
-    obs + info, nothing more. Terminal-only: +1 for the hero being the last one alive, -1 for
-    the hero being dead, 0 on every non-terminal tick (including a truncation that catches the
-    hero alive but not alone -- a timeout is neither a win nor a death). Delete or replace; it
-    exists so the SB3 smoke test (Step 36) has something to run.
+    """NOT tuned, NOT recommended: a worked example of reading obs + info, used by
+    scripts/sb3_smoke.py, scripts/benchmark.py and tests. Terminal-only: +1 when the hero is
+    the last one alive, -1 when it is dead, 0 otherwise (a truncation that catches the hero
+    alive but not alone is neither a win nor a death).
 
-    `info["terminated"]` is already exactly "hero dead OR hero last alive" (core/events.py,
-    Step 27) and those two conditions are mutually exclusive and exhaustive within
-    `terminated`, so `hero_alive` alone is enough to tell them apart -- no need to separately
-    check `n_alive`."""
+    `info["terminated"]` is exactly "hero dead OR hero last alive" (events.compute_done), so the
+    hero's alive flag tells the two apart. It reads `obs["hero"]["alive"]`, the post-decision
+    value, not the latched `info["hero_alive"]`: with action_repeat > 1, a win followed by a
+    death later in the same decision scores -1."""
 
     def __call__(self, obs: dict, info: dict, cfg) -> torch.Tensor:
         terminated = info["terminated"]

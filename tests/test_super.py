@@ -1,4 +1,4 @@
-"""Mortis's Super: charge, action space, piercing bolt, lifesteal (bot_overhaul.md Step D2).
+"""Mortis's Super: charge, action space, piercing bolt, lifesteal.
 
 Its own file because the mechanic spans four modules (hero/projectiles/combat/env) and is the one
 place the action space is three-valued. Deliberately exercises everything through the KIND-generic
@@ -6,6 +6,9 @@ path -- `hero.super_ready`, `params.super_*`, `spawn_supers(fire_mask=(N,E))` --
 special-casing entity 0, because bots are expected to get supers and the machinery is already
 shaped for that.
 """
+import math
+
+import pytest
 import torch
 import yaml
 
@@ -18,6 +21,7 @@ from brawl_sim.env import BrawlVecEnv
 
 CONFIGS = "configs"
 _HERO = int(Kind.HERO_MORTIS)
+_TINY = yaml.safe_load(open(f"{CONFIGS}/presets/debug_tiny.yaml"))
 
 
 class _FakeBank:
@@ -108,7 +112,7 @@ def test_action_mask_exposes_super_only_when_charged():
     state.ent_dash_t[:, 0] = 0.0
 
     mask = hero.action_mask(state, params, cfg)["attack"]
-    assert mask.shape == (1, 4)   # [no-fire, attack, super, gadget] since SIM_OVERHAUL Step G3
+    assert mask.shape == (1, 4)   # [no-fire, attack, super, gadget]
     assert bool(mask[0, 0]) and bool(mask[0, 1]) and not bool(mask[0, 2])
 
     state.ent_super_charge[0, 0] = int(params.super_charge_hits[0, _HERO])
@@ -286,6 +290,72 @@ def test_lifesteal_is_clamped_to_max_hp_and_never_revives_the_dead():
     assert float(healed[0, 1]) == 0.0
 
 
+# ---- aiming the idle super (the game's tap-to-fire; user decision, 2026-09-30) -----------
+
+def test_the_idle_super_aims_at_the_nearest_alive_enemy_in_reach_and_skips_crates():
+    """Nearest alive enemy by centre distance, with no crate in the running: the bolt passes
+    through crates without damaging them, so a nearer crate must not steal the aim, as it does
+    for `hero.auto_aim_target`'s dash. With nothing in reach the facing comes back."""
+    cfg, params = _cfg_and_params()
+    state = _state(cfg, params)
+    state.ent_pos[0, 0] = torch.tensor([10.0, 10.0])
+    state.ent_facing[0, 0] = math.pi / 2                      # facing +y
+    state.ent_pos[0, 1:] = torch.tensor([50.0, 50.0])          # everyone else far away
+    state.box_alive.fill_(False)
+    direction, has = hero.super_aim_target(state, params, cfg)
+    assert direction.shape == (1, 2) and has.shape == (1,)
+    assert not bool(has[0])
+    assert torch.allclose(direction[0], torch.tensor([0.0, 1.0]), atol=1e-5)
+
+    # An enemy 6 tiles east: past the dash's 3.77-tile reach, inside the bolt's. +x.
+    state.ent_pos[0, 1] = torch.tensor([16.0, 10.0])
+    direction, has = hero.super_aim_target(state, params, cfg)
+    assert bool(has[0]) and torch.allclose(direction[0], torch.tensor([1.0, 0.0]), atol=1e-5)
+
+    # A crate 1.5 tiles north is nearer, and changes nothing.
+    state.box_alive[0, 0] = True
+    state.box_pos[0, 0] = torch.tensor([10.0, 8.5])
+    direction, has = hero.super_aim_target(state, params, cfg)
+    assert bool(has[0]) and torch.allclose(direction[0], torch.tensor([1.0, 0.0]), atol=1e-5)
+
+    # A dead enemy one tile west does not count; a live one 5 tiles north is the new nearest.
+    state.ent_alive[0, 2] = False
+    state.ent_pos[0, 2] = torch.tensor([9.0, 10.0])
+    direction, has = hero.super_aim_target(state, params, cfg)
+    assert bool(has[0]) and torch.allclose(direction[0], torch.tensor([1.0, 0.0]), atol=1e-5)
+    state.ent_pos[0, 3] = torch.tensor([10.0, 5.0])
+    direction, has = hero.super_aim_target(state, params, cfg)
+    assert bool(has[0]) and torch.allclose(direction[0], torch.tensor([0.0, -1.0]), atol=1e-5)
+
+    # An enemy ON the hero has no bearing: no target, and the facing again.
+    state.ent_pos[0, 1] = torch.tensor([50.0, 50.0])
+    state.ent_pos[0, 3] = torch.tensor([10.0, 10.0])
+    direction, has = hero.super_aim_target(state, params, cfg)
+    assert not bool(has[0])
+    assert torch.allclose(direction[0], torch.tensor([0.0, 1.0]), atol=1e-5)
+
+
+def test_the_idle_super_reach_is_the_bolts_range_plus_both_bodies():
+    """`super_range + super_radius + unit_radius`: the farthest centre a straight flight of
+    `super_range` can touch. Just outside is no target, just inside is, and a charged long dash
+    does not stretch it: the multiplier is the dash's."""
+    cfg, params = _cfg_and_params()
+    state = _state(cfg, params)
+    state.ent_pos[0, 0] = torch.tensor([10.0, 10.0])
+    state.ent_pos[0, 1:] = torch.tensor([50.0, 50.0])
+    reach = (float(params.super_range[0, _HERO]) + float(params.super_radius[0, _HERO])
+             + float(params.unit_radius[0]))
+    assert reach == pytest.approx(11.1, abs=0.01)
+
+    state.ent_pos[0, 1] = torch.tensor([10.0 + reach + 0.05, 10.0])
+    assert not bool(hero.super_aim_target(state, params, cfg)[1][0])
+    state.ent_attack_idle_t[0, 0] = float(params.long_dash_seconds[0, _HERO]) + 1.0
+    assert bool(hero.long_dash_ready(state, params)[0, 0])
+    assert not bool(hero.super_aim_target(state, params, cfg)[1][0])
+    state.ent_pos[0, 1] = torch.tensor([10.0 + reach - 0.05, 10.0])
+    assert bool(hero.super_aim_target(state, params, cfg)[1][0])
+
+
 # ---- integration through the real env ---------------------------------------------------
 
 def test_firing_the_super_through_env_spends_charge_and_breaks_concealment():
@@ -312,6 +382,66 @@ def test_firing_the_super_through_env_spends_charge_and_breaks_concealment():
     assert float(st.ent_out_of_combat_t[0, 0]) < 1.0, "super did not break out-of-combat regen"
     assert float(st.ent_reveal_t[0, 0]) > 0.0, "super did not break concealment"
     assert not bool(obs["hero"]["super_ready"][0])
+
+
+def test_an_idle_super_through_env_flies_and_expires_at_its_range():
+    """The idle-super mine, through `env.step`: action (0, 2) on a charged super launched the
+    bolt along move bin 0's zero `move_dir`, so it sat at its spawn point until reset, hitting
+    every player who touched it. It must fly at `super_proj_speed` and die on the tick its range
+    runs out, in each case one step covers: idle with an enemy in reach (at the nearest), idle
+    with none (along facing), and moving (along the move bin, whatever is in reach).
+
+    A `tick_hook` records every sub-tick, so the lifetime is pinned to the tick, at the shipped
+    `action_repeat`: the super goes on sub-tick 1 and `_held` zeroes the column after it."""
+    cfg = load_config(f"{CONFIGS}/default.yaml", overrides=_TINY)
+    env = BrawlVecEnv(cfg, n_envs=3, device="cpu", seed=0, autoreset=False, verbose=False)
+    env.reset()
+    st, params = env.state, env.params
+    st.box_alive.fill_(False)
+    # env 0: idle; bot 1 is 5 tiles off along (0.6, 0.8), bot 2 10 tiles off, both in reach.
+    # env 1: idle; both bots ~19 tiles off, out of reach; facing +y.
+    # env 2: move bin 1 (+x) with env 0's bots: the bin wins over the enemy in reach.
+    hero_at = torch.tensor([[4.0, 10.0], [3.0, 3.0], [4.0, 10.0]])
+    st.ent_pos[:, 0] = hero_at
+    st.ent_pos[:, 1] = torch.tensor([[7.0, 14.0], [17.0, 16.0], [7.0, 14.0]])
+    st.ent_pos[:, 2] = torch.tensor([[10.0, 2.0], [16.0, 17.0], [10.0, 2.0]])
+    st.ent_facing[:, 0] = torch.tensor([math.pi, math.pi / 2, math.pi])
+    st.ent_super_charge[:, 0] = int(params.super_charge_hits[0, _HERO])
+    st.ent_attack_cd[:, 0] = 0.0
+    st.ent_dash_t[:, 0] = 0.0
+    expected = torch.tensor([[0.6, 0.8], [0.0, 1.0], [1.0, 0.0]])
+
+    def hero_bolts(s):
+        return s.prj_alive & (s.prj_kind == int(Proj.SUPER_BOLT)) & (s.prj_owner == 0)  # (N,P)
+
+    trace = []   # per sub-tick: ((N,) live bolt count, (N,2) the live bolt's position)
+
+    def record(e):
+        live = hero_bolts(e.state)
+        trace.append((live.sum(dim=1), (e.state.prj_pos * live.unsqueeze(-1)).sum(dim=1)))
+
+    env.tick_hook = record
+    env.step(torch.tensor([[0, 2], [0, 2], [1, 2]]))
+
+    live = hero_bolts(st)
+    assert live.sum(dim=1).tolist() == [1, 1, 1], "each env should have fired exactly one bolt"
+    vel = (st.prj_vel * live.unsqueeze(-1)).sum(dim=1)                        # (N,2)
+    speed = float(params.super_proj_speed[0, _HERO])
+    assert vel.norm(dim=-1).tolist() == pytest.approx([speed] * 3, abs=1e-4), "a bolt is not moving"
+    assert torch.allclose(vel / speed, expected, atol=1e-5)
+
+    for _ in range(4):
+        env.step(torch.zeros(3, 2, dtype=torch.int64))
+
+    step = speed * cfg.dt
+    life = math.ceil(float(params.super_range[0, _HERO]) / step)   # 17 ticks: 16 x 0.6 < 10
+    counts = torch.stack([c for c, _ in trace])                     # (ticks, N)
+    assert counts.shape[0] == 5 * cfg.action_repeat > life
+    assert (counts[:life - 1] == 1).all(), "a bolt died before its range ran out"
+    assert (counts[life - 1:] == 0).all(), "a bolt outlived its range"
+    for tick in range(life - 1):
+        travelled = trace[tick][1] - hero_at
+        assert torch.allclose(travelled, expected * step * (tick + 1), atol=1e-4), f"tick {tick + 1}"
 
 
 def test_super_charge_comes_from_player_hits_not_box_hits():

@@ -75,8 +75,8 @@ release.
 
 ## Fire semantics: once per decision
 
-`attack ∈ {0, 1, 2, 3}`: nothing / attack / super / gadget, the 3 since 2026-09-21
-(SIM_OVERHAUL Step G5), plus 4, the auto-aimed attack, for a run trained under `action.auto_aim`
+`attack ∈ {0, 1, 2, 3}`: nothing / attack / super / gadget, the 3 since 2026-09-21,
+plus 4, the auto-aimed attack, for a run trained under `action.auto_aim`
 (2026-09-26; the mask and `Decision.legal` are then five wide, and `policy.cfg` says which). The
 press starts on the **first** perception tick
 of the decision window and does **not** repeat. This mirrors `env._held`, which zeroes the fire
@@ -93,7 +93,7 @@ its own action, value 4 below, chosen by the policy, never substituted for value
 Apply action masking at inference the way `MaskablePPO` saw it in training — an uncharged super
 means bin 2 is masked, not merely ignored.
 
-**The gadget is the one bare tap** (design §4.4, revised 2026-09-21, SIM_OVERHAUL Step G5; this
+**The gadget is the one bare tap** (design §4.4, revised 2026-09-21; this
 line used to say never to touch the gadget button). `attack == 3` goes down on the calibrated
 gadget centre and lifts on the next tick, no drag: the game aims it at the nearest enemy, exactly
 as the sim's `hero.gadget_target` does. Its mask bit is the shadow's own 18 s timer, with no
@@ -101,9 +101,9 @@ dash, cooldown or ammo term, and a throw is not an attack. **The gadget is NOT t
 anchor** (corrected 2026-09-22, design §5.1). It was believed to be for two weeks, because all three
 button names in `control_calibration.json` sat one disc off and a commanded gadget actually pressed
 the Super. The gate is now on `hypercharge`, the one disc in the cluster nothing presses. Keep it
-there: Step G6 measured the alternative live, and one throw drops the gadget's own ring score under
+there: the alternative was measured live, and one throw drops the gadget's own ring score under
 threshold for 5.0 s, so an agent gated on its own gadget stops dead after every throw.
-Its trace comes from `scripts/deploy_calibrate.py --probe-gadget` (G6.1), in a real match,
+Its trace comes from `scripts/deploy_calibrate.py --probe-gadget`, in a real match,
 never Training Grounds.
 
 **The auto-aimed attack (`attack == 4`) is the other bare tap** (design §4.4 and §9 entry 23,
@@ -298,7 +298,7 @@ written for `enemies` and `projectiles`, where the agent is a spectator. **It do
 constants in `configs/brawlers.yaml`. Verified: `movement.py:54` and `hero.py:276` set
 `ent_facing` from `move_dir`/`dash_dir`; `hero.py:124` defines `long_dash_ready` as a stopwatch
 since our last attack; `hero.py:114-115` tick `attack_cd`/`invuln_t` as plain `-= dt` countdowns.
-Since 2026-09-21 (SIM_OVERHAUL Step G5) `gadget_ready` and `gadget_charge_frac` join them: an
+Since 2026-09-21 `gadget_ready` and `gadget_charge_frac` join them: an
 18 s countdown from `gadget_cooldown`, charged at the gate and restarted by our own throw.
 
 So maintain a **shadow hero state** — the hero's own timers, ticked at `cfg.dt`, advanced by the
@@ -315,7 +315,7 @@ a dropped input, or a dash cut short by a wall. Guard it:
 - **Position** is likewise both CV-tracked and predicted; divergence means movement is not landing.
 - On desync: resync observables from CV, reseed unobservable timers **conservatively** (assume not
   ready), log it. Sustained desync is a fail-closed condition.
-- **The gadget timer is the one thing a resync leaves alone** (2026-09-21, SIM_OVERHAUL Step G5),
+- **The gadget timer is the one thing a resync leaves alone** (2026-09-21),
   a queued throw included. The canary's evidence is ammo, which says nothing about the gadget,
   and the shadow's gadget can lag the game's (a dropped tap) but never lead it, since the loop
   taps only what `ShadowHero.act` modelled. Reseeding it to not ready would throw away up to 18 s
@@ -328,8 +328,8 @@ failure is silent and looks like "the policy is bad at real Brawl Stars."
 ## The history: one snapshot per decision, newest first
 
 `configs/agent_obs_deploy4.yaml` reads the last three decisions: the `history` group and the
-`enemy_hist1..3` grid planes (SIM_OVERHAUL Step H4, 2026-09-21); `configs/agent_obs_deploy5.yaml`
-(OBS_PARITY_TASKS.md C10, 2026-09-24) is deploy4 plus `hero.near_edge` after `hero.in_zone` and
+`enemy_hist1..3` grid planes (2026-09-21); `configs/agent_obs_deploy5.yaml`
+(2026-09-24) is deploy4 plus `hero.near_edge` after `hero.in_zone` and
 `slots: tracked` on `enemies`, with the history rules below unchanged, and `configs/deployment.yaml`
 stays on the deploy4 run until a deploy5 checkpoint exists. The loop keeps a deque of
 `DecisionSnapshot`s sized from `history_frames`. The load-bearing rules:

@@ -60,12 +60,12 @@ from brawl_sim.core import obs_select
 from brawl_deployment.perception.assemble import MapFrame, ObservationAssembler
 
 ATTACK_NONE, ATTACK_FIRE, ATTACK_SUPER, ATTACK_GADGET, ATTACK_AUTO = 0, 1, 2, 3, 4
-# The sim's attack column is 4 wide since SIM_OVERHAUL Step G3 (`[none, attack, super, gadget]`,
+# The sim's attack column is 4 wide (`[none, attack, super, gadget]`,
 # `cfg.action_nvec`), or 5 wide for a run trained under `action.auto_aim` (2026-09-26; the fifth
 # value is the auto-aimed attack). The width is the run's own: `from_run` builds `cfg` from the
 # run's frozen train.yaml, overrides included, so a run trained before the flag keeps 4 and loads.
 # The 3-wide checkpoints trained before the gadget were retired by the operator on 2026-09-21.
-# Since Step G5 the shadow reports every legal, so the gadget column is live.
+# Since 2026-09-21 the shadow reports every legal, so the gadget column is live.
 _PRE_GADGET_ATTACK_WIDTH = 3   # only to NAME that refusal in `check_spaces`; nothing loads at it
 _AUTO_AIM_ATTACK_WIDTH = 5     # likewise, to name a flag mismatch
 
@@ -95,8 +95,8 @@ def check_spaces(model, spec, cfg, *, label: str, spec_path="the spec", cfg_path
     if nvec != want:
         why = ""
         if nvec == (want[0], _PRE_GADGET_ATTACK_WIDTH):
-            why = (" It is a pre-gadget checkpoint (before SIM_OVERHAUL Step G3); those were "
-                   "retired on 2026-09-21, so retrain rather than load it.")
+            why = (" It is a pre-gadget checkpoint (retired on 2026-09-21), so retrain rather "
+                   "than load it.")
         elif nvec == (want[0], _AUTO_AIM_ATTACK_WIDTH) and not cfg.auto_aim:
             why = (" It was trained with the auto-aimed attack (`action.auto_aim: true`, a 5-wide "
                    "attack column) and the config has the flag off; the run's own train.yaml "

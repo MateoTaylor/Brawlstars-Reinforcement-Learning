@@ -1,13 +1,14 @@
-"""Generate candidate Solo Showdown maps (SIM_OVERHAUL_PLAN.md Step M2; M3 picks ten of them).
+"""Generate candidate Solo Showdown maps.
 
     .venv/Scripts/python.exe scripts/gen_maps.py --family standard --seed 1 --count 3 --out-dir runs/maps --preview
     .venv/Scripts/python.exe scripts/gen_maps.py --family all --seed 100 --out-dir runs/maps
 
 Writes `<out-dir>/<family>_<seed>.csv` per map (the CSV the loader reads; copy it to
 `brawl_sim/maps/csv/<name>.csv` to adopt it) and prints one line per map with the seed that
-passed and its shares, plus the seeds `generate` rejected on the way and why -- the README's
-"which seeds were rejected and why" comes straight from this output. `--family all` produces each
-family's planned count (6 standard, 1 open, 1 dense, 2 water_border) unless `--count` is given.
+passed and its shares, plus the seeds `generate` rejected on the way and why. `--family all`
+produces each family's planned count (6 standard, 1 open, 1 dense, 2 water_border, and 3 each
+of the five screenshot families: maze, lake_ring, branches, crescent, vines) unless `--count`
+is given.
 Seeds walk forward: the map after the one that passed at seed s starts from s + 1, so every
 output is reproducible from its own seed.
 """
@@ -31,7 +32,7 @@ def main(argv=None) -> int:
     ap.add_argument("--count", type=int, default=None,
                     help="maps per family (default 1, or the family's planned count with --family all)")
     ap.add_argument("--symmetry", default=None, choices=[g.POINT, g.MIRROR],
-                    help="override the family's symmetry (the plan's one mirror standard map)")
+                    help="override the family's symmetry")
     ap.add_argument("--out-dir", default="runs/maps")
     ap.add_argument("--preview", action="store_true", help="print the ASCII grid of each map")
     args = ap.parse_args(argv)

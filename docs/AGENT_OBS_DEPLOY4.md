@@ -49,7 +49,7 @@ shape: `(9, 9)`, dtype: `float32`, per_entity
 
 shape: `(12, 6)`, dtype: `float32`, per_entity
 
-**Not index-stable** -- the 12 nearest (by `projectiles.time_to_closest`) live slots, re-selected every tick; zero-padded when fewer than that many are alive.
+**Not index-stable** -- the 12 nearest (by `projectiles.time_to_closest`, ties nearest the hero first) live slots, re-selected every tick; zero-padded when fewer than that many are alive.
 
 | columns | field | source units |
 |---|---|---|

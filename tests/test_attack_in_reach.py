@@ -1,4 +1,4 @@
-"""SIM_OVERHAUL_PLAN.md §9 R2 (operator-approved 2026-09-21): the `attack_in_reach` shaping term.
+"""BRAWL_SIM_DESIGN.md §10 (operator-approved 2026-09-21): the `attack_in_reach` shaping term.
 
 One count per decision, paid by training/reward.py: the hero attacked (attack column 1) or used its
 super (column 2) while an enemy it could SEE stood inside its uncharged dash reach. The radius is
@@ -105,7 +105,9 @@ def test_a_super_in_reach_counts_like_an_attack():
     env, override = _duel([11.5, 10.0])
     env.state.ent_super_charge[0, 0] = 5                    # super_charge_hits 5: a full meter
     *_, info = _act(env, override, _SUPER)
-    assert float(env.state.ent_super_charge[0, 0]) == 0.0   # it went out: the meter is spent
+    # It went out: the meter is spent to 0, then the idle super's bolt, aimed at bot 1 like the
+    # game's tap-to-fire (user decision, 2026-09-30), hits it on this tick for the next charge.
+    assert float(env.state.ent_super_charge[0, 0]) == 1.0
     assert int(env.state.ent_shots_fired[0, 0]) == 1
     assert info["attack_in_reach_tick"].tolist() == [1]
 
@@ -213,13 +215,13 @@ def _info(counts):
     }
 
 
-def test_term_names_append_attack_in_reach_last():
+def test_term_names_append_new_terms_last():
     """Appended, not inserted: `term_means` reports in this order, so a TensorBoard run keeps its
-    existing curves."""
+    existing curves. `gadget_hit` (tests/test_gadget_hit.py) came after this file's term."""
     assert TERM_NAMES == (
         "damage_dealt", "damage_taken", "hp_healed", "kill", "cube_pickup",
         "survive_per_step", "in_zone_per_step", "win_bonus", "death_penalty", "rank_bonus",
-        "attack_in_reach",
+        "attack_in_reach", "gadget_hit",
     )
 
 

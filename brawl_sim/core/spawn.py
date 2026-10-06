@@ -1,21 +1,18 @@
-"""Batched partial reset: map/kind/position sampling and reset_envs, the function that ties
-every subsystem's own reset logic together. See BRAWL_SIM_BUILD_PLAN.md Step 24.
+"""Batched partial reset: map/kind/personality/position sampling and reset_envs, the function
+that ties every subsystem's own reset logic together.
 
-Layering note: this is the first core/ module to import from config.py directly (resample_params,
-ARCHETYPE_SHORT_NAMES) rather than only receiving `cfg`/`params` as plain arguments. That's safe
--- config.py sits *below* core/ in the dependency graph (it imports only .constants, never
-anything under core/), so this doesn't create a cycle, unlike the deliberately-avoided core/->bots/
-direction documented in core/zone.py.
+This module imports config.py directly (resample_params, ARCHETYPE_SHORT_NAMES). That makes no
+cycle: config.py imports only constants and core/projectiles, and nothing on that path imports
+config.
 
-zero_(state, reset_mask) (Step 9) already clears every resettable field for masked rows --
-including prj_alive/pku_alive ("clear projectiles & pickups"), act_buf/act_head ("clear the
-latency ring buffer"), and time/step_count/boxes_broken/ent_kills/etc ("counters") -- before
-this module's own code runs a single line. The Step 24 pseudocode lists those as separate
-ordering steps; here they're a free consequence of zero_ rather than something reset_envs does
-itself, so there's no redundant code for them below -- only the fields zero_'s blanket 0/False
-default gets semantically WRONG for a fresh spawn (map_id, ent_kind, ent_pos, ent_hp/max_hp/
-ammo/facing/alive, plus two sentinel fields, ent_target and ent_death_step -- see their own
-notes below) are touched explicitly.
+zero_(state, reset_mask) runs first and clears every resettable field for masked rows
+(projectiles and pickups, the act_buf/act_head latency ring, time/step_count and the episode
+counters), so reset_envs touches only what zero_'s blanket 0/False cannot supply: map_id,
+ent_kind, ent_person, ent_pos, ent_hp/max_hp/ammo/facing/alive, the -1 sentinels ent_target and
+ent_death_step, and ent_hunt_t; then it spawns boxes, initializes the zone and sets n_alive.
+
+The samplers compute every row: reset_mask only sources N, and the caller commits the masked
+rows with torch.where (resample_params' convention).
 """
 import torch
 
@@ -24,22 +21,17 @@ from ..constants import AGGRESSIVE_PERSONS, N_PERSONS
 from . import boxes, geometry as geo, stats, zone
 from .state import zero_
 
-_MAP_W_H_EPS = 1e-6
-
 
 def _const_tensor(values, device, dtype: torch.dtype) -> torch.Tensor:
-    """1-D tensor from a plain Python sequence of scalars -- NOT `torch.tensor(values,
-    device=device)`, which is a real host sync under CUDA (see geometry.vec2's docstring; this
-    is the same fix, generalized past length 2 for enemy_type_weights/fixed_enemy_types)."""
+    """1-D tensor from a plain Python sequence of scalars, NOT `torch.tensor(values,
+    device=device)`, which is a host sync under CUDA: geometry.vec2's fix, for any length."""
     return torch.stack([torch.full((), v, device=device, dtype=dtype) for v in values])
 
 
 def sample_map_ids(reset_mask: torch.Tensor, bank, cfg, gen) -> torch.Tensor:
     """(N,) i64, one map index per env, into cfg.map_names' order (matching MapBank's leading
-    dim, Step 6). Computed fresh for every row regardless of reset_mask -- reset_mask is only
-    used as the source of N, matching resample_params' own convention (Step 3/4); the caller
-    commits only the masked rows via torch.where. cfg.map_selection: "uniform" draws
-    independently per env; "fixed" pins every env to cfg.fixed_map's index."""
+    dim). Computed fresh for every row (see module docstring). cfg.map_selection: "uniform"
+    draws independently per env; "fixed" pins every env to cfg.fixed_map's index."""
     N = reset_mask.shape[0]
     device = reset_mask.device
     M = len(cfg.map_names)
@@ -54,11 +46,11 @@ def sample_map_ids(reset_mask: torch.Tensor, bank, cfg, gen) -> torch.Tensor:
 
 
 def sample_enemy_kinds(reset_mask: torch.Tensor, cfg, gen) -> torch.Tensor:
-    """(N,E) i64. Slot 0 is always HERO_MORTIS (0). Slots 1..E-1: multinomial draw over the 4
-    archetypes weighted by cfg.enemy_type_weights (via inverse-CDF + searchsorted, the same
-    "sort/rank plus a threshold" shape as projectiles.alloc_slots) when
+    """(N,E) i64. Slot 0 is always HERO_MORTIS (0). Slots 1..E-1: a multinomial draw over the
+    bot archetypes (ARCHETYPE_SHORT_NAMES) weighted by cfg.enemy_type_weights (inverse-CDF +
+    searchsorted, the same "sort/rank plus a threshold" shape as projectiles.alloc_slots) when
     cfg.randomize_enemy_types, else cfg.fixed_enemy_types verbatim, tiled across every env.
-    Computed fresh for the whole batch; reset_mask only sources N (see module docstring)."""
+    Computed fresh for the whole batch (see module docstring)."""
     N = reset_mask.shape[0]
     device = reset_mask.device
     E = cfg.n_entities
@@ -92,18 +84,15 @@ def sample_personalities(reset_mask: torch.Tensor, cfg, gen) -> torch.Tensor:
     ent_target and ent_move_smooth are never read. Slots 1..E-1 draw independently from
     cfg.bots_personality_weights by inverse-CDF + searchsorted, the same shape
     sample_enemy_kinds uses for archetypes. Personality and archetype are drawn INDEPENDENTLY:
-    any of the 4 archetypes can come up with any of the 5 personalities.
+    any archetype can come up with any personality. Computed fresh for the whole batch.
 
-    Computed fresh for the whole batch; reset_mask only sources N (see module docstring).
-
-    **The aggression floor.** After the weighted draw, any env that came up with fewer than
-    `cfg.bots_min_aggressive` bots holding an AGGRESSIVE_PERSONS role has the shortfall forced,
-    because a lobby of nothing but campers and trappers is one the agent wins by standing still,
-    and training on it rewards exactly the behavior this system exists to remove. The forced
-    slots are chosen by random rank (a uniform key, biased so already-aggressive slots sort last
-    and a forced conversion is never wasted on one), NOT by taking slot 1 and counting up: entity
-    slot order is stable for a whole episode and appears in the observation, so "slot 1 is always
-    the dangerous one" is a pattern the agent could learn to read instead of learning to fight.
+    **The aggression floor.** After the weighted draw, an env with fewer than
+    `cfg.bots_min_aggressive` bots holding an AGGRESSIVE_PERSONS role has the shortfall forced:
+    a lobby of campers and trappers is one the agent wins by standing still. The forced slots are
+    chosen by random rank (already-aggressive slots sort last, so no conversion is wasted), NOT
+    from slot 1 up: entity slot order is stable for an episode and can appear in the
+    observation, so "slot 1 is the dangerous one" would be a pattern the agent could read instead
+    of learning to fight.
     """
     N = reset_mask.shape[0]
     device = reset_mask.device
@@ -111,7 +100,7 @@ def sample_personalities(reset_mask: torch.Tensor, cfg, gen) -> torch.Tensor:
 
     persons = torch.zeros((N, cfg.n_entities), dtype=torch.int64, device=device)
     if not cfg.bots_personalities:
-        return persons  # every bot is a RUSH: the closest thing to pre-Step-41 behavior
+        return persons  # personalities off: every bot is a RUSH
 
     weights = _const_tensor(cfg.bots_personality_weights, device, torch.float32)
     cdf = torch.cumsum(weights, dim=0) / weights.sum()
@@ -146,11 +135,11 @@ def sample_spawn_positions(reset_mask: torch.Tensor, map_ids: torch.Tensor, bank
     everyone else). A single random rotation r in [0, n_spawns) per env, then entity k claims
     spawn slot (r + floor(k*n_spawns/E)) % n_spawns -- floor-partitioning k across n_spawns
     keeps consecutive entities' slot gaps within one of each other, and since bank.spawns is
-    angle-sorted (loader.spawn_points), that's an even angular spread. Distinct slots per k
-    (as long as E <= n_spawns, guaranteed by Step 5's map minimums for any default-sized
-    roster) means positions are automatically collision-free and on a passable tile (SPAWN
-    tiles are never in TILE_BLOCKS_UNIT) with no extra checking needed here. Computed fresh
-    for the whole batch; reset_mask only sources N (see module docstring)."""
+    angle-sorted (loader.spawn_points), that's an even angular spread. While E <= n_spawns the
+    slots are distinct, so positions are collision-free and passable (SPAWN tiles are never in
+    TILE_BLOCKS_UNIT) with no checking here. Nothing enforces that bound (the loader requires
+    only MIN_SPAWNS, 8): a map with fewer spawns than entities stacks some of them. Computed
+    fresh for the whole batch (see module docstring)."""
     N = reset_mask.shape[0]
     device = reset_mask.device
     E = cfg.n_entities
@@ -171,19 +160,18 @@ def sample_spawn_positions(reset_mask: torch.Tensor, map_ids: torch.Tensor, bank
 
 
 def reset_envs(state, reset_mask: torch.Tensor, bank, params, cfg, gen, spec, params_hook=None) -> None:
-    """MUTATES everything for masked rows. See module docstring for what zero_ already covers
-    for free. Order: zero_ -> resample_params -> params_hook -> map_id -> kinds -> positions ->
-    hp/max_hp/ammo/facing/alive/target/death_step -> spawn_boxes -> init_zone -> n_alive.
+    """MUTATES everything for masked rows (see module docstring for what zero_ covers). Order:
+    zero_ -> resample_params -> params_hook -> map_id -> kinds -> personalities -> positions ->
+    hp/max_hp/ammo/facing/alive -> target/death_step -> hunt_t -> spawn_boxes -> init_zone ->
+    n_alive.
 
-    `params_hook(params, reset_mask)` is an optional post-resample mutation hook, called for
-    every reset immediately AFTER resample_params and BEFORE anything reads `params` back --
-    which is the only correct place for it: `max_hp`/`max_ammo` below are derived from `params`
-    right here, so a hook that ran any later would leave freshly spawned entities' HP
-    disagreeing with their own `base_hp`. Its contract is the same as every other function in
-    this file: mutate `params` in place, torch.where-masked by `reset_mask` over the full batch,
-    sync-free, no Python loop over envs. Built for `training/curriculum.py`'s per-env difficulty
-    tier sampling (a weighted discrete mixture, which the {low, high} range syntax
-    `resample_params` implements cannot express); the simulator itself never sets it."""
+    `params_hook(params, reset_mask)` is an optional hook called immediately AFTER
+    resample_params and BEFORE anything reads `params` back: `max_hp`/`max_ammo` below derive
+    from `params`, so a later hook would spawn entities whose HP disagrees with their own
+    `base_hp`. Contract: mutate `params` in place, torch.where-masked by `reset_mask` over the
+    full batch, sync-free, no Python loop over envs. training/curriculum.py uses it for per-env
+    difficulty tiers (a weighted discrete mixture, which resample_params' {low, high} range
+    syntax cannot express); the simulator itself never sets it."""
     zero_(state, reset_mask)
     resample_params(params, reset_mask, cfg, gen, spec)
     if params_hook is not None:
@@ -214,21 +202,16 @@ def reset_envs(state, reset_mask: torch.Tensor, bank, params, cfg, gen, spec, pa
     state.ent_facing.copy_(torch.where(mask_e, facing, state.ent_facing))
     state.ent_alive.copy_(torch.where(mask_e, torch.ones_like(state.ent_alive), state.ent_alive))
 
-    # ent_target < 0 means "no target" (bots/perception.select_target's own docstring names
-    # this exact function as the place responsible for it, since zero_'s blanket 0-init would
-    # otherwise read as "targeting entity 0"). ent_death_step's "never died" sentinel is -1 for
-    # the same reason: step_count also starts at 0, so a fresh entity's zero_-inited death_step
-    # would be indistinguishable from "died on step 0".
+    # -1 sentinels where zero_'s 0 would lie: ent_target 0 would read as "targeting entity 0"
+    # (bots/perception.select_target relies on this reset), and ent_death_step 0 as "died on
+    # step 0", since step_count also starts at 0.
     state.ent_target.copy_(torch.where(mask_e, torch.full_like(state.ent_target, -1), state.ent_target))
     state.ent_death_step.copy_(torch.where(mask_e, torch.full_like(state.ent_death_step, -1), state.ent_death_step))
 
-    # ent_hunt_t is one more field zero_'s blanket 0 gets semantically wrong: 0 means "the search
-    # timeout already expired", which would make the very first waypoint a hunter selects count as
-    # searched, and be skipped, on its first tick.
-    # The other three personality fields are deliberately NOT touched here, because 0 IS their
-    # correct fresh value: ent_hunt_seen is a bitmask and 0 means "nowhere visited yet", and
-    # bots/personality.advance_wander re-rolls ent_wander_dir/ent_wander_t itself on the
-    # degenerate-heading and expired-timer checks before anything reads them.
+    # ent_hunt_t's 0 would mean "search timeout already expired", so a hunter's first waypoint
+    # would count as searched and be skipped. The other personality fields keep zero_'s 0:
+    # ent_hunt_seen's 0 is "nowhere visited yet", and bots/personality.advance_wander re-rolls
+    # ent_wander_dir/ent_wander_t before anything reads them.
     hunt_t_fresh = torch.full_like(state.ent_hunt_t, cfg.bots_hunt_timeout_seconds)
     state.ent_hunt_t.copy_(torch.where(mask_e, hunt_t_fresh, state.ent_hunt_t))
 

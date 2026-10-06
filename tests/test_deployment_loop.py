@@ -10,6 +10,7 @@ come from. Checking `phase` instead would pass for a loop that set the right pha
 button anyway, which is the exact bug the interlock exists to make impossible.
 """
 from pathlib import Path
+from types import SimpleNamespace
 
 import math
 
@@ -26,16 +27,22 @@ from brawl_deployment.config import DeploymentConfig
 from brawl_deployment.control.buttons import Buttons
 from brawl_deployment.control.joystick import Joystick
 from brawl_deployment.perception.assemble import ObservationAssembler
+from brawl_deployment.perception.known_map import KnownMap
+from brawl_deployment.perception.lattice import LatticePhase
 from brawl_deployment.perception.loot import crate_occlusion
 from brawl_deployment.policy import Decision
 from brawl_deployment.window import WindowFault
 from brawl_sim.config import load_config
-from brawl_sim.core.obs_select import agent_space, load_agent_spec
+from brawl_sim.constants import (TILE_BLOCKS_PROJ, TILE_BLOCKS_UNIT, TILE_IS_BUSH, TILE_IS_WATER,
+                                 Tile)
+from brawl_sim.core.obs_select import agent_obs_index_map, agent_space, load_agent_spec
+from brawl_vision.camera import HERO_ANCHOR_TILES
 from brawl_vision.capture import Frame
 from brawl_vision.hud import BrawlersLeft
 from brawl_vision.object_detection.detector import Detection
 from brawl_vision.object_detection.projectile_detection.classes import (CUBE_BOX, CUBE_DROPPED,
                                                                         PROJECTILE)
+from brawl_vision.terrain.labeling import CLASS_INDEX
 from brawl_vision.terrain.odometry import OdometryResult
 
 CFG = load_config("configs/default.yaml")
@@ -226,7 +233,7 @@ class _Plan:
         f = at - np.round(at)
         if np.abs(f).max() < 1e-9:
             return self
-        out = _Plan()
+        out = type(self)()
         T = np.array([[1.0, 0.0, f[0] * self.pixels_per_tile],
                       [0.0, 1.0, f[1] * self.pixels_per_tile], [0.0, 0.0, 1.0]])
         out.M = T @ self.M
@@ -362,9 +369,8 @@ class _Policy:
         self.move_legal.append(move_legal)
         if self.raises is not None:
             raise self.raises
-        # `DeployedPolicy.act`'s own contract: one legal per attack column, four since Step G5
-        # and five under `action.auto_aim`, and the move half either absent or one flag per bin
-        # plus idle.
+        # `DeployedPolicy.act`'s own contract: one legal per attack column (four, or five under
+        # `action.auto_aim`), and the move half either absent or one flag per bin plus idle.
         assert len(tuple(attack_legal)) == self.cfg.action_nvec[1], attack_legal
         assert move_legal is None or len(move_legal) == self.cfg.n_move_bins + 1, move_legal
         return self.decision
@@ -582,17 +588,21 @@ def test_a_tick_with_no_ammo_read_records_no_ammo_rather_than_a_plausible_zero(l
     assert row.ammo_shadow >= 0.0, "the shadow always has a value, even when the read misses"
 
 
-def test_the_warmup_tick_is_flagged_on_the_row_that_actually_paid_for_it(loop):
-    """`VisionStack.warm` runs inside the gate-opening tick and costs ~1 s of PTX JIT. It has to
-    be attributed to THAT row -- telemetry is appended at tick end, so reaching for `[-1]` while
-    inside the tick flags the previous one and the summary then excludes a healthy tick and keeps
-    the 758 ms one. Exactly one row carries the flag, and it is the one the gate opened on."""
+def test_the_warmup_is_paid_while_waiting_and_flagged_on_the_row_that_paid_for_it(loop):
+    """`VisionStack.warm` costs ~1 s of PTX JIT, once. It is paid on the run's first tick, while
+    the gate is still closed, so no match tick carries it: on the gate's tick it held up the first
+    decision, and with the gate's own work that tick reached 1.22 s. It has to be attributed to
+    THAT row -- telemetry is appended at tick end, so reaching for `[-1]` while inside the tick
+    flags the previous one and the summary then excludes a healthy tick and keeps the slow one."""
     warmed = []
     loop.vision.warm = lambda image: warmed.append(image)
+    for _ in range(3):
+        loop.tick()                            # the gate is closed
     _play(loop, 4)
     rows = [r for r in loop.telemetry if r.warmup]
     assert len(warmed) == 1 and len(rows) == 1
-    assert rows[0].index == 0                  # the first tick is where the gate opened
+    assert rows[0].index == 0 and rows[0].phase == "waiting"
+    assert loop.phase is Phase.PLAYING
 
 
 def test_the_telemetry_grab_time_is_per_tick_not_the_running_total(loop):
@@ -661,6 +671,28 @@ def test_a_capture_stall_stops_the_loop(loop, monkeypatch):
     loop.tick()
     assert loop.phase is Phase.STOPPED
     assert "stall" in loop.stop_reason
+
+
+def test_the_warmup_is_not_a_capture_stall_but_a_later_gap_is(loop, monkeypatch):
+    """The first K5 dry run (2026-09-28) stopped with "capture stalled for 1.22s" on the tick
+    after the one that paid the warm-up. The guard is for a capture that stopped delivering, and
+    the JIT is the loop's own cost, once: it comes out of the next tick's gap, and only that one.
+    A clock the test moves, so the 5 s warm-up costs no real time."""
+    clock = [100.0]
+    monkeypatch.setattr("brawl_deployment.loop.time",
+                        SimpleNamespace(perf_counter=lambda: clock[0], sleep=lambda s: None))
+
+    def slow_warm(image):
+        clock[0] += 5.0
+
+    loop.vision.warm = slow_warm
+    loop.tick()
+    clock[0] += loop.tick_seconds
+    loop.tick()
+    assert loop.phase is Phase.WAITING and loop.stop_reason is None
+    clock[0] += loop.cfg.safety_capture_stall_seconds + 1.0
+    loop.tick()
+    assert loop.phase is Phase.STOPPED and "stall" in loop.stop_reason
 
 
 def test_the_match_watchdog_stops_a_match_that_never_ends(loop):
@@ -865,7 +897,7 @@ def test_only_what_the_shadow_modelled_is_tapped(loop):
 
 
 def test_a_gadget_decision_is_a_bare_tap_on_the_gadget_button(loop):
-    """SIM_OVERHAUL Step G5: attack value 3 reaches the device as a tap on the gadget button,
+    """Attack value 3 reaches the device as a tap on the gadget button,
     down on the decision tick and up on the next, never a drag, and the row records 3. The next
     decision's bitmask has lost bit 3 to the cooldown and kept bit 1, because a throw spends no
     ammo and takes no attack cooldown; the second throw it asks for is refused, and nothing is
@@ -934,6 +966,31 @@ def test_the_first_brawlers_left_read_is_awaited_rather_than_seeded(loop):
     assert _last_attempt(loop).note == "no brawlers-left read"
 
 
+# -- the slot rule -----------------------------------------------------------------------------
+
+# Both off the tracker's own defaults (promote 2, coast 3), which are also today's config: a loop
+# that dropped the run's numbers would fall back to those and pass on the shipped yaml.
+SLOTS_CFG = load_config("configs/default.yaml",
+                        overrides={"slots": {"promote_hits": 4, "max_misses": 1}})
+
+
+def test_the_tracker_takes_the_runs_slot_rule_not_its_own_defaults(monkeypatch):
+    """`slots.*` is the rule the sim's `core/slots.py` trained the enemy rows on, so the live
+    tracker reads the run's numbers. An enemy standing in view reaches the policy's slots on its
+    4th consecutive sighting, not its 2nd, and leaves on its 2nd unseen decision, not its 4th."""
+    _patch_vision(monkeypatch)
+    lp = _build_loop(_Policy(cfg=SLOTS_CFG))
+    assert (lp.tracker.promote_hits, lp.tracker.max_misses) == (4, 1)
+
+    hero = _Detection("player", HERO_PX)
+    lp.vision.entities.detections = [hero, _Detection("enemy", (HERO_PX[0] + 2 * 48, HERO_PX[1]))]
+    _play(lp, 4 * lp.decision_every)
+    lp.vision.entities.detections = [hero]
+    _play(lp, 2 * lp.decision_every)
+    slotted = [any(t is not None for t in call["enemies"]) for call in lp.policy.assembler.calls]
+    assert slotted == [False, False, False, True, True, False]
+
+
 # -- enemy HP bookkeeping ----------------------------------------------------------------------
 
 def test_a_slots_hp_is_dropped_when_its_track_is_replaced(loop):
@@ -968,6 +1025,30 @@ def test_gas_is_read_from_the_accumulated_map_not_the_frame(loop):
     assert loop._in_gas((0.0, 0.0)) is True
 
 
+def test_zone_active_outlives_a_new_segment_and_a_new_match_clears_it(loop, monkeypatch):
+    """The sim's `zone_seen` is cleared by an episode reset and nothing else. Live, a new segment
+    empties the gas map, so a flag read off the map alone would fall back to 0 mid-match with the
+    gas out of view, which is the case here, and it holds. The next match starts at 0 again."""
+    on_screen = {"gas": True}
+    monkeypatch.setattr("brawl_vision.terrain.zone.detect_zone",
+                        lambda rect, plan, cfg=None: _Zone(gassed=on_screen["gas"]))
+    _play(loop, 1)
+    assert loop.policy.assembler.calls[-1]["zone"]["active"] is True
+
+    on_screen["gas"] = False
+    loop.vision.odometry.segment += 1
+    _play(loop, 2 * loop.decision_every)              # the tracker's reset tick is skipped
+    assert loop.policy.calls == 2, _last_attempt(loop).note
+    assert not loop.grid.gas.gassed.any()
+    assert loop.policy.assembler.calls[-1]["zone"]["active"] is True
+
+    loop.match.gate = False
+    loop.tick()                                        # the match ends...
+    _play(loop, 1)                                     # ...and the next one begins
+    assert loop.policy.calls == 3, _last_attempt(loop).note
+    assert loop.policy.assembler.calls[-1]["zone"]["active"] is False
+
+
 # -- the real assembler ------------------------------------------------------------------------
 
 # Globbed, so a new deploy spec is exercised here the day it is added.
@@ -997,10 +1078,10 @@ def test_a_decision_reaches_the_policy_through_the_real_assembler(loop, spec_pat
         assert obs[name].dtype == sub.dtype, name
 
 
-# -- hero_offset and hero.near_edge (OBS_PARITY_TASKS.md C7) ----------------------------------
+# -- hero_offset and hero.near_edge -----------------------------------------------------------
 
 def _near_edge_spec() -> str:
-    """deploy4 with `hero.near_edge` after `hero.in_zone`, the shape C10's deploy5 takes."""
+    """deploy4 with `hero.near_edge` after `hero.in_zone`, the shape deploy5 takes."""
     import tempfile
     import yaml
     doc = yaml.safe_load(open("configs/agent_obs_deploy4.yaml").read())
@@ -1062,7 +1143,7 @@ def _valid(lp) -> list:
 
 
 def test_the_first_decisions_after_the_gate_fill_the_history_one_slot_at_a_time(loop):
-    """SIM_OVERHAUL_STEPS.md H4.1's verify, through the real assembler: [0,0,0], [1,0,0],
+    """Through the real assembler: [0,0,0], [1,0,0],
     [1,1,0], and then the ring is full. A different HP read each decision shows the order:
     newest first, as the sim's ring keeps it."""
     lp = _deploy4_loop(loop)
@@ -1299,7 +1380,7 @@ def _lattice_crate(tile):
 
 
 def test_every_consumer_moves_onto_the_game_lattice_the_crates_give(loop):
-    """Step B through the real loop. The crate reads (+0.3, -0.25) off a tile centre in the
+    """The lattice through the real loop. The crate reads (+0.3, -0.25) off a tile centre in the
     odometry frame. On the third sighting the world frame moves by exactly that. The deposit is
     registered at the moved position, every tracker starts over in the new frame, and the crate the
     loot map confirms sits on a tile centre: the cell the sim keeps a crate in."""
@@ -1360,6 +1441,180 @@ def test_a_new_match_starts_with_no_crates(loop):
     lp.vision.projectiles.detections = []
     _play(lp, 1)
     assert lp.phase is Phase.PLAYING and lp.loot.crates() == []
+
+
+# -- a known map (KNOWN_MAP_LOCALIZATION_PLAN.md step K3) --------------------------------------
+
+# Where the fakes put the camera on Dark Passage: map world = odometry + TRUE_OFFSET. With odometry
+# at (0.5, 0.5) the hero, camera-relative (-4, 0), stands on the centre of the spawn at col 6,
+# row 24, world (-23.5, -5.5), and every plan is a registered one. The camera has stopped 4 tiles
+# east of it, at map col 10.5: 1.6 tiles past where the sim's stops, as the game's does there (K5
+# measured up to 1.9 on the west edge). The 21 x 13 grid around the hero holds wall, bush, water
+# and floor, and its four westmost columns are past the map's edge.
+TRUE_OFFSET = (-20.0, -6.0)
+SPAWN = (6, 24)
+HERO_AT = (-4, 0)            # the hero's camera-relative tile
+PAD = 30                     # tiles of WALL around the label in the arrays read below
+
+
+class _MapPlan(_Plan):
+    """`_Plan` with a viewport whose centre projects to `-HERO_ANCHOR_TILES`, so the camera's
+    nominal point (`localize._nominal`) is camera-relative (0, 0), the hero's tile while the
+    game's camera tracks it. The landing prior puts that point on a spawn, or where the camera
+    stops short of one; on `_Plan` it is 11 tiles from (0, 0)."""
+
+    viewport = tuple(2.0 * (-o - a) * _Plan.pixels_per_tile
+                     for o, a in zip(_Plan.origin_tile, HERO_ANCHOR_TILES))
+
+
+class _MapClassifier:
+    """The terrain classifier on the labelled map: the label's classes under the view, read at the
+    TRUE camera pose (odometry plus `TRUE_OFFSET`), never at the frame the loop hands out, so a
+    wrong fix would see terrain that disagrees with it. WALL past the map's edge."""
+
+    def __init__(self, odometry, known):
+        self.odometry = odometry
+        self.classes = np.pad(known.classes, PAD, constant_values=CLASS_INDEX[Tile.WALL])
+
+    def predict(self, rect, plan):
+        cols, rows = plan.size_tiles
+        # The view's top-left map tile (world + 30), then into the padding.
+        at = np.asarray(plan.origin_tile) + self.odometry.position + TRUE_OFFSET + 30.0 + PAD
+        assert np.allclose(at, np.round(at)), f"the view is off the map's tiles: {at}"
+        c, r = np.round(at).astype(int)
+        return self.classes[r:r + rows, c:c + cols].copy(), np.ones((rows, cols), np.float32)
+
+
+def _map_loop(loop, spec_path="configs/agent_obs_deploy.yaml", real_assembler=True):
+    """The fixture's loop again with `map.name: dark_passage`, the camera as above, and its log
+    kept on `lp.messages`. The commit margin is pinned to the provisional 60, which the clean view
+    clears on its first tick, so tuning the default in step K4 cannot move the commit."""
+    vision = loop.vision
+    vision.plan = _MapPlan()
+    vision.odometry.position = (0.5, 0.5)
+    vision.entities.detections = [_Detection("player", (HERO_PX[0] + HERO_AT[0] * 48,
+                                                        HERO_PX[1] + HERO_AT[1] * 48))]
+    vision.classifier = _MapClassifier(vision.odometry, KnownMap.load("dark_passage"))
+    messages = []
+    cfg = DeploymentConfig(map_name="dark_passage", map_commit_margin=60.0)
+    lp = DeployLoop(capture=_Capture(), guard=_Guard(), match=_Match(), vision=vision,
+                    policy=_Policy(spec_path=spec_path, real_assembler=real_assembler),
+                    controls=loop.controls, cfg=cfg, log=messages.append)
+    lp.backend, lp.messages = loop.backend, messages
+    return lp
+
+
+def _until(lp, done, limit=40):
+    """Tick with the gate open until `done()` holds, at most `limit` ticks."""
+    lp.match.gate = True
+    for _ in range(limit):
+        if done():
+            return
+        lp.tick()
+    assert done(), f"not done after {limit} ticks; log {lp.messages}"
+
+
+def test_on_a_known_map_the_grid_reads_the_label_and_pos_norm_the_map_column(loop):
+    """Once the localizer has fixed on the label, the static planes are the label's cells under
+    the view read through the sim's tile tables, WALL past the edge as the sim pads its maps, and
+    `hero.pos_norm` is the hero's map column over 60.
+
+    The clean view commits on the first tick, which is also the first decision. That decision is
+    still in the lattice frame the tick handed out, so its planes must be the occupancy map's: the
+    label read there would be the map at the wrong place."""
+    lp = _map_loop(loop)
+    _until(lp, lambda: lp.localizer.state == "fixed")
+    assert "map: fixed on dark_passage at offset (-20.00, -6.00)" in lp.messages
+    assert lp.telemetry[0].decision and lp.telemetry[0].map_state == "fixed"    # the premise
+    # The fix is a new epoch, whose first decision the tracker's reset skips. The next goes through.
+    calls = lp.policy.calls
+    _play(lp, 2 * lp.decision_every)
+    assert lp.policy.calls > calls, _last_attempt(lp).note
+
+    tiles = np.pad(KnownMap.load("dark_passage").tiles, PAD, constant_values=int(Tile.WALL))
+    c0, r0 = SPAWN[0] - 10 + PAD, SPAWN[1] - 6 + PAD            # the hero's cell is the centre
+    crop = tiles[r0:r0 + 13, c0:c0 + 21]
+    assert not (crop == Tile.FENCE).any()        # the one tile the grid does not read as the sim
+    first, last, channels = lp.policy.obs[0], lp.policy.obs[-1], lp.grid.spec.channels
+    for name, table in (("blocks_unit", TILE_BLOCKS_UNIT), ("blocks_projectile", TILE_BLOCKS_PROJ),
+                        ("is_bush", TILE_IS_BUSH), ("is_water", TILE_IS_WATER)):
+        plane = channels.index(name)
+        np.testing.assert_array_equal(last["grid"][plane], table[crop], err_msg=name)
+        assert not first["grid"][plane].any(), "the commit tick: an unseen occupancy map, floor"
+    assert last["grid"][channels.index("blocks_unit")][:, :4].all()      # off the map: wall
+
+    start, end = agent_obs_index_map(lp.policy.spec, CFG)["self"]["hero.pos_norm"]
+    assert last["self"][start:end] == pytest.approx([(SPAWN[0] + 0.5) / 60, (SPAWN[1] + 0.5) / 60])
+    row = lp.telemetry[-1]
+    assert row.map_state == "fixed" and (row.map_dx, row.map_dy) == TRUE_OFFSET
+    assert math.isnan(row.map_lead_dx) and math.isnan(row.map_lead_dy)    # K5: fixed, no leader
+
+    # The hero in raw odometry reads the same in the lattice frame (the commit tick) and the map
+    # frame (every tick after), and plus the offset it is the spawn's centre: what K4's report
+    # scores a fix against.
+    placed = [r for r in lp.telemetry if not math.isnan(r.hero_odo_x)]
+    assert placed[0] is lp.telemetry[0] and len(placed) >= 2
+    spawn_world = (SPAWN[0] + 0.5 - 30.0, SPAWN[1] + 0.5 - 30.0)
+    for r in placed:
+        assert (r.hero_odo_x + TRUE_OFFSET[0], r.hero_odo_y + TRUE_OFFSET[1]) == \
+            pytest.approx(spawn_world, abs=1e-6)
+
+
+def test_with_no_map_named_the_loop_is_wired_as_it_was(loop):
+    """`map.name: null`, the default: the lattice hands out the frame and the grid reads the
+    occupancy map, the objects every other test in this file runs on, and the map columns stay
+    empty."""
+    assert DeploymentConfig().map_name is None
+    assert loop.localizer is None and type(loop.lattice) is LatticePhase
+    assert loop.terrain is loop.vision.occupancy and loop.grid.occupancy is loop.vision.occupancy
+    _play(loop, 3)
+    for row in loop.telemetry:
+        assert (row.map_state, row.map_crate_resid) == ("", "")
+        assert all(math.isnan(v) for v in (row.map_dx, row.map_dy, row.map_agree, row.map_margin,
+                                           row.map_lead_dx, row.map_lead_dy))
+
+
+def test_a_tick_without_a_fix_logs_where_the_search_leader_sits(loop):
+    """K5: a search that never commits still logs where its leader puts the map, as the offset a
+    commit on it would take, so a match that never fixes can be scored against its spawn. Margins
+    no lead can reach hold the clean view off a commit it would take on the first tick."""
+    lp = _map_loop(loop)
+    lp.localizer.commit_margin = lp.localizer.whole_map_margin = math.inf
+    _play(lp, 3)
+    assert len(lp.telemetry) == 3
+    for row in lp.telemetry:
+        assert row.map_state == "search" and math.isnan(row.map_dx)
+        assert (row.map_lead_dx, row.map_lead_dy) == TRUE_OFFSET
+
+
+def test_a_crate_seen_before_a_confirmed_cut_is_still_in_the_box_plane_after_it(loop):
+    """A cut the localizer confirms keeps its epoch, so the loot map, the tracks and the history
+    keep their state across it. The crate leaves the screen before the cut, so only the loot map's
+    memory can put it in the box plane afterwards."""
+    lp = _map_loop(loop, "configs/agent_obs_deploy3.yaml", real_assembler=False)
+    _until(lp, lambda: lp.localizer.state == "fixed")
+    # Camera-relative (-2, 1), a true tile centre: map world (-21.5, -4.5), two columns right of
+    # the hero and one row down. Crate check 3 finds the fix on the game's lattice and leaves it.
+    lp.vision.projectiles.detections = [_lattice_crate((-2.0, 1.0))]
+    _until(lp, lambda: lp.loot.crates())
+    assert lp.loot.crates() == [pytest.approx((-21.5, -4.5))]
+    resid = [float(v) for r in lp.telemetry for v in r.map_crate_resid.replace(";", " ").split()]
+    assert resid and max(map(abs, resid)) < 1e-6
+
+    epoch = lp.localizer.epoch
+    lp.vision.projectiles.detections = []
+    # The real odometry's cut: a new segment on a lost tick, the position carried over.
+    lp.vision.odometry.segment += 1
+    lp.vision.odometry.status = "lost"
+    lp.tick()
+    lp.vision.odometry.status = "ok"
+    _until(lp, lambda: lp.localizer.state == "fixed")
+    assert "map: cut confirmed, fix kept" in lp.messages and lp.localizer.epoch == epoch
+
+    calls = lp.policy.calls
+    _until(lp, lambda: lp.policy.calls > calls)
+    box = lp.policy.assembler.calls[-1]["grid"][lp.grid.spec.channels.index("box")]
+    assert box.sum() == 1 and box[6 + 1, 10 + 2] == 1
 
 
 # -- telemetry ---------------------------------------------------------------------------------
@@ -1492,7 +1747,7 @@ def test_vision_stack_build_hands_the_detector_pool_settings_to_both_sessions(mo
 
 
 
-# -- attack-cadence telemetry (SIM_OVERHAUL_STEPS.md Step A2.1 / A2.2) -------------------------
+# -- attack-cadence telemetry ------------------------------------------------------------------
 #
 # The four columns `scripts/audit_attack_cadence.py --telemetry` reads, plus the two the audit's
 # own definitions turned out to need (the shadow's idle timer for long-dash waiting, and the ammo
@@ -1508,7 +1763,7 @@ def test_dash_reach_is_the_audits_radius_from_the_configs(loop):
 
 
 def test_a_decision_with_a_legal_attack_and_an_enemy_two_tiles_away_records_both(loop):
-    """A2.2's acceptance: `attack_legal & 0b10` and `enemy_in_reach` on the decision row.
+    """`attack_legal & 0b10` and `enemy_in_reach` on the decision row.
 
     The SECOND decision: `EntityTracker` confirms a track on its second sighting, and the column
     follows the tracks the policy was handed, so an enemy is "in reach" from the decision after
@@ -1539,7 +1794,7 @@ def test_an_enemy_past_the_dash_reach_is_not_in_reach(loop):
 
 def test_the_columns_are_the_shadows_state_the_policy_was_handed(loop):
     """After a dash the next decision (0.25 s later) has 0.15 s of cooldown left in the shadow
-    (plan section 1.1's walk: the cooldown is set on the sub-tick after the decision)
+    (the cooldown is set on the sub-tick after the decision)
     and the attack column is illegal: the bitmask and the timer on that row must agree with each
     other and with what `policy.act` received. The shadow spends REAL elapsed time and the fixture
     ticks back to back, so the decision period is advanced by hand."""
@@ -1575,7 +1830,7 @@ def test_a_resync_lands_on_the_row_with_the_ammo_error_that_tripped_it(loop, mon
 
 
 def test_a_telemetry_record_without_the_cadence_columns_still_loads():
-    """Old `--telemetry` CSVs predate Step A2. Missing columns take the field defaults; the
+    """Old `--telemetry` CSVs have no cadence columns. Missing columns take the field defaults; the
     required positional fields still have to be there."""
     from brawl_deployment.loop import TickRow
 
@@ -1613,13 +1868,24 @@ def test_write_csv_and_read_telemetry_csv_round_trip_the_cadence_columns(loop, t
     assert all(r.attack_legal == -1 and r.enemy_in_reach is False for r in held)
 
 
-# -- Step A2 review: the audit's `ammo` and the reach's brawler kind ------------------------------
+def test_write_csv_makes_its_folder(loop, tmp_path):
+    """It runs after the match, so a folder that is not there yet lost two K5 dry runs' telemetry
+    (2026-09-28) after the whole match had been played."""
+    from brawl_deployment.loop import read_telemetry_csv
+
+    _play(loop, 2)
+    path = tmp_path / "deploy" / "k5" / "match.csv"
+    loop.write_csv(path)
+    assert len(read_telemetry_csv(path)) == len(loop.telemetry)
+
+
+# -- the audit's `ammo` and the reach's brawler kind -------------------------------------------
 
 def test_the_shadows_clip_is_recorded_even_when_the_frame_has_no_hero_box(loop):
     """`ammo_shadow` is what `scripts/audit_attack_cadence.py --telemetry` reads as the row's
     ammo, next to `attack_legal`. The shadow has a clip whether or not the detector found the
     hero this frame, so the column is written before the hero-box early return -- a `-1.0`
-    sentinel beside a valid mask would reach the audit as a clip size (Step A2 review)."""
+    sentinel beside a valid mask would reach the audit as a clip size."""
     from brawl_deployment.loop import TickRow
 
     _play(loop, 2)
@@ -1631,7 +1897,7 @@ def test_the_shadows_clip_is_recorded_even_when_the_frame_has_no_hero_box(loop):
 
 
 def test_a_decision_taken_while_the_hero_track_coasts_carries_the_shadows_ammo(loop):
-    """The reviewer's probe: `EntityTracker` keeps the hero track for up to three misses, so a
+    """`EntityTracker` keeps the hero track for up to three misses, so a
     decision can proceed on a frame with no `player` box. The cadence columns on that row are
     valid and its `ammo_shadow` must be the shadow's clip, not `-1.0`. (The real `HealthTracker`
     emits no hero reading on such a frame and the loop skips with "no hero hp" first; this

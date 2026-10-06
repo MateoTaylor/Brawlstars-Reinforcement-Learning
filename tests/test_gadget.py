@@ -1,7 +1,7 @@
-"""Steps G2 and G3 (SIM_OVERHAUL_STEPS.md): the gadget spinner.
+"""The gadget spinner.
 
-The first half (G2) drives `hero.gadget_target` and `projectiles.spawn_gadget` by hand and steps
-the projectile pipeline itself -- the mechanics, with no env. The second half (G3.4, below the
+The first half drives `hero.gadget_target` and `projectiles.spawn_gadget` by hand and steps
+the projectile pipeline itself -- the mechanics, with no env. The second half (below the
 "through env.step" banner) throws the gadget the only way the agent can: attack-column value 3
 into `BrawlVecEnv.step`, so it covers the decode, the mask, `_attack_phase`'s wiring and the real
 tick order. Numbers are pinned as literals from the shipped hero block (`gadget_cooldown 18.0`,
@@ -92,7 +92,7 @@ def _target(state, params, bank, cfg, vis=None):
 
 
 def _throw(state, params, cfg, bank, vis=None):
-    """The G3 fire path in miniature: target, then spawn one spinner from the hero. Returns the
+    """The env's fire path in miniature: target, then spawn one spinner from the hero. Returns the
     (N,E) damage the spinner will carry."""
     if vis is None:
         vis = _vis_all_revealed(state)
@@ -120,7 +120,7 @@ def _run_until_empty(state, bank, params, cfg, limit=50):
     return None, total_ent, total_box, per_tick
 
 
-# ---- G2.1 target selection ---------------------------------------------------------------
+# ---- target selection --------------------------------------------------------------------
 
 def test_revealed_enemy_inside_range_travel_is_the_distance_to_it():
     cfg, params = _cfg_and_params()
@@ -162,7 +162,7 @@ def test_nothing_revealed_flies_full_range_along_facing():
 
 
 def test_hidden_close_enemy_is_skipped_for_a_revealed_farther_one():
-    """S10: the spinner homes only on what the agent can see. A concealed enemy one tile away must
+    """The spinner homes only on what the agent can see. A concealed enemy one tile away must
     not pull the throw off the revealed one two tiles away."""
     cfg, params = _cfg_and_params()
     state = _fresh_state(cfg)
@@ -246,7 +246,7 @@ def test_coincident_target_falls_back_to_facing_with_zero_travel():
     assert direction.tolist() == pytest.approx([0.0, 1.0], abs=1e-6)
 
 
-# ---- plan §4 Step G2 acceptance, the parts that need no action wiring -----------------------
+# ---- the spinner's landing and blast, the parts that need no action wiring -----------------
 
 def test_enemy_at_1_5_tiles_takes_2000_on_tick_4_and_the_hero_takes_0():
     cfg, params = _cfg_and_params()
@@ -313,8 +313,8 @@ def test_two_enemies_and_a_box_inside_the_radius_all_take_2000():
 
 
 def test_enemy_behind_a_wall_at_1_5_tiles_is_not_hit():
-    """Plan §4 acceptance: "enemy behind a wall at 1.5 tiles: landing point clipped at the wall,
-    enemy takes 0". Reachable geometry: hero at x=10.7, wall column at x=11, enemy at x=12.2 --
+    """Enemy behind a wall at 1.5 tiles: landing point clipped at the wall, enemy takes 0.
+    Reachable geometry: hero at x=10.7, wall column at x=11, enemy at x=12.2 --
     1.5 tiles away, on the far side of the one-tile wall. (The literal reading with the hero at
     10.0 puts the enemy at 11.5, INSIDE the wall tile, which no entity can occupy; there the
     0.5-clipped landing point is exactly 1.0 from it and `<=` would catch it.) The march's first
@@ -389,7 +389,7 @@ def test_cubes_scale_the_spinner_like_they_scale_the_attack():
     assert total[0, 1].item() == pytest.approx(3000.0, abs=1e-3)
 
 
-# ==== G3.4: the same scenarios THROUGH env.step ================================================
+# ==== the same scenarios THROUGH env.step ======================================================
 #
 # `debug_tiny` (blank 20x20 map, 2 bots, zone off) at one tick per step, with `debug_checks` on so
 # `check_invariants` (which bounds `ent_gadget_cd` to [0, gadget_cooldown]) runs after every step.
@@ -453,9 +453,9 @@ def _throw_and_land(env, override, hp_before):
     return losses
 
 
-def test_env_action_spec_reports_the_four_wide_attack_column():
+def test_env_action_nvec_has_the_four_wide_attack_column():
     env = _env()
-    assert env.action_spec == {"nvec": (17, 4)}
+    assert env.cfg.action_nvec == (17, 4)
     obs = env.reset()
     assert obs["action_mask"]["move"].shape == (1, 17)
     assert obs["action_mask"]["attack"].shape == (1, 4)
@@ -472,7 +472,7 @@ def test_env_revealed_enemy_at_one_and_a_half_tiles_takes_2000_on_tick_4_and_the
                       [0.0, 2000.0, 0.0],      # 0.2 s of flight = 4 ticks, the throw tick included
                       [0.0, 2000.0, 0.0]]      # ...and exactly once
     assert env.state.ent_damage_dealt[0, 0].item() == 2000.0
-    assert int(env.state.ent_super_charge[0, 0]) == 0   # S12: the gadget charges no super
+    assert int(env.state.ent_super_charge[0, 0]) == 0   # the gadget charges no super
 
 
 def test_env_enemy_at_two_point_eight_is_inside_the_blast_of_a_spinner_that_stops_at_two():
@@ -513,7 +513,7 @@ def _stamp_wall_column(env, x, y0, y1):
 
 
 def test_env_enemy_behind_a_wall_at_one_and_a_half_tiles_takes_0():
-    """G2's reachable geometry (its DONE note): hero x 10.7, wall column 11, enemy x 12.2. The
+    """Reachable geometry: hero x 10.7, wall column 11, enemy x 12.2. The
     fair visibility has no wall term, so the enemy IS the target; the pre-throw terrain clip is
     what keeps the blast on the hero's side. The control below removes the wall and nothing else."""
     env, override, hp_before = _duel([12.2, 10.0])
@@ -553,7 +553,7 @@ def test_env_firing_sets_the_cooldown_to_18_and_the_mask_refuses_for_360_ticks()
 
 
 def test_env_the_gadget_breaks_concealment_and_combat_but_not_the_long_dash_or_the_clip():
-    """S12. `reveal_after_attack` is 1.0 s; the long dash needs 3.5 s of not ATTACKING and a
+    """`reveal_after_attack` is 1.0 s; the long dash needs 4.5 s of not ATTACKING and a
     gadget is not an attack. Phase 2 (timers) runs before phase 6 (the throw), so the stopwatch
     that is NOT reset reads one tick more and the ones that are read exactly 0 / 1.0."""
     env, override, _hp = _duel([11.5, 10.0])
@@ -581,7 +581,7 @@ def test_env_the_gadget_breaks_concealment_and_combat_but_not_the_long_dash_or_t
 
 
 def test_env_the_gadget_goes_mid_dash_and_on_an_empty_clip():
-    """S8 through the tick: dash first, then throw while `dash_t > 0` and `attack_cd > 0`."""
+    """Through the tick: dash first, then throw while `dash_t > 0` and `attack_cd > 0`."""
     env, override, _hp = _duel([11.5, 13.0])
     st = env.state
     _act(env, override, _ATTACK, move=1)                 # dash along +x
@@ -691,7 +691,7 @@ def test_env_with_nothing_revealed_the_spinner_flies_two_tiles_along_the_facing(
 
 
 # =====================================================================================================
-# Step G3 review (2026-09-18): the wiring the scenarios above cannot see
+# The wiring the scenarios above cannot see
 # =====================================================================================================
 # Every `_duel` scenario above has the enemy on +x with the hero FACING +x, on a map with no bush.
 # The facing fallback then lands inside the blast radius of every pinned target, so a throw that
@@ -730,7 +730,7 @@ def _bush_scene(bush: bool):
 
 
 def test_env_the_spinner_does_not_home_on_an_enemy_concealed_in_a_bush():
-    """S10: the FAIR visibility reaches `gadget_target`. Kills `ones_like(vis)`."""
+    """The FAIR visibility reaches `gadget_target`. Kills `ones_like(vis)`."""
     env, override, hp_before = _bush_scene(bush=True)
     _act(env, override, _GADGET)
     assert _spinner_target(env.state) == [12.5, 10.0]          # two tiles along the facing
@@ -748,7 +748,7 @@ def test_env_the_spinner_does_not_home_on_an_enemy_concealed_in_a_bush():
 
 
 def test_env_power_cubes_scale_the_spinner_thrown_through_the_env():
-    """G3.2 "damage from G2.5", through `_attack_phase` rather than this file's `_throw` helper
+    """Cube-scaled damage, through `_attack_phase` rather than this file's `_throw` helper
     (which calls `effective_gadget_damage` itself and so cannot see what the env calls).
     5 cubes at +10 % each: 2000 -> 3000. Kills the raw `gather_kind(params.gadget_damage, ...)`."""
     env, override, hp_before = _duel([11.5, 10.0])
@@ -794,7 +794,7 @@ def test_env_an_override_on_the_hero_slot_neither_cancels_nor_throws_a_gadget():
 
 
 def test_env_an_episode_that_ends_with_the_cooldown_running_restarts_charged():
-    """"Starts charged" (G1.4) holds across autoreset. The spinner kills the last enemy on tick
+    """"Starts charged" holds across autoreset. The spinner kills the last enemy on tick
     4, the episode ends there, and the observation `step` returns is the NEXT episode's first
     one. Without the reset the timer would read 17.85 and column 3 would be False."""
     env, override, _hp = _duel([11.5, 10.0])
@@ -813,7 +813,7 @@ def test_env_an_episode_that_ends_with_the_cooldown_running_restarts_charged():
 
 
 # =====================================================================================================
-# Step G3 review, second pass: what one env, one tick per step and a standing hero cannot see
+# What one env, one tick per step and a standing hero cannot see
 # =====================================================================================================
 # Every scenario above runs ONE env at one tick per decision with the hero standing still and an
 # empty projectile buffer. Each test below was checked against the mutant of the wiring it names
@@ -903,12 +903,12 @@ def test_env_a_full_projectile_buffer_spends_the_cooldown_and_throws_nothing():
 
 
 def test_env_at_the_shipped_decision_rate_the_gadget_rearms_on_the_73rd_observation():
-    """S5's decision-boundary effect, for the gadget. The timer still runs out 360 ticks after the
+    """The decision-boundary effect, for the gadget. The timer still runs out 360 ticks after the
     throw, but at `action_repeat: 5` the mask is sampled once per 5-tick decision and the throw
     lands on sub-tick 1: the observation after decision k reads 17.8 - 0.25 k, which is 0.05 (still
     masked) at k = 71 and 0 at k = 72. So the earliest second throw is decision 73, 365 ticks =
-    18.25 s after the first -- the figure a decision-rate mirror (the deployment shadow, Step
-    G5.1) must reproduce, not 18.0."""
+    18.25 s after the first -- the figure a decision-rate mirror (the deployment shadow) must
+    reproduce, not 18.0."""
     env, override, _hp = _duel([11.5, 10.0], action_repeat=5)
     st = env.state
     obs, *_ = _act(env, override, _GADGET)

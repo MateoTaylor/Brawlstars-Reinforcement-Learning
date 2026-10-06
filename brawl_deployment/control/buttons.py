@@ -23,8 +23,8 @@ thumb. The bearing comes from `ShadowHero.attack_bearing`, which reads the same 
 `_start_dash` does, so the device and the shadow agree on the direction by construction.
 
 The drag is not an action-space change. The policy's action is still `(move_bin, attack)`, and
-what deployment emits is `attack in {0, 1, 2, 3}` since SIM_OVERHAUL Step G5 (2026-09-21):
-`brawl_sim/config.py`'s `action_nvec` is `(n_move_bins + 1, 4)` since Step G3, and the fourth
+what deployment emits is `attack in {0, 1, 2, 3}` since 2026-09-21:
+`brawl_sim/config.py`'s `action_nvec` is `(n_move_bins + 1, 4)`, and the fourth
 value is the gadget. The aim is not a new choice, it is the one the policy already made with its
 move bin. The auto-aimed attack IS one (2026-09-26): a run trained under `action.auto_aim` has a
 5-wide column and emits 4 as well, and only such a run does (`cfg.action_nvec[1]`, per run).
@@ -43,9 +43,9 @@ column on sub-ticks 2..K of a decision. The press goes in on the first perceptio
 window and does not repeat. A held fire bit is a bug: the sim never trained under one, and
 `hero.action_mask` promises "you may fire NOW", once.
 
-**The gadget is the one bare tap** (revised 2026-09-21, SIM_OVERHAUL Step G5; until then this
+**The gadget is the one bare tap** (revised 2026-09-21; until then this
 button was never touched). The game aims a gadget at the nearest enemy by itself, as the sim's
-`hero.gadget_target` does (SIM_OVERHAUL_PLAN.md S10), so there is no bearing to drag along:
+`hero.gadget_target` does (BRAWL_SIM_DESIGN.md §4), so there is no bearing to drag along:
 `press` puts a contact down on the button centre and the next `settle` lifts it. Two ticks, the
 shortest press here.
 
@@ -63,7 +63,7 @@ That button is NOT the anchor `match_state.py` watches, and never was (corrected
 5.1). Every button name in `control_calibration.json` sat one disc off, so what this file called
 the gadget was the Super: a commanded gadget pressed the Super, and the gate sat on the Super too.
 The gate is now on `hypercharge`, the one disc in the cluster nothing presses. **Keep the pressed
-buttons and the gate anchor disjoint.** Step G6 measured the alternative live, and one throw drops
+buttons and the gate anchor disjoint.** In a live match one throw drops
 the real gadget's own ring score under threshold for 5.0 s, so an agent gated on it stops dead
 after every throw.
 """

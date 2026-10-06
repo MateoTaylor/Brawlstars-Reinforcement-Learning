@@ -1,37 +1,28 @@
 """TierEvaluator: stationary, per-difficulty evaluation of a policy.
 
-**Why this exists.** Everything else logged during training is measured against the TRAINING
-distribution, which the curriculum deliberately makes harder over time -- so a flat
-`rollout/ep_rew_mean` is genuinely ambiguous between "the policy stopped improving" and "the
-policy improved exactly as fast as the bots did". This module fixes the difficulty and the
-scenarios, so `eval/win_rate_hard` at 2M steps and at 20M steps mean the same thing.
+Everything else logged in training is measured against the curriculum's moving distribution, so
+a flat `rollout/ep_rew_mean` cannot tell "stopped improving" from "improved as fast as the bots".
+This fixes the difficulty and the scenarios, so `eval/win_rate_hard` means the same thing at
+every point of a run.
 
-**One env, every tier.** Rather than building one environment per difficulty, a single
-`BrawlVecEnv` of `len(tiers) * episodes_per_tier` envs is partitioned into contiguous blocks and
-`FixedTierHook` pins each block to one tier -- envs `[0:k)` easy, `[k:2k)` medium, and so on.
-One batched rollout scores every difficulty at once, which is the whole reason this is cheap
-enough to run periodically: the GPU cost of 4 tiers is the cost of 1, times a wider batch.
+**One env, every tier.** A single `BrawlVecEnv` of `len(tiers) * episodes_per_tier` envs is split
+into contiguous blocks and `FixedTierHook` pins each block to one tier, so one batched rollout
+scores every tier at once.
 
-**Reproducibility is the point.** The eval env's generator is reseeded to the SAME value before
-every evaluation, so each run replays an identical set of maps, spawn positions, and bot stats.
-Differences between two evals are then attributable to the policy and nothing else. That seed
-defaults to something unrelated to `run.seed`, so the evaluation scenarios are not a subset of
-the ones training happened to see.
+**Reproducible.** The eval generator is reseeded to the SAME value before every evaluation, so
+each one replays identical maps, spawns and bot stats. The seed defaults to something unrelated
+to `run.seed`, so the scenarios are not a subset of the ones training saw.
 
-**Only the first episode per env slot counts.** Autoreset means a slot that finishes early
-starts another episode and would otherwise be over-represented (short episodes = deaths, so
-counting every finish would bias the win rate DOWN). Each slot contributes exactly one episode;
-the rollout runs until every slot has finished once, bounded by `max_episode_steps`.
+**Only the first episode per env slot counts.** Autoreset would otherwise over-represent slots
+that finish early (short episodes are deaths, biasing the win rate DOWN). The rollout runs until
+every slot has finished once, bounded by `max_agent_steps` decisions.
 
-**Which maps (SIM_OVERHAUL M4).** By default the eval env is built from `run.env_config` +
-`run.env_overrides`, i.e. the SAME resolved `world.maps` the training env draws from -- so every
-`eval/*` number is a TRAINING-MAP number. With configs/train.yaml that is the fourteen maps its
-`run.env_overrides.world.maps` lists, not configs/default.yaml's sixteen. `TierEvaluator(tcfg,
-maps=...)` builds the holdout twin instead: identical in every other respect (tiers, episode
-count, seed, reward, spec), but its map bank holds ONLY the named maps. `build_evaluators`
-returns the pair a run needs. Training-map win rate minus holdout win rate is the map-overfitting
-measurement; it is only meaningful because `validate_train_config` guarantees the two map sets
-are disjoint.
+**Which maps.** By default the eval env is built from `run.env_config` + `run.env_overrides`, the
+SAME resolved `world.maps` the training env draws from, so every `eval/*` number is a
+TRAINING-map number. `TierEvaluator(tcfg, maps=...)` builds the holdout twin, identical except
+that its bank holds ONLY the named maps; `build_evaluators` returns the pair. The gap between the
+two measures map overfitting, and means something only because `validate_train_config` keeps the
+two map sets disjoint.
 """
 from dataclasses import replace
 
@@ -49,17 +40,16 @@ from .reward import ShapedReward
 # Per-tier metric names, in the order `summary_line` prints them.
 METRICS = ("win_rate", "mean_rank", "mean_ep_length", "mean_reward", "gadgets_used")
 
-# The attack column's gadget value: [no-fire, attack, super, gadget] (core/hero.decode_action).
+# The attack column's gadget value: 0 none, 1 attack, 2 super, 3 gadget, and 4 an auto-aimed
+# attack under `action.auto_aim` (core/hero.decode_action).
 _GADGET = 3
 
 
 class TierEvaluator:
     """Builds the pinned eval env once and scores a policy against every tier on demand.
 
-    Construction is deliberately eager (the env is allocated up front, not per evaluation): at
-    `episodes_per_tier=32` over 4 tiers that's 128 envs held for the life of the run, which costs
-    well under the VRAM headroom `benchmark.py` measured, and rebuilding it every 500k steps
-    would re-pay map-bank construction and buffer allocation for nothing.
+    Eager: the env is allocated up front and held for the run (a standing VRAM cost), because
+    rebuilding it every evaluation would re-pay map-bank construction and buffer allocation.
 
     `maps=None` evaluates on the run's own (training) maps. `maps=("a", "b")` replaces the env's
     `world.maps` with exactly those, drawn uniformly -- the holdout evaluator. Everything else is
@@ -71,12 +61,11 @@ class TierEvaluator:
         from .builder import build_spec, _resolve   # local: avoid a circular import at module load
 
         if maps:
-            # Patched into `run.env_overrides` rather than into the EnvConfig alone, because the
-            # env is built from TWO views of that dict (`load_config` and `build_spec` below) and
-            # they must agree. `replace`, not `with_overrides`: this derived config is by
-            # construction one validate_train_config refuses (its world.maps ARE the holdout).
-            # `deep_merge` copies every dict it descends into, so the run's own config is not
-            # written to.
+            # Patched into `run.env_overrides` rather than the EnvConfig alone, because the env is
+            # built from TWO views of that dict (`load_config` and `build_spec` below) and they
+            # must agree. `replace`, not `load_train_config`: validate_train_config refuses this
+            # derived config (its world.maps ARE the holdout). `deep_merge` copies every dict it
+            # descends into, so the run's own config is not written to.
             tcfg = replace(tcfg, run=replace(tcfg.run, env_overrides=deep_merge(
                 tcfg.run.env_overrides or {}, holdout_env_overrides(maps))))
         # Stored AFTER the patch: `self.tcfg` is the config THIS evaluator's env was built from,
@@ -130,14 +119,12 @@ class TierEvaluator:
         `model` is any SB3 algorithm; action masks are passed only when the run's algo is
         `maskable_ppo` (plain `PPO.predict` has no `action_masks` parameter and would raise).
 
-        `gadgets_used` is gadget throws per episode (SIM_OVERHAUL_STEPS.md Step I2). Nothing in the
-        sim state counts throws, so this loop counts the ones it sends, by the sim's own rule:
-        `core/hero.decode_action` throws on attack value 3 where the attack mask allows it, and
-        `env._held` clears the fire column after a decision's first tick, so a decision throws at
-        most once. The mask read here is the one the policy was given. The sim derives its own
-        after ticking the timers, and the two differ only on the tick before a charge completes,
-        where the policy's copy still says not ready. A `maskable_ppo` policy cannot press there,
-        so for it the count is exact.
+        `gadgets_used` is gadget throws per episode. Nothing in the sim state counts throws, so
+        this loop counts the ones it sends, by the sim's own rule: `core/hero.decode_action`
+        throws on attack value 3 where the attack mask allows it, and `env._held` clears the fire
+        column after a decision's first tick, so a decision throws at most once. The mask read
+        here is the one the policy was given; the sim's own differs only on the tick before a
+        charge completes, which a `maskable_ppo` policy cannot press, so for it the count is exact.
         """
         deterministic = self.tcfg.eval.deterministic if deterministic is None else deterministic
         self.sim.gen.manual_seed(self.seed)   # identical scenarios on every call -- see docstring
@@ -178,9 +165,8 @@ class TierEvaluator:
             block = (self._tier_of_env == t) & recorded
             count = int(block.sum())
             if count == 0:
-                # Only reachable if NO episode in this tier finished within max_episode_steps,
-                # which the sim's own truncation makes impossible -- reported rather than
-                # silently producing a nan-filled row.
+                # Only reachable if NO episode in this tier finished within `max_steps` decisions,
+                # which the sim's own truncation prevents; the row says so with `episodes: 0`.
                 out[name] = {m: float("nan") for m in METRICS} | {"episodes": 0}
                 continue
             out[name] = {

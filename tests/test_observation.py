@@ -75,7 +75,7 @@ def test_shapes_match_expected():
 
     assert obs["entities"]["pos"].shape == (n_envs, E, 2)
     # One-hot widths come from the enums, not from literals: they were written as 5 and 4, and
-    # Step B1 added Proj.SUPER_BOLT, so the projectile literal became wrong while reading as a
+    # adding Proj.SUPER_BOLT made the projectile literal wrong while it still read as a
     # deliberate assertion about observation shape. Deriving them means adding an enum member
     # updates this test for free, and a width that DISAGREES with its enum still fails.
     assert obs["entities"]["kind_onehot"].shape == (n_envs, E, N_KINDS)
@@ -92,14 +92,14 @@ def test_shapes_match_expected():
     assert obs["visibility"]["vis"].shape == (n_envs, E, E)
     assert obs["visibility"]["dist_matrix"].shape == (n_envs, E, E)
 
-    # 12 base channels, then one enemy_hist plane per history slot (Step H2, history_frames 3).
+    # 12 base channels, then one enemy_hist plane per history slot (history_frames 3).
     assert obs["view"].shape == (n_envs, 15, cfg.view_h, cfg.view_w)
     assert obs["view"].dtype == torch.uint8
     assert obs["world"].shape == (n_envs, 15, cfg.map_h, cfg.map_w)
 
     assert obs["action_mask"]["move"].shape == (n_envs, cfg.n_move_bins + 1)
-    # Step D2 widened the attack dim to 3 (0 = nothing, 1 = attack, 2 = super) and Step G3 to 4
-    # (3 = gadget). Checked against cfg AND a literal: the cfg comparison alone cannot fail.
+    # The attack dim is 4 wide (0 = nothing, 1 = attack, 2 = super, 3 = gadget). Checked against
+    # cfg AND a literal: the cfg comparison alone cannot fail.
     assert obs["action_mask"]["attack"].shape == (n_envs, cfg.action_nvec[1])
     assert obs["action_mask"]["attack"].shape == (n_envs, 4)
 
@@ -218,7 +218,7 @@ def test_bush_hidden_enemy_is_still_fully_present():
     assert int(world[0, 7, iy, ix]) >= 1  # enemy_hidden
 
 
-# ---- camera-limited reveal (OBS_PARITY_TASKS.md C3) --------------------------------------
+# ---- camera-limited reveal ---------------------------------------------------------------
 
 def _camera_scene(enemy_offsets, hero=(30.5, 30.5), objects=(), overrides=None):
     """The 60x60 `walled` map (no bush tile anywhere, so concealment never enters), the hero
@@ -288,7 +288,7 @@ def test_a_camera_pinned_at_the_west_edge_reveals_the_far_east_of_its_window():
 def test_in_view_is_the_camera_window_for_every_kind_of_object():
     """12 tiles east of a mid-map hero is on screen (the quad reaches about 13 there) and 16
     is not, for entities, projectiles, boxes and pickups alike; the 21-wide crop would have
-    refused both (OBS_PARITY_TASKS.md C4)."""
+    refused both."""
     _, _, obs, _ = _camera_scene([(12, 0), (16, 0)], objects=[(12, 0), (16, 0)])
     assert obs["entities"]["in_view"][0, 1:].tolist() == [True, False]
     for group in ("projectiles", "boxes", "pickups"):
@@ -344,7 +344,7 @@ def test_zone_fields():
 
     vis, los = _vis_los(state, bank, params, cfg)
     assert not obs_mod.build_obs(state, bank, vis, los, params, cfg)["zone"]["active"][0], \
-        "active is a latch (C5): nothing has marked gas as seen yet"
+        "active is a latch: nothing has marked gas as seen yet"
     state.zone_step[0] = 1  # the hand-set rect is a shrunk one, so there is gas to see
     zone_mod.mark_seen(state, camera.camera_centre(state.ent_pos[:, 0], cfg), cfg)
     obs = obs_mod.build_obs(state, bank, vis, los, params, cfg)
@@ -448,7 +448,7 @@ def test_batched_smoke_default_config():
     assert not torch.any(torch.isnan(obs["view"].float()))
 
 
-# ---- the gadget fields (SIM_OVERHAUL Step G4) ----------------------------------------------
+# ---- the gadget fields ---------------------------------------------------------------------
 # 18.0 below is Mortis's `gadget_cooldown` in configs/brawlers.yaml, written as a literal: a value
 # read back out of params would let a wrong cooldown pass.
 
@@ -477,9 +477,9 @@ def test_the_charge_is_one_minus_the_timer_over_18_seconds():
 
 
 def test_gadget_ready_is_the_masks_gadget_column_and_only_it_reads_alive():
-    """G3 made `hero.gadget_ready(state, params)` the one predicate behind the mask and the field
-    reuses it, so the field carries the `alive` term that G4's checklist formula leaves out. The
-    fraction has no `alive` term, like `super_charge_frac`."""
+    """`hero.gadget_ready(state, params)` is the one predicate behind the mask and the field
+    reuses it, so the field carries its `alive` term. The fraction has no `alive` term, like
+    `super_charge_frac`."""
     cfg, params, bank, gen, spec = _cfg_params_bank(n_envs=4)
     state = _reset(cfg, params, bank, gen, spec, 4)
     assert state.ent_kind[:, 0].tolist() == [0, 0, 0, 0]  # Mortis: column 0 is the hero's cooldown
@@ -527,8 +527,7 @@ def test_the_fields_follow_a_throw_through_env_step():
 def test_at_the_shipped_decision_rate_the_first_observation_after_a_throw_shows_four_ticks():
     """action_repeat 5: the throw lands on the decision's first sub-tick and the other four count
     the timer down before the observation is built, so the policy never sees 0.0 here. The same
-    offset is why the gadget is legal again on the 73rd observation, 18.25 s rather than 18.0
-    (SIM_OVERHAUL_STEPS.md G3, behaviour 1)."""
+    offset is why the gadget is legal again on the 73rd observation, 18.25 s rather than 18.0."""
     env = _env(action_repeat=5)
     obs, *_ = env.step(_THROW)
     assert env.state.ent_gadget_cd[0, 0].item() == pytest.approx(17.8, abs=1e-5)
@@ -536,7 +535,7 @@ def test_at_the_shipped_decision_rate_the_first_observation_after_a_throw_shows_
     assert obs["hero"]["gadget_ready"].tolist() == [False]
 
 
-# ---- the history fields and planes (SIM_OVERHAUL Step H2) -------------------------------------
+# ---- the history fields and planes ------------------------------------------------------------
 # K = 3 (configs/default.yaml's history_frames), 17 move bins, 4 attack columns and debug_tiny's
 # 10 x 14 view are literals here, like the 18.0 above. The view's origin is the hero's tile minus
 # (7, 5), so a tile (x, y) lands at view row y - hero_y + 5, column x - hero_x + 7.

@@ -705,7 +705,7 @@ def test_an_emulator_that_stays_covered_times_out_rather_than_hanging():
 
 
 
-# ---------------------------------------------------------- the gadget anchor probe (G6.1)
+# ---------------------------------------------------------- the gadget anchor probe
 
 def _probe_cal():
     from brawl_deployment.match_state import Calibration
@@ -806,8 +806,8 @@ def test_the_probe_taps_the_gadget_once_after_the_pre_roll_and_lifts_it_on_the_n
 def test_the_probe_records_each_anchor_through_the_real_gate_class():
     """The gadget disc vanishes for six ticks after the tap and comes back, which is what a
     recharge looks like. A gate anchored on the gadget would exit on the fourth dark tick and could
-    not re-enter for five more (enter_samples is 6) -- and that shadow gate is recorded, so G6.2
-    can see it. The PRODUCTION gate is on `hypercharge`, which the tap does not touch, so it holds
+    not re-enter for five more (enter_samples is 6) -- and that shadow gate is recorded.
+    The PRODUCTION gate is on `hypercharge`, which the tap does not touch, so it holds
     straight through: after 2026-09-22 that separation is the point of the whole probe."""
     mod = _load_calibrate_script()
     cal = _probe_cal()
@@ -953,7 +953,7 @@ def test_probe_gadget_writes_a_trace_that_loads_back_whole(tmp_path, monkeypatch
 def test_a_button_that_cannot_anchor_the_gate_is_recorded_rather_than_fatal(tmp_path,
                                                                             monkeypatch):
     """The probe refines every non-gate button with a floor of 0. One that does not read as a
-    ring on this source is a finding for G6.2, not a reason to lose the trace.
+    ring on this source is a finding, not a reason to lose the trace.
 
     The dark disc here is the GADGET, which is the strongest form of the case: the probe still
     taps it, still records, and still writes the trace, because the interlock is the gate anchor's
@@ -1080,7 +1080,7 @@ def test_two_buttons_down_at_once_close_the_vote_while_the_match_goes_on():
 
 
 def test_a_dip_too_short_to_exit_is_still_a_change():
-    """G6.2's rule is about the score, not the exit: any post-tap tick under the threshold means
+    """The verdict is about the score, not the exit: any post-tap tick under the threshold means
     the margin is gone. Two dark ticks, one lit, three dark: five under, longest three, and no
     run reaches exit_samples."""
     mod = _load_calibrate_script()

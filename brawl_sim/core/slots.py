@@ -1,13 +1,13 @@
-"""Tracker-style enemy slots for the hero's observation (OBS_PARITY_TASKS.md C8).
+"""Tracker-style enemy slots for the hero's observation.
 
 Live, `brawl_deployment/perception/tracker.EntityTracker` hands each enemy a SLOT: a track is
 pending on its first sighting, promoted to the lowest free slot on its `promote_hits`-th
 consecutive sighting (and shown from that decision, since `assemble` reads the slots after the
 update), holds the slot while it coasts through up to `max_misses` unseen decisions, is retired
 (slot freed) on the next one, and comes back later as a new track in whichever slot is lowest and
-free then. The sim's enemy group used to be "slot k is entity k forever"; this module keeps the
-four `SimState` slot fields (`state.py` `_SLOT_FIELDS`) on the tracker's rule, so a per-entity
-group declared `slots: tracked` (obs_select, C9) reads the same permutation live and in training.
+free then. This module keeps the four `SimState` slot fields (`state.py` `_SLOT_FIELDS`) on the
+tracker's rule, so a per-entity group declared `slots: tracked` (obs_select) reads the same
+permutation live and in training.
 
 Time base: the tracker updates once per 4 Hz DECISION, so `cfg.slots_promote_hits` and
 `cfg.slots_max_misses` are decision counts and `update` runs once per decision, from
@@ -18,10 +18,8 @@ Two things are deliberately not modelled. The assembler's HP-commit rule (a slot
 once its HP numeral has been read, `assemble._put_entities`), which delays a live row by however
 long the read takes and has no sim counterpart. And the order among several entities qualifying
 for fewer free slots in the same decision: the sim promotes by entity index, the tracker by the
-order its pending tracks were created, which is detection order -- the same whenever detections
-come in entity order, and a tie no live match can tell apart. With E - 1 slots for E - 1 enemies
-that case cannot even arise in the sim; the algorithm handles it for the sake of any smaller slot
-count.
+order its pending tracks were created (detection order). With E - 1 slots for E - 1 enemies that
+case cannot arise in the sim; the algorithm handles it for any smaller slot count.
 """
 import torch
 
@@ -67,7 +65,7 @@ def update(state, hero_view: torch.Tensor, cfg) -> None:
     take = need & (need_rank < free.sum(1, keepdim=True))
     match = (take.unsqueeze(2) & free.unsqueeze(1)
              & (need_rank.unsqueeze(2) == free_rank.unsqueeze(1)))   # (N,E,K), one True per taker
-    new_slot = match.to(torch.int64).argmax(2)                       # (N,E); 0 where nothing matched
+    new_slot = match.to(torch.int64).argmax(2)                       # (N,E); 0 if nothing matched
     ent_slot = torch.where(take, new_slot + 1, ent_slot)
     e_index = torch.arange(E, device=device).view(1, E).expand(N, E)
     added = torch.zeros((N, K), dtype=torch.int64, device=device)

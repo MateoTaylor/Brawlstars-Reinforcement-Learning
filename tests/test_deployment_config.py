@@ -313,7 +313,7 @@ def test_a_directory_without_train_yaml_is_not_a_run(tmp_path):
 
 
 def _args(**kw):
-    base = {"config": "configs/deployment.yaml", "run": None, "checkpoint": None}
+    base = {"config": "configs/deployment.yaml", "run": None, "checkpoint": None, "map": None}
     return SimpleNamespace(**{**base, **kw})
 
 

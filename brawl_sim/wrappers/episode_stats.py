@@ -1,23 +1,14 @@
-"""EpisodeStats: per-env episode length/return tracking around BrawlVecEnv. See
-BRAWL_SIM_BUILD_PLAN.md Step 30.
+"""EpisodeStats: per-env episode length/return tracking around BrawlVecEnv.
 
-Stays entirely on-device, torch-native, sync-free -- same discipline as `env.py` itself. This
-is deliberate: per the architecture note at the top of the plan, host transfers are legal in
-exactly one place, `wrappers/sb3_vecenv.py` (Step 33), and nowhere else -- including here, even
-though this module lives under `wrappers/`. `BrawlSB3VecEnv` wraps `EpisodeStats` (not the bare
-`BrawlVecEnv`) and is the thing that eventually turns `final_episode_length`/
-`final_episode_return` into SB3's host-side `info["episode"] = {"r": ..., "l": ...}` dicts.
+On-device and sync-free like `env.py`: host transfers belong only in `wrappers/sb3_vecenv.py` and
+`wrappers/gym_single.py`. `BrawlSB3VecEnv` wraps `EpisodeStats` and turns its two fields into
+SB3's host-side `info["episode"] = {"r": ..., "l": ...}` dicts.
 
-Mirrors the exact `final_observation`/`final_info` pattern `env.py` already established for
-autoreset (Step 29): `info["final_episode_length"]` / `info["final_episode_return"]` are DENSE
-`(N,)` tensors, valid for every env every tick, but only *meaningful* where this tick's
-`terminated | truncated` was True -- for a still-running env they're just that env's
-in-progress totals, not a sentinel. Same reasoning as `final_observation`: `BrawlVecEnv.step()`
-already autoresets internally, so by the time `step()` returns, `state.step_count` etc. for a
-just-finished env already reflect the NEW episode -- these two fields are this wrapper's own
-parallel counters, captured immediately after `env.step()` returns and BEFORE they get zeroed
-for done envs, for exactly the same reason `env.py` clones its own final_observation/final_info
-before autoreset would otherwise stomp them.
+Mirrors `env.py`'s `final_observation`/`final_info` pattern: `info["final_episode_length"]` and
+`info["final_episode_return"]` are DENSE `(N,)` tensors, meaningful only where this step's
+`terminated | truncated` is True (elsewhere they are the in-progress totals, not a sentinel).
+`BrawlVecEnv.step()` has already autoreset a finished env when it returns, so these are this
+wrapper's own counters, captured before it zeroes them for done envs.
 """
 import torch
 
@@ -25,17 +16,15 @@ import torch
 class EpisodeStats:
     """Wraps a `BrawlVecEnv`, forwarding `reset`/`step` unchanged except for adding
     `final_episode_length` (i64) and `final_episode_return` (f32) to `info`. Does not alter
-    `obs`, `reward`, `terminated`, or `truncated` in any way, and does not touch `self.env`'s
-    own state -- safe to construct around an already-stepped env.
+    `obs`, `reward`, `terminated` or `truncated`, and does not touch `self.env`'s own state, so
+    it is safe to construct around an already-stepped env.
 
-    **`final_episode_length` counts DECISIONS, not sim ticks** -- it increments once per `step()`
-    call, and one of those covers `cfg.action_repeat` ticks (env.py `_run_decision`). That is
-    SB3's own convention for `info["episode"]["l"]`, which is what this eventually becomes, and it
-    is why `rollout/ep_len_mean` reads ~600 rather than ~3000 at the shipped `action_repeat: 5`.
-    Multiply by `cfg.action_repeat` for sim ticks, or by `cfg.agent_dt` for seconds of game time.
-    `final_episode_return` needs no such caveat: `reward` is already summed over the decision's
-    sub-ticks by the reward function, so the accumulated return is in absolute units and is
-    invariant to the decision rate."""
+    **`final_episode_length` counts DECISIONS, not sim ticks**: one per `step()`, each covering
+    `cfg.action_repeat` ticks (env.py `_run_decision`). That is SB3's convention for
+    `info["episode"]["l"]`, so `rollout/ep_len_mean` is in decisions; multiply by
+    `cfg.action_repeat` for ticks or by `cfg.agent_dt` for game seconds. `final_episode_return`
+    needs no such caveat: the reward is already summed over the decision's sub-ticks, so the
+    return is invariant to the decision rate."""
 
     def __init__(self, env) -> None:
         self.env = env

@@ -129,7 +129,7 @@ def test_decode_action_legal_fire_passes_through():
     assert bool(fire[0])
 
 
-# ---- the gadget column (SIM_OVERHAUL Step G3.1) --------------------------------
+# ---- the gadget column ---------------------------------------------------------
 
 def test_action_mask_is_twenty_one_wide_with_the_gadget_as_the_fourth_attack_column():
     """17 move bins + [no-fire, attack, super, gadget]. Literal widths: `cfg.action_nvec` is the
@@ -147,7 +147,7 @@ def test_action_mask_is_twenty_one_wide_with_the_gadget_as_the_fourth_attack_col
 
 
 def test_the_gadget_is_legal_while_dashing_on_cooldown_and_with_an_empty_clip():
-    """S8: the gate is `alive & gadget_cd <= 0 & the kind has a gadget` and NOTHING else -- it is
+    """The gate is `alive & gadget_cd <= 0 & the kind has a gadget` and NOTHING else -- it is
     deliberately not ANDed with the `ready` term the attack and the super share."""
     cfg, params = _cfg_and_params()
     state = _fresh_state(cfg)
@@ -162,7 +162,7 @@ def test_the_gadget_is_legal_while_dashing_on_cooldown_and_with_an_empty_clip():
     assert bool(gadget[0]) and not bool(fire[0]) and not bool(sup[0])
 
     # The move column decodes on its own, whatever the attack column holds: bin 5 is straight
-    # down the screen (+y), thrown gadget or not (Step G3 review -- this was unpacked, never read).
+    # down the screen (+y), thrown gadget or not.
     move_dir, _fire, _sup, gadget, _auto = hero.decode_action(torch.tensor([[5, 3]]), state, params, cfg)
     assert bool(gadget[0])
     assert torch.allclose(move_dir, torch.tensor([[0.0, 1.0]]), atol=1e-6)
@@ -188,7 +188,7 @@ def test_the_gadget_is_illegal_while_its_cooldown_runs_and_for_the_dead():
 
 
 def test_a_kind_without_a_gadget_never_gets_the_column():
-    """`gadget_cooldown: 0` is "this kind has no gadget" (Step G1) -- every bot. `gadget_cd <= 0`
+    """`gadget_cooldown: 0` is "this kind has no gadget" -- every bot. `gadget_cd <= 0`
     alone would read a bot's permanently-zero timer as READY, which is the bug the third term of
     the gate exists to prevent."""
     cfg, params = _cfg_and_params()
@@ -237,7 +237,7 @@ def test_ammo_regen_zero_to_full_in_max_ammo_times_reload_seconds():
 
 
 def test_gadget_cooldown_counts_down_and_clamps_at_zero():
-    """Step G1.4. `ent_gadget_cd` is a countdown like ent_attack_cd, and 0 means READY -- which
+    """`ent_gadget_cd` is a countdown like ent_attack_cd, and 0 means READY -- which
     is also what core/state.zero_ leaves on reset, so "starts fully charged" costs nothing. A
     full 18 s cooldown runs out in 360 ticks at dt 0.05, for every entity (the decrement is not
     hero-only), and then sits at exactly 0 rather than going negative."""
@@ -256,7 +256,7 @@ def test_gadget_cooldown_counts_down_and_clamps_at_zero():
 
 
 def test_firing_pauses_the_reload_for_exactly_attack_cooldown():
-    """Step C1 / bot_overhaul.md D7: for `attack_cooldown` seconds after an attack you can neither
+    """BRAWL_SIM_DESIGN.md §5: for `attack_cooldown` seconds after an attack you can neither
     attack nor accrue ammo.
 
     Asserted as a tick count rather than a duration so an off-by-one in the gate-vs-decrement
@@ -292,8 +292,8 @@ def test_firing_pauses_the_reload_for_exactly_attack_cooldown():
 
 
 def test_reload_is_not_paused_when_no_cooldown_is_running():
-    """The other half of the gate: an idle entity reloads exactly as it always did. Pins that C1
-    changed the FIRING case only -- `test_ammo_regen_zero_to_full_in_max_ammo_times_reload_seconds`
+    """The other half of the gate: an idle entity reloads at the full rate; the pause covers the
+    FIRING case only -- `test_ammo_regen_zero_to_full_in_max_ammo_times_reload_seconds`
     passes for this reason and would keep passing even if the gate were inverted, so check the
     per-tick rate directly."""
     cfg, params = _cfg_and_params()
@@ -660,7 +660,7 @@ def test_advance_dash_non_dashers_unaffected():
     assert torch.all(dmg_ent == 0)
 
 
-# ---- long dash (Step D1) ---------------------------------------------------------
+# ---- long dash -------------------------------------------------------------------
 
 def _mortis_state(cfg, params, idle_seconds=0.0):
     state = _fresh_state(cfg)
@@ -812,7 +812,7 @@ def _dash_batch(cfg, params, bank, starts, direction, charged):
 
 def test_no_dash_approach_angle_can_leave_an_entity_stuck_against_a_wall():
     """Regression sweep for the dash wedge, over approach ANGLE as well as distance, for both dash
-    lengths (OBS_PARITY_TASKS.md, pending decision 1).
+    lengths (BRAWL_SIM_DESIGN.md §4).
 
     `terrain.circle_blocked` probes all 8 compass points, so a body that merely OVERLAPS a wall is
     blocked in every direction, including away from it, and stays stuck until its next dash. The

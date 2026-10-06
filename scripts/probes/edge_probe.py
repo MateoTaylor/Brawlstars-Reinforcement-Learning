@@ -1,9 +1,9 @@
-"""Measure the camera clamp onsets from footage (OBS_PARITY_TASKS.md P1), on the replay harness.
+"""Measure the camera clamp onsets from footage, on the replay harness.
 
 The sim's camera follows the hero until the hero comes within `camera.clamp_onset` tiles of a map
 edge (`configs/default.yaml`, west 12.1 / east 12.8 / north 8.9 / south 5.5, geometry defaults),
 then stops; from there the hero drifts off the screen's hero anchor by the distance the camera
-did not travel. Live, that drift is `TrackerResult.hero_offset` (OBS_PARITY_TASKS.md C7): the
+did not travel. Live, that drift is `TrackerResult.hero_offset`: the
 player box's tiles minus the nominal anchor, which the loop records on every decision as
 `hero_offset_x/y`. So replaying a clip through the real loop (`replay_clip.replay`, detectors on
 the CPU) gives the offset at 4 Hz, and a run where it exceeds `--threshold` tiles on an axis for

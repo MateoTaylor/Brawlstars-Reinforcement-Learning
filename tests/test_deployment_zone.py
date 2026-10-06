@@ -5,12 +5,16 @@ standing in gas, standing off the canvas, standing next to gas it has never seen
 those is a documented one-sided bias rather than a bug, and the tests say which side.
 """
 from pathlib import Path
+from types import SimpleNamespace
 
+import numpy as np
 import pytest
 
 from brawl_deployment.perception.grid import GasMap
 from brawl_deployment.perception.zone import PINNED_NEXT_SHRINK_IN, ZoneEstimator
 from brawl_sim.config import load_config
+from brawl_vision.terrain.odometry import OdometryResult
+from brawl_vision.terrain.zone import ZoneMask
 
 CFG = load_config("configs/default.yaml")
 HORIZON = CFG.zone_margin_horizon_tiles          # 10.0 tiles
@@ -28,6 +32,19 @@ def _mark(gas: GasMap, x0, x1, y0, y1) -> None:
 
 def _est() -> ZoneEstimator:
     return ZoneEstimator(CFG)
+
+
+def _deposit(gas: GasMap, *, segment: int, gassed: bool) -> int:
+    """One frame through `GasMap.update`'s own path, on the producers' real result types: a 21x13
+    frame, fully observed and all gas or none, with the camera at world (0, 0) in `segment`."""
+    cols, rows = 21, 13
+    cells = np.full((rows, cols), gassed, bool)
+    zone = ZoneMask(pixels=np.zeros((1, 1), bool), cells=cells, cell_fraction=cells.astype(float),
+                    observed=np.ones((rows, cols), bool), coverage=float(gassed))
+    odo = OdometryResult(delta_tiles=(0.0, 0.0), position_tiles=(0.0, 0.0), response=1.0,
+                         agreement_tiles=0.0, inlier_ratio=1.0, n_windows=11, status="ok",
+                         segment=segment)
+    return gas.update(zone, SimpleNamespace(size_tiles=(cols, rows), origin_tile=(-10, -6)), odo)
 
 
 # ---------------------------------------------------------------------------------------------
@@ -153,13 +170,29 @@ def test_unseen_cells_read_as_safe_which_is_the_documented_bias():
 # ---------------------------------------------------------------------------------------------
 
 def test_active_is_false_until_gas_is_seen_and_then_latches():
-    """Matches the sim, where the zone never turns back off. Latching is free -- `GasMap` is
-    sticky -- so this needs no state of its own."""
+    """Matches the sim, where `zone.active` never turns back off within an episode."""
     gas = _gas()
     est = _est()
     assert est.active(gas) is False
     _mark(gas, 0, 0, 0, 0)
     assert est.active(gas) is True
+
+
+def test_active_survives_a_new_segment_and_only_a_new_match_clears_it():
+    """The sim's `zone_seen` is cleared by an episode reset and by nothing else. `GasMap` is sticky
+    only within a segment: a cut or a lattice re-lock empties it, so read on its own the flag would
+    fall back to 0 mid-match whenever that happens with the gas out of view. The estimator's latch
+    holds it, and `reset`, which the loop calls at a match start and nowhere else, clears it."""
+    gas, est = _gas(), _est()
+    assert _deposit(gas, segment=0, gassed=True) > 0
+    assert est.active(gas) is True
+    _deposit(gas, segment=1, gassed=False)           # a new segment, with no gas in view
+    assert not gas.gassed.any(), "the map itself does not outlive the segment"
+    assert est.active(gas) is True
+    est.reset()                                      # the next match
+    assert est.active(gas) is False
+    _deposit(gas, segment=1, gassed=True)
+    assert est.active(gas) is True, "and that match's first gas latches it again"
 
 
 def test_safe_area_frac_is_one_on_a_clean_map_and_falls_with_observed_gas():
@@ -240,10 +273,11 @@ def test_both_margin_names_are_one_scan():
     assert zone["hero_margin_local"][0] == pytest.approx(5.0)
 
 
-def test_the_estimator_holds_no_state_between_calls():
+def test_the_margins_hold_no_state_between_calls():
     """`GasMap.reset` on a segment change must not need a matching reset here. Holding margins of
     its own would leave them pointing at a world frame that moved, which reads as the gas
-    teleporting rather than as a reset."""
+    teleporting rather than as a reset. `active` is the one field with state: a latch with no
+    position in it, which is meant to outlive the segment (the latch tests above)."""
     est = _est()
     gas = _gas()
     _mark(gas, -40, -5, -40, 40)

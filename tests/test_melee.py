@@ -1,12 +1,11 @@
-"""Melee archetype tests. FIRE and AIM only after Step 41's combat/movement split.
+"""Melee archetype tests: FIRE and AIM only.
 
 The two patrol tests (`test_patrols_to_zone_center_when_no_target_visible` /
 `test_patrols_to_map_center_when_zone_rect_degenerate`) are deliberately GONE, not ported:
-`melee._patrol_direction` no longer exists, and the behavior it tested is precisely the bug Step
-41 set out to remove -- every idle melee bot steering at one shared point. Idle movement is now
-per-entity randomized exploration, asserted in tests/test_personality.py
-(`test_idle_bots_do_not_converge_on_a_shared_point`). "Closes and never retreats" survives as the
-RUSH personality and is tested there too.
+`melee._patrol_direction` no longer exists, and the behavior it tested is a bug -- every idle
+melee bot steering at one shared point. Idle movement is per-entity randomized exploration,
+asserted in tests/test_personality.py (`test_idle_bots_do_not_converge_on_a_shared_point`).
+"Closes and never retreats" is the RUSH personality and is tested there too.
 """
 import torch
 
@@ -25,7 +24,7 @@ def _run_tick(state, bank, params, cfg, gen):
     fire_mask = intent.fire.clone()
     fire_mask[:, 0] = False
 
-    # Melee damage is hitscan in phase 6, resolved BEFORE movement (Section 4), so this helper
+    # Melee damage is hitscan in tick phase 6, resolved BEFORE movement, so this helper
     # keeps that order rather than the projectile archetypes' spawn-then-integrate shape.
     dmg_ent, dmg_by, _dmg_box = combat.melee_hitscan(state, fire_mask, bank, params, cfg)
     combat.apply_damage(state, dmg_ent, int(DeathCause.COMBAT), combat.dominant_attacker(dmg_by),

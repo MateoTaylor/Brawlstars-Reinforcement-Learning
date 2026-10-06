@@ -1,17 +1,19 @@
-# LOW-INFORMATION agent view -- a sibling of configs/agent_obs.yaml, selected per run with
+# LOW-INFORMATION agent view: configs/agent_obs.yaml with the enemy-kind and projectile-type
+# signals removed. Selected per run with
 #   python scripts/train.py --set run.agent_obs=configs/agent_obs_lowinfo.yaml
-# and never by default. configs/agent_obs.yaml is untouched and remains the full-information
-# environment; nothing outside this file changes between the two regimes, so switching back is
-# dropping the --set.
 #
 # WHAT THIS HIDES, AND WHY THIS PARTICULAR LINE
 # ---------------------------------------------
-# The rule is sim-to-real parity with the vision pipeline: the agent may see only what
-# brawl_vision can actually recover from a screen capture. A detector reports "an enemy is at
-# these coordinates with this much of its HP bar left" and "a projectile is at these coordinates,
-# moving this way" -- it does not report which brawler that silhouette is, nor which weapon fired
-# that sprite. Training on fields the deployed system cannot supply builds a policy that leans on
-# a signal that vanishes the moment it leaves the simulator.
+# USER RULE, sim-to-real parity with the vision pipeline: a field is admitted only if brawl_vision
+# can recover it from a screen capture. A detector reports "an enemy is at these coordinates with
+# this much of its HP bar left" and "a projectile is at these coordinates, moving this way" -- it
+# does not report which brawler that silhouette is, nor which weapon fired that sprite. Training
+# on fields the deployed system cannot supply builds a policy that leans on a signal that vanishes
+# the moment it leaves the simulator.
+#
+# This file applies the rule to enemy KIND and projectile TYPE only. The fields it keeps that fail
+# the rule field by field (hero.cubes, entities.cubes / can_attack / dashing, and hp_frac on both
+# sides) are what configs/agent_obs_deploy.yaml removes or replaces.
 #
 # Relative to configs/agent_obs.yaml, exactly two groups differ:
 #

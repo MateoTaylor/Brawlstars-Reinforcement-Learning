@@ -1,12 +1,9 @@
 """TrainConfig: the typed, validated form of configs/train.yaml.
 
-Mirrors `brawl_sim/config.py`'s split in spirit -- frozen dataclasses, everything validated once
-at load, nothing hardcoded downstream -- but stays a separate module because it describes the
-RUN, not the world, and must not become a dependency of anything under `core/`.
-
-Validation is deliberately eager and specific: a run that dies 40 minutes in because
-`batch_size` didn't divide `n_steps * n_envs`, or because a curriculum stage referenced a tier
-that isn't defined, is far more expensive than one that refuses to start.
+Frozen dataclasses validated once at load, like `brawl_sim/config.py`, but a separate module: it
+describes the RUN, not the world, and must not become a dependency of anything under `core/`.
+Validation is eager because a run that dies partway through (a `batch_size` that doesn't divide
+`n_steps * n_envs`, a stage naming an undefined tier) costs far more than one that won't start.
 """
 from dataclasses import dataclass, field, replace
 from pathlib import Path
@@ -24,9 +21,9 @@ TIER_FIELDS: dict[str, float] = {
     "move_speed": 1.0,
     "hp": 1.0,
     "damage": 1.0,
-    # The two behaviour axes (SIM_OVERHAUL B1-B4). Both scale a brawlers.yaml base that is
-    # authored non-zero on every bot kind (`aggression: 1.0`, `hero_focus: 0.5`); a base of 0 is
-    # the "unset, neutral" value and stays 0 under any multiplier.
+    # The two behaviour axes. Both scale a brawlers.yaml base authored non-zero on every bot kind
+    # (`aggression: 1.0`, `hero_focus: 0.5`); a base of 0 is the "unset, neutral" value and stays
+    # 0 under any multiplier.
     "aggression": 1.0,
     "hero_focus": 1.0,
 }
@@ -131,9 +128,12 @@ class RewardConfig:
     cube_pickup: float = 0.25
     survive_per_step: float = 0.002
     in_zone_per_step: float = -0.05
-    # x attacks/supers made with a visible enemy in dash reach (SIM_OVERHAUL_PLAN.md §9 R2). Off by
-    # default so a hand-built RewardConfig keeps its meaning; configs/train.yaml turns it on.
+    # x attacks/supers made with a visible enemy in dash reach (see reward.py). Off by default so
+    # a hand-built RewardConfig keeps its meaning; configs/train.yaml turns it on.
     attack_in_reach: float = 0.0
+    # x gadget spinners that landed on at least one player (see reward.py). Off by default for
+    # the same reason.
+    gadget_hit: float = 0.0
     scale: float = 1.0
 
 
@@ -230,18 +230,16 @@ class CurriculumConfig:
 class EvalConfig:
     """Periodic stationary evaluation -- fixed difficulty, unaffected by the curriculum.
 
-    This is the only signal in the whole run that is comparable ACROSS TIME. `rollout/
-    ep_rew_mean` is measured against the training distribution, which the curriculum
-    deliberately makes harder, so it cannot distinguish "policy improved" from "curriculum got
-    easier". Every eval here replays the same seeded scenarios against the same pinned bots.
+    The one signal comparable ACROSS TIME: `rollout/ep_rew_mean` follows a training distribution
+    the curriculum keeps making harder, while every eval replays the same seeded scenarios against
+    the same pinned bots.
 
-    **Two map sets (SIM_OVERHAUL M4).** The `eval/*` numbers are measured on the TRAINING maps:
-    the evaluator loads `run.env_config` + `run.env_overrides`, the same resolved `world.maps` the
-    training env draws from. `holdout_maps` names maps the run never trains on; when set, a second
-    evaluator scores the same tiers on those maps only and logs `eval/holdout_*`. The gap between
-    the two is the map-overfitting measurement. `None` or empty = no holdout eval (every config
-    written before 2026-09-18 loads that way). `validate_train_config` refuses a holdout map that
-    the training env also draws, and one that is not a registered map.
+    **Two map sets.** The `eval/*` numbers are measured on the TRAINING maps (`run.env_config` +
+    `run.env_overrides`, the same resolved `world.maps` the training env draws from).
+    `holdout_maps` names maps the run never trains on; when set, a second evaluator scores the
+    same tiers on those maps only and logs `eval/holdout_*`, and the gap between the two measures
+    map overfitting. `None` or empty = no holdout eval. `validate_train_config` refuses a holdout
+    map the training env also draws, and one that is not a registered map.
     """
     enabled: bool = True
     every_timesteps: int = 500_000
@@ -296,7 +294,7 @@ class TrainConfig:
 
 def deep_merge(base: dict, patch: dict) -> dict:
     """Recursive dict merge; `patch` wins at the leaves. Public because scripts/train.py's
-    `--smoke` needs to layer two override dicts before either reaches `load_train_config`."""
+    `--smoke` and the holdout evaluator (evaluation.py) layer override dicts with it."""
     out = dict(base)
     for key, value in patch.items():
         if isinstance(value, dict) and isinstance(out.get(key), dict):
@@ -306,21 +304,16 @@ def deep_merge(base: dict, patch: dict) -> dict:
     return out
 
 
-_deep_merge = deep_merge  # internal alias, kept so the call sites below read as before
+_deep_merge = deep_merge  # internal alias used by the call sites below
 
 
 def _coerce_literal(text: str):
-    """Parses a `--set key=value` value with YAML's own scalar rules, so `true`/`3`/`null`/
-    `[1, 2]` all mean what they mean everywhere else in this file, and anything that doesn't
-    parse stays a plain string.
+    """Parses a `--set key=value` value with YAML's scalar rules, so `true`/`3`/`null`/`[1, 2]`
+    mean what they mean in the file, and anything that doesn't parse stays a plain string.
 
-    With one deliberate widening: **YAML 1.1's float resolver requires a decimal point**, so
-    `yaml.safe_load("1e-4")` returns the STRING `"1e-4"`, not `0.0001`. Inside a YAML file that's
-    a non-issue (this repo's configs all write `1.0e-4`), but on a command line `--set
-    learning_rate.initial=1e-4` is exactly what anyone would type, and the string would sail
-    through into a `float` dataclass field and only blow up later comparing `str <= int`. Any
-    scalar YAML leaves as a string is retried as an int, then a float, before being accepted as
-    a genuine string."""
+    One widening: YAML 1.1's float resolver needs a decimal point, so `yaml.safe_load("1e-4")` is
+    the STRING "1e-4", and `--set learning_rate.initial=1e-4` would reach a float field as a str.
+    Any scalar YAML leaves as a string is retried as an int, then a float."""
     try:
         value = yaml.safe_load(text)
     except yaml.YAMLError:
@@ -440,14 +433,10 @@ def load_train_config(path, overrides: dict | None = None, *,
     file yields the dataclass defaults above.
 
     `check_holdout=False` skips `_validate_holdout_maps`, the one check that reads the repo as it
-    is TODAY (the map registry, the resolved rotation, the CSVs on disk) rather than the file. It
-    is for a reader of an ARCHIVED `runs/<name>/train.yaml` that never builds the holdout
-    evaluator, and deployment is the one that passes it: no other step of
-    `DeployedPolicy.from_run` looks at a map name (`load_config` does not check them), so
-    `eval.holdout_maps` would otherwise be the only thing stopping a checkpoint from deploying
-    after a holdout map is renamed or retired. Whatever STARTS or resumes a run keeps the
-    default, and so does `with_overrides`. What the file itself says (a bare string, a repeated
-    name) is refused either way."""
+    is TODAY (map registry, resolved rotation, CSVs on disk) rather than the file. Deployment
+    passes it when reading an ARCHIVED `runs/<name>/train.yaml`, so a renamed or retired holdout
+    map cannot stop an old checkpoint from deploying. Whatever starts or resumes a run keeps the
+    default. What the file itself says (a bare string, a repeated name) is refused either way."""
     raw = yaml.safe_load(Path(path).read_text()) or {}
     if overrides:
         raw = _deep_merge(raw, overrides)
@@ -541,9 +530,9 @@ def _validate_holdout_maps(cfg: TrainConfig) -> None:
 
 def _check_holdout_maps_load(run: RunConfig, holdout) -> None:
     """A REGISTERED map can still be one this run's world cannot hold (`blank` is 20x20, every
-    other map 60x60). Left to the evaluator, that surfaces only when the holdout env is built --
-    in scripts/train.py, that used to be after the run directory existed. Loading the two CSVs
-    against the holdout twin's own EnvConfig costs a few ms and names the map at config time."""
+    other map 60x60), which the evaluator would only find when it builds the holdout env. Loading
+    the holdout CSVs against the holdout twin's EnvConfig is cheap and names the map at config
+    time."""
     from ..config import load_config
     from ..maps.loader import CSV_DIR, load_map_csv, validate_map
 
@@ -560,9 +549,3 @@ def _check_holdout_maps_load(run: RunConfig, holdout) -> None:
             ) from err
 
 
-def with_overrides(cfg: TrainConfig, **sections) -> TrainConfig:
-    """`with_overrides(cfg, run=replace(cfg.run, n_envs=8))` -- used by the tests and the
-    `--smoke` path to shrink a real config without re-parsing YAML."""
-    out = replace(cfg, **sections)
-    validate_train_config(out)
-    return out

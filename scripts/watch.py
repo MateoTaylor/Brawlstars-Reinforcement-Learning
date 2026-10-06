@@ -87,8 +87,8 @@ def watch_env_overrides(tcfg, map_name: str | None = None) -> dict:
     own `train.yaml` used (typically `uniform`, i.e. a random map each episode) -- so `--map`
     reliably shows the requested map instead of just biasing the odds.
 
-    The run's own `world.maps` may not list it: configs/train.yaml trains on fourteen maps and
-    keeps `eval.holdout_maps` out of its rotation (SIM_OVERHAUL M4), and watching the policy on a
+    The run's own `world.maps` may not list it: configs/train.yaml trains on thirty-four maps and
+    keeps `eval.holdout_maps` out of its rotation, and watching the policy on a
     map it never saw is the most interesting thing `--map` can show. Such a map is APPENDED to
     the bank, so every map the run trained on keeps its `map_id` index."""
     overrides = dict(tcfg.run.env_overrides or {})
@@ -229,8 +229,8 @@ def save_rollout(save_path, frames: dict, tcfg, map_name: str | None = None) -> 
     returns the replay command.
 
     A frame stores `map_id`, an INDEX into the recording env's `cfg.map_names`, not a map name.
-    `python -m brawl_sim.render.viewer` rebuilds its bank from configs/default.yaml (sixteen maps)
-    unless told otherwise, while a run records against its own `run.env_overrides` -- fourteen
+    `python -m brawl_sim.render.viewer` rebuilds its bank from configs/default.yaml (thirty-six maps)
+    unless told otherwise, while a run records against its own `run.env_overrides` -- thirty-four
     maps in another order under configs/train.yaml, plus one appended by `--map <holdout>`. Replayed
     bare, every match on `map_id >= 10` is drawn over the WRONG terrain, silently. The preset is
     `watch_env_overrides` verbatim -- the dict this env was built from -- in the format the
@@ -273,9 +273,8 @@ def _parse_args(argv=None):
     p.add_argument("--map", default=None,
                    help="pin a specific map (default: whatever the run's train.yaml uses, "
                         "usually a random pick from world.maps each episode); any registered "
-                        "map of the run's size: the six originals (open, bushy, "
-                        "skull_creek, feast_or_famine, scorched_stone, island_invasion), the ten "
-                        "generated ones (brawl_sim/maps/README.md), or walled by hand. A map "
+                        "map of the run's size (brawl_sim/maps/README.md lists them), or "
+                        "walled by hand. A map "
                         "outside the run's own world.maps (its eval.holdout_maps: split_river, "
                         "hollow_ring) is added to the bank for the match")
     p.add_argument("--train-config", default=None,
@@ -362,7 +361,7 @@ def _check_spaces(model, venv, train_config: Path) -> None:
             "This config is not the one the model was trained with -- pass the right "
             "--train-config (the run directory's own archived train.yaml)."
         )
-    # The attack column's width is mostly code: SIM_OVERHAUL Step G3 widened it 3 -> 4 (gadget),
+    # The attack column's width is mostly code: the gadget widened it 3 -> 4,
     # so a checkpoint trained before it has a 3-wide attack head that no train.yaml can bring
     # back. The one config part is `action.auto_aim` (2026-09-26), a fifth value that a run's
     # own train.yaml carries under env_overrides, which is why the env is built from THAT file.
@@ -371,7 +370,7 @@ def _check_spaces(model, venv, train_config: Path) -> None:
         raise SystemExit(
             f"action space mismatch: the model has {model.action_space} but this build of the "
             f"sim has {venv.action_space}. Either the checkpoint predates an action-space change "
-            "(the attack column is [none, attack, super, gadget] since Step G3) and cannot be "
+            "(the attack column is [none, attack, super, gadget]) and cannot be "
             "watched with this code, or --train-config is not the run's own: `action.auto_aim` "
             "(a fifth value, [auto-aim]) is a per-run override in env_overrides, and the env "
             "here is built from the train.yaml you passed."

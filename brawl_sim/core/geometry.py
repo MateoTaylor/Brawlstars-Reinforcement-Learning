@@ -12,11 +12,10 @@ _TWO_PI = 2.0 * math.pi
 
 def vec2(x: float, y: float, device, dtype: torch.dtype = torch.float32) -> torch.Tensor:
     """(2,) tensor built from two plain Python scalars -- NOT `torch.tensor([x, y],
-    device=device)`, which is a real host sync (confirmed with `torch.cuda.
-    set_sync_debug_mode("error")` while building env.py, Step 29): constructing a CUDA tensor
-    directly from a Python list synchronizes, but `torch.full` with a scalar fill does not.
-    Used anywhere a small map-size-shaped constant (map_w/map_h, a map center, ...) needs to
-    become a device tensor inside the hot path."""
+    device=device)`, which is a real host sync (`torch.cuda.set_sync_debug_mode("error")` flags
+    it): constructing a CUDA tensor directly from a Python list synchronizes, but `torch.full`
+    with a scalar fill does not. Used anywhere a small map-size-shaped constant (map_w/map_h, a
+    map center, ...) needs to become a device tensor inside the hot path."""
     return torch.stack([
         torch.full((), x, device=device, dtype=dtype),
         torch.full((), y, device=device, dtype=dtype),
@@ -63,11 +62,6 @@ def bin_from_dir(v: torch.Tensor, n_bins: int) -> torch.Tensor:
 
 def dist(p: torch.Tensor, q: torch.Tensor) -> torch.Tensor:
     return safe_norm(p - q, dim=-1)
-
-
-def dist2(p: torch.Tensor, q: torch.Tensor) -> torch.Tensor:
-    d = p - q
-    return (d * d).sum(dim=-1)
 
 
 def rotate(v: torch.Tensor, theta: torch.Tensor) -> torch.Tensor:
@@ -167,7 +161,7 @@ def lead_target(
 ) -> torch.Tensor:
     """Aim point blending the target's current position (fraction=0) with a two-iteration
     fixed-point lead solution (fraction=1). Not an exact quadratic intercept solve -- stable
-    and branch-free, which matters more here since bot aim already adds noise on top (D19)."""
+    and branch-free, which matters more here since bot aim already adds noise on top."""
     speed_safe = torch.clamp(proj_speed, min=_EPS)
     t = dist(shooter, target) / speed_safe
     predicted = target + target_vel * t.unsqueeze(-1)

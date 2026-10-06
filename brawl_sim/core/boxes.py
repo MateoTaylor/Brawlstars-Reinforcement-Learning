@@ -1,41 +1,32 @@
-"""Box spawning, damage, and breaking. See BRAWL_SIM_BUILD_PLAN.md Step 22.
+"""Box spawning, damage, and breaking.
 
-Boxes are static (box_pos never changes after spawn_boxes) and block nothing -- MapBank's
-blocks_unit/blocks_proj have no notion of boxes at all, so units and projectiles pass over/
-through their tile freely; only an explicit distance/cone/capsule check (projectiles.py,
-hero.advance_dash, combat.melee_hitscan) ever "hits" one.
+Boxes are static (box_pos never changes after spawn_boxes) and block nothing (user decision,
+2026-09-25: crates stay walkable) -- MapBank's blocks_unit/blocks_proj have no notion of boxes,
+so units and projectiles pass over/through their tile freely; only an explicit
+distance/cone/capsule check (projectiles.py, hero.advance_dash, combat.melee_hitscan) ever
+"hits" one.
 
-spawn_boxes generalizes the spec's "topk smallest n_boxes" to a full ascending sort of every
-candidate spot (topk with k = min(cfg.max_boxes, MAX_BOX_SPOTS), largest=False) followed by a
-`rank < n_boxes_env` mask, rather than calling topk with k = n_boxes directly. n_boxes is a
-SimParams field (N08: scalar-or-range, resampled per env) and can legitimately differ across
-envs in the same batch, but torch.topk takes one Python int k for the whole call -- there is no
-"per-row k" -- so a single sorted ranking plus a per-row mask is the sync-free way to let each
-env keep a different number of its own smallest-key spots. Assumes cfg.max_boxes <=
-MAX_BOX_SPOTS (64, MapBank's fixed padded capacity, Step 6); true for every config in this
-repo. Since 2026-09-25 the default is n_boxes 48 with max_boxes 48, so the min() in spawn_boxes
-resolves to the map's own spot count (16 to 44 on the shipped maps) and every marked spot holds
-a crate: the real maps carry 20 to 30, and the 8 this used to spawn let the hero out-farm the
-bots (bots/policy.py's loot constants carry the measurements).
+spawn_boxes ranks every candidate spot by a random key (one topk-smallest with
+k = min(cfg.max_boxes, MAX_BOX_SPOTS), MapBank's padded spot capacity) and keeps
+`rank < n_boxes_env`, rather than calling topk with k = n_boxes: n_boxes is a SimParams field
+(scalar-or-range, resampled per env) that can differ across envs in one batch, and torch.topk
+takes one Python int k for the whole call, so a shared ranking plus a per-row mask is the
+sync-free way to give each env its own count. configs/default.yaml's `boxes` block says why the
+default fills every marked spot.
 
-Because a full respawn (via reset_mask) always repopulates every one of the k selected slots
-(and explicitly clears the rest), there's no need for projectiles.alloc_slots' incremental
-collision-free allocator here -- that scheme exists for slots claimed piecemeal over many ticks
-by many independent shooters/corpses; box respawn is a single all-at-once replace, so writing
-ranks 0..k-1 directly into box slots 0..k-1 is both correct and simpler. resolve_broken_boxes,
-by contrast, DOES reuse alloc_slots/_set_scalar/_set_vec2 from .projectiles for its pickup
-spawn, for exactly the same reason combat.drop_cubes_on_death does: box-breaking happens
-piecemeal, one box at a time, against the same shared pku_* pool other systems are also
-claiming from on the same tick.
+A respawn replaces every box slot at once (and clears the rest), so spawn_boxes writes ranks
+0..k-1 straight into slots 0..k-1. resolve_broken_boxes instead claims its pickups through
+projectiles.alloc_slots, as combat.drop_cubes_on_death does, because breaking is piecemeal
+against the shared pku_* pool that other systems claim from on the same tick.
 
-Where the cube lands. In the real game a broken crate's cube pops out and lands 0.3-1.8 tiles
-away (measured on footage), not on the crate's tile. `cfg.box_scatter_min_tiles`/`_max_tiles`
-reproduce that: a uniform distance in that band, in a uniform direction. A spot a unit could not
-stand on (`terrain.circle_blocked` at `unit_radius` against blocks_unit: wall, water, off the
-map) is rejected, since a cube nobody can reach is a reward nobody can earn. `_SCATTER_TRIES`
-spots are drawn at once and the first legal one wins; a crate with none drops on itself, which is
-always legal because box spots are floor tiles. Drawn every tick for every slot, broken or not,
-so the cost is fixed and there is no host sync on "did anything break".
+Where the cube lands. In the real game a broken crate's cube pops out a short way from the crate,
+not onto its tile. `cfg.box_scatter_min_tiles`/`_max_tiles` reproduce that: a uniform distance in
+that band, in a uniform direction. A spot a unit could not stand on (`terrain.circle_blocked` at
+`unit_radius` against blocks_unit: wall, water, off the map) is rejected, since a cube nobody can
+reach is a reward nobody can earn. `_SCATTER_TRIES` spots are drawn at once and the first legal
+one wins; a crate with none drops on itself, which is always legal because box spots are floor
+tiles. Drawn every tick for every slot, broken or not, so the cost is fixed and there is no host
+sync on "did anything break".
 """
 import math
 
@@ -93,8 +84,9 @@ def spawn_boxes(state, reset_mask: torch.Tensor, bank, params, cfg, gen) -> None
 
 
 def damage_boxes(state, dmg_box: torch.Tensor) -> None:
-    """MUTATES: box_hp. dmg_box: (N,B), summed from every source (projectiles, AoE, melee
-    cones, dash) by the caller before this is invoked -- clamped at 0."""
+    """MUTATES: box_hp. dmg_box: (N,B), one damage phase's per-box total -- env calls this once
+    each for melee cones, the dash and projectiles (AoE included), and resolve_broken_boxes
+    breaks boxes after all of them. Clamped at 0."""
     state.box_hp.copy_(torch.clamp(state.box_hp - dmg_box, min=0))
 
 

@@ -1,66 +1,40 @@
-# DEPLOYABLE agent view, third pass -- configs/agent_obs_deploy2.yaml with the grid's `box` and
-# `pickup` channels RESTORED. Every other group is byte-identical to its parent;
+# DEPLOYABLE agent view, third of the deploy line: configs/agent_obs_deploy2.yaml with the grid's
+# `box` and `pickup` channels back. Every other group is byte-identical to its parent;
 # tests/test_configs_files.py pins that.
 #
 #   python scripts/train.py --set run.agent_obs=configs/agent_obs_deploy3.yaml
 #
-# WHY A FIFTH FILE RATHER THAN AN EDIT
-# ------------------------------------
-# Same reason as the last two. `runs/*/train.yaml` names its spec BY PATH. agent_obs_deploy2.yaml
-# is the zone rebuild and is correct as it stands; reopening it would make it mean two different
-# widths depending on when you read it.
-#
-# WHAT CHANGED: the operator's TEMPORARY exclusion, reversed (2026-09-11)
-# ----------------------------------------------------------------------
-# agent_obs_deploy2.yaml dropped `box` and `pickup` with the note "explicitly TEMPORARY ... When it
-# returns, restore these two channels AND `reward.cube_pickup`". This is that return. The operator's
-# rule for it, verbatim enough to check against:
-#
-#   the agent cannot see how many cubes an enemy or it has collected, but it CAN physically see
-#   crates and cubes on the map before they are picked up.
-#
-# Both halves are already true of these two channels, which is why nothing else needed changing:
+# WHAT THE TWO CHANNELS SHOW
+# --------------------------
+# The user's rule: the agent cannot see how many cubes an enemy or it has collected, but it CAN
+# see crates and cubes on the map before they are picked up. Both channels keep it:
 #
 #   box      an occupancy count of intact crates per cell (`_build_grid` scatters `box_pos` where
 #            `box_alive`). One crate, one count. Box HP is not in it.
 #   pickup   an occupancy count of pickup OBJECTS per cell, NOT of cubes. A corpse drops one pickup
 #            holding `cubes_on_kill_base` plus everything the victim carried
-#            (`combat.drop_cubes_on_death`), and it reads 1 here whether it holds one cube or nine.
-#            So a pile does not leak what its owner was carrying -- the first half of the rule, kept
-#            by construction rather than by a mask.
+#            (`combat.drop_cubes_on_death`), and it reads 1 here whether it holds one cube or
+#            nine, so a pile does not leak what its owner was carrying.
 #
-# The cube COUNTS stay out, exactly where agent_obs_deploy.yaml put them: `hero.cubes` and
-# `entities.cubes` are in neither this file nor its parents, and `hp_frac -> hp` stays swapped for
-# the reason it was swapped (cubes move max HP by a flat +400 each, invisibly).
+# The cube COUNTS stay out: `hero.cubes` and `entities.cubes` are in neither this file nor its
+# parents, and `hp_frac -> hp` stays swapped (cubes move max HP by a flat +400 each, invisibly).
 #
-# Neither channel is gated by `fair`, and never was in agent_obs.yaml or agent_obs_lowinfo.yaml:
-# `fair` masks enemies the hero cannot see and projectiles outside the view, and a crate or a cube
-# on the ground is neither.
+# Neither channel is gated by `fair`, in any spec: `fair` masks enemies the hero cannot see and
+# projectiles outside the view, and a crate or a cube on the ground is neither.
 #
-# ------------------------------------------------------------------------------------------------
-# DEPLOYABLE since 2026-09-12 -- what supplies the two channels
-# ------------------------------------------------------------------------------------------------
-# Until then brawl_deployment refused this file by name (`GridSpec.load` raised), because nothing
-# detected a crate or a cube. What changed, in the order the old note asked for:
-#   1. the projectile model has `Power Cube Box` and `Power Cube Dropped` classes
+# WHAT SUPPLIES THEM LIVE
+# -----------------------
+#   1. the projectile model's `Power Cube Box` and `Power Cube Dropped` classes
 #      (brawl_vision/object_detection/projectile_detection/classes.py);
 #   2. brawl_deployment/perception/loot.py turns their boxes into a sticky map of fixed cells,
 #      `LootMap.crates()` / `.cubes()`, and grid.py scatters those into `box` and `pickup`;
-#   3. both channels are in grid.py's `_DYNAMIC`, and the loop refuses to start a policy that reads
-#      them on a projectile model without the two classes (`loot.require_loot_classes`).
+#   3. both channels are in grid.py's `_DYNAMIC`, and the loop refuses to start a policy that
+#      reads them on a projectile model without the two classes (`loot.require_loot_classes`).
 # loot.py's docstring lists where the deployed channels still differ from the sim's.
 #
-# THE REWARD THAT COMES BACK WITH THEM
-# ------------------------------------
-# `reward.cube_pickup` is restored to 0.5 in configs/train.yaml, since the agent can now see what it
-# is paid for. The pairing is no longer checked by comparing a shared file against every deploy spec
-# (which could not express "this spec sees cubes, those two do not"). It is checked where the reward
-# and the spec actually meet: `brawl_sim/training/builder.check_reward_is_observable`, at run build
-# time. That check is also what tells you to pass `--set reward.cube_pickup=0` if you retrain on
-# agent_obs_deploy.yaml or agent_obs_deploy2.yaml.
-#
-# WIDTH CHANGES: the grid group goes (8, 13, 21) -> (10, 13, 21). Not a checkpoint swap; train from
-# scratch.
+# THE REWARD: from this spec on, a run can pay `reward.cube_pickup` (configs/train.yaml).
+# brawl_sim/training/builder.check_reward_is_observable checks the pairing at run build time, and
+# names `--set reward.cube_pickup=0` for a run on agent_obs_deploy.yaml or agent_obs_deploy2.yaml.
 fair: true
 normalize: true
 groups:
@@ -97,6 +71,6 @@ groups:
     dtype: uint8
     # `box` and `pickup` back, at the positions agent_obs_lowinfo.yaml has them (between `hero` and
     # `projectile`), so the order matches every non-deploy spec. See the header for what each one
-    # counts and for why this group cannot be deployed yet.
+    # counts and what supplies it live.
     view_channels: [blocks_unit, blocks_projectile, is_bush, is_water, in_zone,
                     enemy_revealed, hero, box, pickup, projectile]

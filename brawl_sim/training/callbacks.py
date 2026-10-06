@@ -1,41 +1,25 @@
 """Training callbacks: curriculum advancement, stationary eval, and continuous training-side
-logging -- the things that make a run's progress legible.
+logging.
 
-`CurriculumCallback` is the host-side half of the curriculum -- `training/curriculum.py` owns
-"apply stage N to the sim", this owns "decide when N should become N+1". The split exists
-because the decision needs episode OUTCOMES, which only exist as Python objects after
-`BrawlSB3VecEnv` has crossed the device->host boundary, while the application has to stay
-device-resident inside `reset_envs`.
+`CurriculumCallback` is the host-side half of the curriculum: `training/curriculum.py` applies
+stage N on device inside `reset_envs`, and this decides when N becomes N+1, because that needs
+episode OUTCOMES, which exist only after `BrawlSB3VecEnv` crosses to the host.
 
 **The win signal.** `BrawlSB3VecEnv._build_infos` attaches `info["outcome"] = {"rank", "won"}`
-(plus `info["episode_stats"]` -- kills/damage/cubes/shots, see `TrainingMonitorCallback`) to every
-env that finished this tick (requires `info_mode` `"episode"` or `"full"`; `TrainConfig`
-validation enforces that for the curriculum). `rank` is 0-indexed off
-`info["final_info"]["hero_rank"]`, so `won` means the hero was genuinely the last one standing --
-a timeout that catches the hero alive but not alone is not a win, which is the behavior you want:
-otherwise the agent can advance the curriculum by learning to hide.
+(plus `info["episode_stats"]`) to every env that finished this step; that needs `info_mode`
+`"episode"` or `"full"`, which `TrainConfig` validation enforces for the curriculum. `won` means
+the hero was the last one standing: a timeout with the hero alive but not alone is not a win, or
+the agent could advance the curriculum by learning to hide.
 
-**What gets logged, and why so much of it.** Every scalar below is prefixed `curriculum/`, so a
-TensorBoard run shows the whole difficulty trajectory next to the reward curve. In particular
-`curriculum/stage_index` is the line to overlay on `rollout/ep_rew_mean`: a shaped reward's
-absolute level is only comparable WITHIN a stage, and a reward drop right after a stage bump is
-expected progress, not a regression. `curriculum/tier_spawned_*` reports what the sim actually
-rolled (as opposed to `tier_weight_*`, what the config asked for) -- they should agree to within
-sampling noise, and if they don't, the mixture is not doing what you think it is.
+**Reading the logs.** Overlay `curriculum/stage_index` on `rollout/ep_rew_mean`: a shaped
+reward's level is only comparable WITHIN a stage. `curriculum/tier_spawned_*` (what the sim
+rolled) should match `tier_weight_*` (what the config asked for) to within sampling noise.
+`curriculum/win_rate` is the curriculum's decision variable and is reset on every stage change,
+so a strong easy-stage window cannot clear the next stage; `train/*` (`TrainingMonitorCallback`)
+is the continuous view. Compare runs on `eval/*`, never on `train/win_rate`.
 
-**`curriculum/win_rate` is NOT a general-purpose training metric** -- it's `CurriculumCallback`'s
-own decision variable, and it is DELIBERATELY reset to empty on every stage transition (a strong
-easy-stage window must not carry over and instantly clear the next, harder stage). That makes it
-unsuitable as "how is training going" at a glance: it drops to 0%/unfilled right after every
-advance, which reads like a regression but isn't one. `TrainingMonitorCallback` exists
-specifically to answer that different question -- a continuous, never-reset view under `train/`,
-present even when the curriculum is disabled entirely.
-
-For the same reason the window skips each env's first finish after a transition: that episode's
-bots were drawn at its reset, from the previous stage. `curriculum/envs_on_previous_stage` counts
-the envs that have not finished one yet. Without the skip, `hard_lean` in
-mortis_deploy3-20260911-203322 advanced 28 decisions after it began, on 656 episodes that were
-almost all the stage before it.
+After a transition the window also skips each env's first finish, whose bots were drawn from the
+previous stage; `curriculum/envs_on_previous_stage` counts the envs still waiting for one.
 """
 import json
 from collections import deque
@@ -51,23 +35,12 @@ from .curriculum import CurriculumManager
 
 
 class TrainingMonitorCallback(BaseCallback):
-    """Continuous, never-reset visibility into the TRAINING distribution itself -- everything SB3
-    doesn't already give you for free.
+    """Continuous, never-reset win rate and play breakdown against whatever the hero trains on
+    right now. Unlike `curriculum/win_rate` it never resets, and unlike stationary eval it follows
+    the curriculum.
 
-    SB3's own logger already reports `train/*` (losses, `learning_rate`, `clip_range`,
-    `approx_kl`, `explained_variance`), `rollout/*` (`ep_rew_mean`, `ep_len_mean` -- via
-    `VecMonitor`), and `time/*` (`fps`, `total_timesteps`, `iterations`). This callback adds the
-    one thing missing from that picture: **a win rate and a "how is the hero actually playing"
-    breakdown, measured against whatever the hero is training against right now**, independent of
-    `CurriculumCallback`'s own `curriculum/win_rate` (which is a DECISION variable, cleared to
-    empty on every stage transition -- see module docstring) and independent of stationary eval
-    (which is deliberately a DIFFERENT, fixed population, precisely so it can't answer "how is
-    training going right now").
-
-    Logged under `train/`, every rollout, over a rolling window of the last `window_episodes`
-    finished TRAINING episodes (defaults to `curriculum.window_episodes`, the same "how many
-    recent episodes" knob the curriculum already exposes -- reused rather than duplicated as a
-    second config field for the same concept):
+    Logged under `train/`, every rollout, over the last `window_episodes` finished TRAINING
+    episodes (`scripts/train.py` passes `curriculum.window_episodes`):
 
       train/win_rate            fraction of the window the hero was last alive
       train/mean_rank           mean 0-indexed placement (0 = won)
@@ -79,11 +52,9 @@ class TrainingMonitorCallback(BaseCallback):
       train/cubes_mean          mean power cubes collected per finished episode
       train/shots_fired_mean    mean shots fired per finished episode
 
-    Reads `info["outcome"]`/`info["episode_stats"]` (`wrappers/sb3_vecenv.py`'s own per-done-env
-    fields) -- both require `run.info_mode` `"episode"` or `"full"`. Under `"minimal"` this
-    callback still runs but every metric above stays at its empty-window default (0.0 win rate,
-    NaN mean_rank, zero episode counts) since neither info key ever appears; `scripts/train.py`
-    prints a note rather than silently shipping a blank chart.
+    Reads `info["outcome"]` / `info["episode_stats"]`, which need `run.info_mode` `"episode"` or
+    `"full"`; under `"minimal"` `scripts/train.py` does not install this callback and prints a
+    note instead.
     """
 
     def __init__(self, window_episodes: int, verbose: int = 0) -> None:
@@ -135,10 +106,9 @@ def _mean(values, default: float) -> float:
 class CurriculumCallback(BaseCallback):
     """Tracks a rolling win rate and steps `manager` through its stages.
 
-    `state_path`, when given, receives a small JSON file rewritten on every stage change (and at
-    the end of training) holding the current stage plus the full transition history -- so a
-    resumed run picks up at the right difficulty, and so a finished run can say what it actually
-    trained against without re-reading the TensorBoard log.
+    `state_path`, when given, receives a JSON file rewritten on every stage change (and at the end
+    of training) with the current stage and the transition history, so a resumed run picks up at
+    the right difficulty.
     """
 
     def __init__(
@@ -319,41 +289,28 @@ class CurriculumCallback(BaseCallback):
 
 
 class TierEvalCallback(BaseCallback):
-    """Runs `TierEvaluator` every `eval.every_timesteps` and logs the result two ways.
+    """Runs `TierEvaluator` every `eval.every_timesteps` and logs the result two ways:
 
-    **1. Named scalars on the run's own logger** -- `eval/win_rate_easy`, `eval/win_rate_hard`,
-    ... These appear as separate TensorBoard charts AND as columns in `logs/progress.csv`, so the
-    numbers survive without TensorBoard installed.
+    1. Named scalars on the run's logger (`eval/win_rate_easy`, ...), so they also land in
+       `logs/progress.csv` and survive without TensorBoard.
+    2. One event-file writer per tier in `logs/eval_<tier>/`, all writing the SAME tag
+       (`eval/win_rate`). TensorBoard treats each subdirectory as a run and overlays identical
+       tags, which draws one chart with a line per tier; separate scalar names cannot.
 
-    **2. A per-tier event-file writer** in `logs/eval_<tier>/`, each writing the SAME tag
-    (`eval/win_rate`). TensorBoard treats each subdirectory as its own "run" and overlays
-    identical tags from different runs on one chart -- so this produces a single `eval/win_rate`
-    plot with one colored line per difficulty, labelled `eval_easy`, `eval_hard`, and so on.
-    That comparison (is the easy-vs-hard gap closing?) is the thing you actually want to look at,
-    and separate scalar names alone cannot draw it. The two paths are complementary, not
-    redundant: (1) is machine-readable and always present, (2) is the readable picture.
+    Also saves `best_model.zip` whenever the mean win rate improves.
 
-    Also tracks the best mean win rate seen and saves `best_model.zip` when it improves --
-    stationary eval is the only signal in the run that "best" can honestly be defined against.
-
-    **Training maps vs holdout maps (SIM_OVERHAUL M4).** `evaluator` scores the maps the run
-    trains on, so every key above is a TRAINING-MAP number. `holdout_evaluator`, when given, is
-    its twin on maps the run never sees (`eval.holdout_maps`) and is scored at the same moments:
+    **Training maps vs holdout maps.** `evaluator` scores the maps the run trains on, so every key
+    above is a TRAINING-map number. `holdout_evaluator`, when given, is its twin on
+    `eval.holdout_maps` (never in the training rotation), scored at the same moments:
       - `eval/holdout_win_rate_<tier>`   per tier, next to `eval/win_rate_<tier>`
       - `eval/holdout_win_rate`          mean over tiers, the mirror of `eval/win_rate_mean`
-      - `eval/holdout_gap`               `win_rate_mean - holdout_win_rate`. The two map sets are
-                                         not equally hard, so read its TREND against the
-                                         `at_start` row, not its sign: a gap that widens as
-                                         training goes on is the policy memorizing maps.
-      - tag `eval/holdout_win_rate` in each `logs/eval_<tier>/`, so TensorBoard draws the same
-        one-line-per-tier overlay for the holdout maps as it does for `eval/win_rate`. That tag
-        is ALSO the run logger's name for the mean (the plan fixes the name), so this one chart
-        carries a line more than `eval/win_rate` does: the six `eval_<tier>` lines plus the
-        run's own, which is the mean over tiers. (`eval/win_rate`'s mean is the separate
-        `eval/win_rate_mean` chart.)
-    `best_model.zip` is selected on the training-map mean ONLY. Picking the checkpoint by its
-    holdout score would fit the selection to the holdout maps, and the number would stop
-    measuring what it exists to measure.
+      - `eval/holdout_gap`               `win_rate_mean - holdout_win_rate`. The map sets are not
+                                         equally hard, so read its TREND against the `at_start`
+                                         row, not its sign: a widening gap is map memorization.
+      - tag `eval/holdout_win_rate` in each `logs/eval_<tier>/`, the per-tier overlay for the
+        holdout maps. The run logger's mean shares that tag, so the chart has one extra line.
+    `best_model.zip` is selected on the training-map mean ONLY: picking it by holdout score would
+    fit the selection to the holdout maps.
     """
 
     def __init__(
@@ -451,16 +408,13 @@ class TierEvalCallback(BaseCallback):
     def _sync_normalization(self, evaluator) -> None:
         """Copies the training env's observation-normalization statistics onto `evaluator`'s env.
 
-        Only matters when `normalize.obs` is on -- but when it is, skipping this silently feeds
-        the policy differently-scaled observations than it trained on, and the eval score becomes
-        meaningless in a way that looks like a training failure. Reward statistics are
-        deliberately NOT synced: eval reports raw returns.
+        Only matters when `normalize.obs` is on, but then skipping it feeds the policy
+        differently-scaled observations and the eval score looks like a training failure. Reward
+        statistics are deliberately NOT synced: eval reports raw returns.
 
-        The statistics are copied directly, NOT through SB3's `sync_envs_normalization`: that
-        helper walks both wrapper stacks in lockstep and asserts they have the same depth, and
-        they never do here -- training is `VecNormalize(VecMonitor(env))` (builder.build_env),
-        an evaluator is `VecNormalize(env)`. Until 2026-09-18 that assertion killed every run
-        with `normalize.obs: true` at its first eval."""
+        Copied directly, NOT through SB3's `sync_envs_normalization`, which asserts both wrapper
+        stacks have the same depth: training is `VecNormalize(VecMonitor(env))`
+        (builder.build_env), an evaluator is `VecNormalize(env)`."""
         train_env = self.model.get_vec_normalize_env()
         if train_env is None or not getattr(train_env, "norm_obs", False):
             return
@@ -494,13 +448,14 @@ class TierEvalCallback(BaseCallback):
 
 
 class VecNormalizeCheckpoint(BaseCallback):
-    """Saves `VecNormalize`'s running statistics next to each model checkpoint.
+    """Saves `VecNormalize`'s running statistics next to each model checkpoint, on the same
+    cadence: SB3's own `save_vecnormalize` option no-ops silently if the wrapper isn't found, and a
+    normalized policy is meaningless without its statistics.
 
-    SB3's own `CheckpointCallback` has a `save_vecnormalize` option, but it only fires on its own
-    schedule and silently no-ops if the wrapper isn't found -- which is exactly the failure that
-    surfaces months later as "my loaded model performs nothing like it did in training", because
-    a `VecNormalize`-trained policy is meaningless without the observation/reward statistics it
-    was normalized against. This saves them unconditionally on the same cadence and says so.
+    The names sort lexicographically (`_final` last, `9..._steps` after `45..._steps`) and
+    `scripts/train.py --resume` loads the last-sorted `*vecnormalize*.pkl` beside the zip, so
+    resume from a folder inside the run holding only the matching pair, with
+    `--set run.total_timesteps=<remaining>`.
     """
 
     def __init__(self, save_freq: int, save_path, name: str = "vecnormalize", verbose: int = 0) -> None:

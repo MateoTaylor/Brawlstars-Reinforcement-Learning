@@ -67,15 +67,9 @@ def test_step_shapes_and_dtypes():
     obs_schema.validate_obs(obs, env.cfg)
 
 
-def test_observation_spec_and_action_spec_properties():
+def test_the_default_action_space_is_17_move_values_by_4_attack_values():
     env = _tiny_env(n_envs=8)
-    spec = env.observation_spec
-    assert "hero.pos" in spec
-    # (move bins + idle, attack). The attack dim is 4-valued: 0 = nothing, 1 = attack,
-    # 2 = super (Step D2), 3 = gadget (SIM_OVERHAUL Step G3). Pinned as a literal on the spec
-    # itself -- comparing the spec to cfg.action_nvec alone is the property compared to itself.
-    assert env.action_spec == {"nvec": env.cfg.action_nvec}
-    assert env.action_spec == {"nvec": (17, 4)}
+    # (move bins + idle, attack): 0 = nothing, 1 = attack, 2 = super, 3 = gadget.
     assert env.cfg.action_nvec == (17, 4)
 
 
@@ -147,7 +141,7 @@ def test_action_latency_delays_hero_dash_by_the_configured_ticks():
     assert disp[2] > walk_step  # and a dash tick outruns a walk tick, which is why it is visible
 
 
-# ---- dash replaces the walk (N02/N03/R02) ------------------------------------------------
+# ---- dash replaces the walk --------------------------------------------------------------
 
 def test_dashing_tick_shows_only_dash_displacement_not_walk():
     env = _tiny_env(n_envs=1, overrides=_PER_TICK)
@@ -217,7 +211,7 @@ def test_override_with_negative_one_sentinel_is_a_no_op():
 
 def test_attacking_sets_the_attackers_reveal_timer():
     """`perception.reveal_after_attack` was loaded into SimParams and read by
-    perception.visibility from Step 3 onward, but nothing ever WROTE ent_reveal_t -- so firing
+    perception.visibility, but nothing ever WROTE ent_reveal_t -- so firing
     from a bush left you hidden and the parameter was inert. Driven here through `override`, which
     forces an attack without depending on any archetype's own fire gate."""
     # Per-tick, same reason as test_the_hero_is_revealed_by_attacking_too below: ent_reveal_t is
@@ -306,7 +300,7 @@ def test_a_hero_out_of_combat_heals_to_full_and_stops_there():
     # `action_repeat` TICKS -- at the shipped 5, `int(3.0 / cfg.dt)` steps advance 15 seconds, not
     # 3, so the "still inside the delay" phase ran nearly four delays past it. It passed anyway
     # only because a bot happened to shoot the hero often enough to keep resetting
-    # out_of_combat_t; Step E1's RNG-stream change moved that coincidence and exposed it.
+    # out_of_combat_t; an RNG-stream change moved that coincidence and exposed it.
     env = _tiny_env(n_envs=1, overrides={**_PER_TICK, "regen": {"enabled": True}})
     env.reset()
     # Bots deal nothing: this test is about the REGEN CURVE, and a live lobby made it depend on
@@ -379,7 +373,7 @@ def test_autoreset_false_leaves_terminal_state_frozen_for_the_caller_to_reset():
     assert torch.equal(info["final_observation"]["hero"]["hp"], obs["hero"]["hp"])
     assert torch.equal(info["final_info"]["terminated"], terminated)
 
-    # `obs` is a zero-copy view into `state` (Step 25/27/29's established convention) -- clone
+    # `obs` is a zero-copy view into `state` (BRAWL_SIM_DESIGN.md §3) -- clone
     # the one field checked below BEFORE the next step() call mutates it in place.
     step_count_after_first = obs["meta"]["step_count"].clone()
 
@@ -476,7 +470,7 @@ def test_batched_smoke_default_config():
         _assert_finite(reward)
 
 
-# ---- super charge vs the gadget (Step G2.4) ------------------------------------------------
+# ---- super charge vs the gadget ------------------------------------------------------------
 
 def _one_enemy_duel(enemy_at):
     """A per-tick tiny env with bot 2 dead, the hero at (10,10), bot 1 at `enemy_at` at its full
@@ -494,9 +488,9 @@ def _one_enemy_duel(enemy_at):
 
 
 def test_a_gadget_only_hit_deals_damage_but_does_not_charge_the_super():
-    """S12 through the real tick: the spinner's 2000 lands in `ent_damage_dealt`, and the hero's
-    super charge stays where it was. No action fires a gadget before Step G3, so the spinner is
-    spawned into the env's state by hand and the env is stepped idle until it lands."""
+    """Through the real tick: the spinner's 2000 lands in `ent_damage_dealt`, and the hero's
+    super charge stays where it was. The spinner is spawned into the env's state by hand and the
+    env is stepped idle until it lands."""
     from brawl_sim.core import projectiles, stats
 
     env, hp_before = _one_enemy_duel([11.5, 10.0])
@@ -520,7 +514,7 @@ def test_a_gadget_only_hit_deals_damage_but_does_not_charge_the_super():
 
 
 def test_a_dash_hit_still_charges_the_super():
-    """The other half of G2.4's pin: nothing about the dash path changed. Move bin 1 is +x
+    """The other half of the pin above: a dash hit does charge the super. Move bin 1 is +x
     (geo.dir_from_bin(0)), straight into the enemy 0.3 tiles east."""
     env, hp_before = _one_enemy_duel([10.3, 10.0])
     st = env.state
@@ -544,7 +538,7 @@ def test_an_auto_aimed_attack_dashes_at_the_nearest_target_not_along_the_move_bi
     env = _tiny_env(n_envs=2, overrides={**_PER_TICK, "action": {"auto_aim": True}},
                     autoreset=False)
     env.reset()
-    assert env.action_spec == {"nvec": (17, 5)}
+    assert env.cfg.action_nvec == (17, 5)
     st = env.state
     st.ent_pos[:, 0] = torch.tensor([10.0, 10.0])
     st.ent_pos[:, 1:] = torch.tensor([17.0, 17.0])       # ~9.9 tiles away, out of reach
@@ -567,7 +561,7 @@ def test_without_the_flag_a_4_in_the_attack_column_is_a_silent_no_op():
     exactly as it did; a 4 there is an illegal value and does nothing."""
     env = _tiny_env(n_envs=1, overrides=_PER_TICK, autoreset=False)
     env.reset()
-    assert env.action_spec == {"nvec": (17, 4)}
+    assert env.cfg.action_nvec == (17, 4)
     st = env.state
     st.ent_pos[:, 1:] = torch.tensor([17.0, 17.0])
     st.ent_ammo[:, 0] = 3.0

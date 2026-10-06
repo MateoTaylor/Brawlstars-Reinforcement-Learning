@@ -89,12 +89,7 @@ def test_dir_from_bin_bin_zero_is_angle_zero():
     assert torch.allclose(v, torch.tensor([[1.0, 0.0]]), atol=1e-5)
 
 
-# ---- dist / dist2 / rotate / perp -------------------------------------------
-
-def test_dist_matches_dist2_sqrt():
-    p, q = _rand_vec(100), _rand_vec(100)
-    assert torch.allclose(geo.dist(p, q) ** 2, geo.dist2(p, q), atol=1e-3)
-
+# ---- rotate / perp -----------------------------------------------------------
 
 def test_rotate_by_pi_over_2_equals_perp():
     v = _rand_vec(100)
@@ -310,7 +305,6 @@ def test_all_functions_support_64x7_leading_batch():
         geo.dir_from_bin(idx, 16),
         geo.bin_from_dir(p0, 16).to(torch.float32),
         geo.dist(p0, p1),
-        geo.dist2(p0, p1),
         geo.rotate(p0, theta),
         geo.perp(p0),
         geo.point_in_cone(p0, p1, theta, r, r).to(torch.float32),

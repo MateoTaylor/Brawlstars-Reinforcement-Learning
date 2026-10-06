@@ -1,4 +1,4 @@
-"""Bot personality tests (Step 41): one section per personality, then the rules that must hold
+"""Bot personality tests: one section per personality, then the rules that must hold
 for ALL of them, then the edge cases where a bot could end up undirected or the agent could game
 the system.
 
@@ -738,7 +738,7 @@ def test_a_retreating_bot_is_pulled_to_no_loot():
 
 
 # =============================================================================================
-# aggression (SIM_OVERHAUL_PLAN.md Step B3): three consumers, every threshold pinned as a literal
+# aggression: three consumers, every threshold pinned as a literal
 # =============================================================================================
 
 def _hunter_at_hp_fraction(hp_fraction, aggression, person=Person.HUNTER):
@@ -755,14 +755,14 @@ def _hunter_at_hp_fraction(hp_fraction, aggression, person=Person.HUNTER):
 
 
 def test_hunter_at_25_percent_hp_closes_at_aggression_1_7_and_retreats_at_1_0():
-    """B3.1: threshold = clamp(0.35 / a, 0.05, 0.90). At a = 1.7 that is 0.206, so 25% HP is
+    """Retreat threshold = clamp(0.35 / a, 0.05, 0.90). At a = 1.7 that is 0.206, so 25% HP is
     above it (CLOSE); at a = 1.0 it is the plain 0.35 (RETREAT)."""
     assert _hunter_at_hp_fraction(0.25, 1.7) is Mode.CLOSE
     assert _hunter_at_hp_fraction(0.25, 1.0) is Mode.RETREAT
 
 
 def test_aggression_zero_is_read_as_one_for_the_retreat_threshold():
-    """A partial spec without the key resolves to 0 (B1); the helper reads it as 1.0, so the
+    """A partial spec without the key resolves to 0; the helper reads it as 1.0, so the
     threshold is 0.35: 25% retreats, 40% closes -- identical to a = 1.0."""
     assert _hunter_at_hp_fraction(0.25, 0.0) is Mode.RETREAT
     assert _hunter_at_hp_fraction(0.40, 0.0) is Mode.CLOSE
@@ -812,7 +812,7 @@ def _unseen_camper_scene():
 
 
 def test_unseen_camper_fires_at_aggression_1_5_and_holds_at_1_0():
-    """B3.3: the veto is `~seen_by_other & a < 1.25`. Literal (N,E) aggression tensors, so the
+    """The CAMPER veto is `~seen_by_other & a < 1.25`. Literal (N,E) aggression tensors, so the
     pin does not go through the helper."""
     state, tgt, _params, cfg = _unseen_camper_scene()
     shape = state.ent_person.shape
@@ -858,7 +858,7 @@ def test_aggression_does_not_lift_the_camper_veto_for_a_non_camper_or_a_seen_cam
 
 
 def test_kite_holds_closer_at_high_aggression_and_farther_at_low():
-    """B3.2 through the movement layer, with RANGE_DEADBAND 1.5 and the far edge capped at Brock's
+    """Through the movement layer, with RANGE_DEADBAND 1.5 and the far edge capped at Brock's
     8.0-tile reach. Brock (attack_range 8.0, desired_range_fraction 0.85) holds 6.8 tiles at
     a = 1.0 (band 5.3 to 8.0). At a = 1.7 the multiplier clamps to 0.6 (4.08, band 2.58 to 5.58),
     so a bot standing at 6.0 is too far out and closes in (west). At a = 1.0 the same bot orbits.

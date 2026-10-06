@@ -1,11 +1,11 @@
 """Throughput/memory/observation-footprint benchmarking harness for BrawlVecEnv and
-BrawlSB3VecEnv. See BRAWL_SIM_BUILD_PLAN.md Step 40.
+BrawlSB3VecEnv.
 
 **Three separate things get measured, each with its own function, not one do-everything loop:**
 `throughput_native`/`throughput_sb3` (env-steps/sec, ms/step, peak VRAM, for one `n_envs` and
-one path), `phase_breakdown` (per-Section-4-phase timing at one representative `n_envs`), and
+one path), `phase_breakdown` (per-phase timing at one representative `n_envs`), and
 `observation_footprint` (a purely analytical byte count from `obs_schema.obs_spec`, no env
-construction needed at all). `main()` just calls each with the plan's requested sweep and
+construction needed at all). `main()` just calls each with the default sweep and
 prints a report -- there's no shared "benchmark runner" abstraction because these three measure
 genuinely different things (wall-clock throughput vs. per-phase device-side timing vs. static
 schema arithmetic) and forcing them through one interface would obscure that, not simplify it.
@@ -31,13 +31,13 @@ CALL time, not at `_tick_fn`-construction time -- so wrapping those same names o
 INSTANCE with a timing wrapper is picked up transparently by the real, unmodified production
 code path. A hand-copied mirror of the phase sequence was considered and rejected: it would
 silently drift the moment `_run_tick`'s own phase order changed, and this repo's own established
-pattern (Steps 37-39) is to reuse production code for debug tooling wherever that's possible
-rather than risk a second copy. This only works because `cfg.compile=False` (the plan's own
-fully-supported default, see Step 31) -- with `torch.compile` enabled, `_run_tick` gets traced
+pattern is to reuse production code for debug tooling wherever that's possible
+rather than risk a second copy. This only works because `cfg.compile=False` (the
+fully-supported default) -- with `torch.compile` enabled, `_run_tick` gets traced
 into a graph on first call and per-phase attribution via instance-attribute monkeypatching would
 no longer mean anything; `main()` never exposes a `--compile` flag for exactly this reason.
 
-**Section 4 has 17 phases; `_run_tick` (Step 29's own docstring) covers phases 1-15, with 16
+**CONVENTIONS.md's tick order has 17 phases; `_run_tick` covers phases 1-15, with 16
 (`_observe`) and 17 (`_autoreset`) run separately by `step()` itself.** `phase_breakdown` times
 all 17 for a complete per-STEP picture. Note "per step", not "per tick": one `step()` is one
 agent decision covering `cfg.action_repeat` sim ticks, so phases 1-15 are each invoked
@@ -47,7 +47,7 @@ to each other and to `throughput_native`'s ms/step. Raising `action_repeat` shou
 phases 1-15 growing roughly linearly while 16/17 stay flat; that flat part is exactly the cost
 action repeat amortizes away. `step()`'s own small amount of work OUTSIDE any of those
 17 methods -- the action tensor's device/dtype cast, and `final_observation`/`final_info`
-cloning via `observation.clone_obs` (Step 29's own documented VRAM-saving early-clone, non-trivial
+cloning via `observation.clone_obs` (env.py's own documented VRAM-saving early-clone, non-trivial
 at scale since `obs["world"]` alone is ~162 MB at n_envs=4096) -- is NOT separately broken out,
 since it isn't a bound method on `env` to monkeypatch. It shows up as the gap between "sum of
 phases" and this same n_envs's own `throughput_native` ms/step number; printed as an explicit
@@ -75,9 +75,9 @@ DEFAULT_AGENT_OBS_PATH = REPO_ROOT / "configs" / "agent_obs.yaml"
 
 _DEFAULT_N_ENVS = (1, 64, 256, 1024, 4096, 16384)
 _SB3_INFO_MODES = ("minimal", "full")
-_NATIVE_TARGET_STEPS_PER_SEC = 100_000  # 5070 Ti, n_envs >= 1024 -- see plan's Step 40 text
+_NATIVE_TARGET_STEPS_PER_SEC = 100_000  # 5070 Ti, n_envs >= 1024
 
-# Section 4 phases 1-15 (_run_tick) + 16/17 (_observe/_autoreset), in the exact order env.py
+# Tick phases 1-15 (_run_tick) + 16/17 (_observe/_autoreset), in the exact order env.py
 # calls them -- see module docstring for why this list is real method NAMES to monkeypatch,
 # not a copy of their logic.
 _PHASE_METHOD_NAMES = (
@@ -295,10 +295,10 @@ def _fmt_bytes(n) -> str:
 
 
 def _check_gpu(device: str) -> str:
-    """Returns the DEVICE STRING TO ACTUALLY USE. Warns loudly (plan's own requirement) on CPU
-    or a non-sm_120 GPU, but only ever falls back CPU<-cuda when cuda was requested but truly
+    """Returns the DEVICE STRING TO ACTUALLY USE. Warns loudly on CPU or a non-sm_120 GPU,
+    but only ever falls back CPU<-cuda when cuda was requested but truly
     unavailable -- an sm_120 mismatch is a warning, not a fallback, since the numbers are still
-    real, just not comparable to the plan's 5070 Ti-specific target."""
+    real, just not comparable to the 5070 Ti-specific target."""
     if device != "cuda":
         print("!" * 78)
         print("WARNING: benchmarking on CPU. Every steps/sec number below is meaningless as a")
@@ -316,7 +316,7 @@ def _check_gpu(device: str) -> str:
     if (major, minor) != (12, 0):
         print("!" * 78)
         print(f"WARNING: GPU is {torch.cuda.get_device_name()} (sm_{major}{minor}), not sm_120")
-        print("(Blackwell). The plan's '100k+ env-steps/sec at n_envs>=1024' target is specific")
+        print("(Blackwell). The '100k+ env-steps/sec at n_envs>=1024' target is specific")
         print("to a 5070 Ti -- treat it as a rough reference on this GPU, not a pass/fail bar.")
         print("!" * 78)
     return device

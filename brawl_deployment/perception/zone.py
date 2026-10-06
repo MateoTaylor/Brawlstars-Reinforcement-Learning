@@ -10,7 +10,7 @@ read `configs/agent_obs_deploy.yaml`, and to supply the group like this:
 |---|---|---|
 | `hero_margin` | four ray scans over observed gas | recoverable **out to a horizon**; saturates past it |
 | `hero_margin_local` | the same four scans | the name and the values agree; the sim clamps at the same horizon |
-| `active` | has any gas been observed | truthful |
+| `active` | has any gas been observed this match | truthful |
 | `safe_area_frac` | 1 - observed gas area / the sim's map area | the group's weak column, knowingly |
 | `next_shrink_in` | **pinned at 0.0** | a lie, measured at <=1 SE, recorded, reversible |
 
@@ -68,10 +68,14 @@ PINNED_NEXT_SHRINK_IN = 0.0
 class ZoneEstimator:
     """`GasMap` + hero position -> the `zone` group, in the sim's units.
 
-    One instance per match, but stateless between calls: everything it reports is a function of the
-    gas map handed in, which is where the accumulation actually lives. Keeping no state of its own
-    means a `GasMap.reset` on a segment change needs no corresponding reset here -- one fewer thing
-    to forget, and forgetting it would leave stale margins pointing at a world frame that moved.
+    One instance per loop, reset by the loop at every match start. The margins and the area are
+    stateless between calls: each is a function of the gas map handed in, which is where the
+    accumulation actually lives, so a `GasMap.reset` on a segment change needs no corresponding
+    reset here -- margins of its own would point at a world frame that moved.
+
+    `active` is the one exception, and on purpose. It is a single bit with no position in it, so
+    it has no world frame to go stale in, and it must NOT follow the gas map through a segment
+    change (see `active`). `reset` clears it, and only a match start calls that.
     """
 
     def __init__(self, cfg):
@@ -79,6 +83,13 @@ class ZoneEstimator:
         # Read, not stored as a literal. See the module docstring.
         self.horizon = float(cfg.zone_margin_horizon_tiles)
         self.map_area = float(cfg.map_w) * float(cfg.map_h)
+        self._seen = False          # `active`'s latch
+
+    def reset(self) -> None:
+        """A new match. `DeployLoop._begin_match` calls this with its other per-match resets, and
+        nothing calls it on a segment change: that is the difference between this latch and the
+        gas map it reads."""
+        self._seen = False
 
     def estimate(self, gas, hero_pos) -> dict:
         """`{field: value}` for `assemble`'s `zone` argument.
@@ -131,14 +142,22 @@ class ZoneEstimator:
         return tuple(out)
 
     def active(self, gas) -> bool:
-        """Whether the zone has started. `cfg.zone_enabled` on the sim side, so it is a property of
-        the match rather than of the moment -- but the deployed loop cannot know the mode's rules,
-        only what it has seen, and gas on screen is the one unambiguous signal that it is on.
+        """Whether gas has been on screen this match. The sim's `zone.active` is the latch
+        `state.zone_seen` (`brawl_sim/core/zone.py` `mark_seen`): set once gas is on screen, kept
+        for the rest of the episode, cleared only by a reset. This is that latch, on the gas the
+        loop has deposited.
 
-        Latches by construction: `GasMap` is sticky, so once true this stays true for the match.
-        That matches the sim, where the zone never turns back off.
+        **The latch is kept here because `GasMap` cannot keep it.** The map is sticky only within
+        an odometry segment: a new segment (a cut, or a lattice re-lock) clears `gassed`, since its
+        cells are in a world frame that no longer exists. Reading `gassed.any()` alone would drop
+        the flag to 0 mid-match whenever that happens with no gas in view, a 1 -> 0 flip the sim
+        never produces. So each call folds the current map into `_seen`, which only `reset` (a
+        match start) clears.
+
+        Called once per decision, from `estimate`, which is also when the sim's `mark_seen` runs.
         """
-        return bool(gas.gassed.any())
+        self._seen = self._seen or bool(gas.gassed.any())
+        return self._seen
 
     def safe_area_frac(self, gas) -> float:
         """Safe area / map area, over the sim's map extent.

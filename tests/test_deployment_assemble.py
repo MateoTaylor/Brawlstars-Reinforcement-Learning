@@ -13,7 +13,7 @@ is an assertion about the deployed path, since `build_agent_obs` is the training
 
 The `history` group gets the same treatment twice. `test_synthetic_snapshots_give_the_sims_history_
 vector_byte_for_byte` writes the sim's rings by hand and demands the same bytes from snapshots of
-the same numbers (SIM_OVERHAUL_STEPS.md H4.2), and `test_deploy4_assembles_whole` runs the spec
+the same numbers, and `test_deploy4_assembles_whole` runs the spec
 that has it against a live env, with the snapshots `DeployLoop` would have taken.
 
 The rest of the file covers the decisions the module makes that the sim has no opinion about: the
@@ -133,8 +133,8 @@ def _suppliers_from(full, cfg, spec, env_i=0, history=(), tracked=False):
 
     # Only the projectiles the camera shows: the live `ProjectileTracker` has no track for an
     # off-screen one (assemble._put_projectiles marks every track `in_view`). The sim path still
-    # RANKS off-screen projectiles into its 12 slots and blanks their rows (OBS_PARITY_TASKS.md
-    # C4, a quirk kept by decision), so in a frame with one alive the two paths lay their rows
+    # RANKS off-screen projectiles into its 12 slots and blanks their rows (a quirk kept by
+    # decision, BRAWL_SIM_DESIGN.md §9), so in a frame with one alive the two paths lay their rows
     # out differently; `_all_projectiles_on_screen` is how the parity tests skip those frames.
     alive_p = (at(prj["alive"]) & at(prj["in_view"])).nonzero().flatten().tolist()
     projectiles = [(tuple(at(prj["rel_pos"])[j].tolist()), tuple(at(prj["vel"])[j].tolist()),
@@ -162,7 +162,7 @@ def _suppliers_from(full, cfg, spec, env_i=0, history=(), tracked=False):
 
 def _near_edge_spec() -> str:
     """deploy4's groups with `hero.near_edge` after `hero.in_zone` in the self group, written to
-    a temp file: the shape C10's deploy5 takes."""
+    a temp file: the shape deploy5 takes."""
     import tempfile
     doc = yaml.safe_load(open(DEPLOY4).read())
     for g in doc["groups"]:
@@ -176,7 +176,7 @@ def _near_edge_spec() -> str:
 
 def _tracked_spec() -> str:
     """deploy4 with `slots: tracked` on its enemies group, written to a temp file: the other half
-    of what C10's deploy5 changes."""
+    of what deploy5 changes."""
     import tempfile
     doc = yaml.safe_load(open(DEPLOY4).read())
     (g,) = [g for g in doc["groups"]
@@ -206,7 +206,7 @@ def _snapshot_of(full, move, attack, env_i=0):
 def test_near_edge_assembles_to_the_sims_bit(hero_xy, want):
     """On the tiny 20-wide map the camera is pinned at x 9.65, so a hero at x 3 is 6.65 tiles
     off its anchor (past the 2-tile flag) and one at x 10 is 0.35. The whole `self` group must
-    still match the sim's (OBS_PARITY_TASKS.md C7)."""
+    still match the sim's."""
     env, cfg = _env()
     asm = _assembler(_near_edge_spec(), cfg)
     spec, buffers = asm.spec, asm.buffers
@@ -235,7 +235,7 @@ def test_hero_offset_is_only_required_by_a_spec_that_reads_near_edge():
 
 
 def test_tracked_slots_assemble_to_the_sims_rows(tracked_action_steps=8):
-    """deploy4 with `slots: tracked` on the enemies group (OBS_PARITY_TASKS.md C9): the sim
+    """deploy4 with `slots: tracked` on the enemies group: the sim
     orders rows by its slot table, the assembler is handed the tracks in that order and writes
     the identity permutation, and the `enemies` group comes out the same at every decision."""
     env, cfg = _env()
@@ -322,7 +322,7 @@ def test_parity_survives_a_frame_with_live_projectiles():
     `obs_select` on both sides -- this is the test that says it stayed there.
 
     Frames with an off-screen live projectile are skipped: the sim ranks it into the 12 slots
-    and blanks its row (the quirk OBS_PARITY_TASKS.md C4 keeps by decision), while the tracker
+    and blanks its row (a quirk kept by decision, BRAWL_SIM_DESIGN.md §9), while the tracker
     never holds it, so the two paths differ there by design."""
     env, cfg = _env(n_envs=1, seed=3)
     asm = _assembler(SPECS[0], cfg)
@@ -345,19 +345,19 @@ def test_parity_survives_a_frame_with_live_projectiles():
 
 
 # `hist.valid` over a match's first four decisions: nothing, then one slot more per decision until
-# the ring is full. SIM_OVERHAUL_STEPS.md H4.1's verify, at the assembler.
+# the ring is full. Checked here at the assembler.
 VALID_BY_DECISION = ([0.0, 0.0, 0.0], [1.0, 0.0, 0.0], [1.0, 1.0, 0.0], [1.0, 1.0, 1.0])
 
 
 def test_deploy4_assembles_whole():
-    """deploy4 through `assemble` against a live env: the gadget pair (Step G5.1), the `history`
+    """deploy4 through `assemble` against a live env: the gadget pair, the `history`
     group from the snapshots `DeployLoop` would have taken, and the thirteen-plane grid.
 
     The first action throws the gadget. A charged gadget reads (True, 1.0), which a swapped pair
     reproduces exactly; after the throw the sim reads (False, 0.2 / 18), and only the right
     wiring reproduces that. The same throw is slot 0's attack one-hot a decision later. Six
     decisions, so the ring fills and then drops its oldest slot twice. The history is compared
-    as bytes, the H4.2 bar."""
+    as bytes."""
     env, cfg = _env()
     asm = _assembler(DEPLOY4, cfg)
     spec, buffers = asm.spec, asm.buffers
@@ -398,7 +398,7 @@ SYNTHETIC = ((5, 3, 7400.0, 0.25, (6.5, 4.25)),
 
 @pytest.mark.parametrize("n", [0, 1, 2, 3])
 def test_synthetic_snapshots_give_the_sims_history_vector_byte_for_byte(n):
-    """SIM_OVERHAUL_STEPS.md H4.2's verify. The sim's rings are written by hand, `n` valid slots
+    """The sim's rings are written by hand, `n` valid slots
     with in-range garbage behind them, and `build_obs` + `obs_select` make the `history` group
     of that. `n` snapshots of the same numbers go through `assemble`. Same bytes, or it fails."""
     env, cfg = _env()
@@ -428,7 +428,7 @@ def test_synthetic_snapshots_give_the_sims_history_vector_byte_for_byte(n):
     assert got.dtype == want.dtype == np.float32 and got.shape == want.shape == (78,)
     assert got.tobytes() == want.tobytes(), f"\ngot  {got}\nwant {want}"
 
-    # And the layout itself (H2's column map), so the two cannot agree on a wrong one. TINY's map
+    # And the column layout itself, so the two cannot agree on a wrong one. TINY's map
     # is 20 tiles, the displacement divisor; hp divides by 20000.
     assert got[:3].tolist() == VALID_BY_DECISION[n]
     if n == 0:

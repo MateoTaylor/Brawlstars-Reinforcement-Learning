@@ -1,14 +1,18 @@
-"""The camera as the sim models it: what the screen shows and where it sits (OBS_PARITY_PLAN.md §2).
+"""The camera as the sim models it: what the screen shows and where it sits. Three facts measured
+from the deployed capture path (BRAWL_SIM_DESIGN.md §9):
 
-Three measured facts, all from the deployed capture path:
-
-- the screen shows a trapezoid of ground (`cfg.camera_quad`, tiles relative to the hero's nominal
-  screen anchor), not the 21x13 rectangle the grid crops, so `in_camera` is four half-planes and
-  not a box test -- the box would discard 23.6 % of on-screen sightings;
+- the screen shows a trapezoid of ground (`cfg.camera_quad`), not the 21x13 rectangle the grid
+  crops, so `in_camera` is four half-planes and not a box test -- the box would discard 23.6 % of
+  on-screen sightings;
 - the game camera follows the hero until it is `cfg.camera_clamp_onset` tiles from a map edge and
   then stops, so near an edge the hero drifts off-centre on screen (`camera_centre`);
 - the deployed detector reports exactly the enemies inside that trapezoid, so the hero's reveal is
   concealment (`bots/perception.visibility`) AND the window (`hero_view`), never the whole map.
+
+`cfg.camera_quad` is in tiles relative to the hero's nominal screen anchor, the viewport centre
+plus `brawl_vision.camera.HERO_ANCHOR_TILES`; tests/test_sim_camera.py pins it to the shipped
+homography through that constant. The quad derives from HERO_ANCHOR_TILES and must never diverge
+from it (user's rule).
 
 Everything here is branch-free and the constants are built once per (device, dtype, config), so
 the per-decision path constructs no tensors (see core/geometry.vec2 on why that matters on CUDA).
@@ -50,7 +54,7 @@ def in_camera(rel: torch.Tensor, cfg) -> torch.Tensor:
     """(..., 2) camera-relative tiles -> (...) bool, inside the trapezoid the screen shows.
 
     Four half-planes, boundary inclusive, corners wound TL, TR, BR, BL with y down (config.validate
-    refuses any other winding). The same predicate scripts/probes/obs_quad_measure.py used, so its
+    refuses any other winding). The same predicate scripts/probes/obs_quad_measure.py uses, so its
     numbers stay comparable."""
     quad, edge, _, _, _ = _constants(cfg, rel.device, rel.dtype)
     d = rel.unsqueeze(-2) - quad                                    # (..., 4, 2)

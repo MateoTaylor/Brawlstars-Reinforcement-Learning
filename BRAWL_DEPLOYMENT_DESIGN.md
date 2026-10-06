@@ -34,7 +34,7 @@ stays a lever rather than a prerequisite, and the sim side of it is now built an
 shape the live loop can actually produce, so pulling that lever is a run, not a design task.
 The GPU blocker is gone: ONNX Runtime now runs both detectors on CUDA at 3.6–4.4× the CPU
 numbers, after four separate faults (§9.12). Sibling of
-`BRAWL_SIM_BUILD_PLAN.md` and
+`BRAWL_SIM_DESIGN.md` and
 `Terrain_Perception_Build_Plan.md`; read `CONVENTIONS.md` first for the rules that govern
 `brawl_sim` and, explicitly, **do not** govern this package (see §1.3).
 
@@ -42,7 +42,7 @@ numbers, after four separate faults (§9.12). Sibling of
 Capture the screen, perceive, decide, inject touch input, detect when the match ends and stop.
 **Out of scope for the MVP:** queueing matches, menu navigation, brawler selection,
 multi-instance, any form of parallelism. Gadget use was on this list until 2026-09-21, when
-SIM_OVERHAUL Step G5 brought it in (§4.4).
+it was brought in (§4.4).
 
 ---
 
@@ -355,8 +355,8 @@ at the bottom-left rest anchor is a direct "did my contact drop" signal, reusing
 
 The agent's action is `(move, attack)` where `move ∈ [0, 16]` and `attack ∈ {0, 1, 2, 3}`
 (`brawl_sim/config.py:130` → `action_nvec = (n_move_bins + 1, 4)`). **Revised 2026-09-21:**
-this read `{0, 1, 2}` and `3` until SIM_OVERHAUL Step G3 added the gadget as attack value 3,
-which deployment presses since Step G5 (§4.4).
+this read `{0, 1, 2}` and `3` until the sim added the gadget as attack value 3,
+which deployment presses since 2026-09-21 (§4.4).
 
 From `hero.decode_action` and `geometry.dir_from_bin`:
 
@@ -419,7 +419,7 @@ contact goes down on the origin, drags `control.aim_radius_px` (75 px) along
 `ShadowHero.attack_bearing`, and lifts. The lift fires. `attack == 1` presses from the attack
 clearance point (§6.8: the attack stick floats), and `attack == 2` from the super button's centre.
 ~~**Gadgets are not emitted** (the policy has no gadget action) and their button is never
-touched.~~ **Struck 2026-09-21:** since SIM_OVERHAUL Step G5 the gadget is emitted, as a bare
+touched.~~ **Struck 2026-09-21:** since then the gadget is emitted, as a bare
 tap; see the last paragraph of this section. The drags left the action space unchanged. The aim
 is the choice the policy already made with its move bin.
 
@@ -443,11 +443,11 @@ shadow's own timer rather than the HUD (§6.3's table). Since 2026-09-26 it is f
 trained under `action.auto_aim`, the fifth bit being the attack's own (the last paragraph of this
 section).
 
-**The gadget is the one bare tap (added 2026-09-21, SIM_OVERHAUL Step G5).** `attack == 3` goes
+**The gadget is the one bare tap (added 2026-09-21).** `attack == 3` goes
 down on the calibrated gadget centre, `Calibration.button("gadget")`, and lifts on the next
 tick with no drag: two ticks where a press takes three. A tap is right for the gadget for the
 same reason it was wrong for the other two. The game aims a gadget at the nearest enemy by
-itself, which is exactly what the sim's `hero.gadget_target` does (SIM_OVERHAUL_PLAN.md S10), so
+itself, which is exactly what the sim's `hero.gadget_target` does (BRAWL_SIM_DESIGN.md §4), so
 there is no bearing to carry: `Buttons.aim_point` refuses the gadget, and `Controls.build` checks
 only that the tap point is on screen. One decision is still one press. The gadget shares the
 attack's single pending slot in the shadow and its contact slot in `Buttons`, and a press still
@@ -668,7 +668,7 @@ Confirmed live the same day in a real match with the gadget thrown: `hypercharge
 floor of 0.991 across 264 ticks and never moved a colour level (§5.1). Note that it held those
 values BIT-IDENTICALLY, one distinct score for the whole trace, as did `super`, while the tapped
 gadget varied across 111 -- either a lossless capture of a static region or a stale ROI, and the
-trace cannot tell which (STEPS G6.2). The anchor does not rest on it either way.
+trace cannot tell which. The anchor does not rest on it either way.
 
 **The guarantee is inertness, and it is conditional on the roster.** Mortis has no hypercharge,
 so this button is drawn and never fills, sweeps or animates. That is stronger than "the policy
@@ -1038,8 +1038,8 @@ because `zone.py` says those answer different questions — `at_least` exists fo
 map's *abstain* path where over-flagging is free, `cells` answers "is this cell in the zone" for
 the agent. The cost is that a false positive is permanent.
 
-**The `enemy_hist{k}` planes of deploy4 are past sightings, not past tracks.** Added 2026-09-21,
-SIM_OVERHAUL Step H4. Plane k draws the enemies seen k decisions ago, from the loop's snapshots,
+**The `enemy_hist{k}` planes of deploy4 are past sightings, not past tracks.** Added 2026-09-21.
+Plane k draws the enemies seen k decisions ago, from the loop's snapshots,
 at the world cell each one stood in. "Seen" is `seen_now`, the set `enemy_revealed` draws,
 because the sim's `hist_enemy_seen` is alive AND revealed: a coasted track is a prediction and is
 never recorded. A sighting is drawn only inside the block the sim's `_history_drawn` keeps,
@@ -1148,7 +1148,7 @@ issue, using the same `configs/brawlers.yaml` params the sim loads. Re-auditing 
 | `hero.facing_vec` | **shadow** | Set by our own `move_dir` / `dash_dir`. Never needed sprite orientation. |
 | `hero.dashing`, `dash_t`, `dash_dir` | **shadow** | Dash is triggered by our own attack; `dash_duration` is a kit constant. |
 | `hero.long_dash_ready`, `long_dash_frac` | **shadow** | Stopwatch since our last attack vs `long_dash_seconds`. |
-| `hero.gadget_ready`, `gadget_charge_frac` | **shadow** | Added 2026-09-21, SIM_OVERHAUL Step G5. Countdown from `gadget_cooldown` (18 s), charged at the gate and restarted by our own throw. Proprioception by design (SIM_OVERHAUL_PLAN.md S18), so no reader is built, and a canary resync leaves it alone: the ammo it compares says nothing about the gadget. |
+| `hero.gadget_ready`, `gadget_charge_frac` | **shadow** | Added 2026-09-21. Countdown from `gadget_cooldown` (18 s), charged at the gate and restarted by our own throw. Proprioception by design, so no reader is built, and a canary resync leaves it alone: the ammo it compares says nothing about the gadget. |
 | `hero.invuln` | **shadow** | Always False since 2026-09-25 (§9 entry 22): the dash grants no i-frames, so nothing seeds `ent_invuln_t` and the `-= dt` countdown only ever counts down from zero. Until then it was seeded by a DASH — not, as this row said before it was built, at spawn: `core/spawn.py` writes pos, hp, ammo, facing and alive and nothing else, and `start_dash` was the field's one writer. The slot stays for shape compatibility. |
 | `meta.time_frac` | wall clock | Seconds since the gate went true ÷ 150, **clamped to [0, 1]**. §9.6. |
 
@@ -1378,7 +1378,7 @@ letting the call site guess, since the error it prevents is a plausible integer 
 
 #### The `history` group of deploy4, BUILT 2026-09-21
 
-SIM_OVERHAUL Step H4. `configs/agent_obs_deploy4.yaml` adds a 78-float `history` group: the last
+`configs/agent_obs_deploy4.yaml` adds a 78-float `history` group: the last
 three decisions, newest first, laid out the way the sim's `core/history.py` rings hold them. It
 needs no new reader. Every column is either our own action or a number the decision already
 assembled, which is why it sits with the proprioception fields:
@@ -1847,7 +1847,7 @@ Four guards, in order:
    spec or env config edited after the run finished — the failure the add-a-file rule exists to
    prevent.
 4. **Action nvec ≠ `cfg.action_nvec` → refuse.** Catches a pre-super checkpoint, whose observation
-   still matches. *2026-09-21:* this holds as written again. SIM_OVERHAUL Step G3 first also
+   still matches. *2026-09-21:* this holds as written again. The gadget change first also
    accepted the pre-gadget `(n_move_bins + 1, 3)`; its 2026-09-21 amendment retired that, and
    a pre-gadget checkpoint is now refused with a message that names it as one.
 
@@ -1858,7 +1858,7 @@ the 44 MB checkpoint could not run on a clean checkout.
 **The mask is the shadow's, not a second copy.** `act(obs, attack_legal)` takes
 `ShadowHero.attack_mask()` verbatim and concatenates it after an all-True move half, giving the
 `[move (17), attack (4)]` layout `wrappers/sb3_vecenv.py:action_masks` produces on every training
-step (`attack (3)` until 2026-09-21; the fourth column is the gadget, SIM_OVERHAUL Step G5). The
+step (`attack (3)` until 2026-09-21; the fourth column is the gadget). The
 formula (`alive & cd <= 0 & dash_t <= 0`, plus ammo for attack and charge for super; the
 gadget's `alive & gadget_cd <= 0` sits outside that gate) lives in the shadow, which owns the
 timers it reads. One extra check: an all-False attack column
@@ -2163,15 +2163,17 @@ The four groups `assemble` needs had suppliers; `zone` did not. §9.14–§9.16 
 the operator took the call (§9.15: deploy on the current checkpoint). This is that call written
 down as code. `tests/test_deployment_zone.py`, 23 tests, in the siloed fast set.
 
-**`ZoneEstimator(cfg)` → `estimate(gas, hero_pos) -> {field: value}`.** Stateless between calls:
-everything it reports is a function of the `GasMap` handed in, so a `GasMap.reset` on a segment
-change needs no matching reset here. `hero_pos` is **world** tiles — `camera_relative +
+**`ZoneEstimator(cfg)` → `estimate(gas, hero_pos) -> {field: value}`.** Stateless between calls
+except for `active` (corrected 2026-09-30): the margins and the area are functions of the `GasMap`
+handed in, so a `GasMap.reset` on a segment change needs no matching reset for them. `active` is a
+latch that the loop clears at each match start (`ZoneEstimator.reset`, from `_begin_match`) and
+nowhere else, because a new segment empties the gas map and the sim's `zone_seen` holds all episode. `hero_pos` is **world** tiles — `camera_relative +
 odometry.position_tiles`, the frame `GasMap` deposits in.
 
 | field | supplier | honesty |
 |---|---|---|
 | `hero_margin` | four ray scans over `gassed`, ±x/±y, capped at `cfg.zone_margin_horizon_tiles` | recoverable out to a horizon |
-| `active` | `gassed.any()` | truthful, and latches for free because `GasMap` is sticky |
+| `active` | a latch over `gassed.any()`, held until the next match | truthful; `GasMap` alone would un-latch, since a new segment empties it (corrected 2026-09-30) |
 | `safe_area_frac` | `1 − gassed cells / (map_w · map_h)` over the map block | the group's weak column, knowingly |
 | `next_shrink_in` | pinned at `0.0` | a lie, priced at ≤1 SE, recorded, reversible |
 
@@ -2395,6 +2397,10 @@ The fixes are structural rather than local, because three of the four are the sa
   backend rather than a dry-run flag on the loop, for the same reason `deploy_run.py` swaps the
   backend instead of setting a boolean: there is then no path in which the two disagree.
 - `TickRow.warmup` flags the tick that paid the JIT, and the summary excludes it by name.
+- **2026-09-28:** the warm-up moved to the run's first tick, while the loop waits for the gate
+  (`DeployLoop._warm`), and the next tick's stall check leaves its cost out. On the gate's tick it
+  held up the first decision, and with the known-map localizer's landing added it made that tick
+  1.22 s in the first K5 dry run, which the 1.0 s capture-stall guard stopped as the match began.
 
 **The lesson worth keeping is about the stubs, not the bugs.** Every one of these three lived
 exactly where a test double was *simpler* than the thing it replaced — constant where the real one
@@ -2735,7 +2741,7 @@ Win rates move within noise (SE ≈ 4.5 pp), the stalls are gone, and about 3% o
 change. `policy.dead_bin_mask: false` turns it off for an A/B run; `TickRow.move_legal` records
 the bitmask the policy was handed, `-1` when it was not.
 
-**Re-measured 2026-09-24** under the camera-limited sim (OBS_PARITY_TASKS.md Status block, the
+**Re-measured 2026-09-24** under the camera-limited sim (the
 same 96-episode protocol as `scripts/probes/wall_push_measure.py`, one definition change: a
 wall-push is any chosen bin that `resolve_move` leaves in place, not only "wall cell 0.75 tiles
 ahead"). Mask off 0.056 / 0.065 of decisions (training / holdout), mask on 0.036 / 0.031; every
@@ -2789,7 +2795,7 @@ Comfortable. The risk is not steady-state, it is **unbounded growth**, so three 
    it keeps the whole budget trivially satisfied. **That includes the parallelism the libraries
    bring uninvited** — see §7.2, where their default thread pools were the lag.
 
-**Cadence columns on `TickRow` (SIM_OVERHAUL_PLAN.md Step A2).** Each decision row also records
+**Cadence columns on `TickRow`.** Each decision row also records
 what the policy was handed: `attack_legal` (the shadow's `attack_mask()` as a bitmask, bit i =
 attack column i, so `& 0b10` is "the dash was legal"), `attack_cd_shadow` and `attack_idle_t_shadow`
 (the shadow's two timers at the decision), `enemy_in_reach` (any enemy track within
@@ -3669,8 +3675,8 @@ stopped agent is recoverable by hand; an agent mashing inputs into a menu is not
     ```
 
 19. **BUILT 2026-09-24 — `agent_obs_deploy5.yaml`: the sim hero sees the screen, not a
-    hero-centred rectangle.** The observation-parity audit (`OBS_PARITY_PLAN.md` rev 3; chunks
-    C1–C11 of `OBS_PARITY_TASKS.md`) went through every place the sim hero got information the
+    hero-centred rectangle.** The observation-parity audit (BRAWL_SIM_DESIGN.md §9; chunks
+    C1–C11) went through every place the sim hero got information the
     deployed loop could not have, and closed the ones the operator decided on. Four changes, two
     of them columns.
 
@@ -3706,19 +3712,22 @@ stopped agent is recoverable by hand; an agent mashing inputs into a menu is not
     the assembler, which already writes track k to row k, reports the identity permutation. The
     rule was fitted to the tracker decision by decision (`tests/test_deployment_tracker.py`). Not
     modelled: the assembler's HP-commit delay, and which of two enemies takes a slot when both
-    qualify at once with fewer free slots than candidates.
+    qualify at once with fewer free slots than candidates. Since 2026-09-30 the live loop builds
+    its tracker from the run's `slots.*`, so an override reaches both sides; before, the live
+    tracker kept its own defaults (2, 3), the values `default.yaml` copied.
 
     **`zone.active` as a latch** (C5). 0 until gas has been on screen at least once in the
     episode, then 1 for the rest of it, which is what `ZoneEstimator.active` means live. It used
     to read 1 from the first decision whenever the zone was enabled. No column changed, only its
-    meaning.
+    meaning. Live, the latch held only within one odometry segment until 2026-09-30, when it
+    moved into `ZoneEstimator` itself (§6.12).
 
     **The spec.** `configs/agent_obs_deploy5.yaml` is deploy4 plus `hero.near_edge` and
     `slots: tracked`: `self` 26 → 27 floats, the extractor 262 → 263, every other group
     byte-identical (`tests/test_configs_files.py` pins both directions). `configs/train.yaml` still names
     deploy4 (the run passes deploy5 with `--set`, below); `configs/deployment.yaml` names the
     deploy5 run since 2026-09-25, after C12's offline gates passed. Phase 2, timing
-    the zone schedule from the game, is Z1–Z4 of the same file.
+    the zone schedule from the game, is entry 20.
 
     The run:
 
@@ -3727,7 +3736,7 @@ stopped agent is recoverable by hand; an agent mashing inputs into a menu is not
     ```
 
 20. **BUILT 2026-09-25 — the gas schedule timed from the game, trained at 1.3× its pace.**
-    Measured on eight recorded matches (`OBS_PARITY_TASKS.md` Z1, `scripts/probes/zone_probe.py`):
+    Measured on eight recorded matches (`scripts/probes/zone_probe.py`):
     the first gas comes 19 s after the loop's gate (18.1–19.7 s), then each side advances one
     tile every 6–7 s (0.14 tiles/s per side over nine clean east/west fronts), and the safe area
     reaches 2 × 2 at about 200 s. The sim's default, first gas at 12 s and a tile every 1.5 s,
@@ -3888,8 +3897,8 @@ stopped agent is recoverable by hand; an agent mashing inputs into a menu is not
     instead of parking; the next run's own eval is the number that matters.
 
     **Found on the way.** `tests/test_deployment_assemble.py`'s two parity tests had passed by
-    trajectory luck since C4: the sim ranks every alive projectile by `time_to_closest` and
-    blanks the off-screen ones under the fairness mask (the kept quirk, OBS_PARITY_TASKS.md C4),
+    trajectory luck since 2026-09-24: the sim ranks every alive projectile by `time_to_closest` and
+    blanks the off-screen ones under the fairness mask (the kept quirk, BRAWL_SIM_DESIGN.md §9),
     while the live tracker never holds an off-screen projectile, so in a frame with one the two
     paths lay their rows out differently. The fixed bots' trajectory reached such frames. The
     fixture now supplies only on-screen projectiles and both tests skip the projectile group in

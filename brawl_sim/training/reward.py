@@ -1,50 +1,35 @@
 """ShapedReward: the dense reward PPO actually trains on.
 
 Satisfies `core.reward.RewardFn` structurally (`__call__(obs, info, cfg) -> (N,) f32`), so it
-drops straight into `BrawlVecEnv(reward_fn=...)` / `BrawlSB3VecEnv(..., reward_fn=...)` with no
-inheritance. Like every other hot-path callable in this codebase it is **device-resident and
-sync-free**: no `.item()`, no `.cpu()`, no boolean indexing, no Python loop over envs. It is
-called from `env.py`'s phase 16 (`_observe`), inside `step()`.
+drops into `BrawlVecEnv(reward_fn=...)` / `BrawlSB3VecEnv(..., reward_fn=...)` with no
+inheritance. Device-resident and sync-free like every hot-path callable; called from `env.py`'s
+phase 16 (`_observe`), inside `step()`.
 
-**Why shaped and not terminal-only.** An episode runs up to `max_episode_steps` sim ticks (3000
-by default, i.e. `max_agent_steps` = 600 decisions at `action_repeat=5`) and ends in a 1-of-10
-placement; a pure win/lose signal gives PPO one bit per episode, which in practice does not get
-a policy off the ground in any reasonable wall-clock budget on this hardware. Every per-tick
-term here exists to make the credit assignment tractable, and every weight lives in
-`configs/train.yaml` so the shaping can be dialled back toward sparse (set the per-tick weights
-to 0.0) once a policy is competent, without touching this file.
+**Why shaped.** An episode is hundreds of decisions ending in a 1-of-`n_entities` placement, and
+one win/lose bit per episode does not get a policy off the ground in a reasonable budget. Every
+weight lives in `configs/train.yaml`, so the shaping can be dialled toward sparse without
+touching this file.
 
-**Every weight below is priced per SIM TICK, not per decision, and stays that way when
-`action_repeat` changes.** The delta terms (damage, kills, cubes, attacks in reach) read `info`
-fields `env.py` already summed over the decision's sub-ticks; the two rate terms read `info["alive_ticks"]` /
-`info["in_zone_ticks"]`, which count sub-ticks rather than firing once per call. So total
-episode return -- the thing PPO actually optimizes -- is invariant to `action_repeat`, and
-retuning the decision rate does not silently rescale the reward out from under a tuned config.
-`gamma` is the one knob that does NOT come along for free: it discounts per decision.
+**Every weight is priced per SIM TICK, not per decision, and stays that way when `action_repeat`
+changes.** The delta terms (damage, kills, cubes, attacks in reach, gadget hits) read `info`
+fields `env.py` already summed over the decision's sub-ticks, and the two rate terms read
+`info["alive_ticks"]` / `info["in_zone_ticks"]`, which count sub-ticks. So the episode return is
+invariant to `action_repeat`; `gamma` is the one knob that is not, since it discounts per
+decision.
 
-**Reward-hacking notes, since shaping invites it.** `damage_dealt` is capped in practice by the
-hero's own ammo/cooldown, so it can't be farmed indefinitely; `survive_per_step` is deliberately
-small relative to `win_bonus`, so hiding in a bush for 3000 ticks scores strictly worse than
-winning; `in_zone_per_step` is a flat per-tick penalty rather than proportional to zone damage,
-so it stays meaningful even at the low DPS the zone opens with. If you raise `survive_per_step`,
-re-check it against `win_bonus + rank_bonus * (n_entities - 1)` -- the terminal payoff must stay
-the dominant term or the agent will correctly learn to stall.
+**Reward-hacking notes.** `damage_dealt` is capped by the hero's ammo and cooldown.
+`survive_per_step` must stay small against `win_bonus + rank_bonus * (n_entities - 1)`, or the
+agent correctly learns to stall. `in_zone_per_step` is flat per tick rather than proportional to
+zone damage, so it means the same at the zone's opening rate as late. `hp_healed` nets out at
+worst to zero against `damage_taken` for COMBAT damage (no healing above max), but zone damage
+never enters `damage_taken_tick` (no attacker), so burning in the gas and regenerating scores
+`hp_healed` with no matching debit. At the shipped weights a second in the zone costs far more
+than regen can return, and regen is slower than the burn; if `hp_healed` is raised a lot, price
+zone damage proportionally instead.
 
-`hp_healed` is the one term that can in principle pay for taking damage, so it is worth spelling
-out why it does not. Total HP healed in an episode cannot exceed total HP lost (you cannot heal
-above max), so at `hp_healed = -damage_taken` the pair nets out at worst to zero -- for COMBAT
-damage. Zone damage is the gap: it never enters `damage_taken_tick` (no attacker, see
-core/events.py), so burning in the gas and regenerating it back scores `hp_healed` with no
-matching debit. At the shipped numbers that trade is heavily negative anyway -- a second in the
-zone costs `20 ticks * in_zone_per_step` (-1.0) and returns at most `0.20 * max_hp * hp_healed`
-(+0.12 at 6000 max HP and 1e-4), and the regen it takes to earn that back runs at 0.13/s against
-the zone's 0.20/s, i.e. slower than the burn. Raising `hp_healed` past roughly `-5 *
-in_zone_per_step / (zone_fraction_per_second * max_hp)` flips the sign of that arithmetic; if you
-do, price zone damage proportionally instead of with a flat per-tick penalty.
-
-**The returned tensor is a shared, preallocated buffer** (same contract as `core.reward
-.ZeroReward`): callers must treat it as read-only, since the next `step()` overwrites it in
-place. `EpisodeStats` and `BrawlSB3VecEnv` both already do (they copy out of it, never into it).
+**The returned tensor is a shared, preallocated buffer** (same contract as
+`core.reward.ZeroReward`): callers must treat it as read-only, since the next `step()`
+overwrites it in place. `EpisodeStats` and `BrawlSB3VecEnv` copy out of it.
 """
 import torch
 
@@ -57,17 +42,14 @@ _HERO = 0
 TERM_NAMES = (
     "damage_dealt", "damage_taken", "hp_healed", "kill", "cube_pickup",
     "survive_per_step", "in_zone_per_step", "win_bonus", "death_penalty", "rank_bonus",
-    "attack_in_reach",
+    "attack_in_reach", "gadget_hit",
 )
 
 
 class ShapedReward:
-    """See module docstring. `track_terms=True` additionally accumulates each term's batch sum
-    into a device-side scalar, so `training/callbacks.py` can log the per-term contribution
-    breakdown once per rollout (one host sync per rollout, not per step). That costs one extra
-    small reduction kernel per enabled term per tick -- a few percent on a launch-bound sim, and
-    worth it while you're still tuning weights. Set it False for a production run with settled
-    weights."""
+    """See module docstring. `track_terms=True` also accumulates each term's batch sum on device,
+    so `training/callbacks.py` can log the per-term breakdown once per rollout (one host sync per
+    rollout, not per step), at the cost of one small reduction per enabled term per tick."""
 
     def __init__(self, cfg: RewardConfig, track_terms: bool = True) -> None:
         self.cfg = cfg
@@ -84,10 +66,9 @@ class ShapedReward:
 
     def __call__(self, obs: dict, info: dict, cfg) -> torch.Tensor:
         w = self.cfg
-        # `obs` is deliberately unread: every field this used to take from it (hero alive/in_zone)
-        # now comes from `info`, which -- unlike `obs` -- is aggregated and latched over the whole
-        # decision rather than describing only its final sim tick. The argument stays because
-        # `core.reward.RewardFn` defines the signature and other reward functions do use it.
+        # `obs` is deliberately unread: `info` is aggregated and latched over the whole decision,
+        # while `obs` describes only its final sim tick. The argument stays because
+        # `core.reward.RewardFn` defines the signature.
         terminated, truncated = info["terminated"], info["truncated"]
         done = terminated | truncated
 
@@ -98,17 +79,15 @@ class ShapedReward:
         if w.damage_dealt != 0.0:
             self._add(reward, "damage_dealt", info["damage_dealt_tick"][:, _HERO], w.damage_dealt)
         if w.damage_taken != 0.0:
-            # damage_taken_tick is COMBAT damage only (it's a projection of the attacker x victim
-            # matrix, and zone damage has no attacker). Zone pressure is priced by
-            # in_zone_per_step instead, deliberately: a flat per-tick cost reads the same at the
-            # zone's opening DPS as at its escalated late-game DPS.
+            # damage_taken_tick is COMBAT damage only (a projection of the attacker x victim
+            # matrix; zone damage has no attacker). Zone pressure is priced by in_zone_per_step,
+            # a flat per-tick cost that reads the same at the zone's opening rate as late.
             self._add(reward, "damage_taken", info["damage_taken_tick"][:, _HERO], w.damage_taken)
         if w.hp_healed != 0.0:
-            # The counterpart to damage_taken, and priced at its mirror image (+1e-4 against
-            # -1e-4) so a wound the hero out-regens or lifesteals back is a wash rather than a
-            # permanent debt. hp_healed_tick is HP ACTUALLY restored -- healing at full HP, or a
-            # dead hero's pending lifesteal, is already zeroed by core/combat.py's clamps -- so
-            # this term is bounded per episode by the HP the hero has actually lost.
+            # damage_taken's counterpart (train.yaml prices it as the mirror image), so a wound
+            # the hero out-regens or lifesteals back is a wash. hp_healed_tick is HP ACTUALLY
+            # restored (core/combat.py's clamps zero overheal and a dead hero's pending lifesteal),
+            # so the term is bounded per episode by the HP the hero has lost.
             self._add(reward, "hp_healed", info["hp_healed_tick"][:, _HERO], w.hp_healed)
         if w.kill != 0.0:
             self._add(reward, "kill", info["kills_tick"][:, _HERO], w.kill)
@@ -139,16 +118,23 @@ class ShapedReward:
             places_above_last = torch.clamp(cfg.n_entities - 1 - rank, min=0)
             self._add(reward, "rank_bonus", done * places_above_last, w.rank_bonus)
 
-        # ---- shaping on the hero's own attack (SIM_OVERHAUL_PLAN.md §9 R2, 2026-09-21) ----
+        # ---- attack shaping (user decision, 2026-09-21; BRAWL_SIM_DESIGN.md §10) ----
         if w.attack_in_reach != 0.0:
             # A count, like `kill`: attacks and supers the hero made while an enemy it could see
-            # stood inside its uncharged dash reach -- the cadence audit's utilization criterion,
-            # which A1 measured at 0.339 (core/events.py, env.py's attack phase). At most one per
-            # decision. Blunt on purpose: a dash AWAY from that enemy and a miss are paid too. Ammo
-            # and cooldown bound it at one per legal attack; at the shipped 0.05, a whole 150 s
-            # episode of in-reach attacks is worth about 3 (some 55 at Mortis's 2.85 s sustained
-            # rate, plus at most one super per five landed hits), against 10 for a win.
+            # stood inside its uncharged dash reach (core/events.py, env.py's attack phase), at
+            # most one per decision. Blunt on purpose: a dash AWAY from that enemy and a miss are
+            # paid too. Ammo and cooldown bound it at one per legal attack, so at the shipped 0.05
+            # a whole episode of in-reach attacks is worth a few units, against 10 for a win.
             self._add(reward, "attack_in_reach", info["attack_in_reach_tick"], w.attack_in_reach)
+
+        # ---- gadget shaping (user decision, 2026-09-30; BRAWL_SIM_DESIGN.md §10) ----
+        if w.gadget_hit != 0.0:
+            # A count: landings of the hero's gadget spinner that hurt at least one player
+            # (core/events.py, env.py's projectile phase). One per landing however many players
+            # it catches, and none for a spinner that lands only on crates or on nothing. Paid on
+            # top of what `damage_dealt` pays for the same blast. The 18 s cooldown bounds it: at
+            # the shipped 0.3 a match of landed spinners is worth about 3, against 10 for a win.
+            self._add(reward, "gadget_hit", info["gadget_hit_tick"], w.gadget_hit)
 
         if w.scale != 1.0:
             reward.mul_(w.scale)

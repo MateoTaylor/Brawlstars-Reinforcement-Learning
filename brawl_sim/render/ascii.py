@@ -1,39 +1,30 @@
-"""render_ascii: a text-mode renderer for one CPU snapshot (core.state.snapshot). See
-BRAWL_SIM_BUILD_PLAN.md Step 37.
+"""render_ascii: a text-mode renderer for one CPU snapshot (core.state.snapshot).
 
 **Signature stays exactly `(snapshot, bank, cfg, mode)` -- no `params`/`state`/`bots` import.**
-Two things the plan's char legend and `mode="agent"` need aren't part of raw `SimState` at all:
+Two things the char legend and `mode="agent"` need aren't part of raw `SimState`:
 `revealed_to_hero` (a `bots/perception.visibility` OUTPUT, not stored state) and `max_ammo` (a
-`SimParams` field, not a `SimState` one). Rather than take extra parameters or import `bots/`
-into `render/` (this package has never needed a `core/`-vs-`bots/` layering rule before now, and
-introducing one late for a debug tool felt like the wrong tradeoff), both are OPTIONAL EXTRA
-KEYS a caller may add to the plain `core.state.snapshot()` dict before calling this function --
-`scripts/record_rollout.py` (this same step) computes and adds them every frame. A bare
-`state.snapshot(state, i)` dict still renders correctly in `"world"`/`"view"` mode (every bot
-just reads as revealed/uppercase, ammo pips fall back to a plain number); `mode="agent"` raises
-a clear `ValueError` if `revealed_to_hero` is missing, since there's no sane default for "which
-enemies is the hero allowed to see."
+`SimParams` field). Both are OPTIONAL EXTRA KEYS a caller adds to the plain
+`core.state.snapshot()` dict, so `render/` never imports `bots/`; `scripts/record_rollout.py`
+adds them every frame. A bare `state.snapshot(state, i)` dict still renders in
+`"world"`/`"view"` mode (every bot reads as revealed/uppercase, ammo pips fall back to a plain
+number); `mode="agent"` raises a `ValueError` without `revealed_to_hero`, since there's no sane
+default for "which enemies is the hero allowed to see."
 
-**`mode="agent"` is a deliberately scoped-down reading of "exactly what `AgentObsSpec(fair=True)`
-exposes."** It reuses the `"view"` mode's egocentric crop and omits bush-hidden bots (the one
-behavior Step 37's own acceptance criterion tests), but does NOT reproduce `AgentObsSpec`'s
-finer-grained gating -- e.g. projectiles are still shown even when they'd be gated by `in_view`
-under the real fair spec. Reproducing that exactly would mean rebuilding the full `obs_select`
-pipeline (which needs live GPU tensors, not a numpy snapshot) inside a text debug renderer;
-out of scope for what this step actually needs. Noted here as a forward pointer, not silently
-glossed over.
+**`mode="agent"` is a scoped-down reading of what `AgentObsSpec(fair=True)` exposes.** It reuses
+the `"view"` crop and omits bush-hidden bots, but does NOT reproduce the spec's finer-grained
+gating -- e.g. projectiles still show where the fair spec would gate them by `in_view`. Matching
+it exactly would mean rebuilding the `obs_select` pipeline (which needs live GPU tensors, not a
+numpy snapshot) inside a text debug renderer.
 
-**Overlay priority (highest wins a cell, ties keep whatever painted first):** hero > bot > box >
+**Overlay priority (highest wins a cell, ties go to whatever paints last):** hero > bot > box >
 projectile > pickup > obstacle terrain (wall/bush/water/fence) > zone marker > floor terrain.
 Obstacles always show through the zone marker (walls don't move because of the zone); the zone
 marker only ever replaces plain floor, never an obstacle or an occupant.
 
-**"revealed" and "inside the crop window" are two different gates in `"view"`/`"agent"` mode,**
-found while writing this module's own tests: a bot can be `revealed_to_hero` (bush/targeting
-visibility) while still standing outside the `view_h x view_w` egocentric crop -- it simply
-won't be drawn either way, same as the real `obs["view"]` grid, which is also spatially cropped
-independent of bush-hiding. `mode="world"` has no crop (the whole map is in range), so this
-distinction only matters for `"view"`/`"agent"`.
+**"revealed" and "inside the crop window" are separate gates in `"view"`/`"agent"` mode:** a bot
+can be `revealed_to_hero` and still stand outside the `view_h x view_w` crop, and then it isn't
+drawn, same as the real `obs["view"]` grid, which is cropped independently of bush-hiding.
+`mode="world"` has no crop.
 """
 import numpy as np
 
@@ -68,8 +59,8 @@ _MODES = ("world", "view", "agent")
 
 
 def status_line(snapshot: dict) -> str:
-    """Shared with render/viewer.py (Step 38) so both renderers report identical HP/ammo/cubes/
-    dash text for the same frame -- one formatting rule, not two copies that can drift."""
+    """Shared with render/viewer.py so both renderers report identical HP/ammo/cubes/dash text
+    for the same frame -- one formatting rule, not two copies that can drift."""
     hp = float(snapshot["ent_hp"][_HERO])
     max_hp = float(snapshot["ent_max_hp"][_HERO])
     ammo = float(snapshot["ent_ammo"][_HERO])
@@ -121,8 +112,8 @@ def render_ascii(snapshot: dict, bank, cfg, mode: str = "world") -> str:
     chars = np.full((out_h, out_w), _OUT_OF_MAP_CHAR, dtype="<U1")
     # Sentinel LOWER than every real priority (including _P_FLOOR=0) -- out-of-map cells stay
     # "#" because the terrain loop below never calls paint() for them (bounded by the real map
-    # intersection), not because this sentinel outranks anything. A sentinel >= _P_FLOOR would
-    # (and, before this fix, did) block ordinary floor tiles from ever painting over it.
+    # intersection), not because this sentinel outranks anything. A sentinel above _P_FLOOR would
+    # block ordinary floor tiles from ever painting over it.
     prio = np.full((out_h, out_w), _P_FLOOR - 1, dtype=np.int64)
 
     def paint(ix: int, iy: int, ch: str, p: int) -> None:

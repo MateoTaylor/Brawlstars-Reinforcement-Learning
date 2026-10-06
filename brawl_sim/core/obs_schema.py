@@ -1,22 +1,20 @@
-"""OBS_SCHEMA: the single source of truth for every field build_obs (Step 25) can produce --
-shape (symbolic dims, resolved per-cfg by obs_spec), dtype, units, range, description, and
-whether it's gated under entities.privileged or a cfg toggle. See BRAWL_SIM_BUILD_PLAN.md
-Step 26.
+"""OBS_SCHEMA: the single source of truth for every field build_obs can produce -- shape
+(symbolic dims, resolved per-cfg by obs_spec), dtype, units, range, description, and whether
+it is gated under entities.privileged or a cfg toggle. scripts/dump_obs_schema.py renders it
+into docs/OBSERVATION.md.
 
-Kept as one declarative table (`_ROWS`, one row per leaf field) rather than ~130 hand-written
-dict literals -- the same "declarative table + a small builder" shape config.py's
-PER_KIND_FIELDS/PER_ENV_FIELDS and state.py's _ENTITY_FIELDS already use for a long,
-mechanically similar list that has to stay in sync with real code. `_ROWS`' order matches
-`core/observation.py`'s own dict-construction order exactly (hero, hist, entities [+ privileged],
-projectiles, boxes, pickups, zone, visibility, view, world, action_mask, meta) -- describe_obs
-and dump_obs_schema.py both render top-to-bottom in this order for free, no separate sort key.
+One declarative row per leaf field (`_ROWS`), in build_obs's dict order (hero, hist, entities
+[+ privileged], projectiles, boxes, pickups, zone, slots, visibility, view, world, action_mask,
+meta). dump_obs_schema.py orders the groups by its own `_GROUP_ORDER` and keeps this table's
+order within each.
 
-Shape dims are either "N" (batch size -- left unresolved even by obs_spec, since n_envs isn't
-part of EnvConfig, it's a separate argument to env construction), a plain int (fixed regardless
-of cfg), or one of the symbols in _DIM_RESOLVERS (resolved against a real EnvConfig by
-obs_spec). `range` is `None` wherever a field's bound is either unbounded or cfg-dependent
-(e.g. position, bounded by map_w/map_h but not by a fixed constant) -- it's best-effort
+Shape dims are "N" (batch size, left unresolved even by obs_spec: n_envs is not part of
+EnvConfig), a plain int, or a symbol in _DIM_RESOLVERS (resolved against a real EnvConfig by
+obs_spec). `range` is None where a bound is unbounded or cfg-dependent (e.g. position); it is
 documentation, not something validate_obs enforces.
+
+`hero.rank` is 1-indexed (1 = best) and derived live by `observation.compute_rank`: every alive
+entity ties at n_alive. `info["hero_rank"]` is the same placement 0-indexed.
 """
 from dataclasses import dataclass
 
@@ -92,7 +90,7 @@ _ROWS: tuple[tuple, ...] = (
     ("hero.gadget_ready", ("N",), "bool", "bool", None, "Gadget is charged and legal to throw this tick; equals action_mask.attack[:, 3].", False, None),
     ("hero.gadget_charge_frac", ("N",), "float32", "fraction", (0.0, 1.0), "1 - gadget_cd / gadget_cooldown; 1.0 = charged, 0.0 for a kind without a gadget.", False, None),
     ("hero.attack_idle_t", ("N",), "float32", "seconds", (0.0, None), "Seconds since the hero last attacked (resets on attack only, not on damage).", False, None),
-    ("hero.invuln", ("N",), "bool", "bool", None, "invuln_t > 0. Always False since 2026-09-25: the dash grants no i-frames; the slot stays for shape compatibility.", False, None),
+    ("hero.invuln", ("N",), "bool", "bool", None, "invuln_t > 0. Always False: nothing grants i-frames (the dash has none); the slot keeps the obs shape.", False, None),
     ("hero.in_bush", ("N",), "bool", "bool", None, "Standing on a BUSH tile.", False, None),
     ("hero.in_zone", ("N",), "bool", "bool", None, "Outside the safe rect (in the damaging area).", False, None),
     ("hero.near_edge", ("N",), "bool", "bool", None, "The camera has stopped following the hero: |hero - cam| > camera.edge_flag_tiles on either axis (core/camera.py). Live: the player box's offset from its nominal screen anchor.", False, None),
@@ -103,7 +101,7 @@ _ROWS: tuple[tuple, ...] = (
     ("hero.shots_fired", ("N",), "int32", "count", (0, None), "Shots/dashes fired this episode.", False, None),
     ("hero.rank", ("N",), "int64", "index", (1, None), "1 = best placement so far; see obs_schema module docstring.", False, None),
 
-    # ---- hist: the last K = history_frames decisions, newest first (Phase H) ------------
+    # ---- hist: the last K = history_frames decisions, newest first ----------------------
     ("hist.valid", ("N", "K"), "bool", "bool", None, "Slot k holds the decision k+1 back; every other hist field is 0 where this is False.", False, None),
     ("hist.move_onehot", ("N", "K", "MOVE"), "uint8", "onehot", (0, 1), "One-hot of the move bin chosen then (0 = idle).", False, None),
     ("hist.attack_onehot", ("N", "K", "ATTACK"), "uint8", "onehot", (0, 1), "One-hot of the attack chosen then: [no-fire, attack, super, gadget] plus [auto-aim] under action.auto_aim.", False, None),
@@ -145,7 +143,7 @@ _ROWS: tuple[tuple, ...] = (
     ("entities.dist_rank", ("N", "E"), "int64", "index", (0, None), "0 = nearest to hero; a permutation of 0..E-1.", False, None),
     ("entities.revealed_to_hero", ("N", "E"), "bool", "bool", None, "On screen and not concealed by a bush (core/camera.hero_view).", False, None),
     ("entities.hero_revealed_to", ("N", "E"), "bool", "bool", None, "This entity currently sees the hero.", False, None),
-    ("entities.los_from_hero", ("N", "E"), "bool", "bool", None, "Clear physical (wall-only) line of sight from the hero.", False, None),
+    ("entities.los_from_hero", ("N", "E"), "bool", "bool", None, "Clear physical (wall-only) line of sight from the hero.", False, "obs_include_raw_los"),
     ("entities.hidden_by_bush", ("N", "E"), "bool", "bool", None, "In a bush and not revealed; off screen counts as not revealed.", False, None),
     ("entities.death_step", ("N", "E"), "int32", "ticks", (-1, None), "step_count at death, or -1 if never died.", False, None),
     ("entities.death_cause", ("N", "E"), "int32", "enum", (0, 2), "brawl_sim.constants.DeathCause value.", False, None),
@@ -174,7 +172,7 @@ _ROWS: tuple[tuple, ...] = (
     ("projectiles.owner_kind", ("N", "P"), "int64", "enum", (0, 7), "Kind of the owning entity.", False, None),
     ("projectiles.damage", ("N", "P"), "float32", "hp", (0.0, None), "Damage on hit.", False, None),
     ("projectiles.radius", ("N", "P"), "float32", "tiles", (0.0, None), "Collision radius.", False, None),
-    ("projectiles.aoe", ("N", "P"), "float32", "tiles", (0.0, None), "AoE radius (lobbed projectiles only; 0 otherwise).", False, None),
+    ("projectiles.aoe", ("N", "P"), "float32", "tiles", (0.0, None), "Artillery blast or hazard radius; 0 otherwise.", False, None),
     ("projectiles.class", ("N", "P"), "int64", "enum", (0, 2), "brawl_sim.constants.ProjClass: how it moves and damages.", False, None),
     ("projectiles.class_onehot", ("N", "P", 3), "uint8", "onehot", (0, 1), "One-hot of class, N_PROJ_CLASSES=3 wide (PROJECTILE/ARTILLERY/HAZARD).", False, None),
     ("projectiles.lobbed", ("N", "P"), "bool", "bool", None, "class == ARTILLERY; kept as a convenience alias.", False, None),
@@ -227,7 +225,7 @@ _ROWS: tuple[tuple, ...] = (
 
     # ---- visibility ----------------------------------------------------------------------
     ("visibility.vis", ("N", "E", "E"), "bool", "bool", None, "vis[i,j]: i sees j (bush-aware targeting visibility).", False, None),
-    ("visibility.los", ("N", "E", "E"), "bool", "bool", None, "los[i,j]: clear physical (wall-only) line of sight i -> j.", False, None),
+    ("visibility.los", ("N", "E", "E"), "bool", "bool", None, "los[i,j]: clear physical (wall-only) line of sight i -> j.", False, "obs_include_raw_los"),
     ("visibility.dist_matrix", ("N", "E", "E"), "float32", "tiles", (0.0, None), "Pairwise entity distances.", False, None),
 
     # ---- grids -----------------------------------------------------------------------------
@@ -291,9 +289,8 @@ def _flatten(node, prefix: str = "") -> dict:
 def validate_obs(obs: dict, cfg) -> None:
     """Raises ValueError with the specific field(s) and reason on any mismatch: missing/extra
     fields (relative to obs_spec(cfg)), wrong shape, wrong dtype, or non-finite floats. Passes
-    silently on a well-formed observation. Not sync-free (does host-transferring .item()-free
-    checks only, but raises via Python control flow) -- a validation/debug utility, not part of
-    the hot path."""
+    silently on a well-formed observation. Not sync-free (the finiteness check reads back to
+    the host): a validation/debug utility, never on the hot path."""
     spec = obs_spec(cfg)
     flat = _flatten(obs)
 
@@ -320,92 +317,6 @@ def validate_obs(obs: dict, cfg) -> None:
 
         if value.is_floating_point() and not torch.isfinite(value).all():
             raise ValueError(f"{name}: contains NaN/Inf")
-
-
-def _fmt_scalar(v: torch.Tensor) -> str:
-    if v.dtype == torch.bool:
-        return "T" if bool(v) else "F"
-    if v.is_floating_point():
-        return f"{v.item():.3g}"
-    return str(v.item())
-
-
-def _fmt_vec(v: torch.Tensor) -> str:
-    return "(" + ", ".join(f"{x:.3g}" for x in v.tolist()) + ")"
-
-
-_HERO_DESCRIBE_FIELDS = (
-    "pos", "hp_frac", "ammo", "cubes", "alive", "in_bush", "in_zone",
-    "dashing", "can_attack", "gadget_ready", "invuln", "rank",
-)
-_MAX_ROWS_PER_GROUP = 8
-
-
-def describe_obs(obs: dict, env_index: int = 0) -> str:
-    """Pretty-prints ONE env's observation for a human, with names/values/units -- a debug/
-    logging utility, like state.snapshot and to_numpy below: never call this from the hot path
-    (it does plenty of host-transferring .item()/.tolist() calls by design). Summarizes rather
-    than dumping the big per-slot/grid/matrix fields in full, so a debug_tiny observation fits
-    on one screen."""
-    meta = obs["meta"]
-    lines = [
-        f"=== env {env_index}  map={int(meta['map_id'][env_index])}  "
-        f"t={meta['time'][env_index].item():.2f}s  step={int(meta['step_count'][env_index])}  "
-        f"n_alive={int(meta['n_alive'][env_index])} ==="
-    ]
-
-    hero = obs["hero"]
-    lines.append("-- hero --")
-    for name in _HERO_DESCRIBE_FIELDS:
-        v = hero[name][env_index]
-        lines.append(f"  {name}: {_fmt_vec(v) if v.dim() > 0 else _fmt_scalar(v)}")
-
-    ent = obs["entities"]
-    E = ent["alive"].shape[1]
-    lines.append(f"-- entities (E={E}) --")
-    for e in range(E):
-        if not bool(ent["alive"][env_index, e]):
-            lines.append(f"  [{e}] dead (death_step={int(ent['death_step'][env_index, e])})")
-            continue
-        lines.append(
-            f"  [{e}] kind={int(ent['kind'][env_index, e])} pos={_fmt_vec(ent['pos'][env_index, e])} "
-            f"hp_frac={ent['hp_frac'][env_index, e].item():.2f} dist={ent['dist'][env_index, e].item():.1f} "
-            f"revealed={bool(ent['revealed_to_hero'][env_index, e])}"
-        )
-
-    for group_name in ("projectiles", "boxes", "pickups"):
-        group = obs[group_name]
-        alive = group["alive"][env_index]
-        idx = torch.nonzero(alive, as_tuple=False).squeeze(-1).tolist()
-        lines.append(f"-- {group_name} ({len(idx)}/{alive.shape[0]} alive) --")
-        for i in idx[:_MAX_ROWS_PER_GROUP]:
-            lines.append(f"  [{i}] pos={_fmt_vec(group['pos'][env_index, i])} dist={group['dist'][env_index, i].item():.1f}")
-        if len(idx) > _MAX_ROWS_PER_GROUP:
-            lines.append(f"  ... and {len(idx) - _MAX_ROWS_PER_GROUP} more")
-
-    zone = obs["zone"]
-    lines.append(
-        f"-- zone -- active={bool(zone['active'][env_index])} step={int(zone['step'][env_index])} "
-        f"dps={zone['dps'][env_index].item():.0f} safe_frac={zone['safe_area_frac'][env_index].item():.2f}"
-    )
-
-    vis = obs["visibility"]["vis"][env_index]
-    n_seen = max(int(vis[0].sum()) - 1, 0)  # exclude self
-    lines.append(f"-- visibility -- hero sees {n_seen} other entities")
-
-    if "view" in obs:
-        v = obs["view"][env_index]
-        lines.append(f"-- view -- shape={tuple(v.shape)} wall_frac={(v[0] > 0).float().mean().item():.2f}")
-    if "world" in obs:
-        lines.append(f"-- world -- shape={tuple(obs['world'][env_index].shape)}")
-
-    am = obs["action_mask"]
-    lines.append(
-        f"-- action_mask -- move_legal={int(am['move'][env_index].sum())}/{am['move'].shape[1]} "
-        f"attack={am['attack'][env_index].tolist()}"
-    )
-
-    return "\n".join(lines)
 
 
 def to_numpy(obs):

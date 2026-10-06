@@ -1,24 +1,18 @@
-# DEPLOYABLE agent view, fourth pass -- configs/agent_obs_deploy3.yaml plus the gadget pair in
-# `self`, a new `history` group, and three `enemy_hist` planes at the end of the grid
-# (SIM_OVERHAUL_PLAN.md Phases G and H). `enemies`, `projectiles` and `zone` are byte-identical to
-# the parent's; tests/test_configs_files.py pins that.
+# DEPLOYABLE agent view, fourth of the deploy line: configs/agent_obs_deploy3.yaml plus the gadget
+# pair in `self`, a `history` group, and three `enemy_hist` planes at the end of the grid.
+# `enemies`, `projectiles` and `zone` are byte-identical to the parent's;
+# tests/test_configs_files.py pins that.
 #
 #   python scripts/train.py --set run.agent_obs=configs/agent_obs_deploy4.yaml
 #
-# WHY A SIXTH FILE RATHER THAN AN EDIT
-# ------------------------------------
-# Same reason as the last three. `runs/*/train.yaml` names its spec BY PATH. agent_obs_deploy3.yaml
-# is what every pre-gadget run trained on; widening it would make it mean two different widths
-# depending on when you read it.
-#
-# WHAT CHANGED (2026-09-21)
-# -------------------------
-#   self      + hero.gadget_ready, hero.gadget_charge_frac (Step G4), right after the super pair so
-#             the three ability pairs read together: long dash, super, gadget. `gadget_ready` is
-#             the action mask's gadget column (alive and off cooldown); the fraction runs 0 -> 1
-#             over the 18 s cooldown and reads 1.0 at the match start.
-#   history   NEW (Step H2). The hero's own last three decisions, newest first. Slot k is the
-#             observation k+1 decisions back and the action that answered it:
+# WHAT THIS ADDS
+# --------------
+#   self      + hero.gadget_ready, hero.gadget_charge_frac, right after the super pair so the three
+#             ability pairs read together: long dash, super, gadget. `gadget_ready` is the action
+#             mask's gadget column (alive and off cooldown); the fraction runs 0 -> 1 over the
+#             18 s cooldown and reads 1.0 at the match start.
+#   history   The hero's own last three decisions, newest first. Slot k is the observation k+1
+#             decisions back and the action that answered it:
 #               hist.valid          whether the slot holds a real decision yet
 #               hist.move_onehot    the move bin chosen, 17 wide
 #               hist.attack_onehot  the attack column chosen, 4 wide (0 none, 1 attack, 2 super,
@@ -35,37 +29,29 @@
 #             inside the 9 x 9 tile block around the hero's tile NOW (`history_radius_tiles: 4`,
 #             Chebyshev on tile indices). `fair` passes them: a plane only ever holds a sighting.
 #
-# Normalization is the existing units' (plan section 5, "Keep it"): hist.hp divides by the HP
-# scale like hero.hp, and hist.displacement by max(map_w, map_h) like entities.rel_pos, so one tile
-# reads 0.017 on the 60-tile map.
+# Normalization uses the existing units: hist.hp divides by the HP scale like hero.hp, and
+# hist.displacement by max(map_w, map_h) like entities.rel_pos, so one tile reads 0.017 on the
+# 60-tile map.
 #
+# WIDTHS: self 26 floats (the gadget pair is columns 22 and 23), history 78, grid (13, 13, 21).
 # Six groups is obs_select._MAX_GROUPS: each group is its own device-to-host copy. The next field
 # joins an existing group; a seventh group will not load.
 #
-# ------------------------------------------------------------------------------------------------
-# DEPLOYABLE since Step H4 (2026-09-21) -- what supplies the new fields
-# ------------------------------------------------------------------------------------------------
-# Every new field passes the deploy rule: the live loop supplies it without a new detector.
-#   hero.gadget_ready,       ShadowHero.observe() (Step G5.1). Proprioception, plan S18: charged
-#   hero.gadget_charge_frac  at the match gate, 18 s from each modelled press, the way the shadow
-#                            already owns attack_cd. No CV read of the button.
-#   hist.*                   the assembler's `history` supplier (Step H4.2), from DeployLoop's
-#                            deque of per-decision snapshots (H4.1), each taken after shadow.act:
-#                            the move bin sent, the attack the shadow modelled, the HP numeral
-#                            read, the shadow's ammo before the shot, and the hero's world
-#                            position. A skipped decision takes no snapshot, and the deque empties
-#                            at the match gate and on a new odometry segment.
-#   enemy_hist1..3           GridBuilder (Step H4.3), drawing the enemies each snapshot saw
-#                            (Track.seen_now) with the sim's block rule exactly
-#                            (observation._history_drawn).
-# tests/test_deployment_loop.py and tests/test_deployment_zone.py glob this file and serve it like
-# every other deploy spec; tests/test_deployment_grid.py and tests/test_deployment_assemble.py
-# check it against the sim cell for cell and byte for byte. SIM_OVERHAUL_STEPS.md Step G6 must
-# still land before a live run of a checkpoint that presses the gadget: the gadget is the match
-# gate's anchor.
-#
-# WIDTH CHANGES: self 24 -> 26 floats (the gadget pair is columns 22 and 23), a new 78-float
-# `history` group, grid (10, 13, 21) -> (13, 13, 21). Not a checkpoint swap; train from scratch.
+# WHAT SUPPLIES THE NEW FIELDS LIVE (no new detector)
+# ---------------------------------------------------
+#   hero.gadget_ready,       ShadowHero.observe(). Proprioception: charged at the match gate,
+#   hero.gadget_charge_frac  18 s from each modelled press, the way the shadow owns attack_cd.
+#                            No CV read of the button.
+#   hist.*                   the assembler's `history` supplier, from DeployLoop's deque of
+#                            per-decision snapshots, each taken after shadow.act: the move bin
+#                            sent, the attack the shadow modelled, the HP numeral read, the
+#                            shadow's ammo before the shot, and the hero's world position. A
+#                            skipped decision takes no snapshot, and the deque empties at the
+#                            match gate and on a new odometry segment.
+#   enemy_hist1..3           GridBuilder, drawing the enemies each snapshot saw (Track.seen_now)
+#                            with the sim's block rule exactly (observation._history_drawn).
+# tests/test_deployment_grid.py and tests/test_deployment_assemble.py check it against the sim
+# cell for cell and byte for byte.
 fair: true
 normalize: true
 groups:

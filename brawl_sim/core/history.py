@@ -1,18 +1,16 @@
-"""Observation history rings (SIM_OVERHAUL_PLAN.md Phase H, Step H1).
-
-The policy has no recurrent memory, and that is fine -- what it gets instead is the last
-`cfg.history_frames` DECISIONS of a few things, kept by the sim in per-env ring buffers
-(core/state `hist_*`, newest at slot 0) and read back by the observation (Step H2: the hero's own
-hp/ammo/action trail plus three local grid channels of where enemies were seen).
+"""Observation history rings. The policy has no recurrent memory, so the sim keeps the last
+`cfg.history_frames` DECISIONS in per-env rings (core/state `hist_*`, newest at slot 0), which
+the observation reads back as the hero's hp/ammo/action trail (`obs["hist"]`) and one enemy_hist
+grid plane per slot (core/observation.py).
 
 `push` is the only writer besides `state.zero_`, which is what a reset does to the rings and what
-"no history yet" means: `hist_valid` all False. It is called from `env.step` BEFORE the world
-advances, with the action the policy just chose and the visibility `_build_observation` computed
-for the observation that action answered. Slot 0 therefore describes exactly the state the policy
-looked at, paired with what it did about it -- which is the pairing a frame stack is for.
+"no history yet" means: `hist_valid` all False. `env.step` calls it BEFORE the world advances,
+with the action the policy just chose and the `hero_view` `_build_observation` computed for the
+observation that action answered, so slot 0 pairs the state the policy looked at with what it
+did about it.
 
-Per decision, not per sim tick: it runs outside `_run_tick`, once per `step()`, whatever
-`action_repeat` is. Everything below is slice copies and boolean ops on the device; no host reads.
+Per decision, not per sim tick: once per `step()`, outside `_run_tick`, whatever `action_repeat`
+is. Slice copies and boolean ops on the device; no host reads.
 """
 import torch
 
@@ -34,7 +32,7 @@ def push(state, action: torch.Tensor, hero_view: torch.Tensor) -> None:
 
     `hero_view` is `core/camera.hero_view`'s (N,E) for the observation this action answers:
     the hero's reveal, concealment AND the camera window, so a sighting the screen never showed
-    is never remembered either (OBS_PARITY_TASKS.md C3).
+    is never remembered either.
     """
     depth = state.hist_valid.shape[1]
     for name in RING_FIELDS:

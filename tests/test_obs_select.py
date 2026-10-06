@@ -205,8 +205,42 @@ def test_projectile_group_selects_k_nearest_by_time_to_closest_and_zero_pads():
     assert torch.equal(out["projectiles"], torch.zeros_like(out["projectiles"]))
 
 
+def test_tied_projectiles_go_nearest_first_whichever_slots_hold_them():
+    """Everything moving away from the hero reads `time_to_closest` exactly 0, so ties are the
+    common case, and `topk` left their order to the slot layout: the sim's scattered slots and
+    deployment's packed list came out different. Ties now go nearest the
+    hero first. The nearest projectile of all still ranks after every tie when its time is later,
+    and dead slots, which keep stale values in the sim, never rank."""
+    cfg = _cfg()
+    path = _write_spec({"fair": False, "normalize": False, "groups": [{
+        "name": "projectiles", "per_entity": True, "max_slots": 3,
+        "fields": ["projectiles.rel_pos", "projectiles.time_to_closest"]}]})
+    try:
+        spec = obs_select.load_agent_spec(path, cfg)
+    finally:
+        os.remove(path)
+    buffers = obs_select.make_agent_obs_buffers(spec, cfg, n_envs=1, device="cpu")
+    P = cfg.max_projectiles
+    # (rel_pos, time_to_closest): four ties at 0, at distances 4, 1, 3 and 2, then the nearest of
+    # all at a later time. Rows come out as (rel_pos x, rel_pos y, time_to_closest).
+    live = [((4.0, 0.0), 0.0), ((0.0, -1.0), 0.0), ((3.0, 0.0), 0.0), ((0.0, 2.0), 0.0),
+            ((0.5, 0.0), 0.2)]
+    want = torch.tensor([[0.0, -1.0, 0.0], [0.0, 2.0, 0.0], [3.0, 0.0, 0.0]])
+    for slots in ([0, 1, 2, 3, 4], [4, 3, 2, 1, 0], [P - 1, 7, 2, P - 5, 11]):
+        alive = torch.zeros(1, P, dtype=torch.bool)
+        rel_pos = torch.full((1, P, 2), 0.1)       # dead slots: stale, and nearer than any live one
+        ttc = torch.zeros(1, P)
+        for slot, (rel, t) in zip(slots, live):
+            alive[0, slot] = True
+            rel_pos[0, slot] = torch.tensor(rel)
+            ttc[0, slot] = t
+        full_obs = {"projectiles": {"alive": alive, "rel_pos": rel_pos, "time_to_closest": ttc}}
+        out = obs_select.build_agent_obs(full_obs, spec, cfg, buffers)["projectiles"][0]
+        assert torch.equal(out, want), f"live projectiles in slots {slots}:\n{out}"
+
+
 def test_a_fair_projectile_group_admits_only_what_is_on_screen():
-    """deploy4's projectile group is gated by `projectiles.in_view`, and since C4 that is the
+    """deploy4's projectile group is gated by `projectiles.in_view`, and that is the
     camera window, not the crop. A projectile 20 tiles east flying at the hero has the smallest
     time_to_closest on the map and still gets an all-zero row; 5 tiles east it fills one."""
     env, cfg, _ = _env_and_obs(n_envs=1, overrides={
@@ -259,7 +293,7 @@ def test_dump_obs_schema_regenerates_agent_obs_docs_deterministically():
 
 
 def test_each_spec_renders_to_a_doc_named_after_itself():
-    """SIM_OVERHAUL Step I3: `--spec` gives every sibling spec its own doc, because each narrowing
+    """`--spec` gives every sibling spec its own doc, because each narrowing
     is a different width and a different from-scratch run, so a column index only means something
     next to the spec it came from. The default path is the one the constant already names."""
     import importlib
@@ -271,7 +305,7 @@ def test_each_spec_renders_to_a_doc_named_after_itself():
 
 
 def test_the_deployed_spec_renders_its_own_layout_not_the_full_one():
-    """The deploy4 doc has to show the widths H3 pins and say which file it came from, or the
+    """The deploy4 doc has to show the pinned widths and say which file it came from, or the
     deployment mirrors have no readable reference for a column index."""
     import importlib
     dump_mod = importlib.import_module("scripts.dump_obs_schema")
@@ -287,10 +321,8 @@ def test_the_deployed_spec_renders_its_own_layout_not_the_full_one():
 
 # ---- normalize: true, per unit ------------------------------------------------------------
 #
-# Until the deployed spec dropped `hp_frac`, nothing here exercised `normalize: true` at all --
-# obs_select's own docstring called it "a genuinely underspecified corner of Step 32's plan text
-# (no acceptance criterion exercises it)". That is how `hp` and `count` fields came to sit in a
-# normalized spec undivided. These tests are that acceptance criterion.
+# These tests pin `normalize: true` for every unit, so an `hp` or `count` field cannot sit in a
+# normalized spec undivided.
 
 def test_every_normalized_unit_divides_by_its_documented_scale():
     cfg = _cfg()
@@ -433,7 +465,7 @@ def test_two_specs_with_a_same_named_grid_do_not_share_channel_indices(first, se
                 os.remove(p)
 
 
-# ---- the history group and planes (SIM_OVERHAUL Step H2) ---------------------------------------
+# ---- the history group and planes --------------------------------------------------------------
 
 _HIST_FIELDS = ["hist.valid", "hist.move_onehot", "hist.attack_onehot", "hist.hp", "hist.ammo_frac",
                 "hist.displacement"]
@@ -453,7 +485,7 @@ def _load_spec(spec_dict, cfg):
 
 
 def test_the_six_hist_fields_make_a_78_column_group():
-    """3 * (1 + 17 + 4 + 1 + 1 + 2), the width H2.2 pins."""
+    """3 * (1 + 17 + 4 + 1 + 1 + 2)."""
     cfg = _cfg()
     spec = _load_spec(_hist_spec(normalize=False), cfg)
     assert spec.groups[0].shape == (78,)
@@ -532,7 +564,7 @@ def test_a_grid_spec_selects_history_planes_and_refuses_one_past_k():
         _load_spec(_grid_spec(["enemy_hist4"]), cfg)
 
 
-# ---- slots: tracked (OBS_PARITY_TASKS.md C9) -------------------------------------------------
+# ---- slots: tracked --------------------------------------------------------------------------
 
 DEPLOY4_YAML = "configs/agent_obs_deploy4.yaml"
 

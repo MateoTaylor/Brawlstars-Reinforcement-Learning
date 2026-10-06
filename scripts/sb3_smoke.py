@@ -1,4 +1,4 @@
-"""End-to-end SB3 plumbing validation. See BRAWL_SIM_BUILD_PLAN.md Step 36.
+"""End-to-end SB3 plumbing validation.
 
 **This is not a training run** -- `total_timesteps` defaults are small enough that no agent
 here learns anything useful. The point is proving every interface built in Steps 32-35 actually

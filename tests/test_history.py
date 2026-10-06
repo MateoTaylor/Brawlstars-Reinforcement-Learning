@@ -1,5 +1,5 @@
-"""Observation history rings (SIM_OVERHAUL_PLAN.md Phase H, Step H1): core/history.push and its
-wiring into env.step. What the H2 observation fields will read; nothing in the tick does.
+"""Observation history rings: core/history.push and its wiring into env.step. What the history
+observation fields will read; nothing in the tick does.
 """
 import torch
 import yaml
@@ -80,7 +80,7 @@ def test_enemy_seen_is_alive_and_visible_and_never_the_hero_itself():
     env = _env(n_envs=1, overrides={"entities": {"n_enemies": 2}})
     env.reset()
     # Everyone beside the hero: the 20-wide tiny map pins the camera at x 9.65 and only tracks
-    # the hero on y, so a random spawn can be off screen (OBS_PARITY_TASKS.md C3).
+    # the hero on y, so a random spawn can be off screen.
     _place(env, (10.5, 10.5), (12.5, 10.5), (8.5, 12.5))
     env.step(_idle(1))
     seen = env.state.hist_enemy_seen[:, 0]

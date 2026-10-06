@@ -1,4 +1,4 @@
-"""Pins brawl_sim/maps/generate.py (SIM_OVERHAUL_PLAN.md Step M2): the grid primitives, every
+"""Pins brawl_sim/maps/generate.py: the grid primitives, every
 stamp's size and bounds, the repair pass on hand-built grids, the checks, and `generate` itself --
 bands, symmetry, loader validity and byte-for-byte determinism per family."""
 import random
@@ -282,7 +282,6 @@ def test_csv_round_trips_through_the_loader(tmp_path):
     path.write_text(g.to_csv(grid))
     tiles = loader.load_map_csv(path, SimpleNamespace(map_h=60, map_w=60))
     assert np.array_equal(tiles, g.to_tiles(grid))
-    assert np.array_equal(g.from_csv(g.to_csv(grid)), grid)
     assert g.render(grid).count("\n") == 59
 
 

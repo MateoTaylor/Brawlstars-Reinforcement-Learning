@@ -1,21 +1,14 @@
-# DEPLOYABLE agent view -- configs/agent_obs_lowinfo.yaml minus the four fields nothing will
-# actually supply at runtime. Selected per run with
+# DEPLOYABLE agent view, the first of the deploy line: configs/agent_obs_lowinfo.yaml minus the
+# fields nothing supplies at runtime. Selected per run with
 #   python scripts/train.py --set run.agent_obs=configs/agent_obs_deploy.yaml
-# and never by default.
+# Each deploy spec is its own file because a finished run's train.yaml names its spec by path.
 #
-# WHY A THIRD FILE RATHER THAN AN EDIT
-# ------------------------------------
-# `runs/mortis_lowinfo-20260902-005036/train.yaml` names configs/agent_obs_lowinfo.yaml BY PATH.
-# Narrowing that file in place would leave that run's own config pointing at a spec it was not
-# trained under -- the checkpoint would still load its weights and then be fed a differently
-# shaped observation, or fail at the first linear layer. Adding a file costs nothing and keeps
-# every finished run reproducible.
-#
-# WHAT THIS DROPS, RELATIVE TO agent_obs_lowinfo.yaml
+# WHAT THIS DROPS, RELATIVE TO agent_obs_lowinfo.yaml (the user's call, BRAWL_DEPLOYMENT_DESIGN.md
+# §9.8)
 # ---------------------------------------------------
 # lowinfo's rule is sim-to-real parity: the agent may see only what brawl_vision can recover from
-# a screen capture. That rule was applied to enemy ARCHETYPE and projectile TYPE. It was never
-# applied field by field, and four survivors fail it:
+# a screen capture. lowinfo applied it to enemy ARCHETYPE and projectile TYPE; applied field by
+# field, four more fail it:
 #
 #   entities.cubes        Another player's power-cube count is not drawn anywhere on screen. The
 #                         cubes themselves are visible as pickups; who has collected how many is
@@ -27,15 +20,15 @@
 #                         whose dash we can name -- and entities.kind_onehot is exactly what
 #                         lowinfo removed. Keeping this would smuggle back a weak type signal.
 #   hero.cubes            The ONE here that CV could supply: the pip row sits in the same box
-#                         stack as the hero's own HP bar. Dropped by operator decision -- no
-#                         reader will be built for it. A field nobody intends to supply is in the
-#                         same position as one nobody can.
+#                         stack as the hero's own HP bar. Dropped because the user decided no
+#                         reader will be built for it, and a field nobody intends to supply is in
+#                         the same position as one nobody can.
 #
 # The alternative to dropping them was feeding a constant into four columns a policy had been
 # trained to trust. That is the specific failure this whole line of configs exists to prevent:
 # it is silent, and it presents as "the policy is bad at real Brawl Stars".
 #
-# WHAT THIS REPLACES: hp_frac -> hp, on BOTH sides
+# WHAT THIS REPLACES: hp_frac -> hp, on BOTH sides (BRAWL_DEPLOYMENT_DESIGN.md §9.10)
 # ------------------------------------------------
 # `hero.hp_frac` and `entities.hp_frac` are `hp / max_hp`, and max_hp is NOT OBSERVABLE. A power
 # cube adds a flat +400 to it (configs/default.yaml `cubes.hp_per_cube`), for the hero and for
@@ -55,32 +48,26 @@
 # because cubes raise HP above every base value, a large HP reading is itself evidence of a
 # cube-fed enemy -- who also hits ~10% harder per cube. hp_frac destroys that signal.
 #
-# Scale: obs_select normalizes `hp` units by _NORM_HP_SCALE (20000), sized so the sim's maximum
-# possible HP -- (10000 + 16*400) * 1.25 = 20500 -- lands at 1.03. A fresh Mortis reads 0.40.
-# `meta.n_enemies_alive` picked up a divisor in the same change (_NORM_COUNT_SCALE), having been
-# the largest raw magnitude in this vector at up to 9.
+# Scale: obs_select normalizes `hp` units by _NORM_HP_SCALE (20000). The largest possible HP, an
+# elite 10000-HP bot at 16 cubes (10000 x 1.5 + 16 x 400 = 21400), lands at 1.07; a fresh Mortis
+# reads 0.40.
 #
 # WHAT DELIBERATELY SURVIVES
 # --------------------------
-#   entities.rel_vel      KEPT, and this is the line to delete if that changes. It is recoverable:
+#   entities.rel_vel      KEPT, the user's call (BRAWL_DEPLOYMENT_DESIGN.md §9.9), and this is the
+#                         line to delete if that changes. It is recoverable:
 #                         brawl_deployment/perception/tracker.py produces it, and the odometry
-#                         error that inflates absolute speeds cancels in `ent_vel - hero_vel`
-#                         (measured: 8% of samples past the physical bound, against 38% for the
-#                         absolute speeds it is built from). An inference-time ablation could not
-#                         detect the trained policy using this column at all -- zeroing it cost
-#                         1.3 pp of win rate against a 2.6 pp standard error -- so removing it
-#                         would probably also be harmless. It stays because it is free, and
-#                         because it is the only enemy field carrying motion.
+#                         error that inflates absolute speeds cancels in `ent_vel - hero_vel`. It
+#                         is the only enemy field carrying motion.
 #
 #   entities.revealed_to_hero    Not a stat lookup: it is whether the tracker saw this enemy on
 #                         THIS tick (Track.seen_now) rather than coasted on a prediction.
 #   entities.in_bush      An occupancy-map lookup at the enemy's tile, not a property of the enemy.
-#   hero.can_attack, hero.dashing, hero.cubes' self-group neighbours
-#                         The `self` group is proprioception, not perception -- the deployed loop
-#                         ISSUES the actions, so its own timers are dead-reckoned exactly from the
-#                         action stream plus configs/brawlers.yaml. See BRAWL_DEPLOYMENT_DESIGN.md
-#                         6.3. That is why hero.can_attack stays while entities.can_attack goes;
-#                         they are the same quantity from opposite sides of the camera.
+#   the `self` group      Proprioception, not perception -- the deployed loop ISSUES the actions,
+#                         so the hero's own timers are dead-reckoned exactly from the action stream
+#                         plus configs/brawlers.yaml. See BRAWL_DEPLOYMENT_DESIGN.md 6.3. That is
+#                         why hero.can_attack stays while entities.can_attack goes; they are the
+#                         same quantity from opposite sides of the camera.
 #
 # NOT A DROP-IN CHECKPOINT SWAP. Narrowing changes the observation width and with it
 # BrawlFeaturesExtractor's first linear layer, so no checkpoint trained under agent_obs.yaml or
@@ -114,24 +101,17 @@ groups:
     # Unchanged from lowinfo. A moving dot and nothing more.
     fields: [projectiles.alive, projectiles.rel_pos, projectiles.vel,
              projectiles.time_to_closest]
-  - name: zone                          # unchanged -- the zone is drawn on screen
+  - name: zone                          # lowinfo's; agent_obs_deploy2.yaml rebuilds it
     per_entity: false
     dtype: float32
     fields: [zone.hero_margin, zone.active, zone.safe_area_frac, zone.next_shrink_in]
-  - name: grid                          # bare occupancy counts, no kind, no class -- and now
-                                        # two channels shorter than lowinfo's. See below.
+  - name: grid                          # bare occupancy counts, no kind, no class -- and two
+                                        # channels shorter than lowinfo's. See below.
     dtype: uint8
-    # `box` and `pickup` DROPPED, taking this group from (10, 13, 21) to (8, 13, 21). Audited
-    # against what is on disk rather than assumed: the entity detector's classes are exactly
-    # {0: enemy, 1: teammate, 2: player} and the terrain classifier's are (FLOOR, WALL, BUSH,
-    # WATER, FENCE). Nothing detects a crate or a power-cube pickup, so these two are in the same
-    # position as the four fields dropped above -- unsuppliable, and a channel of zeros in a
-    # channel the policy was trained to read is the silent failure this file exists to prevent.
-    #
-    # OPERATOR DECISION, and explicitly TEMPORARY: box/pickup detection is excluded for this
-    # training run and the deployment that follows it, to be added later. When it returns, restore
-    # these two channels AND `reward.cube_pickup` in configs/train.yaml, which was zeroed in the
-    # same decision -- the agent cannot be paid for collecting something it cannot see.
-    # tests/test_configs_files.py pins that pairing so the two cannot drift apart.
+    # No `box` or `pickup` channel: (8, 13, 21) against lowinfo's (10, 13, 21), so a run on this
+    # spec cannot see crates or cubes (BRAWL_DEPLOYMENT_DESIGN.md §9.11); agent_obs_deploy3.yaml
+    # adds both back. An agent must not be paid for collecting what it cannot see, so a run on
+    # this spec needs `--set reward.cube_pickup=0`, which
+    # brawl_sim/training/builder.check_reward_is_observable enforces at run build time.
     view_channels: [blocks_unit, blocks_projectile, is_bush, is_water, in_zone,
                     enemy_revealed, hero, projectile]

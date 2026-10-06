@@ -126,7 +126,7 @@ where phase 0 was 0.10 - 0.37 off.
 
 #### What is deliberately NOT here
 
-  * **Wall tops (H_top) as the classifier's input.** Step C, measured and not shipped: against the
+  * **Wall tops (H_top) as the classifier's input.** Measured and not shipped: against the
     ground plane alone it won one seed and lost the other and the BlueStacks hold-out
     (`brawl_vision/terrain/classifier.py`). The lattice here is the ground plane's; the wall-top
     plane only checks it.
@@ -192,6 +192,9 @@ class LatticeResult:
     estimate: tuple[float, float] | None     # running estimate, None before LOCK_SIGHTINGS
     n_sightings: int                         # usable sightings this segment
     n_used: int                              # usable sightings this tick
+    # This tick's usable sightings in ODOMETRY's frame (the phase not taken off), for
+    # `localize.MapLocalizer`'s crate check, which reads crates against a known map instead.
+    sightings: tuple = ()
 
 
 class LatticePhase:
@@ -256,20 +259,20 @@ class LatticePhase:
         elif odometry.segment != self._segment:
             self.reset(odometry.segment)
         if odometry.status != "ok":
-            return self._result(odometry.status, 0)
+            return self._result(odometry.status)
 
         crates = [d for d in detections if d.label == CUBE_BOX
                   and _clear_of_edges(d.xyxy, plan.viewport, self.edge_margin_px)]
         px, py = odometry.position_tiles
         placed = [((tx + px, ty + py), d) for d, (tx, ty) in
                   to_tiles(crates, plan, anchor_frac=CRATE_ANCHOR_FRAC)]
-        used = 0
+        used = []
         for (x, y), d in _merge(placed, self.duplicate_tiles):
             if not self._full_height(d):
                 continue
             self._sum += np.exp(2j * math.pi * _wrap(np.array([x, y]) - 0.5))
             self._n += 1
-            used += 1
+            used.append((x, y))
 
         est = self.estimate()
         if est is None:
@@ -287,8 +290,9 @@ class LatticePhase:
         a, b = self.crate_height_px
         return (y1 - y0) >= self.height_ratio * (a + b * y1)
 
-    def _result(self, status: str, used: int) -> LatticeResult:
-        return LatticeResult(status, self.epoch, self.phase, self.estimate(), self._n, used)
+    def _result(self, status: str, used=()) -> LatticeResult:
+        return LatticeResult(status, self.epoch, self.phase, self.estimate(), self._n, len(used),
+                             tuple(used))
 
     def reset(self, segment: int) -> None:
         """A new world frame: odometry's new segment, or a new match. Phase back to 0, evidence

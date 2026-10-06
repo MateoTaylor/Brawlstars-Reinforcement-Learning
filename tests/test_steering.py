@@ -1,28 +1,6 @@
 import torch
 
-from brawl_sim.config import load_config
-from brawl_sim.constants import Tile, TILE_BLOCKS_UNIT
 from brawl_sim.bots import steering
-
-CONFIGS_DEFAULT = "configs/default.yaml"
-
-
-class _FakeBank:
-    def __init__(self, tiles):
-        self.blocks_unit = TILE_BLOCKS_UNIT[tiles].unsqueeze(0)
-
-
-def _grid(h, w, fill=Tile.FLOOR):
-    t = torch.full((h, w), int(fill), dtype=torch.int64)
-    t[0, :] = Tile.WALL
-    t[-1, :] = Tile.WALL
-    t[:, 0] = Tile.WALL
-    t[:, -1] = Tile.WALL
-    return t
-
-
-def _cfg(map_h=20, map_w=20):
-    return load_config(CONFIGS_DEFAULT, overrides={"world": {"map_h": map_h, "map_w": map_w}})
 
 
 # ---- seek / flee -----------------------------------------------------------------
@@ -128,34 +106,6 @@ def test_maintain_range_max_dist_caps_only_the_seek_edge():
     assert torch.allclose(scalar, new)
 
 
-# ---- avoid_walls (acceptance: escapes a dead end) --------------------------------
-
-def test_avoid_walls_steers_out_of_dead_end():
-    cfg = _cfg()
-    tiles = _grid(20, 20)
-    # carve a dead-end pocket open only to the west (-x): walls to north, south, east.
-    tiles[9, 12] = Tile.WALL
-    tiles[11, 12] = Tile.WALL
-    tiles[10, 13] = Tile.WALL
-    bank = _FakeBank(tiles)
-    map_id = torch.zeros(1, dtype=torch.int64)
-
-    pos = torch.tensor([[[12.5, 10.5]]])  # inside the pocket
-    d = steering.avoid_walls(pos, map_id, bank, probe_dist=1.0, cfg=cfg)
-    assert d[0, 0, 0].item() < 0  # pushed west, back out the open side
-    assert not torch.any(torch.isnan(d))
-
-
-def test_avoid_walls_zero_in_open_space():
-    cfg = _cfg()
-    tiles = _grid(20, 20)
-    bank = _FakeBank(tiles)
-    map_id = torch.zeros(1, dtype=torch.int64)
-    pos = torch.tensor([[[10.5, 10.5]]])
-    d = steering.avoid_walls(pos, map_id, bank, probe_dist=1.0, cfg=cfg)
-    assert torch.allclose(d, torch.zeros_like(d))
-
-
 # ---- escape_zone -------------------------------------------------------------------
 
 def test_escape_zone_zero_when_inside():
@@ -210,10 +160,6 @@ def test_combine_per_entity_weight_tensor():
 # ---- batched leading-dim smoke test -------------------------------------------------
 
 def test_batched_smoke():
-    cfg = _cfg()
-    tiles = _grid(20, 20)
-    bank = _FakeBank(tiles)
-    map_id = torch.zeros(4, dtype=torch.int64)
     pos = torch.rand(4, 3, 2) * 16 + 2
     target = torch.rand(4, 3, 2) * 16 + 2
     zone_lo = torch.full((4, 2), 4.0)
@@ -223,10 +169,9 @@ def test_batched_smoke():
     f = steering.flee(pos, target)
     st = steering.strafe(pos, target, sign=1.0)
     mr = steering.maintain_range(pos, target, desired=8.0, deadband=1.5)
-    aw = steering.avoid_walls(pos, map_id, bank, probe_dist=1.0, cfg=cfg)
     ez = steering.escape_zone(pos, zone_lo.unsqueeze(1).expand(-1, 3, -1), zone_hi.unsqueeze(1).expand(-1, 3, -1))
-    combined = steering.combine((s, 1.0), (f, 0.5), (st, 0.3), (mr, 1.0), (aw, 0.5), (ez, 3.0))
+    combined = steering.combine((s, 1.0), (f, 0.5), (st, 0.3), (mr, 1.0), (ez, 3.0))
 
-    for d in (s, f, st, mr, aw, ez, combined):
+    for d in (s, f, st, mr, ez, combined):
         assert d.shape == (4, 3, 2)
         assert not torch.any(torch.isnan(d))

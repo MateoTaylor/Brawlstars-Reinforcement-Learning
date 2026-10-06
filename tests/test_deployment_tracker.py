@@ -260,7 +260,7 @@ def test_teammate_boxes_are_ignored_entirely():
     assert res.hero is None
 
 
-# ---------------------------------------------------------------- hero_offset (OBS_PARITY_TASKS.md C7)
+# ---------------------------------------------------------------- hero_offset
 
 def _nominal():
     """The stub's nominal player-box tile: the viewport centre through the stub's own
@@ -335,7 +335,7 @@ def test_recorded_player_boxes_read_near_zero_offset_while_tracking():
     assert abs(statistics.median(m[1] for m in medians)) < 0.1
 
 
-# ---------------------------------------------------------------- parity with the sim's slot rule (C8)
+# ---------------------------------------------------------------- parity with the sim's slot rule
 
 SIGHTINGS = [
     "x...",  # d0  A first seen: pending

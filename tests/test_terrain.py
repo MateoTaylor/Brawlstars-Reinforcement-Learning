@@ -274,7 +274,7 @@ def test_march_no_hxw_allocation_scales_with_batch_not_map():
     assert hit_pos.shape == (3, 2)
 
 
-# ---- line_of_sight (Notice 4: only WALL blocks) ------------------------------
+# ---- line_of_sight (only WALL blocks) ----------------------------------------
 
 def test_line_of_sight_blocked_by_wall_only():
     cfg = _cfg(map_h=10, map_w=10, los_step_tiles=0.1, max_ray_tiles=20.0)

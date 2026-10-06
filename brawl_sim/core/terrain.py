@@ -1,13 +1,14 @@
-"""Terrain queries against a MapBank (Step 6). Generic geometric primitives -- this module
-doesn't know about bots or targeting, only terrain. Point queries gather-index the bank's
-(M, H, W) tensors directly (`bank_mask[map_id, iy, ix]`); nothing here ever materializes a
-per-env or per-map (H, W) slice.
+"""Terrain queries against a MapBank. Generic geometric primitives -- this module doesn't know
+about bots or targeting, only terrain. Point queries gather-index the bank's (M, H, W) tensors
+directly (`bank_mask[map_id, iy, ix]`); nothing here ever materializes a per-env or per-map
+(H, W) slice.
 
 line_of_sight is the one exception to "generic": it hardcodes bank.blocks_proj as the blocking
-mask, per Notice 4 -- with only WALL left opaque (fence no longer blocks shots), "is there a
-clear physical shot" and "is there a clear line of sight" are the same question, and this is
-where every caller that needs the physical-LOS answer (melee hit validation, sniper/rifle
-fire-gates, obs["visibility"]["los"]) gets it from.
+mask. Only WALL blocks shots (constants.TILE_BLOCKS_PROJ), so "is there a clear physical shot"
+and "is there a clear line of sight" are the same question, and every caller that needs the
+physical-LOS answer gets it here: melee hit validation (combat.melee_hitscan), the bots' fire
+gate and loot-box shot (bots/perception.target_los, bots/policy), and obs["visibility"]["los"]
+(bots/perception.raw_los).
 """
 import math
 
@@ -45,8 +46,7 @@ def sample(bank_mask: torch.Tensor, map_id: torch.Tensor, pos: torch.Tensor, cfg
     return out | bank_mask[map_id, iy_safe, ix_safe]
 
 
-# 8 fixed probe directions (bin 0 == angle 0), same "small fixed probe count" pattern as
-# bots/steering.avoid_walls' 8 preallocated probe offsets (Step 16).
+# 8 fixed probe directions (bin 0 == angle 0).
 _N_PROBES = 8
 
 
@@ -99,35 +99,28 @@ def march(
     harmlessly).
 
     `max_tiles` is a per-call RAY BUDGET: the number of fixed samples becomes
-    `ceil(max_tiles / los_step_tiles)` instead of `cfg.ray_steps`. `None` (the default) keeps the
-    full `cfg.ray_steps` budget and is bit-identical to this function before the argument existed.
+    `ceil(max_tiles / los_step_tiles)` instead of `cfg.ray_steps` (`None`, the default).
 
     **The budget must be a Python scalar, not a tensor** -- it sizes a tensor dimension, so a
     tensor here would force a host sync in the hot path (CONVENTIONS.md). Callers that want to
     bound a march by a per-env/per-kind stat must derive a STATIC upper bound over that stat's
-    whole configured range instead; see `config.cone_ray_tiles` for the one that exists today.
-
-    **Why this matters.** `cfg.ray_steps` is `ceil(max_ray_tiles / los_step_tiles)` = 48 at the
-    defaults, and every one of those 48 sample points is COMPUTED and gathered before `in_range`
-    masks the ones past `max_dist`. A melee cone spans ~3 tiles and needs 6. Paying 48 for it,
-    over a dense (N,E,E) pair matrix, every tick, was measured at 4.15 ms/tick at n_envs=1024
-    versus 1.95 ms with a 6-step budget -- see bot_overhaul.md Step A1.
+    whole configured range instead, as config.cone_ray_tiles, attack_ray_tiles, dash_ray_tiles
+    and shot_step_tiles do. Why budget at all: every one of the `cfg.ray_steps` samples (48 at
+    the defaults) is computed and gathered before `in_range` masks the ones past `max_dist`, so
+    a short ray -- a melee cone needs 6 -- over a dense (N,E,E) pair matrix pays for all 48.
 
     **Passing a budget SHORTER than some element's own max_dist is legal but changes that
-    element's answer**: samples past the budget are never taken, so a wall beyond it is not seen
-    and `hit` comes back False. That is only sound when the caller independently discards those
-    elements -- `combat.melee_hitscan` does (anything past the cone radius fails `in_cone`, which
-    is ANDed with the LOS result). Do not pass a budget you have not checked that against.
+    element's answer**: samples between the budget and max_dist are never taken (only the
+    endpoint is), so a wall there is not seen and `hit` comes back False. That is only sound when
+    the caller independently discards those elements -- `combat.melee_hitscan` does (anything
+    past the cone radius fails `in_cone`, which is ANDed with the LOS result). Do not pass a
+    budget you have not checked that against.
 
-    The extra endpoint sample is a retroactive fix (found while building Step 29's end-to-end
-    integration tests): without it, any call whose max_dist is SMALLER than one los_step_tiles
-    (e.g. projectiles.step_projectiles' per-tick wall check, for any projectile slower than
-    los_step_tiles/dt tiles/second -- 10 tiles/s at the defaults) has every fixed sample masked
-    out by `in_range` before a single one is ever checked, so march always reports a miss no
-    matter what's actually there. A projectile below that speed threshold could fly straight
-    through a wall, undetected, forever. The extra sample is harmless for the long-range LOS
-    case (line_of_sight, hero.start_dash's dash clip): it only ever wins the "first hit" pick
-    when none of the regular fixed samples did, i.e. exactly when it's needed."""
+    The endpoint sample is what lets a max_dist SHORTER than one los_step_tiles see a wall at
+    all: `in_range` masks every fixed sample out, so without it projectiles.step_projectiles'
+    per-tick wall check would miss for any shot slower than los_step_tiles/dt tiles/second, and
+    that shot would fly through walls. It wins the "first hit" pick only when no fixed sample
+    hit."""
     map_id = _broadcast_map_id(map_id, p0.shape[:-1])
     dir = geo.normalize(dir)
     steps = cfg.ray_steps if max_tiles is None else ray_steps_for(max_tiles, cfg)

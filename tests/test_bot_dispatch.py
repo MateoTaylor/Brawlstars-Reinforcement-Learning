@@ -82,8 +82,7 @@ def test_fire_and_aim_match_the_combat_rule_for_every_kind():
     reaction-delay smoothing at all, so those match unconditionally for every living non-hero
     entity.
 
-    Before Step E1 this compared against four separate archetype modules; there is one rule now,
-    and the per-kind DIFFERENCES it used to prove live in tests/test_combat_rules.py."""
+    The per-kind DIFFERENCES are tested in tests/test_combat_rules.py."""
     cfg, params, gen = _cfg_and_params(n_enemies=4)
     state = _fresh_state_one_of_each(cfg, params)
     tiles = _grid(20, 20)
@@ -316,7 +315,7 @@ def test_no_nan_batched_smoke():
         assert intent.move_dir.shape == (8, cfg.n_entities, 2)
 
 
-# ---- hero_focus reaches select_target through the dispatcher (SIM_OVERHAUL_PLAN.md Step B2.2) --
+# ---- hero_focus reaches select_target through the dispatcher -----------------------------------
 
 def test_dispatcher_passes_hero_focus_through_to_target_selection():
     """all_bot_intents hands `params` to perception.select_target. Same scene, two focus values:
@@ -350,7 +349,7 @@ def test_dispatcher_passes_hero_focus_through_to_target_selection():
         assert state.ent_target[0, 1].item() == want, hero_focus
 
 
-# ---- KITE hold distance scales by clamp(1 / aggression, 0.6, 1.4) (Step B3.2) ------------------
+# ---- KITE hold distance scales by clamp(1 / aggression, 0.6, 1.4) ------------------------------
 
 def test_kite_brock_hold_distance_scales_with_aggression():
     """`Targeting.desired_range` for a Brock (attack_range 8.0 x desired_range_fraction 0.85 =

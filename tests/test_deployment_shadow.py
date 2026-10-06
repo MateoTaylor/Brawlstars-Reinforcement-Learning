@@ -64,7 +64,7 @@ def test_the_params_are_mortis_own_block_not_a_copy_of_it():
                  "dash_duration", "long_dash_seconds", "long_dash_multiplier",
                  "super_charge_hits", "move_speed", "gadget_cooldown"):
         assert getattr(p, name) == block[name], name
-    assert p.gadget_cooldown == 18.0          # the plan's 18 s, pinned apart from the file
+    assert p.gadget_cooldown == 18.0          # the game's 18 s, pinned apart from the file
 
 
 def test_a_randomized_range_refuses_to_load(tmp_path):
@@ -252,7 +252,7 @@ def test_a_super_costs_the_sim_and_the_shadow_the_same_thing():
 
 @pytest.mark.parametrize("action_repeat,n_decisions", [(1, 400), (5, 100)])
 def test_the_shadows_gadget_matches_the_sims(action_repeat, n_decisions):
-    """The gadget's parity test (SIM_OVERHAUL Step G5), closed-loop on the shadow's own mask so
+    """The gadget's parity test, closed-loop on the shadow's own mask so
     every throw is one the deployed loop could send. Decision 0 throws. Each time the gadget is
     legal again it is thrown mid-dash, with a dash started first when none is running, because
     the gadget's mask is the one with no dash term. Between throws the hero fires at random, so
@@ -625,7 +625,7 @@ def test_the_super_mask_still_obeys_the_cooldown_and_the_dash():
 
 
 # ---------------------------------------------------------------------------
-# the gadget (SIM_OVERHAUL Step G5)
+# the gadget
 # ---------------------------------------------------------------------------
 
 def test_the_gadget_is_charged_at_the_gate():
@@ -981,7 +981,7 @@ def test_resync_leaves_the_gadget_timer_alone():
 # ---------------------------------------------------------------------------
 
 # The `self` group fields that come from CV or the wall clock rather than from here -- 6.3's table,
-# plus `hero.near_edge`: the tracker's `hero_offset` through `assemble._near_edge` (C7).
+# plus `hero.near_edge`: the tracker's `hero_offset` through `assemble._near_edge`.
 _NOT_SHADOWED = {"hero.pos_norm", "hero.vel", "hero.hp", "hero.in_bush", "hero.in_zone",
                  "hero.near_edge", "meta.time_frac", "meta.n_enemies_alive"}
 

@@ -1,103 +1,72 @@
-"""BrawlVecEnv: the native, torch-native vectorized environment tying every core/ and bots/
-module built in Steps 1-28 into the Section 4 tick order. See BRAWL_SIM_BUILD_PLAN.md Step 29.
+"""BrawlVecEnv: the batched, torch-native Solo Showdown environment. `core/` never imports
+`bots/`; this module is where the two meet (`_bot_phase` and `_build_observation` call
+`bots/perception` and `bots/policy`).
 
-**This is the first module allowed to import both `core/` and `bots/`.** Every `core/` module
-through Step 27 deliberately avoided importing `bots/` (`core/zone.py`, `core/spawn.py`,
-`core/observation.py` each duplicate a tiny predicate rather than cross that boundary) and
-said so explicitly, promising "the future env.py step loop" as the place the two finally meet.
-This is that place: `_bot_phase`/`_observe`/`reset`/`_autoreset` call `bots/perception.py` and
-`bots/policy.py` directly.
+**Tick order.** One `step()` is one AGENT DECISION: `history.push` records the pre-step state and
+the action, `_run_decision` runs `cfg.action_repeat` sim ticks of phases 1-15 with that action
+held, then phases 16-17 run once.
 
-**Autoreset happens inside `step()`.** A finished env is reset in place, within the SAME call,
-so the very next `step()` call can act on it immediately -- no separate "reset this env" round
-trip. This means the returned `obs` is the FIRST OBSERVATION OF THE NEW EPISODE for any env that
-finished this tick, NOT a view of the tick that just ended. **The finished episode's own final
-obs/info live in `info["final_observation"]` / `info["final_info"]`** (dense over all N envs,
-like everything else in this sim -- only meaningful where `terminated | truncated` was True this
-tick). `reward`/`terminated`/`truncated`/`info` (everything except `obs` itself) describe what
-just happened; `obs` describes what comes next. Get this backwards and reward/observation pairs
-silently misalign for every finished episode -- read this twice.
+     1  action latency buffer       `_pop_action_buffer`
+     2  timers, regen               `_tick_timers`
+     3  decode the hero's action    `_decode`
+     4  bot intents                 `_bot_phase` (its visibility is reused by phase 6)
+     5  external overrides          `_override_phase`
+     6  attacks                     `_attack_phase`: dashes start, supers, gadgets, volleys, melee
+     7  movement                    `_movement_phase`, non-dashing entities only
+     8  dash advance                `_dash_phase`
+     9  projectiles                 `_projectile_phase`
+    10  zone damage                 `_zone_phase`
+    11  broken boxes -> pickups     `_box_phase`
+    12  pickup collection           `_pickup_phase`
+    13  deaths                      `_death_phase`
+    14  zone shrink schedule        `_zone_schedule`
+    15  bookkeeping                 `_bookkeeping`: damage dealt, super charge, time, step_count
+    16  observation, info, reward   `_observe`, once per decision
+    17  autoreset                   `_autoreset`, once per decision
 
-**Every `obs`/`info` returned by `step()`/`reset()` is a zero-copy view into `SimState`'s own
-tensors** (Step 25/27's own established style -- nothing here allocates a fresh copy per field),
-which means **it is only valid until the NEXT `step()`/`reset()` call**: that next call mutates
-the exact same underlying storage in place, and anything still holding the old dict will
-silently see the NEW values, not an error. Callers that need to retain an observation across
-multiple steps (logging, replay buffers, ...) must `core.observation.clone_obs(...)` it
-themselves. The one place this module can't get away with that convention is
-`info["final_observation"]`/`info["final_info"]`: those specifically must survive the
-autoreset that happens later in the SAME `step()` call, so `step()` clones them explicitly
-(and drops its own reference to the pre-clone copy, to keep peak memory down -- see its
-own comment) before `_autoreset` ever calls `reset_envs`.
+Attacks (6) resolve before movement (7), so a dash replaces that tick's walk. Regen (2) runs
+before any damage, so it cannot undo a lethal hit. Deaths (13) resolve after every damage source
+(6-10), so simultaneous kills work.
 
-**One `step()` is one AGENT DECISION, which is `cfg.action_repeat` SIM TICKS** (Section 4 phases
-1-15, run back to back with the same held action -- `_run_decision`). At `action_repeat=1` this
-is exactly the pre-existing one-tick-per-step behavior, down to the tensors allocated. Above 1
-it decouples the agent's decision rate from the simulation rate: `dt=0.05` with
-`action_repeat=5` simulates at 20 Hz and decides at 4 Hz, the way a human holds a direction for
-a beat rather than re-aiming every 50 ms.
+**Autoreset happens inside `step()`.** A finished env is reset in place within the same call, so
+the returned `obs` is the FIRST observation of the new episode for every env that finished, while
+`reward`/`terminated`/`truncated`/`info` describe the decision that just ended. The finished
+episode's own last obs/info are in `info["final_observation"]`/`info["final_info"]` (dense over
+all N envs, meaningful only where `terminated | truncated`). Mixing the two up silently
+misaligns reward/observation pairs.
 
-Three consequences worth reading before touching this:
+**`obs`/`info` are valid only until the next `step()`/`reset()`.** Their fields are views into
+`SimState`'s tensors, which the next call overwrites in place; a caller that keeps one must
+`core.observation.clone_obs` it. `step()` clones `final_observation`/`final_info` itself, before
+autoreset mutates the state.
 
-  *Units.* `cfg.max_episode_steps`, `state.step_count`, `state.time`, `zone.step_seconds`, and
-  `decision_period_ticks` all stay in SIM TICKS -- the world's clock is unchanged. Everything
-  measured in `step()` CALLS (SB3 timesteps, `n_steps`, `info["episode"]["l"]`, any loop bound
-  over an episode) is now in DECISIONS, which is `cfg.max_agent_steps` per episode, not
-  `cfg.max_episode_steps`. `gamma` is per decision too, so a discount tuned at 20 Hz must be
-  raised to `gamma ** action_repeat` to keep the same real-time horizon.
+**action_repeat.** default.yaml's `dt=0.05` with `action_repeat=5` simulates at 20 Hz and decides
+at 4 Hz.
 
-  *Movement is held; fire is not.* The move bin is re-applied on every sub-tick, so the hero
-  keeps walking (or keeps dashing) for the whole window. The FIRE BIT is applied only on the
-  FIRST sub-tick and forced to 0 for the rest -- **one decision means at most one attack
-  attempt.** Two reasons, one of which survives any rebalance. (1) It lines the sim up exactly
-  with `hero.action_mask`, which MaskablePPO evaluates once per decision: the mask promises "you
-  may fire NOW", and the fire happens now, once -- "fire" therefore means the same thing at
-  `action_repeat=5` as at 1. (2) It bounds what a held bit can do if a weapon ever fires faster
-  than the decision rate. Every `attack_cooldown` in configs/brawlers.yaml is currently 0.30-0.50s
-  and so already exceeds one 0.25s window, which makes this guard unreachable with the shipped
-  numbers -- but those cooldowns were 0.05-0.20s until they were deliberately widened (see that
-  file's own DELIBERATE DIVERGENCE note), and at those values a held bit emptied Mortis's entire
-  3-shot clip inside a single decision. The guard is structural precisely so balance changes
-  cannot silently reintroduce that.
+  *Units.* The world's clock (`cfg.max_episode_steps`, `state.step_count`, `state.time`, the zone
+  timings, `decision_period_ticks`) is in sim ticks or sim seconds. Anything counted in `step()`
+  calls (SB3 timesteps, `n_steps`, `info["episode"]["l"]`) is in decisions, `cfg.max_agent_steps`
+  per episode. `gamma` is per decision: a per-tick discount becomes `gamma ** action_repeat`.
 
-  *Events are aggregated, outcomes are latched.* Per-tick deltas (damage, kills, cubes, boxes)
-  are SUMMED across the sub-ticks; the hero's outcome fields (`terminated`, `truncated`,
-  `hero_rank`, `hero_alive`) are LATCHED at the sub-tick that env's episode actually ended, and
-  its per-tick reward counters stop there too. See `core/events.advance_decision_tally` for why
-  latching is load-bearing and for the one thing it deliberately does not fix (a finished env's
-  `final_observation` can be up to `action_repeat - 1` ticks stale).
+  *Movement is held; fire is not.* The move bin applies on every sub-tick, the attack column on
+  the first only (`_held`), so one decision is at most one attack attempt. That is what
+  `hero.action_mask` promises, since MaskablePPO evaluates it once per decision, and it holds for
+  any weapon that could fire faster than the decision rate.
 
-**Visibility/observation are (re)computed THREE separate times per DECISION**, not once, and the
-split is the main reason action repeat is faster than its tick count suggests:
-`bots/perception.visibility` for bot targeting (phase 4, pre-movement) runs once per SUB-TICK
-since bots re-target on the world's clock, but both `build_obs` calls are per DECISION --
-for the finished decision's own state (phase 16, post-movement/combat -- this becomes
-`info["final_observation"]` for any env that's done), and again after autoreset (phase 17) for
-the actually-returned `obs`. Each reflects genuinely different, non-interchangeable state
-(pre- vs post-movement vs post-reset), so none of the three can be skipped or cached across the
-others -- documented here since it's the least obvious performance/design characteristic of this
-whole module.
+  *Events are summed, outcomes are latched.* Per-tick deltas (damage, kills, cubes, boxes, heals)
+  sum over the sub-ticks; `terminated`, `truncated`, `hero_rank` and `hero_alive` latch at the
+  sub-tick the episode ended, and later sub-ticks add nothing. See
+  `core/events.advance_decision_tally`, including why a finished env's `final_observation` can be
+  up to `action_repeat - 1` ticks stale.
 
-**`torch.compile` support (Step 31), off by default (`cfg.compile=False`).** When enabled,
-`_tick_fn` (built once in `__init__`, see `_make_tick_fn`) wraps ONLY `_run_tick` -- Section 4
-phases 1-15, the pure-tensor simulation update -- with `torch.compile(dynamic=False,
-fullgraph=False)`. Phases 16-17 (`_observe`/`_autoreset`) are deliberately excluded: they build
-nested python `dict`s and phase 16 calls `self.reward_fn`, an arbitrary user-supplied callable
-`torch.compile` has no business tracing through. **On this machine (Windows, RTX 5070 Ti /
-Blackwell / sm_120), `torch.compile` cannot actually reach a running state**: the CPU inductor
-backend requires an MSVC `cl.exe` on PATH (not installed), and the CUDA inductor backend
-requires a working Triton install (not installable here as of this writing, confirming the
-plan's own upfront warning). This was root-caused by hand, not just observed to fail: one real
-graph break was found and documented (`torch.randn(..., generator=gen, ...)` in the bot layer's
-aim noise, now `bots/combat_rules.py` -- dynamo has no `as_proxy()` for a bare `torch.Generator`
-argument), and
-both backends fail during actual codegen with clear, typed exceptions (`InductorError`,
-`TritonMissing`), not silent corruption or a hang. `_make_tick_fn`'s `_guarded_tick` catches
-exactly those two failure modes (by checking the raised exception's `__module__`, not by
-message-sniffing) and re-raises a `RuntimeError` naming the cause and pointing back at
-`compile: false` as the fully-supported default -- anything else (a real bug in `_run_tick`
-itself) propagates with its own original type untouched. See BRAWL_SIM_BUILD_PLAN.md Step 31
-for the full investigation and confirmed CUDA-scale (`n_envs=4096`) behavior.
+**Visibility runs in three places, and none can stand in for another:** once per sub-tick for
+the bots (phase 4, pre-movement), then once per observation build, for the finished decision
+(phase 16, post-combat) and after autoreset (phase 17, post-reset).
+
+**`cfg.compile`** (default False) wraps only `_run_tick`, phases 1-15, in
+`torch.compile(dynamic=False, fullgraph=False)`; phases 16-17 build Python dicts and call the
+arbitrary `reward_fn`. On this Windows machine neither inductor backend builds (CPU needs MSVC
+`cl.exe`, CUDA needs Triton), so `_make_tick_fn` re-raises those failures as a `RuntimeError`.
 """
 from pathlib import Path
 
@@ -108,7 +77,7 @@ from .bots import perception, policy
 from .config import EnvConfig, apply_randomization, build_params, load_randomization, validate
 from .constants import DeathCause
 from .core import boxes, camera, combat, events, geometry as geo, hero, history, melee_sweep, movement
-from .core import observation, obs_schema, projectiles, slots, spawn, stats, zone
+from .core import observation, projectiles, slots, spawn, stats, zone
 from .core.reward import ZeroReward
 from .core.state import allocate, check_invariants, snapshot
 from .maps.loader import build_map_bank
@@ -124,40 +93,23 @@ def _load_base_spec() -> dict:
 
 
 class BrawlVecEnv:
-    """See BRAWL_SIM_BUILD_PLAN.md Step 29 for the full design. `cfg` is a resolved
-    `EnvConfig` (from `config.load_config`); it has no brawler stats on it at all (Step 3:
-    "EnvConfig holds static Python values ... SimParams holds the numeric stats"), so this
-    class separately loads `configs/default.yaml` + `configs/brawlers.yaml` (fixed,
-    package-relative paths, same pattern as `maps/loader.py`'s `CSV_DIR`) to build the `spec`
-    dict `build_params`/`resample_params` need. **If your `cfg` came from `load_config(...,
-    overrides=...)` and any override touched a SimParams-only field** (e.g. `base_hp`,
-    `zone.dps`, `entities.enemy_hp_mult` -- anything not in `_ENV_CONFIG_FIELDS`), that
-    override is invisible to `EnvConfig` and would silently be lost here: pass the matching
-    merged dict explicitly via the `spec` argument. This is a real, documented sharp edge, not
-    an oversight -- there is no way to recover SimParams-only values from an `EnvConfig` alone.
+    """`cfg` is a resolved `EnvConfig` (`config.load_config`), which carries no brawler stats, so
+    the env loads `configs/default.yaml` + `configs/brawlers.yaml` itself to build the `spec`
+    that `build_params`/`resample_params` read. **Trap:** a `load_config(..., overrides=...)`
+    entry that touched a SimParams-only field (`base_hp`, `zone.step_seconds`,
+    `entities.enemy_hp_mult` -- anything outside `_ENV_CONFIG_FIELDS`) is invisible to
+    `EnvConfig` and would be lost here; pass the merged dict as `spec`.
 
-    `reward_fn` defaults to `None` (constructing a fresh `ZeroReward()` inside `__init__`), NOT
-    the plan text's literal `reward_fn=ZeroReward()` -- a mutable default argument would be
-    shared across every `BrawlVecEnv` built without an explicit `reward_fn`, and `ZeroReward`
-    is stateful (it caches a tensor keyed by `(n_envs, device)`). Standard Python correctness
-    fix for a well-known footgun, not a design change.
+    `reward_fn=None` builds a fresh `ZeroReward` per env rather than sharing one stateful default
+    instance (it caches its zeros per `(n_envs, device)`).
 
-    `autoreset` (Step 34) defaults to `True`, preserving every behavior described above and
-    tested since Step 29 exactly as-is. Set `False` only for `wrappers/gym_single.py`'s use
-    case -- standard single-env `gymnasium.Env`s are contractually forbidden from silently
-    resetting inside `step()`; the caller must see `terminated`/`truncated` and call `reset()`
-    itself. With `autoreset=False`, `step()`'s phase 17 (`_autoreset`) becomes a no-op: `state`
-    is left exactly as phase 16 finished it (a "frozen", possibly-terminal state) and the
-    returned `obs` IS that finished tick's own observation -- `info["final_observation"]`/
-    `info["final_info"]` still get set (for API-shape consistency with the `autoreset=True`
-    case) but are then simply equal to `obs`/`info`, not a separate pre-reset snapshot.
+    `autoreset=False` is for `wrappers/gym_single.py`, since a single-env `gymnasium.Env` must not
+    reset inside `step()`: phase 17 is skipped, `state` stays as phase 16 left it, and `obs` is
+    that decision's own (possibly terminal) observation. `final_observation`/`final_info` are
+    still set, equal to `obs`/`info`.
 
-    `verbose` (Step 40) defaults to `True`, preserving `core.state.allocate`'s own long-standing
-    default and every existing caller's behavior exactly. Threaded through as a passthrough
-    kwarg (not a new default) because `scripts/benchmark.py` constructs a fresh `BrawlVecEnv`
-    per `(path, n_envs)` sweep point -- a dozen-plus constructions per run -- and had no way to
-    suppress `allocate`'s per-construction memory report before this, burying the actual
-    benchmark results in the printed report. `verbose=False` there; everywhere else is unaffected.
+    `verbose` is passed to `core.state.allocate`, whose memory report tools that build many envs
+    (scripts/benchmark.py) turn off.
     """
 
     def __init__(
@@ -172,22 +124,14 @@ class BrawlVecEnv:
         self.gen.manual_seed(seed)
         self.reward_fn = reward_fn if reward_fn is not None else ZeroReward()
         self.autoreset = autoreset
-        # Plain attribute, not just a constructor argument: `training/curriculum.py` swaps it in
-        # AFTER construction (the manager needs `self.params`/`self.gen`, which don't exist until
-        # __init__ finishes) and re-reads it on every reset. See spawn.reset_envs for the contract.
+        # A plain attribute: training/builder.py installs the curriculum manager here after
+        # construction (it needs `self.gen`), and every reset re-reads it. Contract:
+        # spawn.reset_envs.
         self.params_hook = params_hook
-        # `tick_hook(env)` runs after EVERY SUB-TICK's phases 1-15, i.e. `action_repeat` times per
-        # `step()`. It exists so replay/recording tools can sample the world at the SIM rate
-        # (20 Hz) rather than the decision rate (4 Hz) -- without it, `scripts/watch.py` and
-        # `scripts/record_rollout.py` would only ever see every action_repeat-th tick and replays
-        # would visibly stutter, with projectiles teleporting between frames.
-        #
-        # **Debug tooling only.** It is a python callback in the middle of the hot loop and the
-        # things worth doing in it (`state.snapshot`, `.cpu()`) are host syncs, which is exactly
-        # what the rest of this file exists to avoid. Nothing in the training path installs one,
-        # and `None` (the default) costs a single `is not None` test per sub-tick. Also note that
-        # phases 16/17 have NOT run when it fires: `state` is mid-decision, pre-observation and
-        # pre-autoreset, which is precisely what makes it useful here.
+        # `tick_hook(env)` runs after every SUB-TICK's phases 1-15, before phases 16/17, so
+        # scripts/watch.py and scripts/record_rollout.py can sample the world at the sim rate.
+        # Debug tooling only: what it does (`state.snapshot`, `.cpu()`) are host syncs, and
+        # nothing in the training path installs one.
         self.tick_hook = tick_hook
 
         base_spec = spec if spec is not None else _load_base_spec()
@@ -197,10 +141,8 @@ class BrawlVecEnv:
             randomization_spec = randomization
         else:
             randomization_spec = load_randomization(randomization)
-        # Applied once here, not per-reset: the resulting spec still carries {low, high} RANGES
-        # for any randomized field, and build_params/resample_params re-sample fresh values
-        # from those ranges every reset (N08) -- baking randomization in once is what makes
-        # that resampling behavior correct, not a shortcut that skips it.
+        # Applied once: the spec keeps {low, high} ranges, which resample_params redraws on
+        # every reset.
         self.spec = apply_randomization(base_spec, randomization_spec) if randomization_spec else base_spec
 
         self.bank = build_map_bank(cfg, device=self.device)
@@ -208,22 +150,16 @@ class BrawlVecEnv:
         validate(cfg, self.params)
         self.state = allocate(cfg, n_envs=n_envs, device=self.device, verbose=verbose)
         # The (N,E,E) visibility behind the most recent observation, stashed by
-        # `_build_observation` so `step` can hand it to `history.push` (Phase H) without a
-        # second visibility pass. None until the first reset()/step() builds an observation.
-        # `_obs_hero_view` is that visibility's hero row cut to the camera window
-        # (`core/camera.hero_view`, OBS_PARITY_TASKS.md C3): what the observation actually
-        # revealed, and so what `history.push` may remember. A test that teleports entities
-        # after an observation sets it to None so the next step() recomputes both.
+        # `_build_observation` so `step` can hand it to `history.push` without a second pass.
+        # `_obs_hero_view` is its hero row cut to the camera window (`core/camera.hero_view`):
+        # what the observation revealed, and so what the history may remember. None until the
+        # first observation; a test that teleports entities sets it to None so the next step()
+        # recomputes both.
         self._obs_vis: torch.Tensor | None = None
         self._obs_hero_view: torch.Tensor | None = None
 
-        # `_tick_fn` is built once here, not per-step -- torch.compile(fn) itself is cheap (it
-        # doesn't compile anything yet, just wraps `fn` in a guard/dispatch shim); the actual
-        # compilation happens lazily on the FIRST call, specialized to that call's actual
-        # argument shapes/types (dynamic=False bakes those in as guards). See Step 31 for why
-        # this can legitimately fail on this machine (Windows CPU inductor needs MSVC `cl.exe`,
-        # not installed here; Windows+Blackwell CUDA inductor needs Triton, also not installed
-        # here) and how that failure is surfaced via `_make_tick_fn`.
+        # Built once. Under cfg.compile, compilation happens lazily on the first call, specialized
+        # to its shapes (dynamic=False); see _make_tick_fn for how a failure surfaces.
         self._tick_fn = self._make_tick_fn()
 
     # ---- public API -----------------------------------------------------------------
@@ -239,45 +175,34 @@ class BrawlVecEnv:
         return obs
 
     def step(self, action: torch.Tensor, override: torch.Tensor | None = None):
-        """`action`/`override` are moved onto `self.device` here (in addition to the dtype
-        cast already done before Step 31) if they aren't already -- callers are NOT required
-        to pre-place them. Found by Step 31's own torch.compile diagnosis: dynamo's fake-tensor
-        device propagation turned what used to be a same-machine-happens-to-match-device
-        assumption into a hard, correctly-worded error the moment a CPU-authored action tensor
-        met a CUDA env; eager mode has the exact same bug (`scatter_` in `_pop_action_buffer`
-        requires matching devices), just with a less informative RuntimeError -- confirmed by
-        reproducing the failure with `cfg.compile=False` before fixing it here."""
+        """`action` (N,2) and `override` (N,E,2) are cast to int64 and moved onto `self.device`
+        here, so callers need not pre-place them (`_pop_action_buffer`'s `scatter_` needs
+        matching devices)."""
         assert action.shape == (self.n_envs, 2), f"action shape {tuple(action.shape)} != {(self.n_envs, 2)}"
         action = action.to(device=self.device, dtype=torch.int64)
         if override is not None:
             assert override.shape == (self.n_envs, self.cfg.n_entities, 2)
             override = override.to(device=self.device, dtype=torch.int64)
 
-        # Phase H: record (pre-step state, this action) as the newest history slot BEFORE the
-        # world moves -- once per decision, outside `_run_tick`, so action_repeat can't touch
-        # the ring cadence. `_obs_hero_view` is the reveal of the observation this action
-        # answers; a caller that steps without ever observing (nothing does, but tests could)
-        # gets a fresh pass instead of a None.
+        # Record (pre-step state, this action) as the newest history slot BEFORE the world moves
+        # -- once per decision, outside `_run_tick`, so action_repeat can't touch the ring
+        # cadence. `_obs_hero_view` is the reveal of the observation this action answers; a
+        # caller that steps without observing first gets a fresh pass instead of a None.
         if self._obs_hero_view is None:
             self._obs_vis = perception.visibility(self.state, self.bank, self.params, self.cfg)
             self._obs_hero_view = camera.hero_view(self.state, self._obs_vis, self.cfg)
         history.push(self.state, action, self._obs_hero_view)
 
         (dmg_by_total, newly_dead, newly_broken, cubes_gained, hp_healed, attacks_in_reach,
-         decision) = self._run_decision(action, override)
+         gadget_hits, decision) = self._run_decision(action, override)
 
         obs_before_reset, info, reward = self._observe(
             dmg_by_total, newly_dead, newly_broken, cubes_gained, hp_healed, attacks_in_reach,
-            decision,
+            gadget_hits, decision,
         )
-        # Cloned and dropped HERE, before autoreset's own post-reset build_obs call, not inside
-        # _autoreset itself -- obs_before_reset's world/view grids are large (obs["world"] alone
-        # is ~177 MB at n_envs=4096), and a del() inside _autoreset wouldn't help: step()'s own
-        # local variable is a second, independent reference to the same tensors that keeps them
-        # alive for the rest of this call regardless of what _autoreset does internally. Freeing
-        # it here, before the post-reset rebuild allocates a same-sized second copy, measurably
-        # lowers peak VRAM (this was the difference between passing and failing Step 29's
-        # "peak VRAM under ~2.5 GB at 4096 envs" acceptance check).
+        # Cloned here, and the local dropped before `_autoreset` rebuilds the observation: this
+        # reference would otherwise keep the pre-reset grids (large at thousands of envs) alive
+        # while the post-reset build allocates a same-sized copy, raising peak VRAM.
         final_observation = observation.clone_obs(obs_before_reset)
         final_info = observation.clone_obs(dict(info))
 
@@ -285,9 +210,8 @@ class BrawlVecEnv:
             del obs_before_reset
             obs, terminated, truncated = self._autoreset(info)
         else:
-            # Step 34: gymnasium single envs must not silently reset inside step() -- state is
-            # left exactly as this tick finished it (see class docstring), and `obs` IS this
-            # tick's own (possibly terminal) observation, not a fresh episode's first one.
+            # No reset (see class docstring): `obs` is this decision's own, possibly terminal,
+            # observation.
             obs = obs_before_reset
             terminated, truncated = info["terminated"], info["truncated"]
         info["final_observation"] = final_observation
@@ -298,14 +222,6 @@ class BrawlVecEnv:
 
         return obs, reward, terminated, truncated, info
 
-    @property
-    def observation_spec(self) -> dict:
-        return obs_schema.obs_spec(self.cfg)
-
-    @property
-    def action_spec(self) -> dict:
-        return {"nvec": self.cfg.action_nvec}
-
     def snapshot(self, env_index: int) -> dict:
         """CPU, rendering only -- see core.state.snapshot."""
         return snapshot(self.state, env_index)
@@ -315,25 +231,22 @@ class BrawlVecEnv:
     def _build_observation(self) -> dict:
         vis = perception.visibility(self.state, self.bank, self.params, self.cfg)
         hero_view = camera.hero_view(self.state, vis, self.cfg)  # concealment AND the camera window
-        self._obs_vis, self._obs_hero_view = vis, hero_view       # read by step() -> history.push (Phase H)
+        self._obs_vis, self._obs_hero_view = vis, hero_view       # read by step() -> history.push
         # Tracker-style enemy slots, promoted on this decision's sighting as the live tracker
-        # does (OBS_PARITY_TASKS.md C8); `build_obs` reads them after the update.
+        # does; `build_obs` reads them after the update.
         slots.update(self.state, hero_view, self.cfg)
-        # zone.active is a latch: gas has been on screen at least once (OBS_PARITY_TASKS.md C5).
+        # zone.active is a latch: gas has been on screen at least once.
         zone.mark_seen(self.state, camera.camera_centre(self.state.ent_pos[:, 0], self.cfg), self.cfg)
-        los = perception.raw_los(self.state, self.bank, self.cfg)
+        # Only the two obs fields it feeds read it, and train.yaml turns those off.
+        los = perception.raw_los(self.state, self.bank, self.cfg) if self.cfg.obs_include_raw_los else None
         return observation.build_obs(self.state, self.bank, vis, los, self.params, self.cfg,
                                      hero_view=hero_view)
 
     def _run_tick(self, action: torch.Tensor, override: torch.Tensor | None):
-        """Section 4 phases 1-15, exactly the sequence `step()` ran inline before Step 31 --
-        pulled out into its own method ONLY so it has a stable, single callable to hand to
-        `torch.compile` (`self._tick_fn`, built once in `__init__`). Deliberately excludes
-        phase 16 (`_observe`, which builds nested python dicts and calls `self.reward_fn` --
-        an arbitrary user callable `torch.compile` has no business tracing through) and phase
-        17 (`_autoreset`, which reads the python `dict` `info` phase 16 produced). Every other
-        SimState mutation for this tick happens here, in place, exactly as before -- `step()`
-        just no longer has these 15 calls written out inline."""
+        """Phases 1-15: one sim tick, mutating SimState in place. Its own method so
+        `torch.compile` gets a single callable (`self._tick_fn`); phase 16 (`_observe`: Python
+        dicts and the arbitrary `reward_fn`) and phase 17 (`_autoreset`, which reads that dict)
+        stay outside."""
         effective_action = self._pop_action_buffer(action)
         regen_healed = self._tick_timers()
         hero_move_dir, hero_fire, hero_super, hero_gadget, hero_auto = self._decode(effective_action)
@@ -345,7 +258,7 @@ class BrawlVecEnv:
             move_dir, fire, super_fire, aim_dir, aim_point, gadget_fire, vis, hero_auto=hero_auto)
         self._movement_phase(move_dir)
         dmg_by_dash = self._dash_phase()
-        dmg_by_proj, super_healed, proj_charge_hit = self._projectile_phase()
+        dmg_by_proj, super_healed, proj_charge_hit, gadget_hit = self._projectile_phase()
         self._zone_phase()
         newly_broken = self._box_phase()
         cubes_gained = self._pickup_phase()
@@ -353,61 +266,55 @@ class BrawlVecEnv:
         self._zone_schedule()
 
         dmg_by_total = dmg_by_melee + dmg_by_dash + dmg_by_proj
-        # Every heal source this sim has, summed into the one (N,E) delta `compute_info` takes:
-        # phase 2's out-of-combat regen, phase 6's melee lifesteal (Edgar), and phase 9's super
-        # lifesteal (Mortis). A power cube's max-HP bump
-        # raises current HP by the same amount (core/stats.py) but is deliberately NOT counted --
-        # it is a pickup, already priced by the reward's own `cube_pickup` term, not HP won back
-        # from a wound.
+        # Every heal source, summed into the one (N,E) delta `compute_info` takes: phase 2's
+        # regen, phase 6's melee lifesteal (Edgar) and phase 9's super lifesteal (Mortis). A power
+        # cube's max-HP bump also raises current HP (core/stats.py) but is not counted: it is a
+        # pickup, priced by the reward's `cube_pickup` term, not HP won back from a wound.
         hp_healed = regen_healed + super_healed + melee_healed
-        # Super charge (Step G2.4): melee and dash hits charge exactly as their damage matrices
-        # say; the projectile phase hands up its own mask, which is `dmg_by_proj > 0` minus the
-        # gadget spinner's hits (S12: the gadget charges no super).
+        # Super charge: melee and dash hits charge as their damage matrices say; the projectile
+        # phase hands up `dmg_by_proj > 0` minus the gadget spinner's hits (the gadget charges no
+        # super).
         charge_hit = (dmg_by_melee > 0) | (dmg_by_dash > 0) | proj_charge_hit
         self._bookkeeping(dmg_by_total, charge_hit)
-        return dmg_by_total, newly_dead, newly_broken, cubes_gained, hp_healed, attack_in_reach
+        return (dmg_by_total, newly_dead, newly_broken, cubes_gained, hp_healed, attack_in_reach,
+                gadget_hit)
 
     def _run_decision(self, action: torch.Tensor, override: torch.Tensor | None):
-        """One AGENT DECISION: `cfg.action_repeat` back-to-back `_run_tick` calls holding the
-        same action, aggregated into the single set of per-decision quantities `_observe`
-        expects. Returns `_run_tick`'s own six values (summed over the sub-ticks; the (N,) bool
-        attack-in-reach flag becomes an int32 count) plus the `core/events` decision tally.
+        """One AGENT DECISION: `cfg.action_repeat` `_run_tick` calls holding the same action.
+        Returns `_run_tick`'s seven values summed over the sub-ticks, plus the `core/events`
+        decision tally. Its two (N,) bool flags, attack-in-reach and gadget-hit, become int32
+        counts.
 
-        `action_repeat=1` returns after the first tick having allocated nothing extra beyond the
-        tally itself, so the default configuration keeps its exact previous cost and behavior.
+        The loop is a static `range` over a config int, so it stays sync-free (no `.any()` check
+        for "every env finished") and `torch.compile` only ever sees `_run_tick`.
 
-        The loop is a plain Python `range` over a config int, not a data-dependent `while`: the
-        trip count is static, so this stays sync-free (no `.any()`/`.item()` host check to
-        discover that every env has finished) and `torch.compile` still only ever sees
-        `_run_tick`, one unchanged tick at a time.
+        **`live` is sampled BEFORE each sub-tick:** an env that finished on an earlier sub-tick
+        adds nothing further to any delta, which would otherwise be credited to the finished
+        episode's reward. The tally applies the same gate; see `events.advance_decision_tally`.
 
-        **`live` is sampled BEFORE each sub-tick, not after.** An env that finished on an
-        earlier sub-tick contributes nothing further to any delta -- damage it deals or takes,
-        boxes it breaks, cubes it collects after its own episode ended would otherwise be
-        credited to that finished episode's reward. The tally applies the same gate to its own
-        counters; see `events.advance_decision_tally`.
-
-        **Sub-ticks 2..K hold the MOVE bin but drop the FIRE bit** (`_held`), so one decision is
-        at most one attack attempt -- see the class docstring for why that guard is required
-        rather than merely tidy."""
-        dmg_by, newly_dead, newly_broken, cubes_gained, hp_healed, in_reach = self._tick_fn(action, override)
-        # A COUNT from here on, int32 like the tally's own counters. At most 1 per decision, since
-        # `_held` drops the fire bit; with action latency the attack can land on a later sub-tick,
-        # which is why the loop below adds it under the same `live` gate as every other delta.
+        **Sub-ticks 2..K hold the move bin but drop the attack column** (`_held`), so one
+        decision is at most one attack attempt (see the module docstring)."""
+        (dmg_by, newly_dead, newly_broken, cubes_gained, hp_healed, in_reach,
+         gadget_hit) = self._tick_fn(action, override)
+        # COUNTS from here on, int32 like the tally's counters. At most 1 attack per decision,
+        # since `_held` drops the fire bit; with action latency the attack can land on a later
+        # sub-tick, so the loop below adds it under the same `live` gate as every other delta. A
+        # spinner lands `gadget_flight_seconds` after its throw, so its hit can fall on a later
+        # sub-tick or decision than the throw.
         attacks_in_reach = in_reach.to(torch.int32)
+        gadget_hits = gadget_hit.to(torch.int32)
         decision = events.new_decision_tally(self.state, self.cfg)
         self._run_tick_hook()
         if self.cfg.action_repeat == 1:
-            # Explicit early return, not just a zero-trip loop: it keeps the `_held` clones below
-            # off the per-step path entirely, which is what makes action_repeat=1 cost exactly
-            # what it cost before this method existed.
-            return dmg_by, newly_dead, newly_broken, cubes_gained, hp_healed, attacks_in_reach, decision
+            # Keeps the `_held` clones below off the action_repeat=1 path.
+            return (dmg_by, newly_dead, newly_broken, cubes_gained, hp_healed, attacks_in_reach,
+                    gadget_hits, decision)
 
         held_action, held_override = self._held(action), self._held(override)
         for _ in range(self.cfg.action_repeat - 1):
             live = ~decision["done"]
-            tick_dmg, tick_dead, tick_broken, tick_cubes, tick_healed, tick_in_reach = self._tick_fn(
-                held_action, held_override)
+            (tick_dmg, tick_dead, tick_broken, tick_cubes, tick_healed, tick_in_reach,
+             tick_gadget_hit) = self._tick_fn(held_action, held_override)
             live_e = live.unsqueeze(-1)
             dmg_by = dmg_by + tick_dmg * live.view(-1, 1, 1)
             newly_dead = newly_dead | (tick_dead & live_e)
@@ -415,23 +322,22 @@ class BrawlVecEnv:
             cubes_gained = cubes_gained + tick_cubes * live_e
             hp_healed = hp_healed + tick_healed * live_e
             attacks_in_reach = attacks_in_reach + (tick_in_reach & live).to(torch.int32)
+            gadget_hits = gadget_hits + (tick_gadget_hit & live).to(torch.int32)
             decision = events.advance_decision_tally(decision, self.state, self.cfg)
             self._run_tick_hook()
 
-        return dmg_by, newly_dead, newly_broken, cubes_gained, hp_healed, attacks_in_reach, decision
+        return (dmg_by, newly_dead, newly_broken, cubes_gained, hp_healed, attacks_in_reach,
+                gadget_hits, decision)
 
     @staticmethod
     def _held(action: torch.Tensor | None) -> torch.Tensor | None:
-        """The same action with its FIRE column zeroed -- what sub-ticks 2..K of a decision are
-        driven with. Works for both `action` (N,2) and `override` (N,E,2): the fire bit is the
-        last column of either, and for `override` the `-1` "no override for this slot" sentinel
-        lives in column 0 and is left untouched, so an unoverridden slot stays unoverridden.
+        """The same action with its attack column zeroed, driving sub-ticks 2..K of a decision.
+        Works for `action` (N,2) and `override` (N,E,2): the attack column is the last of either,
+        and `override`'s `-1` "no override" sentinel in column 0 is left alone.
 
-        Zeroing the WHOLE column is what makes the rule hold for every value it can carry -- 1
-        attack, 2 super, 3 gadget (Step G3) -- with no per-value case: one decision is at most one
-        attack, one super or one gadget (tests/test_gadget.py pins the gadget's).
-
-        Built ONCE per decision, not per sub-tick -- it is the same tensor every time."""
+        Zeroing the whole column covers every value it can carry (1 attack, 2 super, 3 gadget,
+        4 auto-aimed attack), so one decision is at most one of them (tests/test_gadget.py pins
+        the gadget's). Built once per decision."""
         if action is None:
             return None
         held = action.clone()
@@ -439,25 +345,19 @@ class BrawlVecEnv:
         return held
 
     def _run_tick_hook(self) -> None:
-        """Calls `self.tick_hook(self)` if one is installed, after a sub-tick's phases 1-15.
-        `None` by default, which costs one `is not None` test per sub-tick and nothing else --
-        see the constructor's own note on what it is for and why it is not free to use."""
+        """Calls `self.tick_hook(self)` after a sub-tick's phases 1-15, if one is installed (see
+        `__init__`)."""
         if self.tick_hook is not None:
             self.tick_hook(self)
 
     def _make_tick_fn(self):
-        """`cfg.compile=False` (the default): returns `self._run_tick` completely unwrapped --
-        zero overhead, zero behavior change from pre-Step-31 `env.py`. `cfg.compile=True`:
-        wraps `torch.compile(self._run_tick, dynamic=False, fullgraph=False)` in a thin guard
-        that turns a compile-MACHINERY failure (inductor/dynamo internals -- e.g. `TritonMissing`
-        on this Windows+Blackwell box, or `InductorError: ... cl is not found` on Windows CPU,
-        both confirmed by hand, see Step 31's plan notes) into a `RuntimeError` with a clear,
-        actionable message and the original exception chained via `from e`. Deliberately does
-        NOT catch exceptions from `torch._dynamo`/`torch._inductor` blindly rewords them and
-        lets everything else (a real bug in `_run_tick` itself, which `fullgraph=False` would
-        surface exactly as it would in eager, just interleaved with compiled segments) propagate
-        with its own original type/message untouched -- a masked domain bug reported as "torch.
-        compile isn't supported here" would be far worse than a clearly-labeled compile failure.
+        """`cfg.compile=False` (the default) returns `self._run_tick` unwrapped. `cfg.compile=True`
+        wraps `torch.compile(self._run_tick, dynamic=False, fullgraph=False)` in a guard that
+        re-raises a compile-machinery failure -- an exception whose type lives in
+        `torch._dynamo`/`torch._inductor`, e.g. `TritonMissing`, or inductor's "cl is not found"
+        on Windows CPU -- as a `RuntimeError` chained `from e`. Everything else (a real bug in
+        `_run_tick`) propagates with its own type and message, so a domain bug is never
+        reported as "compile unsupported".
         """
         if not self.cfg.compile:
             return self._run_tick
@@ -473,29 +373,25 @@ class BrawlVecEnv:
                     raise
                 raise RuntimeError(
                     "torch.compile failed while compiling BrawlVecEnv's inner tick "
-                    "(cfg.compile=True). This is a KNOWN, ACCEPTABLE failure mode on some "
-                    "platforms (see BRAWL_SIM_BUILD_PLAN.md Step 31): the CPU inductor backend "
-                    "needs an MSVC `cl.exe` on PATH, and the CUDA inductor backend needs a "
-                    "working Triton install -- neither is guaranteed on Windows, and Triton on "
-                    "Windows + Blackwell (sm_120) has been especially fragile as of this "
-                    "writing. `compile: false` (the default) is the fully-supported path and "
-                    f"is unaffected by this. Original error -- {type(e).__name__}: {e}"
+                    "(cfg.compile=True). This is a known failure mode on some platforms "
+                    "(BRAWL_SIM_DESIGN.md §12): the CPU inductor backend needs an MSVC `cl.exe` "
+                    "on PATH, and the CUDA inductor backend needs a working Triton install -- "
+                    "neither is guaranteed on Windows. `compile: false` (the default) is the "
+                    "supported path and is unaffected by this. "
+                    f"Original error -- {type(e).__name__}: {e}"
                 ) from e
 
         return _guarded_tick
 
-    # -- Section 4 phase 1 --
+    # -- phase 1 --
     def _pop_action_buffer(self, action: torch.Tensor) -> torch.Tensor:
         """Writes `action` into act_buf[:, act_head], reads back act_buf[:, act_head -
         action_latency_ticks (mod L)], then advances act_head. At 0 ticks (L=1) this is a
         pass-through: write and read hit the same (only) slot.
 
-        Runs once per SUB-TICK, so latency stays denominated in sim ticks no matter what
-        `cfg.action_repeat` is: a decision's held action is written into the buffer on each of
-        its sub-ticks and comes back out `action_latency_ticks` later, exactly as it would at
-        `action_repeat=1`. Correct, but worth knowing that a latency shorter than one decision
-        window is invisible to the agent -- the same action is being written on every sub-tick,
-        so delaying it by a tick or two inside that window changes nothing it can observe."""
+        Runs once per SUB-TICK, so latency is in sim ticks whatever `cfg.action_repeat` is: each
+        sub-tick's action comes back out `action_latency_ticks` later, so a decision's first
+        `action_latency_ticks` sub-ticks still run the actions written before it."""
         state, cfg = self.state, self.cfg
         L = state.act_buf.shape[1]
 
@@ -508,29 +404,26 @@ class BrawlVecEnv:
         state.act_head.copy_((state.act_head + 1) % L)
         return effective_action
 
-    # -- Section 4 phase 2 (regen folded in here; see class docstring) --
+    # -- phase 2: timers and regen --
     def _tick_timers(self) -> torch.Tensor:
-        """Regen isn't its own numbered phase in Section 4, but it reads ent_out_of_combat_t (a
-        timer) and only ever heals -- and running it here, BEFORE this tick's combat, means a
-        fatal hit dealt later this same tick can never be "un-fatal-ed" by a regen tick that
-        hasn't seen it yet. Running it later (e.g. at bookkeeping) would risk exactly that.
-
-        Returns the (N,E) HP regen actually restored, for `info["hp_healed_tick"]`."""
+        """Timers, then regen. Regen runs BEFORE this tick's combat, so it can never undo a
+        lethal hit dealt later in the same tick. Returns the (N,E) HP regen actually restored,
+        for `info["hp_healed_tick"]`."""
         hero.tick_timers(self.state, self.params, self.cfg)
         return combat.apply_regen(self.state, self.params, self.cfg)
 
-    # -- Section 4 phase 3 --
+    # -- phase 3 --
     def _decode(self, effective_action: torch.Tensor):
         return hero.decode_action(effective_action, self.state, self.params, self.cfg)
 
-    # -- Section 4 phase 4 --
+    # -- phase 4 --
     def _bot_phase(self, hero_move_dir: torch.Tensor, hero_fire: torch.Tensor,
                    hero_super: torch.Tensor, hero_gadget: torch.Tensor):
         """Returns `(move_dir, fire, super_fire, gadget_fire, aim_dir, aim_point, vis)`. `vis` is
         this tick's FAIR `(N,E,E)` visibility, handed on so `_attack_phase` can aim the gadget
-        spinner at what each thrower can actually see (Step G3 / S10) without paying for a second
-        `perception.visibility` pass: nothing between here and phase 6 moves an entity or touches
-        a reveal timer (`_override_phase` is pure), so it is exactly what phase 6 would compute."""
+        spinner at what each thrower can see without a second `perception.visibility` pass:
+        nothing between here and phase 6 moves an entity or touches a reveal timer
+        (`_override_phase` is pure), so it is exactly what phase 6 would compute."""
         state, cfg = self.state, self.cfg
         vis = perception.visibility(state, self.bank, self.params, cfg)
         intent = policy.all_bot_intents(state, vis, self.bank, self.params, cfg, self.gen)
@@ -539,44 +432,37 @@ class BrawlVecEnv:
         move_dir[:, 0] = hero_move_dir
         fire = intent.fire.clone()
         fire[:, 0] = hero_fire
-        # `BotIntent.super_fire` is all-False today -- no bot kind configures a super. It exists so
-        # that giving one to a bot is a decision inside its combat rule plus a brawlers.yaml block,
-        # with no plumbing change here (bot_overhaul.md D2).
+        # `BotIntent.super_fire` is all-False: no bot kind configures a super. Giving a bot one
+        # takes its combat rule plus a brawlers.yaml block, with no plumbing change here.
         super_fire = intent.super_fire.clone()
         super_fire[:, 0] = hero_super
-        # The gadget (Step G3). `BotIntent` has no gadget bit: every bot kind resolves
-        # `gadget_cooldown` to 0, so a bot row could never pass `_attack_phase`'s
-        # `hero.gadget_ready` safety net even if one were set. The hero's slot is the only one
-        # that can be True.
+        # `BotIntent` has no gadget bit: every bot kind resolves `gadget_cooldown` to 0, so a bot
+        # row could never pass `_attack_phase`'s `hero.gadget_ready` gate anyway. Only the hero's
+        # slot can be True.
         gadget_fire = torch.zeros_like(fire)
         gadget_fire[:, 0] = hero_gadget
-        # The hero has no separate ranged aim (N02/N03/R02: dash inherits move_dir) -- these
-        # placeholders are only ever read for entity 0 by spawn_volley, whose own proj_count
-        # for hero_mortis is 0 (unset in brawlers.yaml), so they're provably inert.
+        # The hero has no ranged aim (his dash follows move_dir). These placeholders are read for
+        # entity 0 only by spawn_volley, and hero_mortis's proj_count is 0, so they are inert.
         aim_dir = intent.aim_dir.clone()
         aim_dir[:, 0] = geo.from_angle(state.ent_facing[:, 0])
         aim_point = intent.aim_point.clone()
         aim_point[:, 0] = state.ent_pos[:, 0]
         return move_dir, fire, super_fire, gadget_fire, aim_dir, aim_point, vis
 
-    # -- Section 4 phase 5 --
+    # -- phase 5 --
     def _override_phase(self, move_dir: torch.Tensor, fire: torch.Tensor, override: torch.Tensor | None):
         """override[..., 0] == -1 means "no override for this entity slot" (valid move bins are
-        0..n_move_bins, so -1 is an unambiguous sentinel); otherwise override[n,e] REPLACES that
-        entity's move_dir/fire for this tick. Does not touch aim_dir/aim_point -- override drives
-        movement/attack-timing, not targeting; an overridden bot still aims via its own archetype
-        logic, and the hero's "aim" is just its (now overridden) move_dir via the dash.
+        0..n_move_bins); otherwise override[n,e] REPLACES that entity's move_dir/fire for this
+        tick. aim_dir/aim_point are untouched: an overridden bot still aims by its own logic.
 
         **An override drives movement and the ORDINARY attack, nothing else.** Its attack column
-        is read as a bool (`override[..., 1] != 0`), not decoded like the hero's 4-valued one: a 2
-        or a 3 there is an ordinary attack, so an override can throw neither a super nor a gadget.
-        And `super_fire` / `gadget_fire` never pass through here, so an override on the HERO's
-        slot does not cancel a super or a gadget his action asked for -- those always come from
-        the action. The corollary: an override that FIRES under an action that asks for the
-        gadget yields a dash AND a gadget on the same tick, the one way the two ever share one
-        ("one column, one value" is a property of the action, and these are two sources).
-        tests/test_gadget.py pins all three cases. No caller overrides slot 0 outside tests;
-        widening this decode is a separate decision, not an oversight."""
+        is read as a bool (`override[..., 1] != 0`), not decoded like the hero's: any nonzero
+        value, 2, 3 and 4 included, is an ordinary attack, so an override can throw neither a
+        super nor a gadget. `super_fire`/`gadget_fire` never pass through here, so an override on
+        the hero's slot does not cancel a super or gadget his action asked for, and an override
+        that FIRES under an action asking for the gadget yields a dash AND a gadget on one tick.
+        tests/test_gadget.py pins all three cases. No caller overrides slot 0 outside tests; the
+        narrow decode is deliberate."""
         if override is None:
             return move_dir, fire
         cfg = self.cfg
@@ -591,33 +477,30 @@ class BrawlVecEnv:
         fire = torch.where(has_override, override_fire, fire)
         return move_dir, fire
 
-    # -- Section 4 phase 6 --
+    # -- phase 6 --
     def _attack_phase(self, move_dir: torch.Tensor, fire: torch.Tensor,
                       super_fire: torch.Tensor, aim_dir: torch.Tensor, aim_point: torch.Tensor,
                       gadget_fire: torch.Tensor, vis: torch.Tensor,
                       hero_auto: torch.Tensor | None = None):
-        """consume ammo; START DASH (clip path now); spawn volleys; throw gadgets; melee hitscan.
+        """Gates every attack source, starts dashes (clipping their paths now), spends ammo,
+        fires supers, throws gadgets, spawns volleys and resolves melee.
 
         `hero_auto` is the (N,) bool `hero.decode_action` returns for attack value 4 (the
-        auto-aimed attack, `cfg.auto_aim`); `None` means no row asked for it, which is what the
-        direct callers in tests pass by omission. It only changes the HERO's dash direction, see
-        the swap before `hero.start_dash` below; `fire` already carries the attack itself.
+        auto-aimed attack, `cfg.auto_aim`); `None`, which tests pass by omission, means no row
+        asked for it. It only changes the HERO's dash direction (see the swap before
+        `hero.start_dash`); `fire` already carries the attack itself.
 
         `gadget_fire` is (N,E) bool and `vis` the fair (N,E,E) visibility `_bot_phase` computed
-        this tick (Step G3) -- the gadget spinner homes on the nearest enemy its thrower can SEE.
+        this tick: the gadget spinner homes on the nearest enemy its thrower can SEE.
 
-        Returns (dmg_by (N,E,E), healed (N,E), attack_in_reach (N,) bool) -- the second is melee
-        lifesteal as ACTUALLY applied, on the same contract as `_projectile_phase`'s: `apply_heal`
-        drops it for dead entities and clips it at max HP, so it is what `info["hp_healed_tick"]`
-        must be paid on. The third is the hero's attack-in-reach flag for the reward (see where
-        `enemy_in_reach` is computed).
+        Returns (dmg_by (N,E,E), healed (N,E), attack_in_reach (N,) bool). `healed` is melee
+        lifesteal as ACTUALLY applied (`apply_heal` drops it for dead entities and clips it at max
+        HP), the same contract as `_projectile_phase`'s, so it is what `info["hp_healed_tick"]` is
+        paid on. `attack_in_reach` is the hero's flag for the reward (see `enemy_in_reach`).
 
-        Ammo/cooldown/shots_fired bookkeeping for ranged and melee attacks is done HERE, by
-        hand -- neither projectiles.spawn_volley nor combat.melee_hitscan mutates ent_ammo/
-        ent_attack_cd/ent_shots_fired (only hero.start_dash does, for dashes). This also closes
-        a gap core/events.py (Step 27) flagged explicitly: ent_shots_fired was previously only
-        ever incremented by dashes, so ranged/melee bots never counted as having "fired" in the
-        cumulative counter or the observation. They do now."""
+        Ammo, cooldown and shots_fired for ranged and melee attacks are booked HERE: neither
+        projectiles.spawn_volley nor combat.melee_hitscan writes ent_ammo/ent_attack_cd/
+        ent_shots_fired (hero.start_dash does, for dashes)."""
         state, bank, params, cfg = self.state, self.bank, self.params, self.cfg
 
         # Safety net: bot-sourced and hero-sourced fire are already gated on this (fire_gate /
@@ -626,34 +509,31 @@ class BrawlVecEnv:
         can_attack = state.ent_alive & (state.ent_ammo >= 1.0) & (state.ent_attack_cd <= 0) & (state.ent_dash_t <= 0)
         fire = fire & can_attack
 
-        # A SUPER costs charge, not ammo, so its gate deliberately omits the ammo term -- an empty
-        # clip must not block it. It keeps the cooldown and no-dashing terms, so it cannot be used
-        # to sidestep either. Same safety-net role as `can_attack` above: hero-sourced supers are
-        # already gated by `action_mask`, but this makes an illegal one impossible from ANY source,
-        # including a future bot or an override.
+        # A SUPER costs charge, not ammo, so its gate omits the ammo term (an empty clip must not
+        # block it) but keeps the cooldown and no-dashing terms. Same safety-net role as
+        # `can_attack`: `action_mask` already gates the hero's, this gates ANY source.
         can_super = (
             state.ent_alive & (state.ent_attack_cd <= 0) & (state.ent_dash_t <= 0)
             & hero.super_ready(state, params)
         )
         super_fire = super_fire & can_super
 
-        # The GADGET's gate is its own timer and nothing else (S8): no ammo, no `attack_cd`, no
-        # `dash_t` -- the game lets a gadget go mid-dash. `hero.gadget_ready` is the same predicate
-        # `action_mask` publishes, so this is the same kind of safety net as the two above: a
-        # gadget requested while masked (cooldown running, dead, or a kind with no gadget at all,
-        # which is every bot) is a silent no-op from ANY source.
+        # The GADGET's gate is its own timer and nothing else: no ammo, no `attack_cd`, no `dash_t`
+        # (the game lets a gadget go mid-dash). `hero.gadget_ready` is the predicate `action_mask`
+        # publishes, so a gadget requested while masked (cooldown running, dead, or a kind with no
+        # gadget, i.e. every bot) is a silent no-op from ANY source.
         gadget_fire = gadget_fire & hero.gadget_ready(state, params)
 
         dash_distance = stats.gather_kind(params.dash_distance, state.ent_kind)
         is_dash_attack = fire & (dash_distance > 0)
         is_other_attack = fire & ~is_dash_attack
 
-        # Attack in reach (SIM_OVERHAUL_PLAN.md §9 R2; operator, 2026-09-21), the one input of the
-        # reward's `attack_in_reach` term: is an enemy the hero can SEE (`vis` row 0, the fair
-        # visibility) inside its uncharged dash reach? The radius is scripts/audit_attack_cadence.py's
-        # own (dash_distance + dash_radius + unit_radius, 3.77 tiles for Mortis), so the term pays
-        # for exactly the quantity A1 measured. Read before `hero.start_dash`, off the positions the
-        # decision was made on, and ANDed with `attacked` below.
+        # Attack in reach (user decision, 2026-09-21; BRAWL_SIM_DESIGN.md §10), the one input of
+        # the reward's `attack_in_reach` term: is an enemy the hero can SEE (`vis` row 0) inside
+        # his uncharged dash reach? The radius is scripts/audit_attack_cadence.py's (dash_distance
+        # + dash_radius + unit_radius), so the term pays for exactly what the audit measures. Read
+        # before `hero.start_dash`, off the positions the decision was made on, and ANDed with
+        # `attacked` below.
         hero_reach = (
             dash_distance[:, 0] + stats.gather_kind(params.dash_radius, state.ent_kind)[:, 0]
             + params.unit_radius
@@ -663,13 +543,13 @@ class BrawlVecEnv:
             state.ent_alive[:, 1:] & vis[:, 0, 1:] & (enemy_dist <= hero_reach.unsqueeze(-1))
         ).any(dim=-1)
 
-        # The auto-aimed attack (attack value 4, `cfg.auto_aim`; the lead, 2026-09-26): on the
+        # The auto-aimed attack (attack value 4, `cfg.auto_aim`; user decision, 2026-09-26): on the
         # rows that asked for it AND have a target in reach, the hero's dash goes straight at
         # `hero.auto_aim_target`'s nearest enemy-or-crate instead of along the move bin; with
         # nothing in reach the row keeps the ordinary rule below (move bin, or facing when
         # idle), like a bare tap in the game with nothing near. A SEPARATE tensor for the dash:
-        # `move_dir` is read again by `spawn_supers` and by `_movement_phase`, and the hero's
-        # walk must not bend toward the target.
+        # `move_dir` is read again by the super's aim below and by `_movement_phase`, and the
+        # hero's walk must not bend toward the target.
         dash_dir = move_dir
         if hero_auto is not None and cfg.auto_aim:
             auto_dir, has_target = hero.auto_aim_target(state, params, cfg)
@@ -677,52 +557,53 @@ class BrawlVecEnv:
             hero_dir = torch.where(swap, auto_dir, move_dir[:, 0])
             dash_dir = torch.cat([hero_dir.unsqueeze(1), move_dir[:, 1:]], dim=1)
 
+        # The SUPER's aim, its own tensor for the same reason. It follows the move bin, but an idle
+        # bin's `move_dir` is (0, 0), which `spawn_supers` would launch as a bolt that never moves,
+        # and the mask cannot tie the super to the move column. So an idle row falls back to
+        # facing, as `start_dash` does for the dash, and the HERO's idle super aims like the game's
+        # tap-to-fire (user decision, 2026-09-30): at `hero.super_aim_target`'s nearest enemy in
+        # the bolt's reach, along facing with none. Read here, before `start_dash` turns a dasher's
+        # facing, off the state the decision was made on.
+        idle = (move_dir[..., 0] == 0) & (move_dir[..., 1] == 0)                   # (N,E)
+        super_dir = torch.where(idle.unsqueeze(-1), geo.from_angle(state.ent_facing), move_dir)
+        tap_dir, _has_target = hero.super_aim_target(state, params, cfg)          # (N,2)
+        hero_super_dir = torch.where(idle[:, :1], tap_dir, super_dir[:, 0])
+        super_dir = torch.cat([hero_super_dir.unsqueeze(1), super_dir[:, 1:]], dim=1)
+
         hero.start_dash(state, fire, dash_dir, bank, params, cfg)
 
-        # Attacking breaks concealment (Step 41). `perception.reveal_after_attack` has been a
-        # SimParams field since Step 3 and is read by bots/perception.visibility, but nothing ever
-        # WROTE ent_reveal_t -- hero.tick_timers only ever decremented it -- so the parameter was
-        # inert and firing from a bush left you hidden. Applied to `fire` (every attack source,
-        # dashes included) rather than only to bots, so the hero cannot attack out of a bush with
-        # impunity either; that asymmetry was part of what made bush-sitting a winning policy.
-        # torch.maximum, not assignment: a fresh shot must never SHORTEN a longer reveal already
-        # running. tick_timers decrements at phase 2 and this is phase 6, so a reveal set here
-        # lasts its full duration.
-        # `attacked` -- not `fire` -- for everything that means "I just took an offensive
-        # action": a super breaks concealment, breaks out-of-combat for regen, and spends the
-        # long-dash charge exactly like an ordinary attack does. Missing any of these would
-        # make the super a free way to shoot from a bush, out-heal a fight, or keep a charged
-        # long dash banked.
+        # Attacking breaks concealment (`perception.reveal_after_attack`), the hero's included, so
+        # nobody attacks out of a bush unseen. torch.maximum, not assignment: a fresh shot must
+        # never SHORTEN a longer reveal already running. tick_timers decrements at phase 2 and
+        # this is phase 6, so a reveal set here lasts its full duration.
+        # `attacked`, not `fire`, for everything that means "I just took an offensive action": a
+        # super breaks concealment, breaks out-of-combat for regen and spends the long-dash charge
+        # like an ordinary attack, or it would be a free way to shoot from a bush, out-heal a
+        # fight or keep a charged long dash banked.
         attacked = fire | super_fire
-        # The gadget is an offensive action for concealment and for regen (S12) but NOT for the
-        # long dash: `ent_attack_idle_t` below keeps reading `attacked`, because that mechanic is
-        # about his ATTACK and a gadget thrown while the long dash charges must not spend it.
+        # The gadget is offensive for concealment and regen but NOT for the long dash:
+        # `ent_attack_idle_t` below reads `attacked`, so a gadget thrown while the long dash
+        # charges does not spend it.
         offensive = attacked | gadget_fire
-        # The reward's flag reads `attacked` as well: the gadget is no attack for it, as in the
-        # audit, whose "attacked" is attack column 1 or 2.
+        # The reward's flag reads `attacked` too: the gadget is no attack for it, as in
+        # scripts/audit_attack_cadence.py, whose "attacked" is attack column 1, 2 or 4.
         attack_in_reach = attacked[:, 0] & enemy_in_reach
         reveal = params.reveal_after_attack.unsqueeze(-1).expand_as(state.ent_reveal_t)
         state.ent_reveal_t.copy_(
             torch.where(offensive, torch.maximum(state.ent_reveal_t, reveal), state.ent_reveal_t)
         )
 
-        # Attacking also breaks you OUT OF COMBAT for regen purposes, exactly like being hit does
-        # (combat.apply_damage owns that side). Without this, an entity could hold a target down
-        # while out-healing the chip damage it was taking, because only the VICTIM's stopwatch ever
-        # reset -- "regen after 4s of not taking damage or attacking" needs both halves, and this is
-        # the only phase that knows an attack actually happened.
+        # Attacking also breaks you OUT OF COMBAT for regen, as being hit does (combat.apply_damage
+        # owns that side): regen waits for a spell of neither taking damage nor attacking, and
+        # this is the only phase that knows an attack happened.
         state.ent_out_of_combat_t.copy_(
             torch.where(offensive, torch.zeros_like(state.ent_out_of_combat_t), state.ent_out_of_combat_t)
         )
 
-        # Long-dash charge (Step D1). Reset by attacking and by NOTHING ELSE -- notably not by
-        # taking damage, unlike ent_out_of_combat_t above, and not by the gadget (`attacked`, not
-        # `offensive`).
-        #
-        # Placed after `hero.start_dash`, which is load-bearing: start_dash reads the charge to
-        # decide whether THIS dash is a long one, so resetting before it would mean the long dash
-        # could never actually fire. The ordering is the same reason out_of_combat_t is reset here
-        # rather than earlier in the phase.
+        # Long-dash charge: reset by attacking and by NOTHING ELSE -- not by taking damage, unlike
+        # ent_out_of_combat_t above, and not by the gadget (`attacked`, not `offensive`). Must stay
+        # after `hero.start_dash`, which reads the charge to decide whether THIS dash is a long
+        # one; resetting before it would mean the long dash never fires.
         state.ent_attack_idle_t.copy_(
             torch.where(attacked, torch.zeros_like(state.ent_attack_idle_t), state.ent_attack_idle_t)
         )
@@ -733,27 +614,26 @@ class BrawlVecEnv:
         state.ent_shots_fired.copy_(torch.where(is_other_attack, state.ent_shots_fired + 1, state.ent_shots_fired))
 
         # --- super: spend the whole charge, take the cooldown, launch the bolt ---
-        # Charge is zeroed rather than decremented by `super_charge_hits`: it is capped at that
-        # value by `add_super_charge`, so the two are equivalent today, but "firing spends the
-        # meter" stays true if a future brawler ever banks more than one.
+        # Charge is zeroed rather than decremented by `super_charge_hits`: `add_super_charge` caps
+        # it there, so the two agree, but "firing spends the meter" stays true if a brawler ever
+        # banks more than one.
         state.ent_super_charge.copy_(
             torch.where(super_fire, torch.zeros_like(state.ent_super_charge), state.ent_super_charge)
         )
         state.ent_attack_cd.copy_(torch.where(super_fire, attack_cooldown, state.ent_attack_cd))
         state.ent_shots_fired.copy_(torch.where(super_fire, state.ent_shots_fired + 1, state.ent_shots_fired))
-        projectiles.spawn_supers(state, super_fire, state.ent_pos, move_dir, params, cfg)
+        projectiles.spawn_supers(state, super_fire, state.ent_pos, super_dir, params, cfg)
 
-        # --- gadget (Step G3): start the cooldown, throw the spinner ---
+        # --- gadget: start the cooldown, throw the spinner ---
         # The ONLY writer of `ent_gadget_cd` besides `tick_timers`' countdown. It touches neither
         # ammo, `attack_cd` nor `ent_shots_fired`: the gadget is a separate button, not an attack,
-        # so it neither pauses the reload nor counts as a shot in the cadence counters.
-        # `gadget_target` is computed for every entity every tick (one (N,E) march, in budget per
-        # the plan) because masking it to the firing rows would need a data-dependent shape.
+        # so it neither pauses the reload nor counts as a shot. `gadget_target` runs for every
+        # entity every tick, since masking it to the firing rows would need a data-dependent shape.
         # Overflow: the cooldown is written from `gadget_fire`, not from `alloc_slots`' `ok`, so a
-        # FULL projectile buffer spends the 18 s and throws nothing -- the same silent drop as the
-        # super's charge above and every thinned volley. `config.peak_projectile_demand` does not
-        # count the hero's one spinner slot (nor his super bolt: `proj_count` 0 makes his term 0);
-        # default.yaml's 192 leaves 30 slots over the 162 bound, which is what covers both.
+        # FULL projectile buffer spends the cooldown and throws nothing -- the same silent drop as
+        # the super's charge above and every thinned volley. `config.peak_projectile_demand`
+        # counts neither the spinner nor the hero's super bolt (his `proj_count` 0 zeroes his
+        # term), so `limits.max_projectiles` must keep headroom above that bound for both.
         gadget_cooldown = stats.gather_kind(params.gadget_cooldown, state.ent_kind)
         state.ent_gadget_cd.copy_(torch.where(gadget_fire, gadget_cooldown, state.ent_gadget_cd))
         gadget_dir, gadget_travel = hero.gadget_target(state, vis, params, bank, cfg)
@@ -764,19 +644,18 @@ class BrawlVecEnv:
         damage = stats.effective_damage(state.ent_kind, state.ent_cubes, params)
         projectiles.spawn_volley(state, is_other_attack, state.ent_pos, aim_dir, aim_point, state.ent_kind, damage, params, cfg)
 
-        # --- melee, single-cone and SWEPT, resolved in ONE hitscan call (Step C2) ---
+        # --- melee, single-cone and SWEPT, resolved in ONE hitscan call ---
         # Buzz's attack is five cones fanned across his attack_cooldown rather than one at trigger
         # time. `sweep_cone_dir` reads the schedule off `ent_attack_cd`, which the block above just
-        # set for anyone firing this tick -- so on the trigger tick elapsed is 0 and sub-swing 0
-        # lands immediately, and the remaining four land on later ticks of the same cooldown.
+        # set for anyone firing this tick -- so sub-swing 0 lands on the trigger tick and the other
+        # four on later ticks of the same cooldown.
         #
         # A swept kind is masked OUT of the ordinary trigger-time cone (`& ~swept`), because
         # sub-swing 0 already covers that tick; letting both through would double the first swing.
         #
-        # Deliberately ONE melee_hitscan call with a per-entity cone direction rather than two
-        # calls: melee_hitscan is a dense (N,E,E) cone + LOS march and the single most expensive
-        # thing in this phase (~1.95 ms/tick at n_envs=1024 even after Step A1), so a second call
-        # would have doubled it to buy nothing -- the two populations are disjoint per entity.
+        # ONE melee_hitscan call with a per-entity cone direction, not two: it is a dense (N,E,E)
+        # cone + LOS march, the most expensive thing in this phase, and the two populations are
+        # disjoint per entity.
         sweep_fire, sweep_dir = melee_sweep.sweep_cone_dir(state, params, cfg)
         swept = melee_sweep.is_swept(state, params)
         melee_fire = (is_other_attack & ~swept) | sweep_fire
@@ -784,39 +663,35 @@ class BrawlVecEnv:
 
         dmg_ent, dmg_by, dmg_box = combat.melee_hitscan(state, melee_fire, bank, params, cfg, cone_dir=cone_dir)
         combat.apply_damage(state, dmg_ent, int(DeathCause.COMBAT), combat.dominant_attacker(dmg_by), params, cfg)
-        # MELEE LIFESTEAL (Edgar). After apply_damage, for the same reason _projectile_phase heals
-        # after its own damage: a trade that kills the victim resolves the kill first. It also has
-        # to be after it to read the post-damage `ent_invuln_t` that combat.melee_lifesteal mirrors
-        # -- though nothing in apply_damage writes that field, so the two orderings agree today and
-        # this ordering is the one that keeps agreeing if that ever changes.
-        #
-        # Every kind but Edgar has `melee_lifesteal_fraction: 0`, so this is a masked multiply
-        # producing an all-zero heal for the rest of the roster, not a branch.
+        # MELEE LIFESTEAL (Edgar), after apply_damage like _projectile_phase's heal: a trade that
+        # kills the victim resolves the kill first. Every other kind has
+        # `melee_lifesteal_fraction: 0`, so this is a masked multiply, not a branch.
         healed = combat.apply_heal(state, combat.melee_lifesteal(state, dmg_by, params))
         boxes.damage_boxes(state, dmg_box)
         return dmg_by, healed, attack_in_reach
 
-    # -- Section 4 phase 7 --
+    # -- phase 7 --
     def _movement_phase(self, move_dir: torch.Tensor) -> None:
-        """ONLY non-dashing entities -- apply_movement's own `active = alive & dash_t<=0` gate
-        already excludes anyone who just started a dash in _attack_phase (their dash_t is
-        already > 0 by the time this runs), which is exactly what makes the dash replace the
-        walk this same tick (N02/N03/R02)."""
+        """ONLY non-dashing entities: apply_movement's `active = alive & dash_t<=0` gate excludes
+        anyone who just started a dash in _attack_phase, which is what makes the dash replace
+        the walk this same tick."""
         movement.apply_movement(self.state, move_dir, self.bank, self.params, self.cfg)
 
-    # -- Section 4 phase 8 --
+    # -- phase 8 --
     def _dash_phase(self) -> torch.Tensor:
         dmg_ent, dmg_by, dmg_box = hero.advance_dash(self.state, self.params, self.cfg)
         combat.apply_damage(self.state, dmg_ent, int(DeathCause.COMBAT), combat.dominant_attacker(dmg_by), self.params, self.cfg)
         boxes.damage_boxes(self.state, dmg_box)
         return dmg_by
 
-    # -- Section 4 phase 9 --
-    def _projectile_phase(self) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-        """(dmg_by (N,E,E), healed (N,E), charge_hit (N,E,E)) -- the second is the lifesteal
-        ACTUALLY applied, which is not `heal_ent`: apply_heal drops it for dead owners and clips
-        it at max HP. The third is step_projectiles' super-charging hit mask (its `dmg_by > 0`
-        minus the gadget spinner, Step G2.4), passed up untouched for `_bookkeeping`."""
+    # -- phase 9 --
+    def _projectile_phase(self) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+        """(dmg_by (N,E,E), healed (N,E), charge_hit (N,E,E), gadget_hit (N,)) -- the second is
+        the lifesteal ACTUALLY applied, which is not `heal_ent`: apply_heal drops it for dead
+        owners and clips it at max HP. The third is step_projectiles' super-charging hit mask
+        (its `dmg_by > 0` minus the gadget spinner), passed up untouched for `_bookkeeping`. The
+        fourth is "the hero's gadget spinner hurt at least one player this tick", which the
+        reward's `gadget_hit` term pays."""
         dmg_ent, dmg_by, dmg_box, heal_ent, charge_hit = projectiles.step_projectiles(
             self.state, self.bank, self.params, self.cfg)
         combat.apply_damage(self.state, dmg_ent, int(DeathCause.COMBAT), combat.dominant_attacker(dmg_by), self.params, self.cfg)
@@ -824,93 +699,90 @@ class BrawlVecEnv:
         # the death first -- healing a corpse is rejected by apply_heal's own alive gate.
         healed = combat.apply_heal(self.state, heal_ent)
         boxes.damage_boxes(self.state, dmg_box)
-        return dmg_by, healed, charge_hit
+        # The spinner is the one projectile whose hits charge no super, so the hero's hits in
+        # `dmg_by` that `charge_hit` leaves out are its hits. Box damage never enters `dmg_by`, so
+        # a spinner that lands only on crates is no hit. Blind spot: a super bolt that hits the
+        # same player on the landing tick hides the spinner's hit on that player.
+        gadget_hit = ((dmg_by[:, 0] > 0) & ~charge_hit[:, 0]).any(dim=-1)  # row 0: the hero
+        return dmg_by, healed, charge_hit, gadget_hit
 
-    # -- Section 4 phase 10 --
+    # -- phase 10 --
     def _zone_phase(self) -> None:
         state, params, cfg = self.state, self.params, self.cfg
         dmg = zone.zone_damage(state, params, cfg)
         no_attacker = torch.full_like(state.ent_last_hit_by, -1)
         combat.apply_damage(state, dmg, int(DeathCause.ZONE), no_attacker, params, cfg)
 
-    # -- Section 4 phase 11 (box HP already decremented per-source in phases 6/8/9) --
+    # -- phase 11 (box HP already decremented per-source in phases 6/8/9) --
     def _box_phase(self) -> torch.Tensor:
         return boxes.resolve_broken_boxes(self.state, self.bank, self.params, self.cfg, self.gen)
 
-    # -- Section 4 phase 12 --
+    # -- phase 12 --
     def _pickup_phase(self) -> torch.Tensor:
         return combat.collect_pickups(self.state, self.params, self.cfg)
 
-    # -- Section 4 phase 13 --
+    # -- phase 13 --
     def _death_phase(self) -> torch.Tensor:
         newly_dead = combat.resolve_deaths(self.state, self.cfg)
         combat.drop_cubes_on_death(self.state, newly_dead, self.params, self.cfg)
         return newly_dead
 
-    # -- Section 4 phase 14 --
+    # -- phase 14 --
     def _zone_schedule(self) -> None:
         zone.step_zone(self.state, self.params, self.cfg)
 
-    # -- Section 4 phase 15 --
+    # -- phase 15 --
     def _bookkeeping(self, dmg_by_total: torch.Tensor, charge_hit: torch.Tensor) -> None:
-        """time/step_count/n_alive/most cumulative counters are already current by this point
-        (resolve_deaths updates n_alive/kills, resolve_broken_boxes updates boxes_broken,
-        _attack_phase updates shots_fired, apply_damage updates damage_taken -- each as its own
-        event happens). ent_damage_dealt is the one exception: nothing upstream ever writes the
-        ATTACKER's side of a hit (apply_damage only updates the victim's damage_taken), so it's
-        aggregated here from this tick's combined attacker x victim matrix -- combat damage
-        only, matching core/events.py's damage_dealt_tick definition (zone damage has no
-        attacker to credit).
+        """Credits damage dealt and super charge, then advances time and step_count. The other
+        cumulative counters are already current, each written as its event happened
+        (resolve_deaths: n_alive/kills; resolve_broken_boxes: boxes_broken; _attack_phase:
+        shots_fired; apply_damage: damage_taken). ent_damage_dealt is the exception: apply_damage
+        writes only the victim's side, so the attacker's is summed here from this tick's
+        attacker x victim matrix -- combat damage only, matching core/events.py's
+        damage_dealt_tick (zone damage has no attacker to credit).
 
         `charge_hit` (N,E,E) bool is the super-charging subset of `dmg_by_total > 0`: identical
-        for melee and dash damage, and for projectiles it is what `step_projectiles` reports
-        after leaving the gadget spinner out (Step G2.4). Damage dealt still counts the spinner;
-        only the charge does not."""
+        for melee and dash damage, minus the gadget spinner for projectiles. Damage dealt still
+        counts the spinner; only the charge does not."""
         state, cfg = self.state, self.cfg
         state.ent_damage_dealt.copy_(state.ent_damage_dealt + dmg_by_total.sum(dim=2))
 
-        # SUPER CHARGE (Step D2): one per (attacker, victim) pair that connected this tick.
-        # Derived from the attacker x victim matrix rather than a simpler "did I deal damage" flag
-        # for two reasons: it is the only place that distinguishes hits on PLAYERS from hits on
-        # boxes (box damage never enters `dmg_by`), so a hero cannot farm his super off crates; and
-        # it counts a multi-target hit -- Buzz's sweep, Shelly's spread, Grom's cross -- as one
-        # charge per victim, which is what "5 hits against other players" means. Since Step G2.4
-        # the matrix is `charge_hit` rather than `dmg_by_total > 0`, so a gadget-only tick charges
-        # nothing (S12) while every other source charges exactly as before.
+        # SUPER CHARGE: one per (attacker, victim) pair that connected this tick. From the
+        # attacker x victim matrix because it is the only place that separates hits on PLAYERS
+        # from hits on boxes (box damage never enters `dmg_by`), so a hero cannot farm his super
+        # off crates, and it counts a multi-target hit -- Buzz's sweep, Shelly's spread, Grom's
+        # cross -- as one charge per victim, as the game counts hits against players.
         hits = charge_hit.sum(dim=2).to(torch.int32)
         hero.add_super_charge(state, hits, self.params)
 
         state.time += cfg.dt
         state.step_count += 1
 
-    # -- Section 4 phase 16 --
+    # -- phase 16 --
     def _observe(self, dmg_by_total, newly_dead, newly_broken, cubes_gained, hp_healed,
-                 attacks_in_reach, decision):
-        """Runs ONCE per decision, not once per sub-tick -- `reward_fn` therefore sees the
-        summed deltas and the latched outcome fields for the whole decision, and is called
-        exactly once per `step()` no matter what `action_repeat` is. That keeps total episode
-        return invariant to `action_repeat` (per-tick reward terms integrate over
-        `info["alive_ticks"]`/`info["in_zone_ticks"]` rather than firing once per call), which
-        is what makes the decision rate tunable without re-tuning every reward weight."""
+                 attacks_in_reach, gadget_hits, decision):
+        """Runs ONCE per decision: `reward_fn` sees the summed deltas and latched outcomes of the
+        whole decision, once per `step()` whatever `action_repeat` is. Per-tick reward terms
+        integrate over `info["alive_ticks"]`/`info["in_zone_ticks"]` rather than firing once
+        per call, so the decision rate can change without re-tuning every reward weight."""
         obs = self._build_observation()
         info = events.compute_info(
             self.state, dmg_by_total, newly_dead, newly_broken, cubes_gained, self.cfg,
             decision=decision, hp_healed=hp_healed, attacks_in_reach=attacks_in_reach,
+            gadget_hits=gadget_hits,
         )
         reward = self.reward_fn(obs, info, self.cfg)
         return obs, info, reward
 
-    # -- Section 4 phase 17 --
+    # -- phase 17 --
     def _autoreset(self, info: dict):
-        """Resets done envs in place via a boolean mask -- reset_envs is torch.where-masked
-        internally, so calling it every tick (even when nobody's done) is sync-free and
-        correct, never needing a `.any()` host check first.
+        """Resets done envs in place via a boolean mask. reset_envs is torch.where-masked
+        internally, so calling it every decision, even when nobody is done, is sync-free and
+        needs no `.any()` host check first.
 
-        Does NOT take obs_before_reset: `step()` already cloned it into `final_observation`/
-        `final_info` and dropped its own reference before calling this, specifically so those
-        large buffers (obs["world"] alone is ~177 MB at n_envs=4096) can be freed before the
-        `_build_observation()` call below allocates a same-sized SECOND copy for the post-reset
-        `obs` -- see step()'s own comment for why the clone had to happen there, not here."""
+        Does NOT take obs_before_reset: `step()` already cloned it and dropped its own reference,
+        so those large buffers can be freed before the `_build_observation()` below allocates
+        the post-reset copy (see step()'s comment)."""
         terminated, truncated = info["terminated"], info["truncated"]
         done = terminated | truncated
         spawn.reset_envs(self.state, done, self.bank, self.params, self.cfg, self.gen,

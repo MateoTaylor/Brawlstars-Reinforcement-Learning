@@ -254,7 +254,7 @@ def test_gather_indexing_never_materializes_per_env_slice():
     assert blocked.shape == (n,)
 
 
-# ---- the ten generated maps (SIM_OVERHAUL_PLAN.md Step M3) ---------------------------------
+# ---- the generated maps (the first ten, plus fifteen on 2026-09-27) ------------------------
 
 #: name -> (seed, family, symmetry, boxes). Mirrors the table in brawl_sim/maps/README.md; the
 #: box counts are literals on purpose (reading them from the CSV would make the test
@@ -270,14 +270,35 @@ GENERATED_MAPS = {
     "thorn_field": (800, "dense", "mirror", 24),
     "reed_marsh": (901, "water_border", "point", 26),
     "hollow_ring": (904, "water_border", "point", 20),
+    # The fifteen from the five screenshot families (2026-09-27), three picks each, all mirror.
+    "pond_maze": (2, "maze", "mirror", 32),
+    "canal_maze": (3, "maze", "mirror", 32),
+    "picket_maze": (7, "maze", "mirror", 30),
+    "lagoon_ring": (2, "lake_ring", "mirror", 26),
+    "square_lakes": (3, "lake_ring", "mirror", 18),
+    "bush_halo": (6, "lake_ring", "mirror", 20),
+    "bramble_ponds": (1, "branches", "mirror", 20),
+    "bramble_bend": (4, "branches", "mirror", 28),
+    "bramble_stars": (6, "branches", "mirror", 26),
+    "moon_gate": (3, "crescent", "mirror", 20),
+    "half_moon": (5, "crescent", "mirror", 20),
+    "moon_pools": (7, "crescent", "mirror", 26),
+    "vine_springs": (2, "vines", "mirror", 20),
+    "vine_canal": (4, "vines", "mirror", 24),
+    "vine_hollow": (6, "vines", "mirror", 22),
 }
 
-#: `configs/default.yaml` `world.maps` once M3.3 lands: the six that trained every checkpoint so
-#: far, then the ten in README order.
-SIXTEEN_MAP_ROTATION = (
+#: `configs/default.yaml` `world.maps`: the six hand-authored maps, the generated
+#: ten in README order, then (2026-09-27) the five screenshot maps and the fifteen generated
+#: from their families.
+THIRTY_SIX_MAP_ROTATION = (
     "open", "bushy", "skull_creek", "feast_or_famine", "scorched_stone", "island_invasion",
     "broken_wall", "stone_fort", "twin_ponds", "cross_creek", "split_river", "narrow_pass",
     "dry_gulch", "thorn_field", "reed_marsh", "hollow_ring",
+    "hot_maze", "ghost_point", "shadow_spirits", "crescent_lakes", "twisting_vines",
+    "pond_maze", "canal_maze", "picket_maze", "lagoon_ring", "square_lakes", "bush_halo",
+    "bramble_ponds", "bramble_bend", "bramble_stars", "moon_gate", "half_moon", "moon_pools",
+    "vine_springs", "vine_canal", "vine_hollow",
 )
 
 
@@ -305,12 +326,12 @@ def test_generated_map_is_reproduced_by_its_seed_at_the_first_attempt(name):
     assert to_csv(grid) == (CSV_DIR / f"{name}.csv").read_text()
 
 
-def test_default_rotation_is_the_six_plus_the_ten():
+def test_default_rotation_is_the_sixteen_plus_the_twenty():
     cfg = _default_cfg()
-    assert len(cfg.map_names) == 16
-    assert cfg.map_names == SIXTEEN_MAP_ROTATION
+    assert len(cfg.map_names) == 36
+    assert cfg.map_names == THIRTY_SIX_MAP_ROTATION
     bank = build_map_bank(cfg, device="cpu")
-    assert bank.tiles.shape == (16, 60, 60)
+    assert bank.tiles.shape == (36, 60, 60)
 
 
 @pytest.mark.parametrize("name", list(GENERATED_MAPS))
@@ -323,7 +344,7 @@ def test_smoke_episode_on_generated_map_holds_the_invariants(name):
     "1000-step" is read in the config's own unit, SIM TICKS (`sim.max_episode_steps`): 200
     decisions at the shipped `action_repeat: 5`. Measured 2026-09-18 on CPU the sim costs
     ~14 ms per tick whatever `n_envs` or `n_enemies` is (kernel-launch bound), so this is
-    ~15 s per map and ~2.5 min for the ten; 1000 DECISIONS per map would be ~12 min. Random
+    ~15 s per map and ~6 min for the twenty-five; 1000 DECISIONS per map would be ~12 min. Random
     move/attack/super actions rather than idling so the hero walks into walls, water and
     crates and the super's projectiles cross them; the attack column is drawn over the action
     spec's full width so a super (value 2) fires on every map, not only ordinary attacks."""

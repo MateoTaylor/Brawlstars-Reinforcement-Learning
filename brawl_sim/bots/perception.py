@@ -1,16 +1,11 @@
-"""Bot targeting and the observation's visibility annotations. See BRAWL_SIM_BUILD_PLAN.md
-Step 15 / Notice 4: bush-hiding is the only thing that ever CONCEALS an entity -- terrain never
-blocks sight. visibility() (bush-only, whole-map) drives bot targeting and combat; the hero's
-revealed_* observation flags are narrower, `core/camera.hero_view` = this matrix's hero row AND
-the camera window, because the deployed detector only reports what is on screen
-(OBS_PARITY_PLAN.md §2). raw_los() (walls-only, via terrain.line_of_sight) is a separate, purely
-physical query used for fire-gating and obs["visibility"]["los"], never for targeting.
+"""Bot targeting, visibility, and the bush/zone queries bot movement shares.
 
-`bush_scan` (the tile search three of the five bot personalities need, Step 41) lives here
-rather than in the sniper archetype, where its loop-per-probe ancestor `_nearest_bush` lived:
-once Camper/Hunter/Trapper all needed it, it stopped being one archetype's private helper. It's
-also the single most expensive thing the whole bot phase does, so it is deliberately structured
-to be called ONCE per tick for all (N,E) entities and shared -- see its own docstring.
+Standing in a bush is the only thing that CONCEALS an entity; terrain never blocks sight.
+visibility() (bush-only, whole-map) drives bot targeting (narrowed by bot_visibility's sight
+range) and combat. The hero's observation is narrower: core/camera.hero_view = this matrix's hero
+row AND the camera window, because the deployed detector only reports what is on screen. Physical
+wall LOS is separate: target_los gates bot fire and raw_los feeds the observation; neither is used
+for targeting.
 """
 from dataclasses import dataclass
 
@@ -58,28 +53,14 @@ def visibility(state, bank, params, cfg) -> torch.Tensor:
 
 
 def bot_visibility(state, vis: torch.Tensor, cfg) -> torch.Tensor:
-    """(N,E,E) bool -- `vis` narrowed to what a BOT is allowed to act on: the same bush rules, AND
-    within `cfg.bots_sight_tiles`.
+    """(N,E,E) bool -- `vis` narrowed to what a BOT may act on: the same bush rules AND within
+    cfg.bots_sight_tiles (<= 0 disables the limit).
 
-    **`visibility()` has no range limit at all**, by design: it answers "is this entity concealed",
-    and concealment is a property of bushes, not of distance. It stays whole-map because bots and
-    combat read it; the hero's observation is narrowed separately, by `core/camera.hero_view`
-    (concealment AND the camera window), and bots by `sight_tiles` here. Feeding that same matrix
-    straight into bot targeting, which is what happened before Step 41, gave every bot perfect
-    sight across a 60x60 map. Measured consequences on `bushy`:
-      - 84.3% of live bot-ticks had an enemy locked, at a mean range of 22.7 tiles -- roughly three
-        times the longest weapon in the game (8.67).
-      - Bots were therefore always in an engage behavior. The specification's "when no enemies are
-        visible, bots explore the map" fired on 7.7% of ticks and HUNTER's whole reason for
-        existing fired on 3.6%. Bush-searching bots could not search, because they always had
-        someone to shoot at instead.
-    A sight limit is what makes every "nothing visible" branch in bots/personality.py reachable,
-    and it is the difference between bots that converge on each other from across the map (which is
-    exactly the scrum an agent learns to sit out) and bots that have to go looking.
-
-    Deliberately NOT folded into `visibility()`: that function also produces the hero's
-    `revealed_*` observation flags (core/observation.py), and clipping those to a bot's sight range
-    would silently change the agent's observation contract while pretending to be a bot-AI change.
+    visibility() has no range limit by design: concealment is a property of bushes, not distance.
+    Bots need one: with whole-map sight they almost always hold a target, the "nothing visible"
+    branches in bots/personality.py (exploring, HUNTER's sweep) rarely fire, and the lobby
+    converges into one scrum an agent learns to sit out. Not folded into visibility() because
+    that matrix also feeds the hero's observation (core/observation.py, core/camera.hero_view).
     """
     if cfg.bots_sight_tiles <= 0:
         return vis
@@ -89,12 +70,9 @@ def bot_visibility(state, vis: torch.Tensor, cfg) -> torch.Tensor:
 
 def raw_los(state, bank, cfg) -> torch.Tensor:
     """(N,E,E) bool. Physical wall LOS only (terrain.line_of_sight via bank.blocks_proj),
-    independent of bush -- NOT used for targeting, see module docstring.
-
-    **The bot phase does not use this; `target_los` below does.** This full pairwise matrix is
-    built once per DECISION for `obs["visibility"]["los"]`, which genuinely is an all-pairs,
-    whole-map question. It used to be built once per SUB-TICK by bots/policy.all_bot_intents as
-    well, where 90% of it was discarded -- see `target_los`."""
+    independent of bush. Observation-only: env builds it when cfg.obs_include_raw_los, for
+    obs["visibility"]["los"] and entities.los_from_hero. The bot phase uses the (N,E)
+    target_los instead."""
     E = state.ent_pos.shape[1]
     origin_b = state.ent_pos.unsqueeze(2).expand(-1, -1, E, -1)
     target_b = state.ent_pos.unsqueeze(1).expand(-1, E, -1, -1)
@@ -105,23 +83,12 @@ def target_los(state, bank, cfg) -> torch.Tensor:
     """(N,E) bool: physical wall LOS from each entity to ITS OWN CURRENT TARGET
     (`state.ent_target`). Requires `select_target` to have already run this tick.
 
-    **This replaces an (N,E,E) `raw_los` the bot phase only ever read one column of.**
-    bots/policy.targeting's single consumer was `torch.gather(los, 2, idx)` -- LOS to the entity's
-    own target -- so the other E-1 columns per row were computed and thrown away. Measured
-    1.391 -> 0.404 ms/tick at n_envs=1024, E=10 (bot_overhaul.md Step A2).
+    Rows with no target (ent_target -1, clamped to 0) measure LOS to entity 0 and are meaningless:
+    bots/policy.targeting resolves them to has_enemy=False, and fire_gate requires has_target.
 
-    **Rows with no target return a meaningless answer, and every consumer already drops them.**
-    `ent_target` is -1 for "no target" and is clamped to 0 here, so such a row measures LOS to
-    entity 0 at an arbitrary distance. bots/policy.targeting resolves those rows to `has_enemy =
-    False`, and `fire_gate` requires `has_target`, so the value never reaches a fire decision --
-    the same "compute for everyone, select later" discipline the archetype combat functions use.
-
-    **The ray budget is `cfg.bots_sight_tiles`, and that bound is only valid because of how
-    `select_target` works.** all_bot_intents passes it `bot_visibility(...)`, and BOTH of its
-    paths are gated on that matrix -- the nearest-visible re-pick AND the stickiness check -- so a
-    live `ent_target` is guaranteed to be within sight range THIS TICK, not merely to have been
-    when it was acquired. A target that walks out of range is dropped, not held. `<= 0` disables
-    the sight limit entirely, so the budget goes back to the full `cfg.ray_steps` with it.
+    The ray budget is cfg.bots_sight_tiles (<= 0: the full cfg.ray_steps). That is valid only
+    because both of select_target's paths, the re-pick AND the stickiness check, are gated on the
+    sight-limited bot_visibility matrix, so a live target is within sight range THIS tick.
     """
     idx = torch.clamp(state.ent_target, min=0)
     target_pos = torch.gather(state.ent_pos, 1, idx.unsqueeze(-1).expand(-1, -1, 2))
@@ -130,37 +97,21 @@ def target_los(state, bank, cfg) -> torch.Tensor:
                                  max_tiles=max_tiles)
 
 
-def team_id(kind: torch.Tensor, cfg) -> torch.Tensor:
-    """(N,E) i64. Solo Showdown is full FFA (D14: bots fight each other too, not just the
-    hero) -- there is no real team concept to encode. This returns `kind` itself, which is
-    inert for any FFA targeting logic (nothing here compares team_id) and exists only as
-    forward-compatible infrastructure for a possible future team mode."""
-    return kind.clone()
-
-
 def select_target(state, vis: torch.Tensor, params, cfg) -> None:
-    """MUTATES ent_target. Sticky: keeps the current target as long as it's still alive and
-    visible, only re-picking (nearest visible other entity) when it isn't -- this is what
-    prevents oscillation between two ~equidistant targets.
+    """MUTATES ent_target. Sticky: keeps the current target while it is alive and in `vis`,
+    re-picking the nearest visible other entity only when it isn't, which stops oscillation
+    between two ~equidistant targets. bots/policy.all_bot_intents passes bot_visibility, so a
+    target that walks out of sight is dropped, not held. ent_target < 0 means "no target";
+    core/spawn sets it to -1 on reset, since allocate()'s zero-init would read as targeting
+    entity 0.
 
-    `vis` is whatever the caller says bots can see. bots/policy.all_bot_intents passes
-    `bot_visibility(...)`, not the raw `visibility(...)`, so both the re-pick AND the stickiness
-    check are bounded by `cfg.bots_sight_tiles` -- a target that walks out of sight must be
-    dropped, not held forever, or the sight limit would only apply to acquiring targets and not to
-    keeping them. ent_target < 0 means "no target";
-    spawn/reset (Step 24) is responsible for initializing it that way, since allocate()'s
-    blanket zero-init would otherwise leave it at entity index 0.
-
-    **Hero focus (SIM_OVERHAUL_PLAN.md Step B2).** `params.hero_focus` in [0, 1], per kind,
-    discounts the hero's distance by `(1 - hero_focus)` before the nearest pick, so at 0.5 a hero
-    7 tiles away (3.5 effective) beats a bot 4 tiles away and a hero 9 tiles away (4.5) does not.
-    When the discounted hero WINS that comparison the bot switches to the hero even if it holds a
-    valid sticky target -- without that override "favour the hero" would only ever apply to bots
-    that happened to be idle when the hero walked into view. Sight is unchanged: the hero is a
-    candidate only where `vis[:, e, 0]` already says so, so a concealed or out-of-range hero is
-    never picked. With `hero_focus = 0` (the hero kind's own value, and any hand-built partial
-    spec's) `prefer_hero` is False everywhere and the result is bit-for-bit today's
-    `where(current_valid, current, picked)`: the scale is exactly 1.0, so `dist * scale == dist`.
+    Hero focus: `params.hero_focus` in [0, 1], per kind, discounts the hero's distance by
+    `(1 - hero_focus)` before the nearest pick, so at 0.5 a hero 7 tiles away (3.5 effective)
+    beats a bot 4 tiles away and a hero 9 tiles away (4.5) does not. A discounted hero that WINS
+    overrides a valid sticky target; otherwise "favour the hero" would only reach bots that were
+    idle when the hero walked into view. The hero is a candidate only where `vis[:, e, 0]`, so a
+    concealed or out-of-range hero is never picked. hero_focus 0 (the hero kind's own value) is
+    the plain sticky rule bit for bit: the scale is exactly 1.0.
     """
     E = state.ent_pos.shape[1]
     device = state.ent_pos.device
@@ -194,43 +145,14 @@ def select_target(state, vis: torch.Tensor, params, cfg) -> None:
     )
 
 
-def incoming_threat(state, params, cfg) -> torch.Tensor:
-    """(N,E,2). Not specified further by the plan beyond signature/shape -- this sums, over
-    every live projectile not owned by the entity, a unit vector pointing from the
-    projectile's current position toward the entity, weighted by 1/(1+closest_approach_dist)
-    so nearby/imminent threats dominate. A flee steering behavior (Step 16) can use this
-    vector directly."""
-    E = state.ent_pos.shape[1]
-    P = state.prj_pos.shape[1]
-    device = state.ent_pos.device
-
-    ent_pos = state.ent_pos.unsqueeze(2).expand(-1, -1, P, -1)   # (N,E,P,2)
-    prj_pos = state.prj_pos.unsqueeze(1).expand(-1, E, -1, -1)   # (N,E,P,2)
-    prj_vel = state.prj_vel.unsqueeze(1).expand(-1, E, -1, -1)   # (N,E,P,2)
-
-    _, dist = geo.closest_approach(prj_pos, prj_vel, ent_pos)  # (N,E,P)
-
-    owner = state.prj_owner.unsqueeze(1)  # (N,1,P)
-    entity_idx = torch.arange(E, device=device).view(1, E, 1)
-    not_owner = owner != entity_idx
-    alive_p = state.prj_alive.unsqueeze(1)
-    relevant = (not_owner & alive_p).expand(-1, E, -1)
-
-    weight = torch.where(relevant, 1.0 / (1.0 + dist), torch.zeros_like(dist))
-    direction = geo.normalize(ent_pos - prj_pos)
-    return (direction * weight.unsqueeze(-1)).sum(dim=2)
-
-
 @dataclass
 class BushScan:
     """The nearest SAFE (well clear of the shrinking zone) bush tile for every (N,E) entity, from
-    a LOCAL tile scan. This answers "where is the nearest cover I can duck into", which is what
-    CAMPER and TRAPPER need. It deliberately does NOT answer "where should I go looking for
-    someone" -- that is a map-scale question and lives in `hunt_waypoint`, for reasons its own
-    docstring and maps/loader.bush_waypoints spell out.
+    a LOCAL tile scan: "the nearest cover I can duck into", for CAMPER and TRAPPER. The map-scale
+    "where do I go looking" question is `hunt_waypoint`'s.
 
-    `found` is False where no acceptable bush exists inside the search radius, which is the
-    "no non-green bushes available -> behave like RUSH" signal the personality layer keys off."""
+    `found` is False where no acceptable bush exists inside the search radius: the "no non-green
+    bushes available -> behave like RUSH" signal the personality layer keys off (user's rule)."""
     pos: torch.Tensor    # (N,E,2) tile center
     dist: torch.Tensor   # (N,E), +inf where ~found
     found: torch.Tensor  # (N,E) bool
@@ -250,26 +172,15 @@ class HuntTarget:
     n_unvisited: torch.Tensor  # (N,E) i64 -- how many are still unvisited, including this one
 
 
-# (radius, device) -> (K,2) i64 tile offsets. Built once per distinct key, never per tick: the
-# offsets are a pure function of the search radius, and materializing them per call would put a
-# few hundred tiny kernel launches back into the hot path -- the exact cost this whole function
-# was restructured to remove.
+# (radius, device) -> (K,2) i64 tile offsets, built once per key: materializing them per call
+# would put a few hundred tiny kernel launches into the hot path.
 _BUSH_OFFSET_CACHE: dict = {}
 
 
 def _bush_offsets(radius: int, device) -> torch.Tensor:
     """(K,2) i64 tile offsets: a square of side 2*radius+1 clipped to the inscribed circle,
-    INCLUDING (0,0).
-
-    Including the entity's own tile is a deliberate difference from the old sniper archetype's
-    `_nearest_bush`,
-    which this replaced: that function only ever fed a "drift toward cover" steering term, where
-    seeking the tile you already occupy is a no-op, so excluding it cost nothing. It costs a great
-    deal here. `found` is what tells CAMPER and TRAPPER that cover exists at all, and with (0,0)
-    excluded a bot standing in an ISOLATED bush -- no second bush within the search radius --
-    reported `found=False` and fell through to the RUSH fallback, walking straight out of the
-    cover it was sitting in. It also broke HUNTER's arrival test, since a hunter that reached its
-    target bush could no longer see the thing it had just arrived at.
+    INCLUDING (0,0). The entity's own tile must count: without it a bot standing in an isolated
+    bush reports found=False, and the RUSH fallback walks it out of the cover it is in.
     """
     key = (radius, device)
     cached = _BUSH_OFFSET_CACHE.get(key)
@@ -301,25 +212,17 @@ def bush_scan(
     """The nearest BUSH tile center within `cfg.bots_bush_search_tiles` tiles of every (N,E)
     entity, as a single batched `(N,E,K)` tile gather over K fixed offsets (K=49 at radius 4).
 
-    **Call this ONCE per tick and share the result.** It is the single most expensive operation
-    in the bot phase and every bush-using personality needs the same answer. Its predecessor
-    (the sniper archetype's `_nearest_bush`, one Python iteration per offset) measured
-    13.8 ms/tick at
-    n_envs=1024 -- 43% of the entire bot phase -- purely in kernel-launch overhead from K
-    separate tiny gathers; this batched form measured 1.07 ms for identical output
-    (tests/test_perception.py::test_bush_scan_matches_a_naive_per_offset_reference checks it
-    against an independent whole-map reference). That ~12.7 ms is what pays for the whole
-    personality system.
+    Call this ONCE per tick and share the result: every bush-using personality needs the same
+    answer. One batched gather rather than K small ones, because kernel-launch overhead dominates
+    at this size (tests/test_perception.py::test_bush_scan_matches_a_naive_per_offset_reference
+    checks it against an independent whole-map reference).
 
     `zone_lo`/`zone_hi` are (N,1,2) and exclude candidate tiles inside the damaging shrunk-away
-    area, plus -- with `zone_margin` > 0 -- any tile whose own `zone_clearance` is below that
-    margin. The margin matters: excluding only tiles that are ALREADY lethal would let a bot walk
-    to a bush one tile inside the boundary that the next shrink step swallows, and (worse) would
-    let a camper fleeing the zone pick the bush it is already standing in as its destination, so
-    it would never actually move. With the margin, any bush the scan returns is strictly further
-    from the edge than the flee threshold, so "go to the nearest safe bush" is always genuine
-    forward progress. Pass None (or a degenerate rect) to skip the exclusion entirely.
-
+    area, plus, with `zone_margin` > 0, any tile whose own `zone_clearance` is below that margin.
+    Excluding only lethal tiles would send a bot to a bush the next shrink swallows, and let a
+    camper fleeing the zone pick the bush it already stands in; with the margin, every bush
+    returned is farther from the edge than the flee threshold, so reaching it is real progress.
+    Pass None (or a degenerate rect) to skip the exclusion.
     """
     device = pos.device
     offsets = _bush_offsets(int(cfg.bots_bush_search_tiles), device)  # (K,2)
@@ -338,10 +241,8 @@ def bush_scan(
     )  # (N,E,K,2)
 
     if zone_lo is not None and zone_hi is not None:
-        # Shape guard, not a debug_checks-gated assertion: this is a pure-Python check on .dim()
-        # (no tensor read, no host sync, legal in the hot path), and getting it wrong is SILENT --
-        # a (N,1,1,2) zone rect broadcasts the candidate mask up to rank 4, argmin then reduces the
-        # wrong axis, and every entity gets another entity's answer with no error anywhere.
+        # Always-on shape guard (a .dim() check, no host sync): a (N,1,1,2) rect would broadcast
+        # the mask to rank 4 and argmin would silently reduce the wrong axis.
         if zone_lo.dim() != 3 or zone_hi.dim() != 3:
             raise ValueError(
                 f"bush_scan expects (N,1,2) zone bounds (see bots/policy.zone_rect), got "
@@ -349,8 +250,8 @@ def bush_scan(
             )
         lo = zone_lo.unsqueeze(-2)  # (N,1,1,2), broadcasts against (N,E,K,2)
         hi = zone_hi.unsqueeze(-2)
-        # Same degenerate-rect guard as bots/policy.zone_contribution: a zero-area rect means
-        # "no zone active yet", not "the whole map is lethal".
+        # Same degenerate-rect guard as bots/policy.zone_rect: a zero-area rect means "no zone
+        # active yet", not "the whole map is lethal".
         rect_active = (hi[..., 0] > lo[..., 0]) & (hi[..., 1] > lo[..., 1])
         lethal = in_zone(center, lo, hi) | (zone_clearance(center, lo, hi) < zone_margin)
         is_bush = is_bush & ~(lethal & rect_active)
@@ -368,15 +269,12 @@ def hunt_waypoint(
 ) -> HuntTarget:
     """The nearest bush waypoint (maps/loader.bush_waypoints) this entity has not yet visited.
 
-    `seen` is (N,E) int64 used as a BITMASK -- bit `w` set means waypoint `w` has been searched.
-    One scalar per entity holds the entity's complete search history, which is both smaller and
-    more capable than the fixed-size ring of remembered POSITIONS this replaced: a ring of 4
-    positions let a hunter re-search everywhere it had been 5 stops ago, and it could not express
-    "I have now been everywhere" at all.
+    `seen` is (N,E) int64 used as a BITMASK: bit `w` set means waypoint `w` has been searched, so
+    one scalar holds the entity's whole search history, including "I have been everywhere".
 
-    Cost is a single (N,E,W) gather with W <= 63 regardless of map size -- see
-    maps/loader.bush_waypoints for why this is both cheaper AND a genuine map-scale sweep, where
-    growing `bush_scan`'s radius would have been neither.
+    Cost is a single (N,E,W) gather with W <= 63 regardless of map size; see
+    maps/loader.bush_waypoints for why this is a map-scale sweep where a larger `bush_scan`
+    radius would not be.
     """
     device = pos.device
     waypoints = bank.bush_wp[map_id]        # (N,W,2)
@@ -384,10 +282,9 @@ def hunt_waypoint(
     W = waypoints.shape[1]
 
     if W == 0:
-        # A bank with no waypoint SLOTS at all. maps/loader always pads to MAX_BUSH_WAYPOINTS, so
-        # real banks never land here (a bush-free map has W=63 slots with n_bush_wp=0, which the
-        # `exists` mask below handles); hand-built test banks do. Guarded because torch.argmin
-        # raises on a zero-length reduction axis rather than returning "nothing found".
+        # A bank with no waypoint SLOTS at all: only hand-built test banks (maps/loader pads real
+        # ones to MAX_BUSH_WAYPOINTS; a bush-free map has n_bush_wp=0, which `exists` handles).
+        # torch.argmin raises on a zero-length axis rather than returning "nothing found".
         empty = torch.zeros(pos.shape[:-1], dtype=torch.bool, device=device)
         return HuntTarget(
             pos=torch.zeros_like(pos),
@@ -455,22 +352,16 @@ def in_zone(pos: torch.Tensor, zone_lo: torch.Tensor, zone_hi: torch.Tensor) -> 
     )
 
 
-def nearest_safe_point(pos: torch.Tensor, zone_lo: torch.Tensor, zone_hi: torch.Tensor) -> torch.Tensor:
-    x = torch.clamp(pos[..., 0], zone_lo[..., 0], zone_hi[..., 0])
-    y = torch.clamp(pos[..., 1], zone_lo[..., 1], zone_hi[..., 1])
-    return torch.stack([x, y], dim=-1)
-
-
 def zone_clearance(pos: torch.Tensor, zone_lo: torch.Tensor, zone_hi: torch.Tensor) -> torch.Tensor:
     """(...) tiles from pos to the NEAREST EDGE of the safe rect, measured from the inside:
     0 exactly on the boundary, growing toward the rect's middle, and 0 (clamped, not negative)
     anywhere already outside. This is the "how much room do I have left" number both universal
     zone avoidance (bots/policy.zone_avoid_contribution) and Camper's "will not leave its bush
-    unless the green zone is 2 or fewer squares away" release condition are expressed in.
+    unless the green zone is 2 or fewer squares away" release condition (user's rule) are
+    expressed in.
 
-    Deliberately NOT `dist(pos, nearest_safe_point(pos))`, which is 0 everywhere INSIDE the rect
-    and only grows once you're already taking damage -- useless for avoiding the zone before
-    entering it, which is the entire point (D14's "bots avoid the zone")."""
+    Measured from the inside on purpose: a distance TO the safe rect is 0 everywhere inside it
+    and only grows once the entity is already taking damage, too late to avoid the zone."""
     to_lo = pos - zone_lo
     to_hi = zone_hi - pos
     per_axis = torch.minimum(to_lo, to_hi)  # (...,2)

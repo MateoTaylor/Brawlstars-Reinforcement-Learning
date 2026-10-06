@@ -19,8 +19,8 @@ from brawl_sim.config import (
 )
 from brawl_sim.constants import N_KINDS, Proj
 
-# These mirror BRAWL_SIM_BUILD_PLAN.md Step 4's configs/default.yaml and configs/brawlers.yaml
-# verbatim (section/key names must match exactly -- Step 4 adds no code, only these files).
+# These mirror the sim's original configs/default.yaml and configs/brawlers.yaml verbatim
+# (section/key names must match exactly).
 DEFAULT_YAML = """
 seed: 0
 device: cpu
@@ -40,7 +40,6 @@ action: {n_move_bins: 16, dash_on_idle: facing}
 observation:
   include_world_grid: true
   include_privileged: true
-  grid_dtype: uint8
 
 entities:
   n_enemies: 6
@@ -67,20 +66,16 @@ boxes: {n_boxes: 8, hp: 3000}
 
 zone:
   enabled: true
-  mode: rect
   start_fraction: 0.2
   step_seconds: 4.0
   tiles_per_step: 1
-  # Step B3 renamed these from the flat `dps` / `dps_growth_per_step`. This fixture is exactly the
-  # stale-config case validate() now rejects -- it was carrying `dps: 1000.0`, which the new
-  # schema does not read, leaving the zone silently inert. Caught by the new check, as intended.
   max_hp_fraction_per_second: 0.20
   fraction_growth_per_step: 0.04
   iframes_block_zone: false
 
 regen: {enabled: false, delay_seconds: 3.0, max_hp_fraction_per_second: 0.13}
 
-bots: {break_boxes: true, collect_cubes: true, avoid_zone: true, fight_each_other: true}
+bots: {break_boxes: true, collect_cubes: true, avoid_zone: true}
 
 perception:
   bush_reveal_radius: 2.0
@@ -227,7 +222,7 @@ def _dummy_params(cfg: EnvConfig) -> SimParams:
     # `peak_projectile_demand` reads -- with those at 0 the demand computes as 0 and the
     # max_projectiles check below can never fire. This fixture exists to exercise validate's OTHER
     # branches, so it must not itself be invalid OR vacuous.
-    # desired_range_fraction is required alongside attack_range (Step E1): it is the fraction of
+    # desired_range_fraction is required alongside attack_range: it is the fraction of
     # its own range a KITE bot holds, and 0 would make one charge to point blank.
     shooter = {"max_ammo": 3, "attack_range": 8.0, "attack_cooldown": 0.25,
                "desired_range_fraction": 0.8}
@@ -258,7 +253,7 @@ def test_load_config_maps_fields(config_dir):
     assert cfg.action_latency_seconds == 0.001
     assert cfg.obs_include_world_grid is True
     assert cfg.bots_break_boxes is True
-    assert cfg.zone_enabled is True and cfg.zone_mode == "rect"
+    assert cfg.zone_enabled is True
     assert cfg.regen_enabled is False
     assert cfg.los_step_tiles == 0.5 and cfg.max_ray_tiles == 24.0
     assert cfg.debug_checks is False
@@ -296,7 +291,7 @@ def test_derived_properties():
     cfg = EnvConfig(n_enemies=6, n_move_bins=16, max_ray_tiles=24.0, los_step_tiles=0.5,
                      action_latency_seconds=0.001, dt=0.05)
     assert cfg.n_entities == 7
-    # 4-valued attack dim: 0 = nothing, 1 = attack, 2 = super (Step D2), 3 = gadget (Step G3).
+    # 4-valued attack dim: 0 = nothing, 1 = attack, 2 = super, 3 = gadget.
     assert cfg.action_nvec == (17, 4)
     assert cfg.ray_steps == 48
     assert cfg.action_latency_ticks == 0
@@ -477,7 +472,7 @@ def test_validate_passes_on_default(config_dir):
     validate(cfg, params)  # must not raise
 
 
-# ---- the two difficulty axes (SIM_OVERHAUL_PLAN.md Phase B, Step B1) ---------------------------
+# ---- the two difficulty axes -------------------------------------------------------------------
 
 def _params_from(cfg, spec):
     gen = torch.Generator(device="cpu")
@@ -499,7 +494,7 @@ def test_validate_reads_a_missing_aggression_and_hero_focus_as_neutral(config_di
 
 
 def test_validate_rejects_a_negative_aggression_naming_the_kind(config_dir):
-    """aggression DIVIDES the retreat threshold (Step B3), so a negative value would turn "retreat
+    """aggression DIVIDES the retreat threshold, so a negative value would turn "retreat
     below x% HP" into "charge below x% HP" -- and it names the kind, since seven blocks share the
     key."""
     cfg = load_config(config_dir / "default.yaml")
@@ -511,7 +506,7 @@ def test_validate_rejects_a_negative_aggression_naming_the_kind(config_dir):
 
 @pytest.mark.parametrize("bad", [-0.1, 1.5])
 def test_validate_rejects_a_hero_focus_outside_the_unit_interval(config_dir, bad):
-    """hero_focus discounts the hero's distance by (1 - hero_focus) (Step B2): above 1 the
+    """hero_focus discounts the hero's distance by (1 - hero_focus): above 1 the
     distance goes negative and the hero wins the nearest-target argmin from anywhere, below 0 it
     is inflated and the bot avoids the hero."""
     cfg = load_config(config_dir / "default.yaml")
@@ -533,7 +528,7 @@ def test_validate_accepts_both_difficulty_axes_at_their_extremes(config_dir):
     assert float(params.hero_focus[0, 1]) == 1.0 and float(params.aggression[0, 1]) == 2.5
 
 
-# ---- the gadget's per-kind numbers (SIM_OVERHAUL_PLAN.md Phase G, Step G1) --------------------
+# ---- the gadget's per-kind numbers ------------------------------------------------------------
 
 _GADGET = {"gadget_cooldown": 18.0, "gadget_range": 2.0, "gadget_flight_seconds": 0.2,
            "gadget_damage": 2000.0, "gadget_radius": 1.0}
@@ -603,7 +598,7 @@ _QUAD = ((-14.11, -10.59), (14.77, -10.93), (11.73, 7.45), (-11.55, 7.01))
 
 
 def test_camera_and_slots_load_from_the_yaml_and_default_when_absent(config_dir):
-    """OBS_PARITY_TASKS.md C1. The dataclass defaults ARE the shipped values, so a train.yaml that
+    """The dataclass defaults ARE the shipped values, so a train.yaml that
     points at an older default.yaml (no `camera:` block) evaluates under the same camera."""
     absent = load_config(config_dir / "default.yaml")      # DEFAULT_YAML has no camera/slots block
     shipped = load_config(_SHIPPED / "default.yaml")
@@ -656,9 +651,9 @@ def test_validate_rejects_a_bad_camera_or_slot_setting(bad, name):
 
 
 def test_history_config_loads_from_the_observation_block_and_rejects_zero(config_dir):
-    """SIM_OVERHAUL_PLAN.md Phase H (Step H1.1). Both knobs are structural (they size the
-    `hist_*` rings and the H2 observation), so they are EnvConfig fields under `observation:`.
-    This file's DEFAULT_YAML omits them, which must mean the defaults, not an error."""
+    """Both knobs are structural (they size the `hist_*` rings and the history observation), so they
+    are EnvConfig fields under `observation:`. This file's DEFAULT_YAML omits them, which must mean
+    the defaults, not an error."""
     cfg = load_config(config_dir / "default.yaml")
     assert (cfg.history_frames, cfg.history_radius_tiles) == (3, 4)
     cfg = load_config(config_dir / "default.yaml",
@@ -709,7 +704,7 @@ def test_validate_zone_start_time_too_late():
 
 
 def test_validate_rejects_a_zone_that_is_enabled_but_deals_no_damage():
-    """The stale-config trap from Step B3's `zone.dps` -> `zone.max_hp_fraction_per_second`
+    """The stale-config trap from the `zone.dps` -> `zone.max_hp_fraction_per_second`
     rename. The old key is simply not read any more, so a config still using it resolves the new
     one to `_dget`'s default of 0 and the zone silently becomes INERT -- no error, no damage.
 
@@ -717,8 +712,8 @@ def test_validate_rejects_a_zone_that_is_enabled_but_deals_no_damage():
     ordinary-looking number. The symptom would surface much later as "episodes never resolve",
     which is exactly what the zone exists to prevent, so it must fail at construction instead.
 
-    `config.check_removed_keys` now also rejects the old SPELLING outright at build_params time
-    (Step E2), which catches the same mistake one step earlier and by name. Both layers are worth
+    `config.check_removed_keys` also rejects the old SPELLING outright at build_params time,
+    which catches the same mistake one step earlier and by name. Both layers are worth
     having: the spelling check only sees keys someone left in the file, while this one also
     catches a params object assembled by hand or mutated by a params_hook."""
     cfg = EnvConfig()

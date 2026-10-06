@@ -56,7 +56,7 @@ def test_construction_builds_one_artist_set_per_entity_slot():
     # of a fixed-size scatter dot, since its `prj_radius` actually matters to what's on screen).
     #
     # Derived from the enum, not written as a literal set: the literal silently became wrong the
-    # moment Step B1 added Proj.SUPER_BOLT, and the failure read as "the viewer built the wrong
+    # moment Proj.SUPER_BOLT was added, and the failure read as "the viewer built the wrong
     # artists" rather than "a projectile kind was added". Derived, adding a Proj member is a
     # passing change here and FORGETTING to give it a colour is the failure -- which is the bug
     # actually worth catching, since viewer._PROJ_COLOR.get() would otherwise fall back silently.

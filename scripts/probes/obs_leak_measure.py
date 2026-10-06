@@ -6,7 +6,7 @@ have supplied: revealed enemies beyond the window, projectile slots taken by off
 projectiles, zone margins reporting gas that is not on screen, and how rarely the bush rule
 (the only concealment the sim has) actually hides anyone.
 
-Since OBS_PARITY_TASKS.md C3 the hero's reveal is `core/camera.hero_view` (concealment AND the
+Since 2026-09-24 the hero's reveal is `core/camera.hero_view` (concealment AND the
 camera quad), so the enemy block must read 0 off-screen by construction; it stays as the
 regression check, and the window here is the quad, not the 21x13 crop.
 """

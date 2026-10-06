@@ -2,9 +2,7 @@
 
 Not a conftest.py: these are plain helper FUNCTIONS that tests import by name, not pytest
 fixtures, and `from bot_fixtures import ...` is unambiguous where a magically-injected fixture
-would not be. tests/test_sniper.py etc. each used to carry their own private copy of `_FakeBank`/
-`_grid`/`_cfg_and_params`/`_fresh_state`; Step 41 needed all of them plus a `Targeting` builder in
-a sixth file, which is where five copies stopped being tolerable.
+would not be.
 """
 import yaml
 import torch
@@ -100,9 +98,8 @@ def build_targeting(state, bank, params, cfg):
     (vis, tgt) since several tests assert on `vis` too.
 
     Mirrors production deliberately, including the (N,E) `target_los` rather than the (N,E,E)
-    `raw_los` this used to build (Step A2) -- an archetype test that fed `targeting` a
-    differently-shaped LOS than the real dispatcher does would be testing a code path that no
-    longer exists."""
+    `raw_los` -- an archetype test that fed `targeting` a differently-shaped LOS than the real
+    dispatcher does would be testing a code path that does not exist."""
     vis = perception.bot_visibility(state, perception.visibility(state, bank, params, cfg), cfg)
     perception.select_target(state, vis, params, cfg)
     los = perception.target_los(state, bank, cfg)

@@ -1,25 +1,13 @@
 """BrawlGymEnv: a standard single-environment `gymnasium.Env` wrapping `BrawlVecEnv(n_envs=1)`.
-See BRAWL_SIM_BUILD_PLAN.md Step 34.
 
-**Validation and debugging only** -- one env, host transfers, `.item()`/`.cpu()`/`.numpy()`
-calls throughout. `wrappers/sb3_vecenv.py` (Step 33) called itself "the ONLY place in the repo
-where host transfers... are permitted"; that claim was true when it was written but is
-superseded here -- this file has the exact same obligation for the same reason (gymnasium's
-`Env.step`/`reset` contract requires plain Python floats/bools and numpy arrays, not torch
-tensors) and is the second, equally legitimate place it happens. Neither file's existence makes
-the other's discipline optional; nothing outside these two files should ever need a host
-transfer.
+**Validation and debugging only.** gymnasium's `step`/`reset` contract needs plain Python
+floats/bools and numpy arrays, so this file and `wrappers/sb3_vecenv.py` are the two places host
+transfers are allowed; nothing else should need one.
 
-**No autoreset.** Standard single-env `gymnasium.Env`s are contractually forbidden from
-resetting inside `step()` -- the caller must see `terminated`/`truncated` and call `reset()`
-itself. `BrawlGymEnv.__init__` enforces this by setting `env.autoreset = False` on the
-`BrawlVecEnv` it's given (Step 34's own addition to `env.py`; see that module's docstring) --
-the SAME "wrapper takes ownership of an attribute on construction" pattern
-`BrawlSB3VecEnv.__init__` already established for `env.reward_fn` (Step 33), not a new idiom.
-Once `terminated | truncated` is `True`, calling `step()` again without an intervening
-`reset()` raises `RuntimeError` rather than silently continuing to simulate a hero that's
-already dead (or an episode that's already timed out) -- a debugging tool should fail loudly on
-caller misuse, not produce quietly-meaningless data.
+**No autoreset.** A single-env `gymnasium.Env` must not reset inside `step()`, so `__init__` sets
+`env.autoreset = False` on the `BrawlVecEnv` it is given (and takes over `env.reward_fn`, as
+`BrawlSB3VecEnv` does). Calling `step()` after `terminated | truncated` without a `reset()`
+raises `RuntimeError` rather than simulating a dead hero or a finished episode.
 """
 import gymnasium as gym
 import numpy as np
@@ -38,7 +26,7 @@ class BrawlGymEnv(gym.Env):
                 f"BrawlGymEnv wraps exactly one env; got env.n_envs={env.n_envs}. "
                 "Construct BrawlVecEnv(..., n_envs=1) for this wrapper."
             )
-        env.reward_fn = reward_fn  # same reward-ownership takeover as BrawlSB3VecEnv, Step 33
+        env.reward_fn = reward_fn  # same reward-ownership takeover as BrawlSB3VecEnv
         env.autoreset = False      # see module docstring
         self.env = env
         self.cfg = env.cfg
@@ -67,7 +55,7 @@ class BrawlGymEnv(gym.Env):
         if self._done:
             raise RuntimeError(
                 "step() called after terminated/truncated was True without an intervening "
-                "reset() -- gymnasium single envs don't autoreset (Step 34). Call reset() first."
+                "reset() -- gymnasium single envs don't autoreset. Call reset() first."
             )
         action_t = torch.as_tensor(np.asarray(action), dtype=torch.int64, device=self.env.device).view(1, 2)
         full_obs, reward_t, terminated_t, truncated_t, info = self.env.step(action_t)

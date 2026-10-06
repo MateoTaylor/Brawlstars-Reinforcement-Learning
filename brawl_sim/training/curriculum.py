@@ -1,28 +1,22 @@
 """CurriculumManager: weighted bot-difficulty sampling, applied per env on every reset.
 
-**What it does.** Every reset, each bot ARCHETYPE in each env independently draws a difficulty
-tier from the current stage's weighted mixture, and that tier's multipliers are applied to that
-archetype's `SimParams` columns. Archetype *selection* is untouched -- bots stay uniformly
-randomly chosen by `core/spawn.sample_enemy_kinds` throughout the whole curriculum; what changes
-is how well the bots you draw actually play.
+Every reset, each bot KIND in each env independently draws a difficulty tier from the current
+stage's weighted mixture, and that tier's multipliers scale the kind's `SimParams` columns. Which
+kinds spawn is untouched (`core/spawn.sample_enemy_kinds`, weighted by
+`entities.enemy_type_weights`); the curriculum changes how well the drawn bots play.
 
-**Where it plugs in.** As `BrawlVecEnv(params_hook=...)`, which `core/spawn.reset_envs` calls
-immediately after `resample_params` and before anything reads `params` back -- see that
-function's docstring for why that exact position is the only correct one (`max_hp` is derived
-from `base_hp` right there, so a `hp` multiplier applied any later would leave entities spawning
-with HP that disagrees with their own stats).
+It plugs in as `BrawlVecEnv(params_hook=...)`, which `core/spawn.reset_envs` calls right after
+`resample_params` and before anything reads `params` back: `max_hp` is derived from `base_hp`
+there, so an `hp` multiplier applied later would spawn entities whose HP disagrees with their
+stats.
 
-**Why a hook and not the {low, high} range syntax.** `resample_params` already resamples every
-randomized field per env on every reset (N08) -- but a range is a single *continuous uniform*,
-and a curriculum needs a *weighted discrete mixture* over named tiers ("70% easy, 25% medium,
-5% hard"), which no `{low, high}` pair can express. The two compose cleanly and are independent:
-`configs/randomization.yaml` jitters the base value, this then scales it by the drawn tier.
+A hook rather than the {low, high} range syntax because a range is one continuous uniform and a
+curriculum needs a weighted discrete mixture over named tiers. The two compose:
+`configs/randomization.yaml` jitters the base value, then the drawn tier scales it.
 
-**Discipline.** Sync-free and fully batched, exactly like the simulator code it runs inside: one
-`torch.rand` + `searchsorted` for the whole batch, `torch.where` over all N rows, no
-`.item()`/`.cpu()`/boolean indexing/Python loop over envs. The only Python-level loop is over
-the 4 archetypes' worth of *fields* (a compile-time constant list), which CONVENTIONS.md
-explicitly permits.
+Sync-free and fully batched like the sim code it runs inside: one `torch.rand` + `searchsorted`
+for the whole batch, `torch.where` over all N rows. The only Python loop is over the
+compile-time list of target fields, which CONVENTIONS.md permits.
 """
 import torch
 
@@ -33,22 +27,19 @@ from .config import CurriculumConfig, DifficultyTier
 # the hero and is never touched by the curriculum.
 _N_BOT_KINDS = N_KINDS - 1
 
-# (tier multiplier field, SimParams attribute(s) it scales). One tier knob may drive more than
-# one field: `aim_noise` moves both the angular noise the sniper/melee/rifle archetypes use and
-# the positional noise the artillery archetype uses, so a tier stays one number per concept
-# rather than one number per archetype's implementation detail.
+# (tier multiplier field, SimParams attribute(s) it scales). `aim_noise` drives both the angular
+# noise of LEAD-aimed kinds and the landing-point noise of LOB kinds (artillery, Spike), so a tier
+# stays one number per concept.
 _FLOAT_TARGETS = (
     ("aim_noise", ("aim_noise_std_rad", "aim_noise_tiles")),
     ("reaction_delay", ("reaction_delay",)),
     ("move_speed", ("move_speed",)),
     ("hp", ("base_hp",)),
     ("damage", ("base_damage",)),
-    # Unclamped on purpose: bots/personality.py clamps each of aggression's READS itself (retreat
-    # threshold, KITE hold scale). A 0 MULTIPLIER cannot happen -- DifficultyTier refuses
-    # `aggression: 0`, because core/stats.aggression_of reads a 0 as the neutral 1.0 and the tier
-    # would silently play like `hard`. A 0 BASE (a kind whose brawlers.yaml omits the key) can:
-    # it stays 0 under any multiplier and is read as that same neutral 1.0, which is what "unset"
-    # means -- pinned by tests/test_training.py::test_manager_clamps_hero_focus_to_one.
+    # Unclamped: bots/personality.py clamps each read. A 0 MULTIPLIER cannot happen (DifficultyTier
+    # refuses it: core/stats.aggression_of reads 0 as the neutral 1.0). A 0 BASE (brawlers.yaml
+    # omits the key) stays 0 and reads as that neutral 1.0, i.e. "unset" -- pinned by
+    # tests/test_training.py::test_manager_clamps_hero_focus_to_one.
     ("aggression", ("aggression",)),
 )
 
@@ -67,13 +58,11 @@ _UNIT_TARGETS = (
 
 
 class TierApplier:
-    """Turns a per-(env, archetype) tier index into `SimParams` multipliers.
+    """Turns a per-(env, bot kind) tier index into `SimParams` multipliers.
 
-    Split out from `CurriculumManager` so evaluation can reuse it: `FixedTierHook` (below) pins
-    every env to one named tier, `CurriculumManager` samples the index from the current stage's
-    mixture, and both must apply a tier the SAME way or an `eval/win_rate_hard` number would not
-    describe the same bots the curriculum's `hard` stage trains against -- which is the entire
-    point of having a stationary yardstick.
+    Shared by `CurriculumManager` (samples the index from the stage's mixture) and `FixedTierHook`
+    (pins one named tier, for evaluation), so an `eval/win_rate_hard` number describes the same
+    bots the curriculum's `hard` tier trains against.
     """
 
     def __init__(self, tiers: dict, device) -> None:
@@ -86,26 +75,18 @@ class TierApplier:
         self._ones_col: torch.Tensor | None = None
         self._bot_cols: torch.Tensor | None = None
 
-    def tier_index(self, name: str) -> int:
-        if name not in self.tier_names:
-            raise ValueError(f"unknown tier {name!r}; defined tiers are {list(self.tier_names)}")
-        return self.tier_names.index(name)
-
     def apply_tiers(self, params, reset_mask: torch.Tensor, tier_idx: torch.Tensor) -> None:
         """MUTATES (rebinds, matching `config.resample_params`' own convention): every per-kind
         SimParams tensor any tier multiplier targets, for masked rows only.
 
-        `tier_idx` is `(N, _N_BOT_KINDS)` int64 -- one tier per (env, archetype).
+        `tier_idx` is `(N, _N_BOT_KINDS)` int64 -- one tier per (env, bot kind).
         """
         n_envs = reset_mask.shape[0]
         device = reset_mask.device
         ones = self._ones_column(n_envs, device)  # (N,1), the hero's always-1.0 multiplier
-        # Every write is gated on `mask_k & bot_cols`, so column 0 (the hero) is provably never
-        # written -- for ANY field. The 1.0 multiplier in `ones` alone is NOT sufficient: the two
-        # fields below additionally clamp, and `clamp(round(0 * 1.0), min=1)` would have quietly
-        # moved the hero's own (unused, 0-valued) decision_period to 1. Caught by
-        # tests/test_training.py::test_manager_never_touches_the_hero_column; the invariant is
-        # cheap to hold exactly, so hold it exactly rather than argue the leak is harmless.
+        # Every write is gated on the bot columns, so column 0 (the hero) is never written for ANY
+        # field. The 1.0 multiplier in `ones` alone is not enough: the clamped fields below would
+        # move the hero's unused 0 decision_period to `clamp(round(0 * 1.0), min=1)`.
         write = reset_mask.unsqueeze(1) & self._bot_columns(device)   # (N,K)
 
         for tier_field, attrs in _FLOAT_TARGETS:
@@ -114,9 +95,8 @@ class TierApplier:
                 current = getattr(params, attr)
                 setattr(params, attr, torch.where(write, current * mult, current))
 
-        # Fractions: scaling one freely could push a tier past 1.0 (elite's 1.5 x a 0.9 lead, or
-        # 1.7 x a 0.7 hero_focus), so they clamp rather than saturating into a different
-        # behaviour -- see _UNIT_TARGETS for what "past 1.0" would mean for each.
+        # Fractions clamp to [0, 1] (elite's 1.5 x the sniper's 0.9 lead would over-lead); see
+        # _UNIT_TARGETS for what "past 1.0" would mean for each.
         for tier_field, attr in _UNIT_TARGETS:
             mult = self._multiplier(tier_field, tier_idx, ones)
             current = getattr(params, attr)
@@ -124,9 +104,8 @@ class TierApplier:
                 write, torch.clamp(current * mult, min=0.0, max=1.0), current
             ))
 
-        # decision_period is in TICKS (int64) -- round after scaling, and floor at 1: a period of
-        # 0 would mean "re-decide zero times per tick", which the archetype policies read as a
-        # modulo divisor and would divide by zero on.
+        # decision_period is in TICKS (int64): round after scaling and floor at 1, because
+        # bots/policy.py uses it as a modulo divisor.
         mult = self._multiplier("decision_period", tier_idx, ones)
         period = params.decision_period
         scaled = torch.round(period.to(torch.float32) * mult).clamp(min=1.0).to(torch.int64)
@@ -134,12 +113,12 @@ class TierApplier:
 
     def _multiplier(self, tier_field: str, tier_idx: torch.Tensor, ones: torch.Tensor) -> torch.Tensor:
         """(N, K) multiplier column-aligned with a per-kind SimParams tensor: 1.0 for the hero
-        in column 0, then each archetype's own drawn tier's value in columns 1..K-1."""
-        bots = self._tables[tier_field][tier_idx]  # (T,)[(N,4)] -> (N,4)
+        in column 0, then each bot kind's drawn tier's value in columns 1..K-1."""
+        bots = self._tables[tier_field][tier_idx]  # (T,)[(N, K-1)] -> (N, K-1)
         return torch.cat([ones, bots], dim=1)
 
     def _bot_columns(self, device) -> torch.Tensor:
-        """(1, K) bool: False for the hero's column 0, True for every bot archetype column."""
+        """(1, K) bool: False for the hero's column 0, True for every bot kind column."""
         if self._bot_cols is None or self._bot_cols.device != device:
             cols = torch.ones((1, N_KINDS), dtype=torch.bool, device=device)
             cols[0, 0] = False
@@ -155,13 +134,10 @@ class TierApplier:
 class FixedTierHook(TierApplier):
     """A `params_hook` that pins every env to ONE named tier, for stationary evaluation.
 
-    Optionally takes a per-env assignment so a single batched env can evaluate several tiers at
-    once: `assignment[i]` is the tier index env `i` is pinned to. `training/evaluation.py` uses
-    that to score every tier in one rollout -- envs `[0:k)` are easy, `[k:2k)` medium, and so on
-    -- rather than building and stepping one env per tier.
-
-    Unlike `CurriculumManager` this draws no randomness at all, which is what makes an eval
-    number comparable across checkpoints: same seed, same maps, same spawns, same bot quality.
+    `assignment[i]` is the tier index env `i` is pinned to, so one batched env can score every
+    tier in one rollout (`training/evaluation.py`: envs `[0:k)` get the first tier, `[k:2k)` the
+    second, ...). It draws no randomness, which keeps an eval number comparable across
+    checkpoints.
     """
 
     def __init__(self, tiers: dict, device, assignment: torch.Tensor) -> None:
@@ -169,7 +145,7 @@ class FixedTierHook(TierApplier):
         if assignment.ndim != 1:
             raise ValueError(f"assignment must be 1-D (N,), got shape {tuple(assignment.shape)}")
         self.assignment = assignment.to(device=self.device, dtype=torch.int64)
-        # (N, 4): the same tier for all four archetypes in a given env.
+        # (N, _N_BOT_KINDS): the same tier for every bot kind in a given env.
         self._tier_idx = self.assignment.unsqueeze(1).expand(-1, _N_BOT_KINDS).contiguous()
 
     @classmethod
@@ -224,8 +200,8 @@ class CurriculumManager(TierApplier):
         if total <= 0:
             raise ValueError(f"stage {self.stage.name!r} has zero total weight over known tiers")
         probs = torch.tensor([w / total for w in weights], dtype=torch.float32, device=self.device)
-        # Inverse-CDF sampling, the same shape core/spawn.sample_enemy_kinds already uses for
-        # archetype selection -- one `searchsorted` for the whole batch, no multinomial, no sync.
+        # Inverse-CDF sampling, as core/spawn.sample_enemy_kinds does: one `searchsorted` for the
+        # whole batch, no multinomial, no sync.
         self._cdf = torch.cumsum(probs, dim=0)
         self._cdf[-1] = 1.0  # guard the last bucket against float32 cumsum landing at 0.9999994
 
@@ -271,7 +247,7 @@ class CurriculumManager(TierApplier):
         u = torch.rand((n_envs, _N_BOT_KINDS), generator=self.gen, device=device)
         tier_idx = torch.clamp(
             torch.searchsorted(self._cdf, u.contiguous(), right=True), max=len(self._tiers) - 1
-        )  # (N, 4), one tier per (env, archetype)
+        )  # (N, _N_BOT_KINDS), one tier per (env, bot kind)
 
         self.apply_tiers(params, reset_mask, tier_idx)
 
@@ -285,9 +261,9 @@ class CurriculumManager(TierApplier):
         return {"stage_index": self.stage_index, "stage_name": self.stage.name}
 
     def load_state_dict(self, state: dict) -> None:
-        """Restores the stage pointer. Matches by NAME first and falls back to the index, so
-        reordering or renaming stages in configs/train.yaml between runs fails loudly here
-        rather than silently resuming at the wrong difficulty."""
+        """Restores the stage pointer. Matches by NAME (by index only when no name was recorded),
+        so reordered stages still resume the right one and a renamed stage fails loudly rather
+        than resuming at the wrong difficulty."""
         name = state.get("stage_name")
         index = int(state.get("stage_index", 0))
         if name is not None:

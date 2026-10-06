@@ -64,7 +64,7 @@ MAX_WALK_TILES_S = 2.73
 # recordings, 1 113 single-box sightings while tracking: the median of the per-clip medians, with
 # per-clip medians from -0.15 to -0.04 in x and -0.92 to -0.71 in y. Live only: the sim has no
 # boxes, and `HERO_ANCHOR_TILES` must stay the ring's position because the sim's `camera.quad` is
-# derived from it (OBS_PARITY_TASKS.md, pending decision 2). Pinned against the recordings by
+# derived from it (BRAWL_DEPLOYMENT_DESIGN.md §9 entry 19). Pinned against the recordings by
 # tests/test_deployment_tracker.py::test_recorded_player_boxes_read_near_zero_offset_while_tracking.
 PLAYER_BOX_FROM_RING_TILES = (-0.08, -0.78)
 
@@ -114,7 +114,7 @@ class TrackerResult:
 class _Point:
     """A zero-size box, so `to_tiles` projects exactly this pixel: it takes `anchor(frac)`, which
     for a box of no height is the point itself whatever `frac` is. Keeps the nominal hero tile
-    on the ONE pixel-to-tile path the detections use (OBS_PARITY_TASKS.md C7)."""
+    on the ONE pixel-to-tile path the detections use."""
     label: str
     confidence: float
     xyxy: tuple

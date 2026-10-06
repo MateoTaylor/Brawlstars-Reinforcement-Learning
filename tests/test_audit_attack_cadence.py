@@ -1,10 +1,10 @@
-"""Step A1.4 (SIM_OVERHAUL_STEPS.md): the cadence audit's recorder and statistics, exercised by a
+"""The cadence audit's recorder and statistics, exercised by a
 hand-scripted policy that attacks at every legal decision with one enemy pinned in dash reach.
 
 This is also the regression pin for the STRUCTURAL cadence cap itself: Mortis's 0.35 s
 attack_cooldown against a 0.25 s decision period means the earliest legal dash after a dash is the
-second decision boundary, 10 ticks later. The `10` below is a literal on purpose -- Step A3 (the
-fire latch) is what changes it, and it must change this test when it does.
+second decision boundary, 10 ticks later. The `10` below is a literal on purpose -- a fire latch
+would change it, and it must change this test when it does.
 """
 from pathlib import Path
 
@@ -117,7 +117,7 @@ def test_summarize_segments_fights_by_reach_and_episode():
 
 
 def test_a_gadget_decision_is_not_counted_as_an_attack():
-    """Attack-column value 3 is the gadget (SIM_OVERHAUL Step G3): its own timer, no cooldown, no
+    """Attack-column value 3 is the gadget: its own timer, no cooldown, no
     ammo. `>= 1` would have scored it as an attack taken; a super (2) still counts."""
     def row(step, col):
         return {"env": 0, "step_count": step, "can_attack": True, "attack_cd": 0.0, "dash_t": 0.0,
@@ -128,7 +128,7 @@ def test_a_gadget_decision_is_not_counted_as_an_attack():
     assert s["interval_hist"] == {10: 1}          # attack at 0, super at 10; the gadget at 5 is not one
 
 
-# ---- the pre-gadget checkpoint refusal (SIM_OVERHAUL Step G3 review) ----------------------------
+# ---- the pre-gadget checkpoint refusal ----------------------------------------------------------
 # The sim's attack column went 3 -> 4 wide, so every checkpoint trained before it carries a
 # MultiDiscrete([17, 3]) head. Both sim-side checkpoint consumers (scripts/watch.py and this
 # script's --run mode) must say so, not die inside `predict` on a 20-vs-21 mask shape. The widths
@@ -191,7 +191,7 @@ def test_the_sim_audit_refuses_a_pre_gadget_checkpoint_before_the_first_predict(
 def test_watch_and_the_audit_load_an_archived_run_without_the_holdout_check(tmp_path, monkeypatch):
     """Neither script evaluates on the holdout maps, so neither may refuse an archived run because
     one of its `eval.holdout_maps` has since left the map registry: the opt-out
-    `DeployedPolicy.from_run` already takes (Step M4 review). `scripts/train.py --resume` stays
+    `DeployedPolicy.from_run` already takes. `scripts/train.py --resume` stays
     strict, because it re-runs the holdout eval. A run whose TRAINING map left the registry is
     still refused, by `BrawlVecEnv`'s own validation."""
     from types import SimpleNamespace
@@ -229,11 +229,11 @@ def test_summarize_on_no_rows_reports_nothing_rather_than_dividing_by_zero():
     assert "n/a" in render_report(s, {})
 
 
-# -- Step A2.3: the same statistics from deployment telemetry ---------------------------------
+# -- the same statistics from deployment telemetry --------------------------------------------
 #
 # Synthetic `TickRow`s at the shipped rates: 12 Hz perception, a decision every 3 ticks, and the
 # sim's 5 ticks per decision. The chain below attacks on every legal decision and the shadow makes
-# every other one illegal (0.15 s of cooldown left, plan section 1.1), which is the 0.50 s chain.
+# every other one illegal (0.15 s of cooldown left), which is the 0.50 s chain.
 # Every expected number is a literal.
 
 DECISION_EVERY = 3        # perception ticks per decision at 12 Hz
@@ -260,7 +260,7 @@ def _match(start, n_decisions, *, resync_at=(), skip_at=(), in_reach=True):
         else:
             ticks.append(_tick(
                 index, decision=True, move_bin=1, attack=1 if legal else 0,
-                # Bit 3 is a charged gadget, set on real rows since SIM_OVERHAUL Step G5.
+                # Bit 3 is a charged gadget, set on real rows since 2026-09-21.
                 attack_legal=0b1011 if legal else 0b1001,
                 attack_cd_shadow=0.0 if legal else 0.15, attack_idle_t_shadow=0.0,
                 ammo_shadow=3.0, ammo_cv=3.0, enemy_in_reach=in_reach,
@@ -340,20 +340,20 @@ def test_the_telemetry_cli_writes_the_same_report_with_a_sixth_row(tmp_path):
     out = tmp_path / "report.md"
     assert main(["--telemetry", str(path), "--out", str(out)]) == 0
     text = out.read_text(encoding="utf-8")
-    assert text.startswith("# Attack cadence audit (deployment side, Step A2)")
+    assert text.startswith("# Attack cadence audit (deployment side)")
     assert "| 1 | utilization P(attack \\| legal & enemy in reach) | 1.000 | 20 / 20 |" in text
     assert "| 2 | inter-attack interval, ticks (mode) | 10 | 19 intervals |" in text
     assert "| 6 | shadow resyncs per minute inside fights | 6.00 | 1 in 0.17 fight-min (1 in the file) |" in text
     assert "+1.00" in text
 
 
-def test_the_telemetry_cli_refuses_a_file_from_before_step_a2(tmp_path):
+def test_the_telemetry_cli_refuses_a_file_without_cadence_columns(tmp_path):
     from scripts.audit_attack_cadence import load_telemetry
 
     path = tmp_path / "old.csv"
     path.write_text("index,t,grab_ms,phase,decision,attack\n0,0.0,1.0,playing,True,1\n",
                     encoding="utf-8")
-    with pytest.raises(SystemExit, match="before Step A2"):
+    with pytest.raises(SystemExit, match="with no cadence columns"):
         load_telemetry(path)
 
 
@@ -363,8 +363,6 @@ def test_a_missing_telemetry_file_is_a_clear_refusal(tmp_path, capsys):
     assert main(["--telemetry", str(tmp_path / "nope.csv")]) == 1
     assert "no such telemetry file" in capsys.readouterr().err
 
-
-# -- Step A2 review ----------------------------------------------------------------------------
 
 def test_the_resync_count_covers_the_file_when_the_raw_ticks_are_handed_in():
     """The canary runs before the brawlers-left read can skip a decision, so a resync can sit on

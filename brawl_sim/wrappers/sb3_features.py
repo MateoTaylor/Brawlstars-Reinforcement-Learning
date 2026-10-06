@@ -1,46 +1,24 @@
-"""BrawlFeaturesExtractor: the minimum model-side code needed for SB3 to *accept* this
-observation. See BRAWL_SIM_BUILD_PLAN.md Step 35.
+"""BrawlFeaturesExtractor: the features extractor SB3 needs to accept this observation.
 
-**Not a tuned architecture -- a working default you will replace.**
+A working default, not a tuned architecture. SB3's `CombinedExtractor` routes any 3D `uint8`
+subspace to `NatureCNN`, whose unpadded 8/4 -> 4/2 -> 3/1 stack collapses a 13 x 21 view to an
+invalid size and raises. This replaces it wholesale: a small padded 3x3 CNN for the one `uint8`
+grid group, and a flatten + Linear + SiLU MLP over every other (float32) group, concatenated.
 
-**Why this exists (concrete gotcha).** SB3's default `MultiInputPolicy` uses `CombinedExtractor`,
-which routes any 3D `uint8` subspace to `NatureCNN` -- whose fixed 8/4-then-4/2-then-3/1
-kernel/stride stack (no padding) collapses `configs/agent_obs.yaml`'s `grid` group (`(10, 13,
-21)` by default, `(10, 10, 14)` under `debug_tiny`) to an invalid size and raises. Confirmed by
-hand in Step 33's own integration smoke test, not just anticipated from this step's text.
-`BrawlFeaturesExtractor` replaces `CombinedExtractor` wholesale: a small padded 3x3-kernel CNN
-for the one `uint8` grid group (padding is what keeps this stack alive on small grids where
-`NatureCNN`'s stack dies), and a flatten+`Linear`+`ReLU` MLP for every other (float32) group
-concatenated together, concatenated with the CNN's output.
+`n_flatten` is measured by pushing one sample of the real observation space through the stack,
+so the view size can change without touching this file; a checkpoint still loads only at its own
+view size, since the observation shape and the first linear layer both depend on it.
 
-**Nothing here is sized by hand.** `n_flatten` is measured by pushing one sample of the real
-observation space through the stack, so the view size can change without touching this file --
-which it did: `Terrain_Perception_Build_Plan.md` Phase K measured the real camera and the default
-view went from 20x40 to 13x21, taking the CNN's output from 5x10 to 4x6 and `cnn_linear`'s input
-from 3200 to 1536. That resizing is also the reason a checkpoint trained at the old view cannot be
-loaded at the new one: the observation shape and the first linear layer both changed.
+Hard-requires `stable_baselines3` (the `sb3` optional dependency group), like
+`wrappers/sb3_vecenv.py`; nothing under `core/`/`bots/`/`env.py` imports it.
 
-**This module hard-requires `stable_baselines3`** (no `try`/`except ImportError` guard) -- the
-same choice `wrappers/sb3_vecenv.py` (Step 33) already made, kept consistent here rather than
-introducing a different import-guarding convention for one file in the same package. Both are
-under the `sb3` optional dependency group (`pyproject.toml`); nothing under `core/`/`bots/`/
-`env.py` imports this module or requires it to be installed.
+**`normalize_images=False` is required, and this extractor cannot enforce it**: the POLICY reads
+it (`preprocess_obs`) before any features extractor sees the data. `default_policy_kwargs`
+returns it as a top-level key so it reaches the policy constructor; without it SB3 would divide
+the grid's occupancy counts by 255.
 
-**`normalize_images=False` is required, and is NOT something `BrawlFeaturesExtractor` itself
-can enforce** -- it's read by the POLICY (`BaseModel.extract_features`, via
-`preprocess_obs(obs, observation_space, normalize_images=self.normalize_images)`), one level
-above where any features extractor runs, before `BrawlFeaturesExtractor.forward` ever sees the
-data. `default_policy_kwargs` returns it as a top-level key specifically so
-`PPO(..., policy_kwargs=default_policy_kwargs(spec, cfg))` wires it into the POLICY constructor,
-not into `features_extractor_kwargs`. Without it, SB3 would divide the grid's small occupancy
-counts (0-255, but NOT pixel intensities) by 255 before this extractor ever runs.
-
-**If you wrap the vec env in `VecNormalize`,** pass `norm_obs_keys=float_group_names(spec)` to
-exclude the `uint8` grid group -- `VecNormalize` tracks a running mean/std per key and applying
-that to occupancy counts (rather than continuous vector features) would corrupt them. This
-module can't enforce that choice either (it happens entirely outside this file, at `VecNormalize`
-construction time); `float_group_names` exists so you don't have to hand-transcribe your
-`AgentObsSpec`'s group names/dtypes to get it right.
+**Under `VecNormalize`,** pass `norm_obs_keys=float_group_names(spec)` to exclude the `uint8`
+grid group: a running mean/std would corrupt occupancy counts.
 """
 import numpy as np
 import torch
@@ -52,13 +30,11 @@ from ..core import obs_select
 
 
 class BrawlFeaturesExtractor(BaseFeaturesExtractor):
-    """Small CNN sized for the one `uint8` grid group (`(C, view_h, view_w)`) + MLP for every
-    other (float32) group, concatenated. Grid conv stack: 3x3 s1 -> 3x3 s2 -> 3x3 s2 -> flatten
-    -> Linear -> ReLU (all convs padded, unlike `NatureCNN` -- see module docstring for why).
-    Vector groups: flatten each, concatenate, -> `len(mlp_hidden_dims)` stacked Linear->ReLU
-    layers (a single layer by default). Works with any `AgentObsSpec`-derived `observation_space`,
-    not just the default `configs/agent_obs.yaml` layout -- zero, one uint8 group and any number
-    of float32 groups (including zero of either, as long as not both) are all handled."""
+    """Small CNN for the one `uint8` grid group (`(C, view_h, view_w)`) + MLP for every other
+    (float32) group, concatenated. Grid: 3x3 s1 -> 3x3 s2 -> 3x3 s2 (all padded, unlike
+    `NatureCNN`) -> flatten -> Linear -> SiLU. Vector groups: flatten, concatenate, then
+    `len(mlp_hidden_dims)` stacked Linear -> SiLU layers. Handles zero or one uint8 group and any
+    number of float32 groups, as long as there is at least one group."""
 
     def __init__(
         self, observation_space: spaces.Dict,

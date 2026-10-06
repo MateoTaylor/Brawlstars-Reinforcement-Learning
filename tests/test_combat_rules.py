@@ -1,10 +1,9 @@
-"""bots/combat_rules.py -- the data-driven fire/aim rule that replaced the four archetype
-modules in Step E1.
+"""bots/combat_rules.py -- the data-driven fire/aim rule shared by every bot kind.
 
 The point of this file is that it is almost entirely KIND-AGNOSTIC. Each test takes one kind,
 rewrites a single field of its rule, and asserts the behavior follows the FIELD rather than the
-Kind -- because the reason E1 exists is that a sixth brawler should be a configs/brawlers.yaml
-block, and a rule table that only happens to work for the five shipped brawlers would not deliver
+Kind -- because the table exists so that a new brawler is just a configs/brawlers.yaml
+block, and a rule table that only happens to work for the shipped brawlers would not deliver
 that. Per-brawler behavior (Brock holds LOS, Grom lobs over walls, Buzz needs its cone, Shelly
 holds fire on crossers) is still covered end-to-end in tests/test_sniper.py, test_artillery.py,
 test_melee.py and test_rifle.py.
@@ -193,7 +192,7 @@ def test_a_positive_attack_arc_gates_fire_on_facing_and_a_zero_arc_does_not():
 def test_hitscan_sweep_widens_the_cone_gate_by_half_the_sweep():
     """A swept attack fans across `hitscan_sweep_rad`, so the reachable half-angle is
     (sweep + arc) / 2. Without the sweep term Buzz would refuse to start a sweep whose later
-    sub-swings land squarely (Step C2)."""
+    sub-swings land squarely."""
     k = int(Kind.BOT_MELEE)
     cfg, params, gen, _s, _b = _setup(kind=Kind.BOT_MELEE)
     arc = float(params.attack_arc_rad[0, k])
@@ -318,9 +317,9 @@ def test_aim_noise_is_angular_for_lead_and_positional_for_lob():
 # =================================================================================================
 
 def test_a_kind_can_be_redefined_into_a_different_archetype_from_params_alone():
-    """The E1 acceptance test. BOT_MELEE ships as a point-blank DIRECT cone swinger with no LOS
+    """BOT_MELEE ships as a point-blank DIRECT cone swinger with no LOS
     requirement; rewriting only its per-kind params -- no Python -- must turn it into a
-    long-range LOS-gated leading shooter with a range fraction, which is what "a sixth brawler is
+    long-range LOS-gated leading shooter with a range fraction, which is what "a new brawler is
     a brawlers.yaml block" has to mean."""
     k = int(Kind.BOT_MELEE)
 
@@ -363,7 +362,7 @@ def test_a_kind_can_be_redefined_into_a_different_archetype_from_params_alone():
 
 def test_shipped_roster_rules_match_the_documented_table():
     """Pins each brawler's rule SHAPE (does it need a line, how does it aim), not its tuned
-    numbers -- those are game statistics and are meant to move. See bots/combat_rules.py's table.
+    numbers -- those are game statistics and are meant to move. See BRAWL_SIM_DESIGN.md §7's roster table.
     """
     cfg, params, _gen = cfg_and_params(map_h=40, map_w=40)
     expected_los = {Kind.BOT_SNIPER: 1, Kind.BOT_ARTILLERY: 0, Kind.BOT_MELEE: 0, Kind.BOT_RIFLE: 1}

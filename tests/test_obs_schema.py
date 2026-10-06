@@ -1,4 +1,4 @@
-import copy
+import dataclasses
 
 import numpy as np
 import pytest
@@ -44,7 +44,7 @@ def _obs(n_envs=8, overrides=None, tiny=True):
     return cfg, obs
 
 
-# ---- set-comparison: build_obs output <-> obs_spec(cfg) (Step 26's core acceptance test) -----
+# ---- set-comparison: build_obs output <-> obs_spec(cfg) --------------------------------------
 
 def test_every_build_obs_field_is_in_schema_and_vice_versa_both_toggles_on():
     cfg, obs = _obs(overrides={"observation": {"include_world_grid": True, "include_privileged": True}})
@@ -62,6 +62,28 @@ def test_every_build_obs_field_is_in_schema_and_vice_versa_both_toggles_off():
     assert not any(k.startswith("entities.privileged.") for k in flat)
 
 
+def test_raw_los_toggle_drops_exactly_its_two_fields():
+    """`observation.include_raw_los`: off drops `entities.los_from_hero`
+    and `visibility.los` -- and nothing else -- from both build_obs and obs_spec, and build_obs
+    never reads `raw_los`, which is what lets the env skip the march altogether."""
+    cfg_on, params, bank, gen, spec = _cfg_params_bank(n_envs=4)
+    cfg_off = dataclasses.replace(cfg_on, obs_include_raw_los=False)
+    assert cfg_on.obs_include_raw_los is True
+    state = allocate(cfg_on, n_envs=4, device="cpu", verbose=False)
+    spawn.reset_envs(state, torch.ones(4, dtype=torch.bool), bank, params, cfg_on, gen, spec)
+    vis = perception.visibility(state, bank, params, cfg_on)
+
+    on = obs_mod.build_obs(state, bank, vis, perception.raw_los(state, bank, cfg_on), params, cfg_on)
+    off = obs_mod.build_obs(state, bank, vis, None, params, cfg_off)
+    schema.validate_obs(off, cfg_off)
+    flat_on, flat_off = schema._flatten(on), schema._flatten(off)
+    dropped = {"entities.los_from_hero", "visibility.los"}
+    assert set(flat_on) - set(flat_off) == dropped and set(flat_off) <= set(flat_on)
+    assert set(schema.obs_spec(cfg_on)) - set(schema.obs_spec(cfg_off)) == dropped
+    for key, value in flat_off.items():
+        assert torch.equal(value, flat_on[key]), key
+
+
 def test_obs_spec_shapes_resolve_against_cfg():
     cfg, obs = _obs(overrides={"observation": {"include_world_grid": True}})
     spec = schema.obs_spec(cfg)
@@ -69,7 +91,7 @@ def test_obs_spec_shapes_resolve_against_cfg():
     assert spec["projectiles.pos"].shape == ("N", cfg.max_projectiles, 2)
     assert spec["boxes.alive"].shape == ("N", cfg.max_boxes)
     assert spec["pickups.alive"].shape == ("N", cfg.max_pickups)
-    # 12 base channels, then one enemy_hist plane per history slot (Step H2, history_frames 3).
+    # 12 base channels, then one enemy_hist plane per history slot (history_frames 3).
     assert spec["view"].shape == ("N", 15, cfg.view_h, cfg.view_w)
     assert spec["world"].shape == ("N", 15, cfg.map_h, cfg.map_w)
     assert spec["action_mask.move"].shape == ("N", cfg.n_move_bins + 1)
@@ -126,24 +148,6 @@ def test_validate_obs_fails_on_nan():
         assert "hero.hp" in str(exc)
 
 
-# ---- describe_obs -------------------------------------------------------------------------
-
-def test_describe_obs_fits_on_one_screen_debug_tiny():
-    cfg, obs = _obs(n_envs=8, overrides={"observation": {"include_world_grid": False}})
-    text = schema.describe_obs(obs, env_index=0)
-    lines = text.split("\n")
-    assert len(lines) <= 60, f"describe_obs produced {len(lines)} lines, expected to fit one screen"
-    assert all(len(line) <= 200 for line in lines)
-
-
-def test_describe_obs_reflects_real_values():
-    cfg, obs = _obs(n_envs=1)
-    text = schema.describe_obs(obs, env_index=0)
-    assert "hero" in text
-    assert "entities" in text
-    assert f"map={int(obs['meta']['map_id'][0])}" in text
-
-
 # ---- to_numpy ------------------------------------------------------------------------------
 
 def test_to_numpy_preserves_structure_and_values():
@@ -172,7 +176,7 @@ def test_render_covers_every_schema_field():
         assert f"`{name}`" in text, f"{name} missing from generated docs"
 
 
-# ---- the gadget rows (SIM_OVERHAUL Step G4) --------------------------------------------------
+# ---- the gadget rows -------------------------------------------------------------------------
 
 def test_the_gadget_rows_are_declared_as_the_plan_specifies():
     ready = schema.OBS_SCHEMA["hero.gadget_ready"]
@@ -200,12 +204,7 @@ def test_validate_obs_requires_both_gadget_fields():
             schema.validate_obs(obs, cfg)
 
 
-def test_describe_obs_shows_the_gadget():
-    cfg, obs = _obs(n_envs=1)
-    assert "  gadget_ready: T" in schema.describe_obs(obs, env_index=0).split("\n")
-
-
-# ---- the history rows (SIM_OVERHAUL Step H2) ---------------------------------------------------
+# ---- the history rows --------------------------------------------------------------------------
 
 _HIST_ROWS = ["hist.valid", "hist.move_onehot", "hist.attack_onehot", "hist.hp", "hist.ammo_frac",
               "hist.displacement"]
@@ -226,8 +225,8 @@ def test_the_hist_rows_are_declared_as_the_plan_specifies():
 
 
 def test_every_row_is_in_build_obs_order_with_hist_right_after_hero():
-    """The module docstring's promise for the whole table, not only the hero rows: describe_obs
-    and dump_obs_schema.py both render in OBS_SCHEMA's order."""
+    """The module docstring's promise for the whole table, not only the hero rows:
+    dump_obs_schema.py renders in OBS_SCHEMA's order."""
     cfg, obs = _obs(overrides={"observation": {"include_world_grid": True, "include_privileged": True}})
     declared = list(schema.obs_spec(cfg))
     assert list(schema._flatten(obs)) == declared

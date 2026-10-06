@@ -26,10 +26,10 @@ run:
   #
   # This is the DEFAULT run. `scripts/deploy_run.py --run <name> [--checkpoint best|final]` plays a
   # different one for a single invocation, by the name it was trained as, without editing this file.
-  # Repointed 2026-09-22 (SIM_OVERHAUL I5). It named the deploy3 run, which is pre-gadget AND was
+  # Repointed 2026-09-22. It named the deploy3 run, which is pre-gadget AND was
   # deleted, so a live run would have failed on a missing path and the pre-flight test SKIPPED
   # rather than failing -- see test_deployment_policy.py's dangling-pointer guard.
-  # Repointed 2026-09-25 to deploy5 (OBS_PARITY_TASKS.md C12: its offline gates passed). deploy5
+  # Repointed 2026-09-25 to deploy5 (its offline gates passed). deploy5
   # is the first spec that reads `hero.near_edge`, which needs the tracker's player-box offset
   # (`tracker.PLAYER_BOX_FROM_RING_TILES`) that landed the same day. deploy4 stays playable with
   # `--run mortis_deploy4-20260921-185945`.
@@ -186,3 +186,37 @@ telemetry:
   # Frames to dump for debugging, hard-capped. 0 = off, and 0 is the only value that should
   # survive into an unattended run.
   frame_dump: 0
+
+map:                      # KNOWN_MAP_LOCALIZATION_PLAN.md
+  # The hand-labelled map the match is played on, brawl_deployment/data/maps/<name>.csv. null
+  # keeps the map-agnostic terrain: the occupancy map, in odometry's frame on the crate lattice.
+  # Named, the loop finds the camera on the label, hands out the map frame (world = map tile - 30)
+  # and gives the policy the label's terrain while it has a fix. Usually set for one session with
+  # `deploy_run.py --map dark_passage` instead of here.
+  name: null
+  # The localizer's thresholds, at MapLocalizer's defaults (brawl_deployment/perception/
+  # localize.py). Margins are in scored cells, agreements are rates in [0, 1].
+  # K4 (2026-09-28) kept the plan's values. On the 3 tuning recordings, fresh and back to back on
+  # one stack, every landing committed on the right spawn within 0.1 s of the gate (the lead hit
+  # commit_margin by the second tick) and no fix was dropped. The fix's smoothed agreement had a
+  # 5th percentile of 0.64-0.65 against guard_agreement, and no neighbour's lead came within 22
+  # cells of slip_margin. whole_map_margin and wrong_map_agreement were not exercised: no fix was
+  # lost, and the map was right. The held-out pair, replayed once: both landed right at the gate.
+  # One dropped a right fix 23 s in, where the view read under 0.6 at every placement; the
+  # whole-map search led by whole_map_margin within 0.8 s, but its agreement peaked at 0.648,
+  # under min_agreement, so 39% of that match went without a fix. Since then (the user's call,
+  # 2026-09-28) min_agreement holds only until the match's first fix. After it, a commit needs
+  # only guard_agreement, the rate that keeps a fix: in the search after a drop, and in a cut's
+  # confirm. The tuning recordings never searched after their first fix, so they are unchanged.
+  # K5 (the user's call, 2026-09-28): a commit in the spawn windows needs only guard_agreement
+  # too. The first live held-out landing led by commit_margin from its first tick but agreed at
+  # 0.62-0.65 and never fixed, and on synthetic views no other map's view committed in the windows
+  # at 0.6. So min_agreement now holds only in the whole-map search before a first fix.
+  commit_margin: 60.0       # the leader's lead needed to commit, in a spawn or after-cut window
+  whole_map_margin: 120.0   # the same, once the search has widened to the whole map
+  slip_margin: 15.0         # a neighbour's smoothed lead that moves the fix a tile
+  min_agreement: 0.65       # a whole-map commit before the match's first fix needs this rate
+  guard_agreement: 0.6      # under this for 2 s near the fix, it is dropped; other commits need it
+  wrong_map_agreement: 0.55 # the landing search's best under this means the wrong map
+  search_tiles: 4           # after an odometry cut, how far the fix is searched for
+  search_seconds: 5.0       # landing: spawn windows only for this long; a cut: time to confirm

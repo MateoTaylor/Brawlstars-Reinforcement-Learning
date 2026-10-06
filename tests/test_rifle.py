@@ -1,6 +1,6 @@
-"""Rifle archetype tests. FIRE and AIM only after Step 41's combat/movement split -- rifle's old
-kite-and-strafe movement and its below-30%-HP flee are personality behaviors now and are tested
-in tests/test_personality.py (as KITE and as the RETREAT mode respectively).
+"""Rifle archetype tests: FIRE and AIM only. Kite-and-strafe movement and the low-HP flee are
+personality behaviors, tested in tests/test_personality.py (as KITE and as the RETREAT mode
+respectively).
 """
 import torch
 
@@ -47,7 +47,7 @@ def test_fire_requires_los():
     state.ent_pos[0, 1] = torch.tensor([9.5, 10.5])
 
     _vis, tgt = build_targeting(state, bank, params, cfg)
-    assert state.ent_target[0, 1].item() == 0  # targeting ignores the wall (Notice 4)
+    assert state.ent_target[0, 1].item() == 0  # targeting ignores the wall
 
     fire, _, _ = combat_rules.combat(state, tgt, bank, params, cfg, gen)
     assert not bool(fire[0, 1])
@@ -136,11 +136,9 @@ def test_no_nan_in_combat_output_ever():
 # ---- full-loop acceptance ----------------------------------------------------------
 
 def test_kiting_rifle_reaches_and_holds_range_and_lands_a_hit():
-    """Step 20's acceptance test as a KITE. It no longer needs Step 20's 300-tick budget and its
-    long explanation of an outward orbital drift: that came from rifle's OWN deadband being 2.0
-    while only 0.9*range was fire-eligible, leaving a sliver of the settle band from which the bot
-    could not shoot. The unified personality.RANGE_DEADBAND of 1.5 keeps the whole settle band
-    inside firing distance, so the pathology is gone rather than merely tolerated."""
+    """The rifle as a KITE. personality.RANGE_DEADBAND of 1.5 keeps the whole settle band inside
+    firing distance (only 0.9*range is fire-eligible), so there is no sliver of it from which the
+    bot cannot shoot."""
     cfg, params, gen = cfg_and_params(n_enemies=1)
     state = fresh_state(cfg, params, enemy_kind=Kind.BOT_RIFLE, person=Person.KITE)
     bank = FakeBank(grid(20, 20))

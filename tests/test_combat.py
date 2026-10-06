@@ -282,7 +282,7 @@ def test_melee_blocked_by_wall_but_not_by_water_bush_fence():
 
 
 def test_melee_los_budget_matches_full_budget_ray():
-    """bot_overhaul.md Step A1: melee_hitscan caps its LOS march at `params.cone_ray_tiles`
+    """melee_hitscan caps its LOS march at `params.cone_ray_tiles`
     instead of the full `cfg.ray_steps`. That deliberately gives a WRONG `los` for pairs further
     apart than the budget, so this pins the actual claim -- that the wrongness is unobservable,
     because every pair it affects is one `in_cone` already rejected.

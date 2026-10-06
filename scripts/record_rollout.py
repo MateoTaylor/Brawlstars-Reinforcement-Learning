@@ -1,7 +1,6 @@
 """Records a BrawlVecEnv(n_envs=1) rollout to a stacked-array .npz, for offline replay via
-render/ascii.py (Step 37) or render/viewer.py (Step 38). See BRAWL_SIM_BUILD_PLAN.md Step 37;
-extended in Step 38 with two more optional extra fields the viewer needs, and in Step 39 with
-`extra_fields`'s rename to public (see its own docstring).
+render/ascii.py or render/viewer.py, plus the optional extra fields those consumers read (see
+the public `extra_fields` and its own docstring).
 """
 import argparse
 import sys
@@ -21,23 +20,22 @@ DEFAULT_CONFIG_PATH = REPO_ROOT / "configs" / "default.yaml"
 
 
 def extra_fields(env: BrawlVecEnv) -> dict:
-    """Optional extra keys, none part of raw SimState (Step 9) -- every consumer (`render_ascii`
-    Step 37, `render.viewer` Step 38, `play_manual` Step 39) treats them as OPTIONAL, so adding
-    more here over time is safe and doesn't require touching any renderer's required-field
-    contract. Public (no leading underscore, renamed in Step 39) since `play_manual.py` now
-    imports this directly rather than keeping a third hand-written copy -- same treatment
-    `render/ascii.py`'s `status_line` got in Step 38 for the same reason.
+    """Optional extra keys, none part of raw SimState -- every consumer (`render_ascii`,
+    `render.viewer`, `play_manual`) treats them as OPTIONAL, so adding more here over time is
+    safe and doesn't require touching any renderer's required-field contract. Public (no leading
+    underscore) since `play_manual.py` imports this directly rather than keeping a third
+    hand-written copy -- same reason `render/ascii.py`'s `status_line` is public.
 
-    `revealed_to_hero`/`max_ammo`: see render/ascii.py's module docstring (Step 37).
+    `revealed_to_hero`/`max_ammo`: see render/ascii.py's module docstring.
 
-    `los_to_hero` (added Step 38, for the viewer's reveal overlay): `bots.perception.raw_los`'s
-    hero row -- physical wall-only LOS, independent of bush-hiding (Notice 4). The viewer's 'v'
+    `los_to_hero` (for the viewer's reveal overlay): `bots.perception.raw_los`'s
+    hero row -- physical wall-only LOS, independent of bush-hiding. The viewer's 'v'
     overlay specifically highlights entities that are `los_to_hero` (no wall in the way) but NOT
     `revealed_to_hero` (bush-hidden) -- i.e. bush-hiding is the only reason they're not visible,
     as opposed to a wall being in the way, which `render_ascii` doesn't distinguish (it only
     ever draws what IS visible, never annotates *why* something isn't).
 
-    `unit_radius` (added Step 38, for sizing the viewer's entity circles): a `SimParams`
+    `unit_radius` (for sizing the viewer's entity circles): a `SimParams`
     PER_ENV field (config.py PER_ENV_FIELDS) -- one scalar per env, shared by every entity in
     that env, not per-kind. Recomputed every frame like everything else here, since an autoreset
     mid-recording resamples it."""
@@ -58,7 +56,7 @@ def extra_fields(env: BrawlVecEnv) -> dict:
 def record_rollout(cfg, steps: int, seed: int = 0, device: str = "cpu", action_seed: int = 0) -> dict:
     """`n_envs=1`, `steps` frames: frame 0 is the post-`reset()` state; frame `i` (`i>0`) is the
     state after the `i`-th SIM TICK, driven by random actions (this script is a visual-debugging
-    aid, not a policy evaluation tool -- Step 39's `play_manual.py` is where a human/policy
+    aid, not a policy evaluation tool -- `play_manual.py` is where a human/policy
     drives the hero). Returns `{field_name: (steps, ...) numpy array}`, one array per
     `core.state.snapshot()` field plus the extras from `extra_fields`.
 
@@ -86,7 +84,7 @@ def record_rollout(cfg, steps: int, seed: int = 0, device: str = "cpu", action_s
     try:
         while len(frames) < steps:
             move = torch.randint(0, env.cfg.n_move_bins + 1, (1,), generator=gen, device=device)
-            # The whole attack column (0 none, 1 attack, 2 super, 3 gadget -- Step G3), so a random
+            # The whole attack column (0 none, 1 attack, 2 super, 3 gadget), so a random
             # recording shows the super bolt and the gadget spinner too. Illegal picks are silent
             # no-ops (`hero.decode_action`), so drawing them unmasked is safe.
             fire = torch.randint(0, env.cfg.action_nvec[1], (1,), generator=gen, device=device)

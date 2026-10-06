@@ -1,8 +1,8 @@
 """Live keyboard play of BrawlVecEnv(n_envs=1) at 20 Hz -- the human feel-check for Mortis's
-dash. See BRAWL_SIM_BUILD_PLAN.md Step 39.
+dash.
 
-**Matplotlib** (Notice 3 -- no pygame wheel for this machine's cp314 interpreter), same as
-`render/viewer.py` (Step 38). This module reuses `ReplayViewer` PURELY as an artist/drawing
+**Matplotlib** (no pygame wheel for this machine's cp314 interpreter), same as
+`render/viewer.py`. This module reuses `ReplayViewer` PURELY as an artist/drawing
 toolkit -- it never calls `ReplayViewer.show()`, whose own `FuncAnimation` and key bindings
 (space=pause, left/right=scrub, ...) are built for scrubbing a pre-recorded rollout, not driving
 a live one, and would collide with this module's WASD/space controls (space means "fire" here,
@@ -11,7 +11,7 @@ it replaces `viewer.frames` with a fresh one-frame dict (`{name: arr[None] for .
 shape trick `tests/test_viewer.py` uses to feed `ReplayViewer` hand-built scenarios) built from
 `scripts.record_rollout.extra_fields(env)` + `core.state.snapshot(env.state, 0)` -- the exact
 same per-tick data a recorded rollout would have produced, so this is honestly the same renderer
-Step 38 already shipped and tested, not a fork of it.
+the replay viewer uses, not a fork of it.
 
 **Held-key state, not discrete key events, drives movement/fire** -- `key_press_event` adds a
 key to `_held_keys`, `key_release_event` discards it, and every 20 Hz tick reads whatever's
@@ -34,11 +34,10 @@ direction's (x, y) unit-ish vector -- not a hand-rolled angle table. `action[:, 
 `decode_action` applies to `action[:, 1]` before it ever reaches the sim) drawn as a small
 `Rectangle` in axes-fraction coordinates (`transform=ax.transAxes`, top-left corner) so it
 doesn't scale or move with the map -- green when firing is legal, grey otherwise. Since that one
-boolean is `alive & ammo>=1 & cooldown<=0 & dash_t<=0`, it already IS "greys out during dash and
-while reloading" in one gate, per the plan's acceptance bullet -- no separate dash/reload cases
-needed.
+boolean is `alive & ammo>=1 & cooldown<=0 & dash_t<=0`, it already greys out during a dash and
+while reloading in one gate -- no separate dash/reload cases needed.
 
-**`g` throws the gadget** (SIM_OVERHAUL_PLAN.md Step G3): attack-column value 3. The column holds
+**`g` throws the gadget**: attack-column value 3. The column holds
 ONE value per tick, so when `g` and space are both held the gadget wins only while
 `action_mask["attack"][:, 3]` says it is legal and space gets the column otherwise. A human's tap
 of `g` spans several 20 Hz ticks; without that fall-through every tick after the throw would send
@@ -47,7 +46,7 @@ state (`READY` or the seconds left on its 18 s cooldown).
 
 **The super has no key, on purpose.** On 2026-09-21 the operator decided manual play does not need
 super or gadget controls, so attack-column value 2 has no binding and none should be added unless
-the operator asks for one. `g` above predates that decision (Step G3) and was left in place. This
+the operator asks for one. `g` above predates that decision and was left in place. This
 script is a feel-check for movement and the dash; super and gadget behaviour is verified by
 `tests/test_super.py` and `tests/test_gadget.py`, not here.
 
@@ -129,8 +128,7 @@ class ManualPlaySession:
         return {name: arr[None] for name, arr in frame.items()}
 
     def _update_overlay(self) -> None:
-        """Redraws the current state and appends the action-mask/dash line the plan's
-        acceptance bar asks for ('Display the action mask and current dash state')."""
+        """Redraws the current state and appends the action-mask/dash line to the title."""
         self.viewer.frames = self._one_frame()
         artists = self.viewer._draw_frame(0)
 
@@ -209,7 +207,7 @@ class ManualPlaySession:
 
         Every pyplot figure is born with matplotlib's own `key_press_handler` connected, and its
         default keymap overlaps this module's controls. Measured against a toolbar-carrying
-        canvas: `g` (the gadget, Step G3) cycles the axes grid state and forces a full redraw
+        canvas: `g` (the gadget) cycles the axes grid state and forces a full redraw
         under the blitted animation whenever the cursor is over the map -- which is where it is,
         since left-click fires; `s` (move down) opens the toolbar's save dialog; `left`/`right`
         walk the toolbar's view history; `q` closes the figure behind `tick`'s back; and a stray

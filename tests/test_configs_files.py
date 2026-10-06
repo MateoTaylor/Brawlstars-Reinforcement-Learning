@@ -1,6 +1,6 @@
-"""Exercises the actual files under configs/ against brawl_sim.config, per Step 4's acceptance
-criteria. Step 3's tests/test_config.py already covers the loader machinery in isolation with
-inline fixtures; this file is the end-to-end check that the real files parse correctly.
+"""Exercises the actual files under configs/ against brawl_sim.config. tests/test_config.py
+covers the loader machinery in isolation with inline fixtures; this file is the end-to-end check
+that the real files parse correctly.
 """
 from pathlib import Path
 
@@ -66,7 +66,7 @@ def test_single_archetype_preset_pins_sniper():
 
 
 def test_every_shipped_bot_kind_authors_both_difficulty_axes():
-    """SIM_OVERHAUL_PLAN.md Phase B (Step B1). `validate()` reads 0 as neutral for `hero_focus`
+    """`validate()` reads 0 as neutral for `hero_focus`
     and `aggression` so that partial specs keep loading, which means a shipped bot block that
     FORGETS one loads without complaint and then never scales with the curriculum's tier table:
     a tier multiplier on a 0 base is 0. So the shipped file must author both on every bot, and
@@ -85,7 +85,7 @@ def test_every_shipped_bot_kind_authors_both_difficulty_axes():
 
 
 def test_the_shipped_hero_authors_the_gadget_as_specified_and_no_bot_has_one():
-    """SIM_OVERHAUL_PLAN.md Phase G (Step G1.3), the operator's numbers: an 18 s cooldown, a
+    """The operator's numbers (BRAWL_SIM_DESIGN.md §4): an 18 s cooldown, a
     spinner that flies up to 2 tiles in 0.2 s and deals 2000 in a 1-tile radius. Pinned off the
     built tensors so a renamed or misspelled key fails here rather than as a gadget that never
     fires. `gadget_cooldown: 0` on every bot is what "no gadget" means."""
@@ -103,7 +103,7 @@ def test_the_shipped_hero_authors_the_gadget_as_specified_and_no_bot_has_one():
 
 def test_randomization_file_ships_only_the_gas_jitter():
     """configs/train.yaml's `run.randomization` names this file, so every uncommented line trains
-    in the next run: the gas schedule's +/-10 % (OBS_PARITY_PLAN.md section 4) and nothing else.
+    in the next run: the gas schedule's +/-10 % (BRAWL_SIM_DESIGN.md §8) and nothing else.
     A bot or stat example uncommented by accident would change what the run trains against."""
     spec = load_randomization(CONFIGS / "randomization.yaml")
     jitter = {"low": 0.9, "high": 1.1, "mode": "multiplicative"}
@@ -111,10 +111,10 @@ def test_randomization_file_ships_only_the_gas_jitter():
 
 
 def test_the_shipped_run_trains_the_gas_at_1_3x_the_games_pace():
-    """OBS_PARITY_TASKS.md pending decision 3, the lead's call 2026-09-25. Z1 measured the game's
-    first gas 19 s after the start and one tile per side every ~6.5 s after that; the run trains
-    at 1.3x that pace in a 185 s episode, a little shorter than a real match. Read through the
-    run's own merge (env config plus `run.env_overrides`), as `builder.build_env` reads it.
+    """BRAWL_SIM_DESIGN.md §8, the lead's call 2026-09-25. `scripts/probes/zone_probe.py` measured
+    the game's first gas 19 s after the start and one tile per side every ~6.5 s after that; the run
+    trains at 1.3x that pace in a 185 s episode, a little shorter than a real match. Read through
+    the run's own merge (env config plus `run.env_overrides`), as `builder.build_env` reads it.
 
     default.yaml keeps its 150 s: runs name it by path and brawl_deployment/policy.py rebuilds the
     live `time_frac` denominator from it plus the run's own overrides, so moving it would stretch
@@ -182,8 +182,7 @@ def test_uncommenting_one_randomization_line_only_adds_variation():
 
 
 def test_agent_obs_yaml_loads_as_a_real_agent_spec():
-    # Step 4 only needed the file to exist and parse as a placeholder; Step 32 replaced it with
-    # the real schema (brawl_sim.core.obs_select) -- this is the end-to-end check for that file,
+    # The end-to-end check for agent_obs.yaml against the real schema (brawl_sim.core.obs_select),
     # the same role every other test in this module plays for configs/default.yaml et al.
     from brawl_sim.core.obs_select import load_agent_spec
 
@@ -693,10 +692,10 @@ def test_no_deploy_spec_shows_how_many_cubes_anyone_holds(spec_name):
 
 # ---- configs/agent_obs_deploy4.yaml: the gadget pair, the history group, three history planes --
 #
-# deploy4 is deploy3 plus what Phases G and H added to build_obs (2026-09-21): the gadget pair in
+# deploy4 is deploy3 plus the gadget and history observations (2026-09-21): the gadget pair in
 # `self`, the six `hist.*` fields as a new `history` group, and `enemy_hist1..3` after deploy3's
 # grid planes. The tests below pin exactly that in both directions, and the widths the extractor
-# is built on (Step H3 builds it). The parametrized deploy-lineage tests above cover it too.
+# is built on. The parametrized deploy-lineage tests above cover it too.
 
 GADGET_FIELDS = ("hero.gadget_ready", "hero.gadget_charge_frac")
 HISTORY_FIELDS = ("hist.valid", "hist.move_onehot", "hist.attack_onehot", "hist.hp",
@@ -773,7 +772,7 @@ def test_deploy4_differs_from_deploy3_by_exactly_the_history_and_gadget_addition
 
 
 def test_the_shipped_run_trains_deploy5_at_its_pinned_input_widths():
-    """SIM_OVERHAUL_STEPS.md Step I2: a bare `python scripts/train.py` trains the deployable spec,
+    """A bare `python scripts/train.py` trains the deployable spec,
     deploy5 since the operator moved train.yaml to it on 2026-09-25 (the mortis_ppo run trained on
     it), and the extractor it builds takes 13 grid channels and 266 floats. Built through the run's
     own env config and overrides, as `builder.build_env` does, so an override that moved a width
@@ -797,7 +796,7 @@ def test_the_shipped_run_trains_deploy5_at_its_pinned_input_widths():
 
 # ---- configs/agent_obs_deploy5.yaml: hero.near_edge, and the enemies rows in tracked-slot order --
 #
-# deploy5 is deploy4 plus what OBS_PARITY_TASKS.md C1-C9 put in build_obs (2026-09-24): the
+# deploy5 is deploy4 plus what the observation-parity work put in build_obs (2026-09-24): the
 # `hero.near_edge` bit in `self`, right after `hero.in_zone`, and `slots: tracked` on `enemies`.
 # The camera window and the zone.active latch change no column, so they leave no trace here; the
 # tests below pin the two changes that do, in both directions, and the widths the extractor is
@@ -882,7 +881,7 @@ def test_deploy5_differs_from_deploy4_by_exactly_near_edge_and_tracked_slots():
 
 
 def test_near_edge_is_read_by_deploy5_and_by_nothing_older():
-    """OBS_PARITY_TASKS.md C6 and C10: the bit went into deploy5 only. The older deploy specs are
+    """The bit went into deploy5 only. The older deploy specs are
     named by path in shipped runs and keep their widths; the full-information and low-info views
     are not deploy targets and stay as they were."""
     from brawl_sim.core.obs_select import load_agent_spec
@@ -907,3 +906,15 @@ def test_the_shipped_run_trains_the_auto_aimed_attack_and_default_yaml_does_not(
     assert plain.auto_aim is False and plain.action_nvec == (17, 4)
     merged = load_config(CONFIGS.parent / tcfg.run.env_config, overrides=tcfg.run.env_overrides or None)
     assert merged.auto_aim is True and merged.action_nvec == (17, 5)
+
+
+def test_training_skips_the_raw_los_fields_and_default_yaml_keeps_them():
+    """`observation.include_raw_los`: default.yaml keeps the two raw
+    line-of-sight obs fields for the tools, and train.yaml turns them off, since no agent_obs group
+    reads them and each obs build would otherwise march every entity pair for them."""
+    from brawl_sim.training.config import load_train_config
+
+    tcfg = load_train_config(CONFIGS / "train.yaml")
+    assert load_config(CONFIGS / "default.yaml").obs_include_raw_los is True
+    merged = load_config(CONFIGS.parent / tcfg.run.env_config, overrides=tcfg.run.env_overrides or None)
+    assert merged.obs_include_raw_los is False

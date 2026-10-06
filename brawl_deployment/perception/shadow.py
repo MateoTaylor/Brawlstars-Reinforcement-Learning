@@ -13,7 +13,7 @@ Owned outright, because they are pure functions of our own actions and the clock
 
     ammo  ammo_frac  ammo_whole  attack_cd  can_attack  dashing  dash_t  dash_dir
     invuln  long_dash_ready  long_dash_frac  attack_idle_t  facing  facing_vec
-    gadget_ready  gadget_charge_frac        -- since Step G5; see "The gadget" below
+    gadget_ready  gadget_charge_frac        -- see "The gadget" below
 
 Held here but SOURCED FROM CV, because the shadow can only ever see them fall:
 
@@ -130,9 +130,9 @@ readiness is neither.
 
 #### The gadget is owned outright, and sits outside every attack gate
 
-Unlike the super, the gadget IS a function of our own action stream (SIM_OVERHAUL_PLAN.md S18):
-charged at the match gate, restarted to `gadget_cooldown` (18 s) by each throw we model, and
-changed by nothing a camera could see. So `gadget_ready` and `gadget_charge_frac` are
+Unlike the super, the gadget IS a function of our own action stream: charged at the match gate,
+restarted to `gadget_cooldown` (18 s) by each throw we model, and changed by nothing a camera
+could see (BRAWL_DEPLOYMENT_DESIGN.md §6.3). So `gadget_ready` and `gadget_charge_frac` are
 proprioception, like `attack_cd`, and nothing reads the button with CV. Four things about it are
 deliberate, and each is the sim's (`hero.gadget_ready`, `env._attack_phase`):
 
@@ -538,7 +538,7 @@ class ShadowHero:
         The super reads it too. In the sim an idle super goes along a zero `move_dir` and does not
         travel; the game has no such shot, and `facing` is the nearest thing to what the policy
         meant. The gadget does not read it: it is a tap, and the game aims it at the nearest
-        enemy, as `hero.gadget_target` does (SIM_OVERHAUL_PLAN.md S10). A pending auto-aimed
+        enemy, as `hero.gadget_target` does (BRAWL_SIM_DESIGN.md §4). A pending auto-aimed
         attack with a target reads its `aim`, the direction `_start_dash` will use; it is a tap
         too, so the device never reads this for it, and telemetry does.
         """
@@ -727,7 +727,7 @@ class ShadowHero:
         `facing` is left alone: it has no CV source and no safe default, and the next nonzero move
         bin overwrites it anyway.
 
-        So is the gadget, its timer and a queued throw alike (Step G5). The canary's evidence is
+        So is the gadget, its timer and a queued throw alike. The canary's evidence is
         ammo, which a throw never spends, so a trip says nothing about the gadget. The loop taps
         only what `act` modelled, so the shadow's gadget can lag the game's, when the game drops
         a tap, but never lead it. And a queued throw was pressed on the device in the decision

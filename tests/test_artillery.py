@@ -1,4 +1,4 @@
-"""Artillery archetype tests. FIRE and AIM only after Step 41's combat/movement split.
+"""Artillery archetype tests: FIRE and AIM only.
 
 `test_cover_direction_pulls_toward_a_wall_between_it_and_the_target` is deliberately GONE, not
 ported: `artillery._cover_direction` no longer exists. It was movement, it cost 3.8 ms/tick at
@@ -53,7 +53,7 @@ def test_fire_does_not_require_los():
     assert not bool(tgt.los[0, 1])  # confirm the wall really is in the way physically
 
     fire, _, _ = combat_rules.combat(state, tgt, bank, params, cfg, gen)
-    assert bool(fire[0, 1])  # fires anyway -- Step 18's documented design choice
+    assert bool(fire[0, 1])  # fires anyway -- a lobbed shell arcs over walls
 
 
 def test_aim_point_is_exact_leaded_position_with_zero_noise():

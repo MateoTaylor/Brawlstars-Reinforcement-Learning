@@ -4,6 +4,8 @@
     python scripts/train.py --set run.n_envs=1024 --set ppo.n_steps=256
     python scripts/train.py --smoke                          # 30-second wiring check on CPU
     python scripts/train.py --resume runs/mortis_ppo-.../checkpoints/model_4000000_steps.zip
+    python scripts/train.py --resume <zip> --restart-schedules --set run.total_timesteps=100000000 \
+        --set learning_rate.initial=5e-5 --set clip_range.initial=0.1   # fine-tune at the floors
 
 Every knob lives in configs/train.yaml (see that file's own comments); `--set` patches single
 dotted keys on top of it for one-off sweeps without editing the file. The merged config is
@@ -93,12 +95,19 @@ def _parse_args(argv=None):
                    help="tiny CPU run that proves the wiring; overrides run/ppo/curriculum sizes")
     p.add_argument("--resume", default=None, metavar="MODEL_ZIP",
                    help="continue from a saved model; loads the sibling VecNormalize stats if present")
+    p.add_argument("--restart-schedules", action="store_true",
+                   help="with --resume: run the config's learning_rate and clip_range over this "
+                        "run's total_timesteps instead of continuing the checkpoint's own schedules "
+                        "(a fine-tune; a crash recovery leaves this off)")
     p.add_argument("--curriculum-stage", type=int, default=None, metavar="N",
                    help="start (or resume) at this 0-indexed stage instead of stage 0")
     p.add_argument("--out-dir", default=None, help="override run.out_dir")
     p.add_argument("--no-stamp", action="store_true",
                    help="use runs/<name> verbatim instead of runs/<name>-<timestamp>")
-    return p.parse_args(argv)
+    args = p.parse_args(argv)
+    if args.restart_schedules and not args.resume:
+        p.error("--restart-schedules only applies to --resume")
+    return args
 
 
 def _make_run_dir(tcfg, out_dir: str | None, stamp: bool) -> Path:
@@ -192,7 +201,8 @@ def main(argv=None) -> int:
 
     if args.resume:
         model = _resume(model, venv, tcfg, Path(args.resume), curriculum, run_dir,
-                        stage_pinned=args.curriculum_stage is not None)
+                        stage_pinned=args.curriculum_stage is not None,
+                        restart_schedules=args.restart_schedules)
 
     # After any resume: `_resume` returns a DIFFERENT model object (algo.load builds a new one),
     # and a logger installed on the pre-resume model would be silently discarded with it.
@@ -252,9 +262,7 @@ def main(argv=None) -> int:
         print("\n[interrupted] saving current model before exit...")
 
     elapsed = time.perf_counter() - t0
-    model.save(run_dir / "final_model.zip")
-    if tcfg.normalize.enabled:
-        venv.save(str(run_dir / "final_vecnormalize.pkl"))
+    _save_final(model, run_dir)
     venv.close()
     for evaluator in evaluators:
         if evaluator is not None:
@@ -271,9 +279,26 @@ def main(argv=None) -> int:
     return 0
 
 
-def _resume(model, venv, tcfg, model_path: Path, curriculum, run_dir: Path, stage_pinned: bool = False):
+def _save_final(model, run_dir: Path) -> None:
+    """final_model.zip plus the VecNormalize statistics the model trained through. Those come from
+    the model, never from main()'s `venv`: a resume trains through the restored copy `_resume`
+    attaches, and until 2026-09-27 saving `venv` wrote statistics that never saw a step (the 450M
+    run's continuation: ret_rms count 1e-4 and var 1, where the model had trained against ~46)."""
+    model.save(run_dir / "final_model.zip")
+    normalizer = model.get_vec_normalize_env()
+    if normalizer is not None:
+        normalizer.save(str(run_dir / "final_vecnormalize.pkl"))
+
+
+def _resume(model, venv, tcfg, model_path: Path, curriculum, run_dir: Path, stage_pinned: bool = False,
+            restart_schedules: bool = False):
     """Loads `model_path`'s weights and optimizer state into the freshly built run, plus the
     sibling `*vecnormalize*.pkl` if one is there.
+
+    The learning-rate and clip schedules are the CHECKPOINT's, not the config's: SB3 pickles them
+    into the zip and `load` restores them, evaluated over all the model's steps (done + this run's
+    total). That is what a crash recovery needs. `restart_schedules` swaps in the config's own,
+    squeezed into this run's steps (see schedules.over_segment), for a fine-tune.
 
     Resuming the CURRICULUM is deliberately explicit rather than automatic: the stage lives in
     the source run's `curriculum.json`, which is copied forward and applied here, but
@@ -297,6 +322,22 @@ def _resume(model, venv, tcfg, model_path: Path, curriculum, run_dir: Path, stag
         print(f"[resume] WARNING: normalize is on but no *vecnormalize*.pkl was found next to "
               f"{model_path.name}; the policy will see differently-scaled inputs than it "
               "trained on until the fresh running statistics converge")
+
+    # SB3 counts this run's progress over done + total steps, so its first update comes here.
+    start = tcfg.run.total_timesteps / (loaded.num_timesteps + tcfg.run.total_timesteps)
+    if restart_schedules:
+        from stable_baselines3.common.utils import FloatSchedule
+        # `learning_rate` as well as `lr_schedule`: load rebuilds the latter from the former, so
+        # this is what the checkpoints carry into a crash recovery of this run.
+        loaded.learning_rate = schedules.over_segment(schedules.make_schedule(tcfg.learning_rate), start)
+        loaded.lr_schedule = FloatSchedule(loaded.learning_rate)
+        loaded.clip_range = FloatSchedule(
+            schedules.over_segment(schedules.make_schedule(tcfg.clip_range), start))
+    print(f"[resume] learning rate {loaded.lr_schedule(start):.3g} -> {loaded.lr_schedule(0.0):.3g}, "
+          f"clip range {loaded.clip_range(start):.3g} -> {loaded.clip_range(0.0):.3g} over these "
+          f"{tcfg.run.total_timesteps:,} steps ("
+          + ("the config's, restarted" if restart_schedules else
+             "the checkpoint's own; --restart-schedules runs the config's instead") + ")")
 
     source_state = model_path.parent.parent / "curriculum.json"
     if curriculum is not None and source_state.exists():

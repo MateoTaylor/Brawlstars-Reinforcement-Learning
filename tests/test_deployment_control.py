@@ -197,7 +197,7 @@ def test_a_press_does_not_disturb_the_movement_contact():
 
 
 def test_a_gadget_press_is_a_bare_tap_on_the_gadget_button():
-    """The one press with no drag (SIM_OVERHAUL Step G5): the game aims the gadget at the nearest
+    """The one press with no drag: the game aims the gadget at the nearest
     enemy by itself, as the sim does, so there is no bearing to drag along. Down on the button
     centre, up on the next settle, never a move, whatever bearing is passed."""
     b = NullBackend()
@@ -401,7 +401,7 @@ def test_the_gate_never_anchors_on_a_button_the_policy_can_press():
     The gate reads a button's ring score to decide whether we are in a match. Anchoring it on a
     control the agent presses makes the agent able to switch itself off: a fired Super greys its
     button for the whole recharge, which is many times the 4-tick exit. The file shipped in
-    exactly that state from Step G5 until it was caught live, because its anchor was named
+    exactly that state until it was caught live, because its anchor was named
     `gadget` while sitting on the Super.
 
     Stated against `Controls.build`'s own reads rather than a name list, so a fourth pressable
@@ -545,7 +545,7 @@ def test_controls_build_taps_the_calibrated_gadget(monkeypatch):
 def test_a_dry_run_keeps_every_control_and_touches_only_the_null_backend():
     """`scripts/deploy_run.py --dry-run` rebuilds the controls on a `NullBackend` through
     `Controls.with_backend`. The script's own positional rebuild would have crashed every dry
-    run once the gadget became a required button (SIM_OVERHAUL Step G5), with nothing offline
+    run once the gadget became a required button, with nothing offline
     to see it. Every field is a number nothing else uses, the defaults included, so a field
     dropped or swapped in the copy shows."""
     from brawl_deployment.loop import Controls

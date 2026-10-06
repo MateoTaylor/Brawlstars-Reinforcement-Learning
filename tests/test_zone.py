@@ -28,10 +28,9 @@ _TEST_MAX_HP = 8000.0
 
 
 def _fresh_state(cfg, n_envs=1, max_hp=_TEST_MAX_HP):
-    """`allocate` zero-inits everything, including ent_max_hp. That was harmless while zone damage
-    was a flat HP/s, but since Step B3 the rate is a FRACTION of max HP -- a zero-HP body takes
-    zero zone damage, so every damage assertion here would trivially compare 0 to 0. Give the
-    fixture a real body."""
+    """`allocate` zero-inits everything, including ent_max_hp. Zone damage is a FRACTION of max
+    HP, so a zero-HP body takes zero zone damage and every damage assertion here would trivially
+    compare 0 to 0. Give the fixture a real body."""
     state = allocate(cfg, n_envs=n_envs, device="cpu", verbose=False)
     state.ent_max_hp.fill_(max_hp)
     state.ent_hp.fill_(max_hp)
@@ -256,7 +255,7 @@ def test_zone_damage_escalates_with_zone_step():
 
 
 def test_zone_kills_any_body_in_the_same_time_regardless_of_max_hp():
-    """bot_overhaul.md D15: nothing survives more than ~5 seconds in the zone, whoever it is.
+    """BRAWL_SIM_DESIGN.md §8: nothing survives more than ~5 seconds in the zone, whoever it is.
 
     This is THE property the flat-DPS -> proportional change exists to create, so it is asserted
     directly rather than inferred from the formula. Under the old flat `dps: 1000` these three
@@ -353,7 +352,7 @@ def test_batched_smoke():
     assert not torch.any(torch.isnan(state.zone_hi))
 
 
-# ---- mark_seen: the zone.active latch (OBS_PARITY_TASKS.md C5) ---------------------------
+# ---- mark_seen: the zone.active latch ----------------------------------------------------
 
 def _cam(cfg, x, y):
     return camera.camera_centre(torch.tensor([[x, y]]), cfg)

@@ -43,7 +43,7 @@ def test_record_rollout_is_deterministic_for_a_fixed_seed():
 
 
 def test_the_random_policy_draws_the_whole_attack_column_so_a_recording_shows_the_gadget():
-    """SIM_OVERHAUL Step G3.3: the random policy draws attack values 0..3, not the old 0/1. The
+    """The random policy draws attack values 0..3, not the old 0/1. The
     gadget starts every episode charged, so the first 3 drawn throws a spinner (projectile kind 7,
     a literal: `Proj.GADGET_SPINNER`), and only the hero (entity 0) has a gadget. 100 ticks is 20
     decisions -- a draw that never hits 3 in 20 is a 0.3 % event, and the seed is fixed anyway.

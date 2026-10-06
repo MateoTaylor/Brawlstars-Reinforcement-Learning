@@ -1,9 +1,8 @@
-"""Time the poison-gas schedule from footage (OBS_PARITY_TASKS.md Z1). CPU only, no detectors.
+"""Time the poison-gas schedule from footage. CPU only, no detectors.
 
 Three numbers with provenance: `T0` = seconds from the match gate to the first gas on screen,
 `P` = seconds between successive gas advances, `D` = cells the front moves per advance. Each is
-backed by the events behind it, and the per-clip tables are what `OBS_PARITY_PLAN.md` section 4
-records.
+backed by the events behind it, and BRAWL_SIM_DESIGN.md §8 records the schedule they measured.
 
 Per frame, the deploy loop's own zone path (`scripts/vision_watch.py`'s per-frame pattern):
 `rect = plan.rectify(frame)`, `odo = odometry.update(rect)`, `zone = detect_zone(rect, plan, cfg)`,
@@ -23,7 +22,7 @@ Usage:
     .venv/Scripts/python.exe scripts/probes/zone_probe.py tests/fixtures/vision/zone_grows_from_east.mp4 --hud phone
     .venv/Scripts/python.exe scripts/probes/zone_probe.py tests/fixtures/vision/bluestacks-example-zone.mp4 --hud emulator
     .venv/Scripts/python.exe scripts/probes/zone_probe.py "C:/Users/mateo/Videos/2026-09-23 20-20-47.mp4" \
-        --hud emulator --start 400 --stop 1700 --out OBS_PARITY_PLAN_zone_measurements.md
+        --hud emulator --start 400 --stop 1700 --out zone_measurements.md
 
 `--start/--stop` are file-relative frame indices, inclusive. `--out` APPENDS the report as
 markdown. Writes nothing else (a `.bounds.json` beside a recording that has none is

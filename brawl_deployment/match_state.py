@@ -36,10 +36,11 @@ the numbers below as the claim. A ring-score table is worth only the code path i
 through.
 
 **The gate watches `hypercharge`, the one disc in the cluster the policy never touches**
-(2026-09-22, SIM_OVERHAUL Step G6.2). That is the property a gate needs, and it is the property
-this docstring spent two weeks claiming for whichever disc was called `gadget`. Re-measured on the
-same clip through this class's own path, stored centres and radii, 238 samples, scores partitioned
-by the threshold the way `test_gate_separates_gameplay_from_menus_on_real_footage` partitions them:
+(2026-09-22, BRAWL_DEPLOYMENT_DESIGN.md §5). That is the property a gate needs, and it is the
+property this docstring spent two weeks claiming for whichever disc was called `gadget`. Re-measured
+on the same clip through this class's own path, stored centres and radii, 238 samples, scores
+partitioned by the threshold the way `test_gate_separates_gameplay_from_menus_on_real_footage`
+partitions them:
 
     disc          menu max   play min   play median
     hypercharge     0.212      0.968       0.985

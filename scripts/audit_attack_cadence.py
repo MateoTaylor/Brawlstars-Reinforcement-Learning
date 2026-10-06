@@ -1,4 +1,4 @@
-"""Sim-side attack-cadence audit (SIM_OVERHAUL_PLAN.md Phase A, Step A1).
+"""Sim-side attack-cadence audit.
 
     python scripts/audit_attack_cadence.py --run runs/mortis_deploy3_elite-20260913-015933 \\
         --checkpoint best_model.zip --episodes 200 --tier elite --device cpu
@@ -10,7 +10,7 @@ structural cadence cap shows up. The cap: Mortis's `attack_cooldown` is 0.35 s a
 dash per 10 ticks, when the weapon itself would allow one per 7. If the agent learned to attack at
 every legal opportunity the histogram below sits at 10 ticks and utilization is ~1.0; if it learned
 to over-conserve, utilization is low and the intervals spread out. Which of those is true decides
-whether Phase A's fire latch (Step A3) is worth building.
+whether a fire latch (BRAWL_SIM_DESIGN.md §1) is worth building.
 
 The five statistics (`summarize`), all measured at DECISION boundaries, i.e. on the state the
 policy's observation was built from:
@@ -35,7 +35,7 @@ the hook fires after every sub-tick, mid-decision, and never sees the action. Re
 `step()` reads exactly the state the observation came from, with no host sync in the sim itself.
 One host transfer per decision -- an audit, not the hot path.
 
-Deployment side (Step A2.3):
+Deployment side:
 
     python scripts/audit_attack_cadence.py --telemetry runs/deploy/<match>.csv
 
@@ -72,7 +72,7 @@ into the dict `CadenceRecorder.rows()` would have produced:
 A sixth, deployment-only statistic: resyncs per minute INSIDE FIGHTS (the shadow's ammo canary
 tripping while an enemy is in reach, each costing up to one cooldown of refused attacks) and the
 ammo error that tripped each (CV minus shadow, in pips). Report: `runs/audit/cadence_<file stem>.md`,
-same format, plus a resync block. Plan section 2 Step A2's table reads the two reports together.
+same format, plus a resync block.
 
 The rates behind the mapping (`deployment_rates`) come from the REPO's `configs/default.yaml` and
 `configs/deployment.yaml`, resolved off this file's location so the command works from any CWD.
@@ -198,7 +198,7 @@ def _segment(rows: list[dict]) -> tuple[list[list[dict]], int]:
 def _attacked(row: dict) -> bool:
     # 1 = dash, 2 = super: both are "used the attack column" for cadence purposes. A super shares
     # the cooldown, so counting it keeps a super-happy policy from reading as over-conserving.
-    # 3 = gadget (SIM_OVERHAUL Step G3) is NOT an attack: it has its own 18 s timer, shares no
+    # 3 = gadget is NOT an attack: it has its own 18 s timer, shares no
     # cooldown and spends no ammo, so a gadget decision is an attack opportunity that was passed up.
     # 4 = the auto-aimed dash (`action.auto_aim`, 2026-09-26): the same dash as 1 with a
     # different direction, so it counts like 1.
@@ -261,7 +261,7 @@ def summarize(rows: list[dict]) -> dict:
     }
 
 
-# ---- deployment telemetry (Step A2.3) ---------------------------------------------------------
+# ---- deployment telemetry ---------------------------------------------------------------------
 
 TELEMETRY_ENV = 0
 # `TickRow.attack_legal` on a row that made no decision.
@@ -293,7 +293,7 @@ def telemetry_rows(ticks, *, decision_every: int, ticks_per_decision: int) -> li
                 # not know, and `-1.0` would otherwise be summarized as a clip size.
                 raise ValueError(f"telemetry row {tick.index}: attack_legal recorded but "
                                  f"ammo_shadow is {tick.ammo_shadow} -- the loop that wrote this "
-                                 f"file predates the Step A2 review; play the match again")
+                                 f"file does not record it on every decision; play the match again")
             rows.append({
                 "env": TELEMETRY_ENV,
                 "step_count": int(ticks_per_decision * (ticks_in_match // decision_every)),
@@ -341,7 +341,7 @@ def summarize_telemetry(rows: list[dict], *, decision_seconds: float,
 
 
 def load_telemetry(path):
-    """The CSV as `TickRow`s, refusing one written before Step A2 by name: an older file loads
+    """The CSV as `TickRow`s; a file with no cadence columns is refused: an older file loads
     (every missing column defaults) but carries no mask and no reach, and a report of "no fights"
     from it would read as a finding."""
     import csv
@@ -352,7 +352,7 @@ def load_telemetry(path):
     with open(path, newline="", encoding="utf-8") as fh:
         header = next(csv.reader(fh), [])
     if "attack_legal" not in header:
-        raise SystemExit(f"{path}: no `attack_legal` column -- telemetry from before Step A2; "
+        raise SystemExit(f"{path}: no `attack_legal` column -- telemetry with no cadence columns; "
                          f"play the match again with the current loop")
     return read_telemetry_csv(path)
 
@@ -394,7 +394,7 @@ def _hist_block(hist: dict, unit: str) -> str:
     return "\n".join(lines)
 
 
-def render_report(summary: dict, header: dict, title: str = "sim side, Step A1") -> str:
+def render_report(summary: dict, header: dict, title: str = "sim side") -> str:
     u, p, w, a = (summary["utilization"], summary["phasing_loss"],
                   summary["long_dash_waiting"], summary["ammo_at_first_attack"])
     lines = [f"# Attack cadence audit ({title})", ""]
@@ -458,7 +458,7 @@ def render_report(summary: dict, header: dict, title: str = "sim side, Step A1")
     lines += [
         "Reading it: a histogram sitting at 10 ticks with utilization near 1.0 means the policy "
         "attacks at every legal decision and the 0.35 s cooldown against the 0.25 s decision "
-        "period is the whole cap (plan section 2; Step A3 fixes that). Low utilization or intervals "
+        "period is the whole cap. Low utilization or intervals "
         "spread past 10 means the policy itself learned to hold fire.",
         "",
     ]
@@ -566,7 +566,7 @@ def main_telemetry(args) -> int:
         "date": _dt.date.today().isoformat(),
     }
     out = Path(args.out) if args.out else Path("runs") / "audit" / f"cadence_{path.stem}.md"
-    title = "deployment side, Step A2"
+    title = "deployment side"
     out.parent.mkdir(parents=True, exist_ok=True)
     out.write_text(render_report(summary, header, title), encoding="utf-8")
     print(render_report(summary, header, title))
@@ -602,7 +602,7 @@ def main(argv=None) -> int:
     sim, venv, _ = build_audit_env(tcfg, tier, args.n_envs, args.seed, args.device)
     venv = watch.maybe_wrap_vecnormalize(venv, model_path, tcfg, verbose=True)
     # Same refusal scripts/watch.py gives: a checkpoint from before an action-space change (the
-    # attack column went 3 -> 4 wide in SIM_OVERHAUL Step G3) otherwise dies inside `predict` on a
+    # attack column went 3 -> 4 wide for the gadget) otherwise dies inside `predict` on a
     # bare "shape '[-1, 20]' is invalid for input of size 42" from the mask.
     watch._check_spaces(model, venv, train_config)
 

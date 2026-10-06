@@ -1,0 +1,17 @@
+{
+ "image": "dark_passage.png",
+ "image_size": [
+  752,
+  760
+ ],
+ "pitch_px": [
+  12.488,
+  12.479
+ ],
+ "origin_px": [
+  0.962,
+  8.2
+ ],
+ "origin_convention": "tile (0, 0)'s top-left corner; pixel i spans [i, i+1)",
+ "date": "2026-09-28"
+}

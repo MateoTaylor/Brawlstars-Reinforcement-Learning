@@ -77,7 +77,7 @@ def test_is_hero_matches_kind_enum():
 
 def test_hero_cube_bonus_scales_linearly_with_each_configured_rate():
     """HP and damage cube bonuses have DIFFERENT SHAPES, not just different rates: HP is a FLAT
-    `cubes.hp_per_cube` added to base (400, the real game's number, Step E2) while damage is a
+    `cubes.hp_per_cube` added to base (400, the real game's number) while damage is a
     FRACTION of base. Each expectation is derived from its own param, so a rebalance of either
     moves the test with the code.
 
@@ -213,7 +213,7 @@ def test_functions_support_n_e_batch():
         assert not torch.any(torch.isnan(out))
 
 
-# ---- effective_gadget_damage (Step G2.5) ---------------------------------------------------
+# ---- effective_gadget_damage ---------------------------------------------------------------
 
 def test_effective_gadget_damage_is_2000_for_the_hero_with_no_cubes():
     cfg, params = _real_params(n_envs=2)

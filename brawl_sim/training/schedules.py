@@ -1,16 +1,12 @@
 """Hyperparameter schedules in the exact shape Stable-Baselines3 wants.
 
-SB3 accepts either a float or a `Callable[[float], float]` for `learning_rate` and `clip_range`,
-and calls it with **`progress_remaining`**, which runs 1.0 at the first step down to 0.0 at
-`total_timesteps` -- i.e. it counts DOWN, not up. Getting that direction backwards silently
-trains with a rising learning rate, which is the single easiest way to make a PPO run diverge
-late; every function here is written in terms of `t = 1 - progress_remaining` (elapsed
-fraction, counting up) to keep the intent visible at the point of use.
+SB3 calls a `learning_rate` / `clip_range` callable with `progress_remaining`, which counts DOWN
+from 1.0 at the first step to 0.0 at `total_timesteps`; getting that backwards silently trains
+with a rising learning rate. Every function here works in `t = 1 - progress_remaining` (elapsed
+fraction, counting up) to keep the intent visible.
 
-`progress_remaining` is clamped to [0, 1] on the way in: SB3 computes it as
-`1 - num_timesteps / total_timesteps`, and `num_timesteps` can legitimately overshoot
-`total_timesteps` by up to one rollout (it advances `n_envs` at a time), which would otherwise
-push an exponential schedule below its own floor on the last update.
+`progress_remaining` is clamped to [0, 1]: `num_timesteps` can overshoot `total_timesteps` by up
+to one rollout, which would otherwise push an exponential schedule below its floor.
 """
 import math
 
@@ -48,6 +44,17 @@ def exponential_schedule(initial: float, final: float):
     def _schedule(progress_remaining: float) -> float:
         t = _elapsed(progress_remaining)
         return initial * (ratio ** t)
+    return _schedule
+
+
+def over_segment(schedule, start_progress: float):
+    """`schedule` squeezed into the last `start_progress` of SB3's progress, for `scripts/train.py
+    --resume --restart-schedules`. A resumed model counts progress over ALL its timesteps, so a
+    fine-tune's first update arrives at `progress_remaining = total / (done + total)`, not 1.0;
+    squeezed, the schedule still starts at its `initial` there and reaches `final` at the end. It
+    is saved inside the model, so a plain `--resume` after a crash continues it."""
+    def _schedule(progress_remaining: float) -> float:
+        return schedule(progress_remaining / start_progress)
     return _schedule
 
 

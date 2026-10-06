@@ -1,25 +1,13 @@
-"""Composable steering primitives for the bot archetypes (Steps 17-20). See
-BRAWL_SIM_BUILD_PLAN.md Step 16.
+"""Composable steering primitives for bot movement (bots/personality.movement, bots/policy).
 
-Every primitive here is a pure function of plain (N,E,2)/(N,E) tensors -- none of them touch
-SimState, params, or perception.select_target directly. That keeps them reusable both for
-per-entity steering (archetypes call them with an entity's own position and its target's
-gathered position) and for simple tests. Each primitive returns an UNNORMALIZED direction;
-only combine() normalizes, once, after the weighted sum -- normalizing earlier would throw
-away relative magnitude information (e.g. maintain_range's "how far outside the deadband")
-that combine's weights are meant to balance against each other.
-
-avoid_walls reuses the exact "8 fixed dir_from_bin offsets, Python for over a compile-time
-constant" pattern terrain.circle_blocked already established (see the comment on
-terrain._N_PROBES, which points back at this module) -- CONVENTIONS.md sanctions a fixed-count
-Python loop like this since it doesn't depend on runtime tensor shapes.
+Each is a pure function of plain (N,E,2)/(N,E) tensors -- never SimState or params. seek, flee,
+maintain_range and escape_zone return raw offsets (length = distance), strafe a unit vector. Only
+combine() normalizes, once, after the weighted sum, so a seek/flee term weighs weight x distance
+against the others.
 """
 import torch
 
 from ..core import geometry as geo
-from ..core import terrain
-
-_N_PROBES = 8
 
 
 def seek(pos: torch.Tensor, target_pos: torch.Tensor) -> torch.Tensor:
@@ -34,7 +22,8 @@ def flee(pos: torch.Tensor, threat_pos: torch.Tensor) -> torch.Tensor:
 
 def strafe(pos: torch.Tensor, target_pos: torch.Tensor, sign) -> torch.Tensor:
     """(N,E,2). Direction perpendicular to the seek vector toward target_pos, scaled by
-    `sign` (python +-1, or an (N,E) tensor such as Step 19's (-1)**entity_index)."""
+    `sign`: python +-1, or a tensor broadcastable to (N,E) such as bots/policy.strafe_sign's (E,)
+    (-1)**slot."""
     to_target = geo.normalize(target_pos - pos)
     perp = geo.perp(to_target)
     s = sign.unsqueeze(-1) if torch.is_tensor(sign) else sign
@@ -44,21 +33,18 @@ def strafe(pos: torch.Tensor, target_pos: torch.Tensor, sign) -> torch.Tensor:
 def maintain_range(pos: torch.Tensor, target_pos: torch.Tensor, desired, deadband,
                    max_dist=None) -> torch.Tensor:
     """(N,E,2). Seeks (unnormalized diff toward target) when dist > desired+deadband, flees
-    (negated diff) when dist < desired-deadband, zero inside the deadband. desired/deadband
-    are python scalars or (N,E) tensors -- dist is deliberately kept (N,E) (no keepdim) so the
-    too_far/too_close comparisons broadcast against them elementwise; keepdim's (N,E,1) would
-    instead broadcast against an (N,E) desired as if E were a *second* entity axis, silently
-    comparing the wrong pairs whenever E happens to also be a valid broadcast target (this bit
-    a real caller -- see BRAWL_SIM_BUILD_PLAN.md Step 17's note).
+    (negated diff) when dist < desired-deadband, zero inside the deadband. desired/deadband are
+    python scalars or (N,E) tensors. `dist` stays (N,E), no keepdim, on purpose: an (N,E,1) dist
+    would broadcast against an (N,E) desired as if E were a second entity axis and silently
+    compare the wrong pairs for some shapes instead of raising.
 
     `max_dist` (optional, scalar or (N,E)) also seeks whenever dist > max_dist, so the seek edge
-    becomes min(desired + deadband, max_dist) and the flee edge is untouched. The seek edge, not
-    `desired`, is where an approaching entity stops: inside the deadband this term is zero, the
-    caller's strafe is all that is left, and an orbit only ever drifts outward. bots/personality.py
-    passes each bot's fire reach (operator, 2026-09-21); before that an easy KITE Brock walking in
-    parked at 11.0 tiles with an 8.0-tile rocket. Where both edges hold at once (only possible if
-    desired - deadband > max_dist) seeking wins and the entity jitters on max_dist, so a caller
-    keeps desired <= max_dist -- bots/policy.targeting caps desired at the same reach."""
+    becomes min(desired + deadband, max_dist); the flee edge is untouched. The seek edge, not
+    `desired`, is where an approaching entity stops, since inside the band only the caller's
+    strafe is left and an orbit drifts outward. bots/personality.movement passes each bot's fire
+    reach so no kiter parks out of its own range (user decision, 2026-09-21). If both edges hold
+    at once (desired - deadband > max_dist) seeking wins and the entity jitters on max_dist, so
+    callers keep desired <= max_dist, as bots/policy.targeting does."""
     diff = target_pos - pos
     dist = geo.safe_norm(diff, dim=-1)
     too_far = dist > (desired + deadband)
@@ -69,27 +55,10 @@ def maintain_range(pos: torch.Tensor, target_pos: torch.Tensor, desired, deadban
     return torch.where(too_far, diff, torch.where(too_close, -diff, torch.zeros_like(diff)))
 
 
-def avoid_walls(pos: torch.Tensor, map_id: torch.Tensor, bank, probe_dist, cfg) -> torch.Tensor:
-    """(N,E,2). Probes bank.blocks_unit at 8 fixed compass offsets scaled by probe_dist;
-    returns the negated sum of each blocked probe's own direction, so a bot boxed in by walls
-    on most sides is pushed toward whichever probe(s) remain open (a dead end pushes it back
-    out the way it came)."""
-    probe_idx = torch.arange(_N_PROBES, device=pos.device, dtype=torch.int64)
-    probe_dirs = geo.dir_from_bin(probe_idx, _N_PROBES)  # (_N_PROBES, 2)
-    push = torch.zeros_like(pos)
-    for k in range(_N_PROBES):  # fixed compile-time constant, CONVENTIONS.md-sanctioned
-        d = probe_dirs[k]
-        probe_pos = pos + probe_dist * d
-        blocked = terrain.sample(bank.blocks_unit, map_id, probe_pos, cfg)  # (N,E)
-        push = push - torch.where(blocked.unsqueeze(-1), d.expand_as(pos), torch.zeros_like(pos))
-    return push
-
-
 def escape_zone(pos: torch.Tensor, zone_lo: torch.Tensor, zone_hi: torch.Tensor) -> torch.Tensor:
     """(N,E,2). Direction from pos to the nearest point inside [zone_lo, zone_hi]; zero when
-    already inside. zone_lo/zone_hi are plain tensors (not read off state), matching
-    perception.in_zone / nearest_safe_point (Step 15) -- core/zone.py (Step 23) is the eventual
-    source of these bounds."""
+    already inside. zone_lo/zone_hi are plain tensors (not read off state), like
+    perception.in_zone's."""
     x = torch.clamp(pos[..., 0], zone_lo[..., 0], zone_hi[..., 0])
     y = torch.clamp(pos[..., 1], zone_lo[..., 1], zone_hi[..., 1])
     return torch.stack([x, y], dim=-1) - pos

@@ -184,6 +184,21 @@ class DeploymentConfig:
     # that should survive into an unattended run.
     telemetry_frame_dump: int = 0
 
+    # --- a known map (KNOWN_MAP_LOCALIZATION_PLAN.md) ----------------------------------------
+    # The hand-labelled map the match is played on, `brawl_deployment/data/maps/<name>.csv`, or
+    # None for the map-agnostic terrain. Named, `MapLocalizer` finds the camera on the label and
+    # the grid reads the label instead of the occupancy map. The rest are `MapLocalizer`'s keyword
+    # arguments at its defaults, PROVISIONAL until step K4 measures them on recorded matches.
+    map_name: str | None = None
+    map_commit_margin: float = 60.0
+    map_whole_map_margin: float = 120.0
+    map_slip_margin: float = 15.0
+    map_min_agreement: float = 0.65
+    map_guard_agreement: float = 0.6
+    map_wrong_map_agreement: float = 0.55
+    map_search_tiles: int = 4
+    map_search_seconds: float = 5.0
+
 
 # (dotted YAML path, DeploymentConfig field name, type coercion)
 _DEPLOYMENT_CONFIG_FIELDS = (
@@ -212,6 +227,15 @@ _DEPLOYMENT_CONFIG_FIELDS = (
     ("safety.capture_stall_seconds", "safety_capture_stall_seconds", float),
     ("telemetry.dir", "telemetry_dir", str),
     ("telemetry.frame_dump", "telemetry_frame_dump", int),
+    ("map.name", "map_name", lambda v: None if v is None else str(v)),
+    ("map.commit_margin", "map_commit_margin", float),
+    ("map.whole_map_margin", "map_whole_map_margin", float),
+    ("map.slip_margin", "map_slip_margin", float),
+    ("map.min_agreement", "map_min_agreement", float),
+    ("map.guard_agreement", "map_guard_agreement", float),
+    ("map.wrong_map_agreement", "map_wrong_map_agreement", float),
+    ("map.search_tiles", "map_search_tiles", int),
+    ("map.search_seconds", "map_search_seconds", float),
 )
 
 

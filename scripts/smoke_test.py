@@ -1,6 +1,5 @@
 """For every world-config variant, builds `BrawlVecEnv(n_envs=8)`, resets, and runs 500 random
-steps with `debug_checks=True`, asserting a battery of invariants. See BRAWL_SIM_BUILD_PLAN.md
-Step 41.
+steps with `debug_checks=True`, asserting a battery of invariants.
 
 **"every config in configs/ and configs/presets/" is read as "every world-config variant," not
 literally every `.yaml` file in those two directories.** `configs/brawlers.yaml`,
@@ -20,9 +19,8 @@ overrides=yaml.safe_load(preset_path))`).
 check_invariants(...)`), and already covers: NaN/Inf on every float field, position bounds,
 `0 <= hp <= max_hp`, no dead-with-nonzero-hp, `cubes <= max_cubes`, `dash_t <= dash_duration`,
 live projectile count `<= max_projectiles`, `act_head` bounds, `env_idx` identity. Setting
-`debug_checks=True` on every config this script builds IS how the plan's own "no NaN/Inf;
-positions in bounds; ... 0 <= hp <= max_hp; live projectiles <= max_projectiles; cubes <=
-max_cubes" acceptance items are satisfied -- this script does not re-implement any of them.
+`debug_checks=True` on every config this script builds IS how those are checked here -- this
+script does not re-implement any of them.
 
 **What this script adds on top** (things `check_invariants` structurally can't check, since
 they need either cross-tick history or calls it has no access to): alive-never-resurrects-
@@ -63,7 +61,7 @@ def config_variants() -> list:
 
 def _random_action(env: BrawlVecEnv) -> torch.Tensor:
     move = torch.randint(0, env.cfg.n_move_bins + 1, (env.n_envs,), device=env.device)
-    # The whole attack column (0 none, 1 attack, 2 super, 3 gadget -- SIM_OVERHAUL Step G3), so the
+    # The whole attack column (0 none, 1 attack, 2 super, 3 gadget), so the
     # battery's invariant checks see supers and spinners in flight too, as `record_rollout` does.
     # Illegal picks are silent no-ops (`hero.decode_action`), so drawing them unmasked is safe.
     fire = torch.randint(0, env.cfg.action_nvec[1], (env.n_envs,), device=env.device)
@@ -78,7 +76,7 @@ def _with_debug_checks(overrides: dict | None) -> dict:
 
 def run_smoke(label: str, overrides: dict | None, device: str, n_envs: int = N_ENVS, steps: int = N_STEPS, seed: int = 0) -> None:
     """Raises on the first violation found -- no partial-success return value, same "smoke
-    test" contract `scripts/sb3_smoke.py` (Step 36) already uses."""
+    test" contract `scripts/sb3_smoke.py` already uses."""
     cfg = load_config(DEFAULT_CONFIG_PATH, overrides=_with_debug_checks(overrides))
     env = BrawlVecEnv(cfg, n_envs=n_envs, device=device, seed=seed, verbose=False)
 

@@ -7,17 +7,15 @@ agent is here to learn the Brawl Stars environment, so an accurate roster matter
 one. Some characters are simply stronger than others, and that is a fact to learn rather than a bug
 to tune out.
 
-When each brawler fires and how it aims is no longer per-character Python. It is five per-kind
-fields read by [brawl_sim/bots/combat_rules.py](brawl_sim/bots/combat_rules.py) — `fire_needs_los`,
+When each brawler fires and how it aims is not per-character Python. It is five per-kind fields
+read by [brawl_sim/bots/combat_rules.py](brawl_sim/bots/combat_rules.py) — `fire_needs_los`,
 `fire_range_fraction`, the lateral-hold pair, and `aim_model` — so no brawler needs a Python
 module of its own. Movement is orthogonal and comes from the entity's `Person`, in
 [brawl_sim/bots/personality.py](brawl_sim/bots/personality.py).
 
-That covers *when* a brawler shoots, not *what its weapon does*. A brawler whose weapon is a new
-mechanic still needs engine work: Edgar's lifesteal is a function in `core/combat.py`, and Spike's
-six-arm ring turned a hardcoded four-direction constant in `core/projectiles.py` into a per-kind
-`split_count`. Both were additive — no existing brawler's behaviour changed — but neither was
-config alone.
+That covers *when* a brawler shoots, not *what its weapon does*. A weapon that is a new mechanic
+still needs engine work: Edgar's lifesteal is `melee_lifesteal` in `core/combat.py`, and Spike's
+six-arm ring is the per-kind `split_count` in `core/projectiles.py`.
 
 **Everything in this file is implemented.** See "Still unimplemented" at the bottom for what is not.
 
@@ -29,14 +27,15 @@ config alone.
   neither attack again nor accrue ammo. One field, both effects — there is no separate "attack
   animation" concept. Sustained fire is therefore `attack_cooldown + reload_seconds` per shot, not
   `reload_seconds`. The 0.25s floor absorbs the real game's short attack frames plus the "+0.1s
-  after" rule into a single number; Mortis (0.35s) and Buzz (1.00s) need genuinely longer.
+  after" rule into a single number; Mortis (0.35s), Edgar (0.50s) and Buzz (1.00s) need genuinely
+  longer.
 - **Power cubes** give **+10% damage and a flat +400 max HP** each, the real game's numbers. Flat HP
   means cubes narrow the HP spread rather than widening it: every brawler gains the same amount.
   Capped at `max_cubes: 16`.
 - **Out-of-combat regen**: after 3 seconds with no attacking and no damage taken, health regenerates
   at 13% of max HP per second. Any attack or hit resets the clock.
-- **The zone** deals 20% of each entity's max HP per second, so nothing survives more than ~5s in
-  it regardless of HP or cube count.
+- **The zone** deals 20% of each entity's max HP per second, rising 4 points with every shrink, so
+  nothing survives more than ~5s in it (2.5s by the fifth shrink) regardless of HP or cube count.
 
 ---
 
@@ -44,33 +43,35 @@ config alone.
 
 - Health: 8000
 - Attack damage: 2000 per dash hit
-- Attack type: melee dash (no ranged projectile; the "Attack" input drives `start_dash()` directly)
-- Dash distance: 2.67 tiles · duration 0.30s · radius (hit width) 0.70 tiles
+- Attack type: melee dash (no ranged projectile; the "Attack" input drives `start_dash()` directly,
+  and under `action.auto_aim` attack value 4 aims it at the nearest enemy or crate in reach)
+- Dash distance: 2.67 tiles · duration 0.30s · radius (hit width) 0.70 tiles · no invulnerability
+  during it (user decision: it is an attack animation, and Mortis can be hit throughout)
 - Move speed: 2.73 tiles/s
-- Ammo: 3 max, **reload 2.25s**
+- Ammo: 3 max, **reload 2.50s**
 - Attack cooldown: 0.35s — must exceed `dash_duration` 0.30, since a dash *is* his attack
 - **Long dash**: after **4.5 seconds without attacking**, the next dash reaches **2× as far**
   (5.34 tiles). Only the range doubles — hit width and damage are unchanged — so a charged dash
   covers twice the ground in the same 0.30s and is therefore twice as fast, which makes it an
   escape tool as much as an engage. The agent sees both `hero.long_dash_ready` (the flag) and
   `hero.long_dash_frac` (the 0→1 charge).
-- **Super**: 10-tile range, aimed by the same logic as his normal attack. A 0.70-radius projectile
-  travels in a straight line, **passes through walls**, pierces every player it touches for **1800
-  damage**, and **heals Mortis 1800 per player hit**. Charged by landing **5 hits on other
-  players** — box hits never charge it. Masked out of the action space until ready; the agent sees
-  `hero.super_ready` and `hero.super_charge_frac`.
-- **Gadget** (SIM_OVERHAUL_PLAN.md Phase G, operator spec 2026-09): a third value on the attack
-  column with its own **18 s cooldown, which starts fully charged**. On use a spinner flies **up to
-  2 tiles toward the nearest revealed enemy** (along Mortis's facing when none is visible), lands
-  after **0.2 s**, and deals **2000 damage in a 1-tile radius** to every enemy and box inside.
-  Rules: no self-damage; boxes take the damage; it charges no super; using it breaks concealment
-  like any attack but **does not reset the long-dash timer**. Nothing in flight can be hit or
-  blocked (it is an ARTILLERY-class projectile, `Proj.GADGET_SPINNER`). Masked out of the action
-  space while cooling; the agent sees `hero.gadget_ready` and `hero.gadget_charge_frac`. Config:
-  `gadget_cooldown 18.0`, `gadget_range 2.0`, `gadget_flight_seconds 0.2`, `gadget_damage 2000`,
-  `gadget_radius 1.0`; `gadget_cooldown: 0` on every other kind means "no gadget".
+- **Super**: 10-tile range. It flies along the move bin, like his dash; on an idle move bin it
+  aims like the game's tap-to-fire (user decision, 2026-09-30), at the nearest alive enemy within
+  11.1 tiles (the range plus both bodies), even off screen and skipping boxes, or along his facing
+  with none. A 0.70-radius projectile travels in a straight line, **passes through walls**,
+  pierces every player it touches for **1800 damage**, and **heals Mortis 1800 per player hit**.
+  Charged by landing **5 hits on other players** — box hits never charge it. Masked out of the
+  action space until ready; the agent sees `hero.super_ready` and `hero.super_charge_frac`.
+- **Gadget** (user spec): a third value on the attack column with its own **18 s cooldown, which
+  starts fully charged**. On use a spinner flies **up to 2 tiles toward the nearest revealed
+  enemy** (along Mortis's facing when none is visible), lands after **0.2 s**, and deals **2000
+  damage in a 1-tile radius** to every enemy and box inside. Rules: no self-damage; boxes take the
+  damage; it charges no super; using it breaks concealment like any attack but **does not reset the
+  long-dash timer**. Nothing in flight can be hit or blocked (it is an ARTILLERY-class projectile,
+  `Proj.GADGET_SPINNER`). Masked out of the action space while cooling; the agent sees
+  `hero.gadget_ready` and `hero.gadget_charge_frac`.
 
-### 2. Brock — `bot_sniper` (was Nani)
+### 2. Brock — `bot_sniper`
 
 - Health: 6000
 - Attack damage: **2320** per rocket (a single rocket, not a collapsed 3-pellet volley)
@@ -79,14 +80,14 @@ config alone.
   shot in the roster and the one the agent can most readily see coming and sidestep
 - **Lingering sphere**: wherever the rocket dies (wall, unit, box, or range expiry) it leaves a
   **0.75-radius sphere** that **ticks twice, at 2s and 4s**, dealing **30% of the rocket's damage**
-  (696 at the shipped 2320) to anything standing in it. It ignores walls, stacks with other
-  spheres, and never damages its own owner. Expressed as a *fraction* so it scales with power
-  cubes and difficulty tiers. This roughly doubles Brock's sustained output.
+  (696 at 2320) to anything standing in it. It ignores walls, stacks with other spheres, and never
+  damages its own owner. Expressed as a *fraction* so it scales with power cubes and difficulty
+  tiers. A target that stands in it for both ticks takes 1.6× the rocket's damage.
 - Move speed: 2.40 tiles/s · Ammo: 3 max, **reload 2.1s** · Cooldown: 0.25s
 - Fire rule: needs line-of-sight, fires at any range it can reach, LEAD aim (0.06 rad noise,
   0.9 lead) · prefers to hold 0.85× range when kiting
 
-### 3. Grom — `bot_artillery` (was Dynamike)
+### 3. Grom — `bot_artillery`
 
 - Health: 6000
 - Attack damage: **2080** on the landing tile, **2080** from any one split shard — 2080 if you are
@@ -105,9 +106,9 @@ config alone.
   this is the archetype's whole identity. LOB aim: positional noise (0.8 tiles) on the *landing
   point* rather than angular noise on the bearing.
 
-### 4. Buzz — `bot_melee` (was El Primo)
+### 4. Buzz — `bot_melee`
 
-- Health: 10000 — the tankiest in the roster
+- Health: 10000 — the tankiest in the roster (tied with Bull)
 - Attack: **five hitscan cones fanned across 70° (1.222 rad)**, one every 0.2s over a full second,
   each dealing **840** damage. Consecutive cones overlap slightly, but at `attack_arc_rad: 0.65` at
   most **3** can connect — max 2520 for a full sweep. One ammo buys all five.
@@ -115,31 +116,27 @@ config alone.
 - Move speed: 2.57 tiles/s · Ammo: 3 max, **reload 1.0s**
 - **Attack cooldown 1.00s** — by far the largest in the roster, and the one place the "no attack, no
   reload" rule really bites. The sweep *is* the cooldown. This is what makes a five-hitscan attack a
-  genuine commitment rather than free damage, and it is why Buzz has the lowest sustained DPS of the
-  four bots despite the highest health. That trade is the real character; it is not a balance bug.
+  genuine commitment rather than free damage. That trade is the real character; it is not a balance
+  bug.
 - He can move during the sweep but stays facing the direction he started it in.
 - Fire rule: no LOS gate (the hitscan resolves its own per-victim ray), requires the target inside
   the swing arc, DIRECT aim (nothing in flight to lead)
 
-### 5. Shelly — `bot_rifle` (was Bo)
+### 5. Shelly — `bot_rifle`
 
 - Health: 7800
-- Attack: **5 pellets** in a radial shotgun spread of **34.4° total** (±17.2°), each dealing
-  **600** damage — 3000 if every pellet lands, which only happens inside ~2 tiles
-  - This used to read "60° total (30° either side)", which was wrong in both docs and in
-    `brawlers.yaml`'s own comment: `proj_spread_rad: 0.6` is **0.6 radians**, and the number was
-    misread as a degree figure. The value was hand-tuned, so the config was right and the prose was
-    wrong. The field is the TOTAL tip-to-tip span, not a half-angle.
-  - The fan stays *continuous* over its whole length — at 8 tiles the pellets are 1.18 tiles apart
-    and each covers 1.40 — so the hold-fire rules below are about a target having time to move out
-    of it during the ~1.25s flight, not about gaps opening up in it.
+- Attack: **5 pellets** in a radial shotgun spread of **34.4° total** (±17.2°, `proj_spread_rad:
+  0.6`), each dealing **600** damage — 3000 if every pellet lands, which only happens inside ~2
+  tiles. The fan stays *continuous* over its whole length — at 8 tiles the pellets are ~1.2 tiles
+  apart and each covers 1.40 — so the hold-fire rules below are about a target having time to move
+  out of it during the ~1.25s flight, not about gaps opening up in it.
 - Attack range: 8 tiles · Projectile: `RIFLE_ARROW`, **speed 6.4 tiles/s** (~1.25s to cross the
-  full range), radius 0.25
+  full range), radius 0.30
 - Move speed: 2.40 tiles/s · Ammo: 3 max, **reload 1.75s** · Cooldown: 0.25s
-- Fire rule: the only brawler that uses every field. Needs line-of-sight; **holds fire past 0.9× of
-  its range** (the fan has diverged too far to land); **holds fire on targets crossing faster than
-  2 tiles/s beyond 0.6× range** (they slip between the pellets). Inside 0.6× the fan is tight
-  enough to land on a mover anyway. LEAD aim, 0.08 rad noise, 0.7 lead.
+- Fire rule: needs line-of-sight; **holds fire past 0.9× of its range** (the fan has diverged too far
+  to land); **holds fire on targets crossing faster than 2 tiles/s beyond 0.6× range** (they slip
+  between the pellets). Inside 0.6× the fan is tight enough to land on a mover anyway. LEAD aim,
+  0.08 rad noise, 0.7 lead.
 
 ### 6. Edgar — `bot_edgar`
 
@@ -155,8 +152,7 @@ point-blank multi-hit hitscan) without inventing a distinction the sim does not 
   the first. It is still genuinely two attacks — each re-tests the cone and its own line-of-sight
   0.25s apart, so a target who steps out between them costs Edgar half the combo.
 - **Lifesteal: 35% of the damage he deals**, per hit. Landing one hit of two heals half as much
-  (378, not 756). **Players only** — hitting a loot box heals nothing, and damage an invulnerable
-  (dashing) target never took heals nothing either.
+  (378, not 756). **Players only** — hitting a loot box heals nothing.
 - Attack range: 2.00 tiles · arc 0.50 rad (~29°) — the shortest reach in the roster, a focused
   forward slash rather than Buzz's 70° fan
 - Move speed: **2.73 tiles/s** — tied with Mortis for the fastest in the game, which is what lets a
@@ -198,9 +194,8 @@ description too, and the two play nothing alike.
 
 ### 8. Bull — `bot_bull`
 
-The roster's second shotgun, and the first brawler added since the archetypes went data-driven that
-needed **no engine change at all** — he reuses Shelly's pellet fan exactly and differs only in
-numbers. Named for the brawler because "shotgun" is already Shelly's role.
+The roster's second shotgun: he reuses Shelly's pellet fan exactly and differs only in numbers.
+Named for the brawler because "shotgun" is already Shelly's role.
 
 - Health: **10000** — ties Buzz for the tankiest frame in the game
 - Attack: **5 pellets** in a **28.6° total** spread (±14.3°), each dealing **880** — **4400** if the
@@ -231,10 +226,9 @@ numbers. Named for the brawler because "shotgun" is already Shelly's role.
 
 ### Still unimplemented
 
-- **Star Powers and Hypercharges** — out of scope; see BRAWL_SIM_BUILD_PLAN.md Appendix A. Gadgets
-  moved OUT of this list on 2026-09-21: Mortis throws one (the block above, SIM_OVERHAUL Phase G),
-  and no other kind has one, since `gadget_cooldown: 0` means "no gadget". Giving a bot one is the
-  same shape of change as giving it a super, below.
+- **Star Powers and Hypercharges** — out of scope; see BRAWL_SIM_DESIGN.md §2.
+- **Gadgets for bots.** Only Mortis has one: `gadget_cooldown: 0` means "no gadget", and
+  `BotIntent` has no gadget bit yet.
 - **Supers for bots.** Only Mortis has one. Nothing about the mechanic is hero-specific — the charge
   counter, readiness test, projectile and lifesteal are all per-entity, and `super_charge_hits: 0`
   is what means "this kind has no super" — so giving a bot one is a `brawlers.yaml` block plus a
@@ -256,11 +250,9 @@ numbers. Named for the brawler because "shotgun" is already Shelly's role.
 - Not sourced from real data (hand-tuned for feel, not a CSV conversion): `dash_duration`,
   `dash_radius`, `proj_radius`, `aoe_radius`, `aim_noise_*`, `reaction_delay`,
   `lead_target_fraction`, `decision_period_ticks`, `super_proj_speed`, `melee_lifesteal_fraction`,
-  and the `split_*` fields. Grom's `attack_range` is Dynamike's converted value — CHARACTER_DETAILS
-  never specified one for Grom. Edgar's, Spike's and Bull's numbers were specified directly by the
-  repo owner rather than converted from the CSVs, so their `split_count` / `split_distance` /
-  `split_seconds` / lifesteal fraction / pellet damage are the spec, not a conversion. Bull's
-  `move_speed` is an ordinary conversion like the rest (Speed=650 / 300, the SLOW tier).
+  and the `split_*` fields. Grom's `attack_range` is Dynamike's converted value, not his own.
+  Edgar's, Spike's and Bull's numbers are the user's spec rather than CSV conversions (their
+  `split_*`, lifesteal fraction and pellet damage included); Bull's `move_speed` is an ordinary
+  conversion like the rest.
 - `proj_spread_rad` is in **radians** and is the **total** tip-to-tip span (`spawn_volley` lays the
-  pellets from −spread/2 to +spread/2). Reading it as degrees is what produced the wrong "60°"
-  figure for Shelly that stood in this file until Bull was added.
+  pellets from −spread/2 to +spread/2).

@@ -61,7 +61,7 @@ observation cannot disagree about who is visible.
 
 #### The history planes are past sightings, cut to the sim's block
 
-`configs/agent_obs_deploy4.yaml` adds `enemy_hist1..3` (SIM_OVERHAUL_STEPS.md H4.3). Plane k marks
+`configs/agent_obs_deploy4.yaml` adds `enemy_hist1..3`. Plane k marks
 the enemies that were `seen_now` k decisions ago, which `DeployLoop` keeps in its decision
 snapshots and hands over as `enemy_history`, newest first. Each is drawn at the world cell it stood
 on then, in the CURRENT window, with no re-centring, which is `observation._build_grid`'s rule. And

@@ -1,89 +1,69 @@
 # ===============================================================================================
-# ROSTER RE-GROUNDING (bot_overhaul.md Step B1). Four of the five archetypes now model a DIFFERENT
-# real brawler than they used to:
+# THE ROSTER: one block per entity kind, read into SimParams by brawl_sim/config.py. Every kind is
+# also described in prose in CHARACTER_DETAILS.md, and the two must agree: a number changed here
+# needs its description changed there.
 #
-#     bot_sniper     Nani     -> BROCK
-#     bot_artillery  Dynamike -> GROM
-#     bot_melee      El Primo -> BUZZ
-#     bot_rifle      Bo       -> SHELLY
-#     hero_mortis    Mortis      (unchanged)
+#     hero_mortis    MORTIS (the agent)
+#     bot_sniper     BROCK
+#     bot_artillery  GROM
+#     bot_melee      BUZZ
+#     bot_rifle      SHELLY
+#     bot_edgar      EDGAR
+#     bot_spike      SPIKE
+#     bot_bull       BULL
 #
-# **CHARACTER_DETAILS.md is now the source of truth for every stat below**, not the datamined CSV
-# conversions described further down. Those conversions are retained because they still explain
-# the fields nobody re-specified (move_speed everywhere, Grom's attack_range, Buzz's move_speed)
-# and because the units they establish -- tiles, seconds, Power-11 HP/damage -- are what
-# CHARACTER_DETAILS' own numbers are expressed in. Where the two disagree, CHARACTER_DETAILS wins.
-#
-# Not all of the re-grounding lands in B1. Deferred, each with the step that owns it, because
-# applying the number alone would be a balance change nobody asked for:
-#     attack_cooldown  (all five)  -> Step C1, paired with the reload pause that gives it meaning
-#     attack_arc_rad   (Buzz 0.65) -> Step C2, paired with the 5-hitscan sweep
-#     proj_count 5 / proj_spread   -> Step B2, needs MAX_PROJ_PER_ENTITY and the budget formula
-#     on_hit_area_* (Brock sphere) -> Step C3
-#     split_seconds (Grom)         -> Step C4
-#     long_dash_* / super_*        -> Steps D1 / D2
+# Only Mortis has a Super and a Gadget; Star Powers and Hypercharges are out of scope
+# (BRAWL_SIM_DESIGN.md §2).
 # ===============================================================================================
 #
-# Original grounding pass (D05/D06 refresh) -- see BRAWL_SIM_BUILD_PLAN.md Appendix A item 1 for
-# why Gadgets/Star Powers/Hypercharges are still out of scope (Mortis's Super is now in scope, via
-# Step D2, because CHARACTER_DETAILS specifies one).
-#
-# Source: Supercell's own datamined game files, mirrored at
+# Where a stat is a conversion rather than a spec, the source is Supercell's datamined game files,
+# mirrored at
 #   github.com/tailsjs/brawl-stars-assets, version 68.250, csv_logic/{characters,skills}.csv
-# (ground truth -- NOT a wiki paraphrase; cross-checked against user-confirmed real max-level
-# numbers for Mortis/Bo/Dynamike/Nani before trusting the conversions below).
-#
-# Conversions derived and validated against those real numbers (all four matched exactly):
+# (ground truth, not a wiki paraphrase), and the conversions were validated against real
+# max-level numbers the user confirmed:
 #   - HP / per-hit damage: raw CSV value is Power 1; Power 11 (max level, what Showdown boosts
 #     everyone to) = Power 1 x2 exactly (Supercell's level curve is +10% of base per level,
 #     linear not compounding, so 10 levels above 1 = +100%).
-#   - move_speed: raw `Speed` / 300 = tiles/s (cross-checked: existing 2.56 placeholder was
-#     already 770/300 for the wrong speed tier).
-#   - attack_range / dash_distance: raw `CastingRange` / 3 = tiles (cross-checked against
-#     Piper's CastingRange=30 -> 10 tiles, the commonly-cited longest range in the game, and the
-#     melee/mid/long ordering of Mortis(8) < Bull(16) < Dynamike(22) < Bo/Nani(26) < Colt(27) <
-#     Piper(30) matches known real range tiers).
+#   - move_speed: raw `Speed` / 300 = tiles/s.
+#   - attack_range / dash_distance: raw `CastingRange` / 3 = tiles (Piper's CastingRange=30 ->
+#     10 tiles, the commonly-cited longest range in the game).
 #   - reload_seconds: raw `RechargeTime` (ms) / 1000.
+# Not conversions (hand-tuned, or the user's spec): dash_duration, dash_radius, proj_radius,
+# aoe_radius, super_proj_speed, melee_lifesteal_fraction, the split_* fields and the bot-AI fields
+# (aim_noise_*, reaction_delay, lead_target_fraction, decision_period_ticks). Edgar's, Spike's and
+# Bull's numbers are all the user's spec, and Grom's attack_range is Dynamike's conversion, since
+# none is specified for Grom.
 #
 # ---------------------------------------------------------------------------------------------
-# attack_cooldown: THE NO-ATTACK, NO-RELOAD WINDOW (Step C1 / bot_overhaul.md D7)
+# attack_cooldown: THE NO-ATTACK, NO-RELOAD WINDOW
 #
 # For `attack_cooldown` seconds after an attack an entity can neither attack again NOR accrue
 # ammo. One field, both effects -- there is no separate "attack animation" concept in the sim;
-# core/hero.tick_timers gates ammo regen on this same timer.
+# core/hero.tick_timers gates ammo regen on this same timer. So sustained fire is
+# `attack_cooldown + reload_seconds` per shot, not `reload_seconds`, and an entity that empties
+# its 3-round clip is out of the fight for the sum of both.
 #
-# Consequence worth internalising: sustained fire is `attack_cooldown + reload_seconds` per shot,
-# not `reload_seconds`. An entity that empties its 3-round clip is out of the fight for the sum
-# of both. This REPLACES the previous philosophy, under which the cooldown was deliberately kept
-# below reload_seconds so that "sustained DPS is unchanged" -- it is now changed on purpose.
+# 0.25 s is the floor, and three kinds need longer:
 #
-# Values are a 0.25 s floor for everyone, with two exceptions that need longer:
-#
-#   0.25  bot_sniper / bot_artillery / bot_rifle
-#         The floor, not a tuned value. It absorbs CHARACTER_DETAILS' "most characters have short
-#         attack frames, but account for them anyway (+0.1 s after)" into a single number. It also
-#         equals exactly one agent decision (sim.action_repeat 5 x dt 0.05 = 0.25 s), so the agent
-#         always gets at least one decision between its own shots.
-#         NOTE these are FLIGHT times, not cooldowns, and are modelled elsewhere: Grom's 1.25 s
-#         shell is proj_flight_seconds (he can throw again while one is airborne) and Brock's
-#         1.5 s rocket travel is proj_speed.
+#   0.25  bot_sniper / bot_artillery / bot_rifle / bot_spike / bot_bull
+#         The floor, not a tuned value. It absorbs the real game's short attack frames plus the
+#         "+0.1 s after" rule (CHARACTER_DETAILS.md) into a single number, and it equals exactly
+#         one agent decision (sim.action_repeat 5 x dt 0.05 = 0.25 s), so the agent always gets
+#         at least one decision between its own shots.
+#         FLIGHT times are not cooldowns and are modelled elsewhere: Grom's 1.25 s shell is
+#         proj_flight_seconds (he can throw again while one is airborne), and Brock's and
+#         Spike's 1.5 s travel is proj_speed.
 #   0.35  hero_mortis -- must exceed dash_duration 0.30, since a dash IS his attack.
-#   1.00  bot_melee -- Buzz's attack is FIVE hitscans over one second (Step C2 clocks the
-#         sub-swings off this very timer). The sweep is the cooldown. One ammo buys all five.
+#   0.50  bot_edgar -- his two-hit combo; core/melee_sweep.py times both hits off this timer.
+#   1.00  bot_melee -- Buzz's attack is FIVE hitscans over one second, clocked off this very
+#         timer (core/melee_sweep.py). The sweep is the cooldown. One ammo buys all five.
 # ---------------------------------------------------------------------------------------------
 #
-# Not sourced from this pass (no clean CSV field / bot-AI-only, kept as prior placeholders):
-# dash_duration, dash_radius, proj_speed, proj_radius, proj_spread_rad, aoe_radius, aim_noise_*,
-# reaction_delay, lead_target_fraction, decision_period_ticks, attack_arc_rad, and the
-# Grom-shaped lob fields (proj_flight_seconds, split_distance, split_damage_fraction) -- those
-# three are hand-tuned to feel like the real attack, not converted from any CSV column.
-#
 # ---------------------------------------------------------------------------------------------
-# ADDING A NEW BRAWLER (Step E1)
+# ADDING A NEW BRAWLER
 #
-# A block here is now the WHOLE of a new bot. There is no archetype module to write: the four
-# hand-written ones (sniper/artillery/melee/rifle) were replaced by bots/combat_rules.py, which
-# reads its entire fire/aim rule off the fields below.
+# A block here is the WHOLE of a new bot: bots/combat_rules.py reads its entire fire/aim rule off
+# the fields below, so there is no per-kind module to write.
 #
 # Required for any bot:
 #   base_hp, base_damage, move_speed, attack_range, max_ammo, reload_seconds, attack_cooldown
@@ -95,21 +75,20 @@
 #   aim_model                <- DIRECT | LEAD | LOB. Defaults to DIRECT (no lead, no noise), which
 #                               is the SAFE default, not the good one -- say what you mean.
 #
-# Authored on every bot (SIM_OVERHAUL_PLAN.md Phase B: the two difficulty axes). Both are per-kind
-# BASES that the curriculum multiplies per tier -- the `aggression` and `hero_focus` columns of the
-# tier table in configs/train.yaml (brawl_sim/training/config.TIER_FIELDS, Step B4) -- so a block
-# that leaves one out does not fail to load, it just never scales: a multiplier on 0 is 0.
+# Authored on every bot: the two difficulty axes. Both are per-kind BASES that the curriculum
+# multiplies per tier -- the `aggression` and `hero_focus` columns of the tier table in
+# configs/train.yaml (brawl_sim/training/config.TIER_FIELDS) -- so a block that leaves one out
+# does not fail to load, it just never scales: a multiplier on 0 is 0.
 # tests/test_configs_files.py pins that every bot block below authors both.
 #   hero_focus               <- 0..1. How strongly the bot prefers the hero as a target while the
 #                               hero is in view: the hero's distance is discounted by
 #                               (1 - hero_focus) before the nearest-target pick
-#                               (bots/perception.select_target, Step B2). 0 = no preference,
-#                               1 = the hero whenever it is seen. `validate()` rejects anything
-#                               outside [0, 1].
+#                               (bots/perception.select_target). 0 = no preference, 1 = the hero
+#                               whenever it is seen. `validate()` rejects anything outside [0, 1].
 #   aggression               <- 1.0 = the bot as authored. Divides the retreat HP threshold and the
 #                               KITE hold distance, and lets a CAMPER fire on sight at >= 1.25
-#                               (bots/personality.py and bots/policy.py, Step B3). 0 is read as
-#                               1.0; `validate()` rejects a negative value.
+#                               (bots/personality.py and bots/policy.py). 0 is read as 1.0;
+#                               `validate()` rejects a negative value.
 #
 # Optional, all of which mean "off" at 0 / unset:
 #   fire_needs_los                     require a physical line before firing (straight shots)
@@ -129,43 +108,41 @@
 # read its per-kind loop before assuming a field is optional.
 # ---------------------------------------------------------------------------------------------
 #
-# Every value accepts scalar-or-range (N08): base_hp: 3800  OR  base_hp: {low: 3200, high: 4400}
+# Every value accepts scalar-or-range: base_hp: 3800  OR  base_hp: {low: 3200, high: 4400}
 # hero_mortis has no attack_range/proj_kind/aim_noise_*/decision_period_ticks: those are
-# bot-AI-only fields (D19). The hero's "Attack" input drives start_dash() directly (Step 11),
-# not a separate ranged attack.
+# bot-AI-only fields. The hero's "Attack" input drives start_dash() directly, not a separate
+# ranged attack.
 
 hero_mortis:                        # Undertaker / mortis -- characters.csv, UndertakerWeapon
   base_hp: 8000                     # Hitpoints=4000 x2
   base_damage: 2000                 # Damage=1000 x2
   move_speed: 2.73                  # Speed=820 / 300
   max_ammo: 3
-  # MEASURED off Nulls Brawl (BRAWL_DEPLOYMENT_DESIGN.md 6.15, brawl_deployment/data/
-  # kit_timing.json): pip-to-pip reload with no shot in between, 2.50 s on the one clip of known
-  # provenance and 2.45-2.51 s on six more. That interval is `reload_seconds` whether or not firing
-  # pauses the reload, so it refits this number without taking a side on the C1 pause below --
-  # which stays: it is Mortis's attack animation (operator). Whether firing pauses the reload is
-  # OUT OF SCOPE and not wanted (operator, 2026-09-11): do not measure it or propose removing it.
-  reload_seconds: 2.50              # measured (was 2.25, B1: CHARACTER_DETAILS; 2.4 before that)
-  attack_cooldown: 0.35             # C1 (was 0.30). Must EXCEED dash_duration 0.30: a dash is his
-                                    # attack, and can_attack also requires dash_t <= 0, so a
-                                    # cooldown at or below it would be entirely masked by the dash.
+  # MEASURED off Nulls Brawl footage (BRAWL_DEPLOYMENT_DESIGN.md 6.15, brawl_deployment/data/
+  # kit_timing.json): the pip-to-pip reload with no shot in between, which is `reload_seconds`
+  # whether or not firing pauses the reload. USER RULE: that pause (attack_cooldown below) is
+  # Mortis's attack animation and stays; whether firing pauses the reload is out of scope -- do
+  # not measure it or propose removing it.
+  reload_seconds: 2.50              # measured, see above
+  attack_cooldown: 0.35             # Must EXCEED dash_duration 0.30: a dash is his attack, and
+                                    # can_attack also requires dash_t <= 0, so a cooldown at or
+                                    # below it would be entirely masked by the dash.
   dash_distance: 2.67               # CastingRange=8 / 3 (uncharged reach)
   dash_duration: 0.30
   dash_radius: 0.70
-  # --- long dash (Step D1). CHARACTER_DETAILS: "after not attacking for 4.5 seconds, the range of
-  # Mortis' next attack is doubled". Only the RANGE doubles -- dash_radius (hit width) and
-  # base_damage are unchanged, per that wording.
+  # --- long dash: after 4.5 s without attacking, his next dash reaches twice as far
+  # (CHARACTER_DETAILS.md). Only the RANGE doubles -- dash_radius (hit width) and base_damage are
+  # unchanged.
   #
   # dash_duration is deliberately NOT scaled with it, so a charged dash covers 5.34 tiles in the
   # same 0.30 s and is therefore twice as fast (17.8 tiles/s). That is what makes it an escape and
   # an engage tool rather than just a longer lunge.
   long_dash_seconds: 4.5
   long_dash_multiplier: 2.0
-  # --- Super (Step D2). CHARACTER_DETAILS: "high range (10 tiles), attack direction follows the
-  # same logic as his normal attack. A projectile (same radius as his normal attack) travels across
-  # a direction, passes through walls, and deals 1800 damage to whatever it hits. Mortis heals 1800
-  # for every hit to another player. For super to be available, Mortis must make 5 hits against
-  # other players to charge it."
+  # --- Super (CHARACTER_DETAILS.md): 10-tile range, aimed like his normal attack. A projectile
+  # with his attack's radius flies in a straight line, passes through walls, and deals 1800 to
+  # whatever it touches; Mortis heals 1800 for every player it hits. Five hits on other players
+  # charge it.
   #
   # `super_charge_hits: 0` on every OTHER kind is what means "no super". Nothing here is
   # hero-specific: the charge counter, the readiness test, the projectile and the lifesteal are all
@@ -177,64 +154,59 @@ hero_mortis:                        # Undertaker / mortis -- characters.csv, Und
   super_heal: 1800                  # per PLAYER hit; boxes heal nothing and never charge it
   super_proj_speed: 12.0            # not specified; fast enough to read as a committed strike
   super_radius: 0.70                # "same radius as his normal attack" = dash_radius
-  # --- Gadget (SIM_OVERHAUL_PLAN.md Phase G, operator spec 2026-09). A third value on the attack
-  # column with its own cooldown, which STARTS CHARGED (state.ent_gadget_cd is 0 = ready, and 0 is
-  # what a reset leaves). On use a Proj.GADGET_SPINNER flies up to `gadget_range` toward the
-  # nearest revealed enemy (along Mortis's facing when none is visible), lands after
-  # `gadget_flight_seconds`, and deals `gadget_damage` to every enemy AND box within
-  # `gadget_radius`. No self-damage, charges no super, does not reset the long-dash timer.
-  # `gadget_cooldown: 0` on every OTHER kind is what means "no gadget" -- see core/hero.gadget_ready.
+  # --- Gadget (user spec). Value 3 of the attack column, on its own cooldown, which STARTS
+  # CHARGED (state.ent_gadget_cd is 0 = ready, and 0 is what a reset leaves). On use a
+  # Proj.GADGET_SPINNER flies up to `gadget_range` toward the nearest revealed enemy (along
+  # Mortis's facing when none is visible), lands after `gadget_flight_seconds`, and deals
+  # `gadget_damage` to every enemy AND box within `gadget_radius`. No self-damage, charges no
+  # super, does not reset the long-dash timer. `gadget_cooldown: 0` on every OTHER kind is what
+  # means "no gadget" -- see core/hero.gadget_ready.
   gadget_cooldown: 18.0
   gadget_range: 2.0
   gadget_flight_seconds: 0.2
   gadget_damage: 2000
   gadget_radius: 1.0
 
-bot_sniper:                         # grounded in BROCK (was Nani) -- see CHARACTER_DETAILS.md
-  base_hp: 6000                     # B1 (was 5000)
-  base_damage: 2320                 # B1 (was 4800). Single rocket, not a collapsed 3-pellet max.
+bot_sniper:                         # BROCK -- see CHARACTER_DETAILS.md
+  base_hp: 6000
+  base_damage: 2320                 # a single rocket
   move_speed: 2.40                  # Speed=720 / 300
-  attack_range: 8.0                 # B1: CHARACTER_DETAILS "~8 tiles" (was 8.67)
+  attack_range: 8.0                 # CHARACTER_DETAILS: ~8 tiles
   max_ammo: 3
-  reload_seconds: 2.1               # B1 (was 1.8)
-  attack_cooldown: 0.25             # C1 (was 0.50) -- the floor. His 1.5 s rocket travel is
-                                    # proj_speed, not a cooldown.
+  reload_seconds: 2.1
+  attack_cooldown: 0.25             # the floor. His 1.5 s rocket travel is proj_speed, not a
+                                    # cooldown.
   proj_kind: SNIPER_BOLT
-  # B1 (was 14.0). CHARACTER_DETAILS gives Brock's rocket a ~1.5 s MAX TRAVEL TIME over his 8-tile
-  # range, so the speed is 8 / 1.5. This is the single biggest behavioral change in B1: the bolt
-  # was the fastest thing in the game and is now the SLOWEST straight-line shot, which is what
-  # makes a Brock rocket something the agent can actually see coming and sidestep.
+  # A ~1.5 s MAX TRAVEL TIME over his 8-tile range (CHARACTER_DETAILS.md), so the speed is
+  # 8 / 1.5: the slowest straight-line shot in the roster, which is what makes a Brock rocket
+  # something the agent can actually see coming and sidestep.
   proj_speed: 5.33
   proj_radius: 0.25
   proj_count: 1
   proj_spread_rad: 0.0
   aoe_radius: 0.0
-  # --- lingering sphere (Step C3b). CHARACTER_DETAILS: "after a hit, Brock's projectiles turn
-  # into a 0.75 radius sphere, which ticks twice over 4 seconds before disappearing, dealing 696
-  # damage to any entities inside it".
-  #
-  # Spawns wherever the rocket DIES -- wall, unit, box or range expiry (assumption A2), which
-  # matters because a 5.33 tiles/s rocket at 8 tiles range often expires without hitting anyone.
-  # Ticks at age 2.0s and 4.0s and vanishes on the second (D3); ignores walls, since it is a patch
-  # of ground rather than a shot (D5); stacks with other spheres but never damages its own owner
-  # (D4). It roughly DOUBLES Brock's sustained output: 2320/2.35 = 987 from the rocket plus
-  # 2 x 696 / 2.35 = 592 from the sphere, making him the highest-DPS bot in the roster.
+  # --- lingering sphere. Wherever the rocket DIES -- wall, unit, box or range expiry, which
+  # matters because a 5.33 tiles/s rocket at 8 tiles range often expires without hitting anyone --
+  # it leaves a 0.75-radius sphere that ticks at age 2.0 s and 4.0 s and vanishes on the second.
+  # It ignores walls, since it is a patch of ground rather than a shot, and stacks with other
+  # spheres but never damages its own owner. A target that stays in it for both ticks takes 1.6x
+  # the rocket's damage: sustained, 2320 / 2.35 = 987 per second from the rocket plus
+  # 2 x 696 / 2.35 = 592 from the sphere.
   on_hit_area_radius: 0.75
   # 0.30 x the rocket's own damage = 696 at the shipped base_damage of 2320. Expressed as a
   # FRACTION so it scales with power cubes, enemy_damage_mult and the curriculum's difficulty
-  # tiers -- an absolute 696 would have made an "easy" Brock's sphere hit exactly as hard as
-  # an elite one's.
+  # tiers -- an absolute 696 would make an easy Brock's sphere hit exactly as hard as an elite
+  # one's.
   on_hit_area_damage_fraction: 0.30
   on_hit_area_ticks: 2
   on_hit_area_interval: 2.0
-  # --- fire rule (Step E1). These five fields ARE bots/sniper.py, which no longer exists;
-  # bots/combat_rules.py reads them for every kind. Brock needs a physical line for a
-  # straight-line rocket, fires at any range he can reach, and leads with angular aim noise.
+  # --- fire rule (bots/combat_rules.py reads the same fields for every kind). Brock needs a
+  # physical line for a straight-line rocket, fires at any range he can reach, and leads with
+  # angular aim noise.
   fire_needs_los: true
   aim_model: LEAD
-  desired_range_fraction: 0.85     # was policy.RANGE_FRACTION_BY_KIND[1]
-  # --- difficulty axes (Phase B). Bases for the per-tier `hero_focus` / `aggression` multipliers
-  # in configs/train.yaml; the glossary at the top of this file says what each drives.
+  desired_range_fraction: 0.85
+  # --- difficulty-axis bases, multiplied per tier by configs/train.yaml (glossary above).
   hero_focus: 0.5
   aggression: 1.0
   aim_noise_std_rad: 0.06
@@ -242,40 +214,37 @@ bot_sniper:                         # grounded in BROCK (was Nani) -- see CHARAC
   lead_target_fraction: 0.9
   decision_period_ticks: 4
 
-bot_artillery:                      # grounded in GROM (was Dynamike) -- see CHARACTER_DETAILS.md
-  base_hp: 6000                     # unchanged
-  base_damage: 2080                 # B1 (was 3200). Main strike; splits now deal the SAME (below).
+bot_artillery:                      # GROM -- see CHARACTER_DETAILS.md
+  base_hp: 6000
+  base_damage: 2080                 # the main strike; each split shard deals the same (below)
   move_speed: 2.57                  # Speed=770 / 300
-  # Not specified for Grom in CHARACTER_DETAILS -- kept at Dynamike's converted value.
-  # bot_overhaul.md assumption A3.
+  # Not specified for Grom: Dynamike's CastingRange=22 / 3.
   attack_range: 7.33
   max_ammo: 3
-  reload_seconds: 2.3               # B1 (was 1.4)
-  attack_cooldown: 0.25             # C1 (was 0.45) -- the floor. His 1.25 s shell flight is
+  reload_seconds: 2.3
+  attack_cooldown: 0.25             # the floor. His 1.25 s shell flight is
                                     # proj_flight_seconds; he can throw again while one is in
                                     # the air, which is exactly how Grom plays.
   proj_kind: ARTILLERY_SHELL
   # --- Grom-shaped lob (see core/projectiles._spawn_splits). The shell is a TIMED arc, not a
   # constant-speed one: it lands proj_flight_seconds after it is fired whatever the distance, so
-  # proj_speed no longer describes it -- it now sets the speed of the four split shards below.
-  # Closing on an artillery bot therefore does NOT shorten your reaction window the way it used
-  # to; a point-blank lob crawls (2 tiles / 0.9 s = 2.2 tiles/s) while a max-range one is the
-  # fastest arc it can throw (7.33 / 0.9 = 8.1 tiles/s).
-  proj_speed: 6.0                   # SHARD speed; the shell itself uses proj_flight_seconds
-  proj_flight_seconds: 1.25         # B1 (was 0.9) -- CHARACTER_DETAILS "~1.25 s to land"
+  # closing on an artillery bot does NOT shorten your reaction window. A 2-tile lob crawls
+  # (2 / 1.25 = 1.6 tiles/s) while a max-range one is the fastest arc he throws
+  # (7.33 / 1.25 = 5.9 tiles/s).
+  proj_speed: 6.0                   # inert: the shell is timed by proj_flight_seconds and the
+                                    # shards by split_seconds; it applies only if either is 0
+  proj_flight_seconds: 1.25         # CHARACTER_DETAILS: ~1.25 s to land
   proj_radius: 0.30
   proj_count: 1
   proj_spread_rad: 0.0
-  # The blast is now the LANDING TILE only, down from a 1.5-tile disc: 0.6 is half a tile plus a
-  # little, so a unit whose centre is on the tile the shell lands on is caught and one standing
-  # clear of it is not. The area the old disc used to cover is what the cross replaces.
+  # The blast is the LANDING TILE only: 0.6 is half a tile plus a little, so a unit whose centre
+  # is on the tile the shell lands on is caught and one standing clear of it is not. The cross
+  # below covers the ground around it.
   aoe_radius: 0.6
-  # Four shards along the world axes. As of B1 they deal the shell's FULL damage, not half:
-  # CHARACTER_DETAILS gives Grom "2080 with the main strike and 2080 with any of the split
-  # strikes". 2080 if you are standing where it lands, 2080 if an arm catches you, and never both
-  # -- the shards start beyond the blast rim, so the two regions still do not overlap. The rim
-  # geometry below is what guarantees that and is now load-bearing for a different reason than it
-  # was: it used to prevent 3200+1600 stacking, it now prevents 2080+2080.
+  # Four shards along the world axes, each dealing the shell's FULL damage (CHARACTER_DETAILS.md):
+  # 2080 if you are standing where it lands, 2080 if an arm catches you, and never both -- the
+  # shards start beyond the blast rim, so the two regions do not overlap. The rim geometry below
+  # is what rules out a 2080 + 2080 stack.
   #
   # split_distance is how far a shard FLIES, not how far the cross reaches: it starts at the rim
   # (aoe_radius + unit_radius + proj_radius = 1.3 tiles out) and damages within
@@ -283,28 +252,23 @@ bot_artillery:                      # grounded in GROM (was Dynamike) -- see CHA
   # and spans ~6.4 tip to tip. Raising this to 2.0 (a literal "2 tiles of travel") pushes the
   # reach to 4.0, which is over half of this archetype's own 7.33 attack range from one shell.
   split_distance: 1.2
-  split_damage_fraction: 1.0        # B1 (was 0.5) -- splits deal full damage, see above
+  split_damage_fraction: 1.0        # splits deal full damage, see above
   # Four arms on the world axes. The DIRECTIONS are derived from this count (evenly spaced from
-  # +x, so 4 gives exactly +x/+y/-x/-y), not configured -- see core/projectiles._ring. Previously
-  # hardcoded as SPLIT_DIRS; it became a field when Spike needed a six-arm ring.
+  # +x, so 4 gives exactly +x/+y/-x/-y), not configured -- see core/projectiles._ring.
   split_count: 4
-  # C4: CHARACTER_DETAILS gives the arms "~0.5 seconds to finish their paths". The shard SPEED is
-  # derived (split_distance / split_seconds = 2.4 tiles/s), so this states the duration you can
-  # actually observe rather than a speed someone has to solve for.
-  #
-  # Bigger change than it looks: shards used to fly at proj_speed 6.0 and crossed their 1.2-tile
-  # arm in 4 ticks -- effectively instant, nothing to react to. At 2.4 tiles/s the cross takes 10
-  # ticks to form, so it can be seen and stepped out of. Combined with the arms now dealing FULL
-  # damage (B1), that is the whole shape of Grom: a big, slow, readable threat.
+  # The arms take ~0.5 s to finish their paths (CHARACTER_DETAILS.md). The shard SPEED is derived
+  # (split_distance / split_seconds = 2.4 tiles/s), so this states the duration you can actually
+  # observe rather than a speed someone has to solve for. At that speed the cross takes 10 ticks
+  # to form, so it can be seen and stepped out of. With the arms dealing FULL damage, that is the
+  # whole shape of Grom: a big, slow, readable threat.
   split_seconds: 0.5
-  # --- fire rule (Step E1), formerly bots/artillery.py. NO line-of-sight requirement: an arcing
-  # shell does not need a physical line to land, which is this archetype's whole identity. LOB
-  # scatters the LANDING POINT (aim_noise_tiles) instead of the bearing -- see constants.AimModel.
+  # --- fire rule. NO line-of-sight requirement: an arcing shell does not need a physical line to
+  # land, which is this archetype's whole identity. LOB scatters the LANDING POINT
+  # (aim_noise_tiles) instead of the bearing -- see constants.AimModel.
   fire_needs_los: false
   aim_model: LOB
-  desired_range_fraction: 0.7      # was policy.RANGE_FRACTION_BY_KIND[2]
-  # --- difficulty axes (Phase B). Bases for the per-tier `hero_focus` / `aggression` multipliers
-  # in configs/train.yaml; the glossary at the top of this file says what each drives.
+  desired_range_fraction: 0.7
+  # --- difficulty-axis bases, multiplied per tier by configs/train.yaml (glossary above).
   hero_focus: 0.5
   aggression: 1.0
   aim_noise_tiles: 0.8
@@ -312,48 +276,44 @@ bot_artillery:                      # grounded in GROM (was Dynamike) -- see CHA
   lead_target_fraction: 0.6
   decision_period_ticks: 4
 
-bot_melee:                          # grounded in BUZZ (was El Primo) -- see CHARACTER_DETAILS.md
-  base_hp: 10000                    # unchanged
-  base_damage: 840                  # B1 (was 1500). PER SUB-SWING: Step C2 makes one attack five
-                                    # hitscans, of which at most 3 can connect (max 2520).
-  move_speed: 2.57                  # Speed=770 / 300; not specified for Buzz, kept
-  attack_range: 2.67                # B1 (was 3.00) -- CHARACTER_DETAILS "same range as Mortis",
-                                    # i.e. his dash_distance
-  # --- swept melee (Step C2). Buzz's one attack is FIVE hitscans fanned clockwise across
-  # `attack_cooldown` (1.0 s above), one ammo for the whole sweep.
+bot_melee:                          # BUZZ -- see CHARACTER_DETAILS.md
+  base_hp: 10000
+  base_damage: 840                  # PER SUB-SWING: one attack is five hitscans, of which at
+                                    # most 3 can connect (max 2520).
+  move_speed: 2.57                  # Speed=770 / 300; none is specified for Buzz
+  attack_range: 2.67                # CHARACTER_DETAILS: the same range as Mortis, i.e. his
+                                    # dash_distance
+  # --- swept melee. Buzz's one attack is FIVE hitscans fanned clockwise across
+  # `attack_cooldown` (1.0 s, below), one ammo for the whole sweep.
   #
   # Geometry, and why attack_arc_rad is 0.65: 5 hitscans spanning 70 deg (1.222 rad) leaves 4 gaps,
   # so the spacing is 1.222/4 = 0.3054 rad (17.5 deg). A stationary target at a fixed bearing is
   # caught by every sub-swing whose centre lies within arc/2 of it, i.e. by
   # floor(arc / spacing) + 1 of them. For a maximum of 3 that needs arc >= 2*spacing = 0.611, so
   # 0.65 gives 0.65/0.3054 = 2.13 -> at most 3 connect, with consecutive cones overlapping
-  # slightly. That is exactly CHARACTER_DETAILS' "should overlap slightly, but it is unrealistic
-  # players are hit by more than 3". Max damage for a full sweep: 3 x 840 = 2520.
-  #
-  # Was 0.9 (El Primo's single wide swing) until this step -- narrowing it before the sweep
-  # existed would have been a straight nerf, which is why B1 deliberately left it alone.
+  # slightly: the spec's "should overlap slightly, but it is unrealistic players are hit by more
+  # than 3". Max damage for a full sweep: 3 x 840 = 2520.
   attack_arc_rad: 0.65
   hitscan_count: 5
   hitscan_sweep_rad: 1.222          # 70 degrees, tip to tip
   max_ammo: 3
-  reload_seconds: 1.0               # B1 (was 0.8)
-  # C1 (was 0.30). Buzz's attack is FIVE hitscans over one second, and this timer IS that second:
-  # Step C2 clocks the sub-swings off it (elapsed = attack_cooldown - ent_attack_cd). One ammo
-  # buys the whole sweep. By far the largest cooldown in the roster, and the one place where the
-  # "no attack, no reload" rule really bites -- Buzz pays 1.0 s of frozen reload per swing, which
-  # is what makes a five-hitscan attack a genuine commitment rather than free damage.
+  reload_seconds: 1.0
+  # Buzz's attack is FIVE hitscans over one second, and this timer IS that second:
+  # core/melee_sweep.py clocks the sub-swings off it (elapsed = attack_cooldown - ent_attack_cd).
+  # One ammo buys the whole sweep. By far the largest cooldown in the roster, and the one place
+  # where the "no attack, no reload" rule really bites -- Buzz pays 1.0 s of frozen reload per
+  # swing, which is what makes a five-hitscan attack a genuine commitment rather than free damage.
   attack_cooldown: 1.00
   proj_kind: NONE
-  # --- fire rule (Step E1), formerly bots/melee.py. The cone gate is NOT a field here: it is
-  # `attack_arc_rad > 0` above, which is already how the rest of the sim identifies a cone
-  # swinger. No LOS gate either -- combat.melee_hitscan marches its own per-victim ray in phase 6,
-  # so requiring it here would pay for the same answer twice. DIRECT because a hitscan has nothing
-  # in flight to lead; Buzz's damage never reads these aim outputs at all.
+  # --- fire rule. The cone gate is NOT a field here: it is `attack_arc_rad > 0` above, which is
+  # already how the rest of the sim identifies a cone swinger. No LOS gate either --
+  # combat.melee_hitscan marches its own per-victim ray in phase 6, so requiring it here would pay
+  # for the same answer twice. DIRECT because a hitscan has nothing in flight to lead; Buzz's
+  # damage never reads these aim outputs at all.
   fire_needs_los: false
   aim_model: DIRECT
-  desired_range_fraction: 0.5      # was policy.RANGE_FRACTION_BY_KIND[3]
-  # --- difficulty axes (Phase B). Bases for the per-tier `hero_focus` / `aggression` multipliers
-  # in configs/train.yaml; the glossary at the top of this file says what each drives.
+  desired_range_fraction: 0.5
+  # --- difficulty-axis bases, multiplied per tier by configs/train.yaml (glossary above).
   hero_focus: 0.5
   aggression: 1.0
   aim_noise_std_rad: 0.10
@@ -361,41 +321,38 @@ bot_melee:                          # grounded in BUZZ (was El Primo) -- see CHA
   lead_target_fraction: 0.0
   decision_period_ticks: 2
 
-bot_rifle:                          # grounded in SHELLY (was Bo) -- see CHARACTER_DETAILS.md
-  base_hp: 7800                     # B1 (was 7600)
-  base_damage: 600                  # B1 (was 1280). PER PELLET; Step B2 raises proj_count 3 -> 5.
+bot_rifle:                          # SHELLY -- see CHARACTER_DETAILS.md
+  base_hp: 7800
+  base_damage: 600                  # PER PELLET, five pellets a blast (proj_count)
   move_speed: 2.40                  # Speed=720 / 300
-  attack_range: 8.0                 # B1 (was 8.67) -- CHARACTER_DETAILS "8 tiles"
+  attack_range: 8.0                 # CHARACTER_DETAILS: 8 tiles
   max_ammo: 3
-  reload_seconds: 1.75              # B1 (was 1.7)
-  attack_cooldown: 0.25             # C1 (was 0.40) -- the floor.
+  reload_seconds: 1.75
+  attack_cooldown: 0.25             # the floor
   proj_kind: RIFLE_ARROW
-  proj_speed: 6.4                   # B1 (was 9.0) -- 8 tiles / 1.25 s travel time
+  proj_speed: 6.4                   # 8 tiles / 1.25 s travel time
   proj_radius: 0.30
-  proj_count: 5                     # B2 (was 3) -- Shelly's shotgun blast
+  proj_count: 5                     # Shelly's shotgun blast
   # RADIANS, and it is the TOTAL span, not the half-angle: core/projectiles.spawn_volley lays the
-  # pellets from -spread/2 to +spread/2. 0.6 rad is therefore **34.4 degrees tip to tip**
-  # (+-17.2 deg), NOT the 60 degrees the comment here and CHARACTER_DETAILS.md both used to claim
-  # -- that was the number 0.6 misread as a degree figure. Hand-tuned to this value; the docs were
-  # never corrected to follow.
+  # pellets from -spread/2 to +spread/2, so 0.6 rad is 34.4 degrees tip to tip (+-17.2 deg).
+  # Hand-tuned to this value.
   proj_spread_rad: 0.6
   aoe_radius: 0.0
-  # --- fire rule (Step E1), formerly bots/rifle.py -- the only kind that uses all five fields.
-  # Both hold-fire rules exist because a 5-pellet fan misses a target it is not nearly on top of:
-  # past 0.9 of her range the pellets have spread wide enough that a small sidestep clears the
-  # cluster, and past 0.6 of it a target crossing faster than 2 tiles/s slips out of it during the
-  # ~1.25 s flight. Inside 0.6 the fan is tight enough to land on a mover anyway, which is what the
-  # second fraction encodes. Note these are AI heuristics about hitting a MOVING target, not a
-  # geometric claim about the fan: at 8 tiles the pellets are 1.18 tiles apart and each covers 1.40,
-  # so the fan is still continuous -- it is the target's movement that beats it, not a hole in it.
+  # --- fire rule. Both hold-fire rules exist because a 5-pellet fan misses a target it is not
+  # nearly on top of: past 0.9 of her range the pellets have spread wide enough that a small
+  # sidestep clears the cluster, and past 0.6 of it a target crossing faster than 2 tiles/s slips
+  # out of it during the ~1.25 s flight. Inside 0.6 the fan is tight enough to land on a mover
+  # anyway, which is what the second fraction encodes. Note these are AI heuristics about hitting
+  # a MOVING target, not a geometric claim about the fan: at 8 tiles the pellets are 1.18 tiles
+  # apart and each covers 1.40, so the fan is still continuous -- it is the target's movement that
+  # beats it, not a hole in it.
   fire_needs_los: true
   fire_range_fraction: 0.9
   fire_lateral_speed_limit: 2.0
   fire_lateral_hold_range_fraction: 0.6
   aim_model: LEAD
-  desired_range_fraction: 0.75     # was policy.RANGE_FRACTION_BY_KIND[4]
-  # --- difficulty axes (Phase B). Bases for the per-tier `hero_focus` / `aggression` multipliers
-  # in configs/train.yaml; the glossary at the top of this file says what each drives.
+  desired_range_fraction: 0.75
+  # --- difficulty-axis bases, multiplied per tier by configs/train.yaml (glossary above).
   hero_focus: 0.5
   aggression: 1.0
   aim_noise_std_rad: 0.08
@@ -407,7 +364,7 @@ bot_edgar:                          # EDGAR -- named for the brawler, not a role
   base_hp: 7400
   base_damage: 1080                 # PER HIT. His attack is two of them, so a full combo is 2160.
   move_speed: 2.73                  # "equal to Mortis" -- hero_mortis.move_speed exactly
-  attack_range: 2.00                # very short: below Buzz's 2.67, the shortest reach in the roster
+  attack_range: 2.00                # below Buzz's 2.67: the shortest reach in the roster
   # --- the two-hit combo (core/melee_sweep.py). One ammo buys BOTH hits.
   #
   # `hitscan_count: 2` over `attack_cooldown: 0.50` gives melee_sweep an interval of
@@ -421,9 +378,6 @@ bot_edgar:                          # EDGAR -- named for the brawler, not a role
   # and `core/movement.apply_movement` freezes facing for the duration of any swept attack
   # (`is_swept` is `hitscan_count > 1`, which Edgar satisfies), so that facing is the one he
   # triggered with even though he keeps walking through the combo.
-  #
-  # config.validate used to REJECT this exact pairing; see the comment there for why Edgar
-  # retired that check rather than working around it.
   attack_arc_rad: 0.50              # ~29 deg total. A focused forward slash, not Buzz's 70-deg fan
   hitscan_count: 2
   hitscan_sweep_rad: 0.0
@@ -439,13 +393,12 @@ bot_edgar:                          # EDGAR -- named for the brawler, not a role
   reload_seconds: 1.25
   attack_cooldown: 0.50             # the animation; also the clock melee_sweep runs the combo off
   proj_kind: NONE
-  # --- fire rule (Step E1), same shape as bot_melee: the cone gate is `attack_arc_rad > 0`, and
-  # there is no LOS gate because combat.melee_hitscan marches its own per-victim ray in phase 6.
+  # --- fire rule, the same shape as bot_melee's: the cone gate is `attack_arc_rad > 0`, and there
+  # is no LOS gate because combat.melee_hitscan marches its own per-victim ray in phase 6.
   fire_needs_los: false
   aim_model: DIRECT
   desired_range_fraction: 0.5
-  # --- difficulty axes (Phase B). Bases for the per-tier `hero_focus` / `aggression` multipliers
-  # in configs/train.yaml; the glossary at the top of this file says what each drives.
+  # --- difficulty-axis bases, multiplied per tier by configs/train.yaml (glossary above).
   hero_focus: 0.5
   aggression: 1.0
   aim_noise_std_rad: 0.10
@@ -469,7 +422,7 @@ bot_spike:                          # SPIKE -- named for the brawler, not a role
   attack_range: 8.0
   max_ammo: 3
   reload_seconds: 2.25
-  attack_cooldown: 0.25             # C1 floor. His 1.5 s shell travel is proj_speed, not a cooldown.
+  attack_cooldown: 0.25             # the floor; his 1.5 s shell travel is proj_speed
   proj_kind: SPIKE_SHELL
   # --- the shell. ProjClass.ARTILLERY (proj_kind ARTILLERY_SHELL is not the only trigger -- see
   # core/projectiles.spawn_volley), so it deals NO damage in flight and resolves at its landing
@@ -478,8 +431,8 @@ bot_spike:                          # SPIKE -- named for the brawler, not a role
   #
   # CONSTANT SPEED, not a timed lob: "a standard slow moving projectile (similar to Brock's)" with
   # "around 1.5 seconds to fire its full distance" is 8 / 1.5 = 5.33 tiles/s, which is exactly
-  # Brock's rocket speed. proj_flight_seconds is therefore left at 0 -- setting it would give Grom's
-  # behavior instead, where a point-blank throw takes the same 1.5 s as a max-range one.
+  # Brock's rocket speed. proj_flight_seconds is therefore left at 0 -- setting it would give
+  # Grom's behavior instead, where a point-blank throw takes the same 1.5 s as a max-range one.
   proj_speed: 5.33
   proj_radius: 0.30
   proj_count: 1
@@ -511,7 +464,7 @@ bot_spike:                          # SPIKE -- named for the brawler, not a role
   split_distance: 4.0
   split_seconds: 0.6                # shard speed is derived: 4.0 / 0.6 = 6.67 tiles/s
   split_damage_fraction: 1.0        # each spike deals the shell's full 1080
-  # --- fire rule (Step E1). LOB, like Grom: the payload is an area landing on a point, so a miss
+  # --- fire rule. LOB, like Grom: the payload is an area landing on a point, so a miss
   # physically means a scattered LANDING POINT (aim_noise_tiles), not a scattered bearing.
   #
   # fire_needs_los: true is the one place this block deliberately differs from Grom, who has it
@@ -524,8 +477,7 @@ bot_spike:                          # SPIKE -- named for the brawler, not a role
   fire_needs_los: true
   aim_model: LOB
   desired_range_fraction: 0.75
-  # --- difficulty axes (Phase B). Bases for the per-tier `hero_focus` / `aggression` multipliers
-  # in configs/train.yaml; the glossary at the top of this file says what each drives.
+  # --- difficulty-axis bases, multiplied per tier by configs/train.yaml (glossary above).
   hero_focus: 0.5
   aggression: 1.0
   # Non-zero for a LOB kind is not optional decoration. With no positional noise a bot aims at a
@@ -540,8 +492,8 @@ bot_spike:                          # SPIKE -- named for the brawler, not a role
 bot_bull:                           # BULL -- named for the brawler, not a role (constants.Kind)
   base_hp: 10000                    # ties Buzz for the tankiest frame in the roster
   base_damage: 880                  # PER PELLET. Five of them, so a point-blank volley is 4400.
-  # Speed=650 / 300 -- the SLOW tier, one full step below Shelly's NORMAL 720 (2.40). Confirmed by
-  # the repo owner as Bull's real tier, so this is an ordinary CSV conversion like every other
+  # Speed=650 / 300 -- the SLOW tier, one full step below Shelly's NORMAL 720 (2.40). The user
+  # confirmed it as Bull's real tier, so this is an ordinary CSV conversion like every other
   # move_speed in the file, not a hand-picked "slightly slower" figure.
   #
   # It is the slowest brawler in the roster, and that is the counterweight to the block above: 4400
@@ -552,7 +504,7 @@ bot_bull:                           # BULL -- named for the brawler, not a role 
   attack_range: 7.0                 # "1 tile shorter range" than Shelly's 8.0
   max_ammo: 3
   reload_seconds: 2.0               # "reloads 1 ammo every 2 seconds"
-  attack_cooldown: 0.25             # the C1 floor, same as Shelly
+  attack_cooldown: 0.25             # the floor, same as Shelly
   proj_kind: BULL_SLUG
   # Same pellet physics as Shelly (constant-speed PROJECTILE class, dies on the first thing it
   # touches) at the same speed, so his shorter range also means a shorter time to target:
@@ -567,9 +519,9 @@ bot_bull:                           # BULL -- named for the brawler, not a role 
   # overlaps more heavily than hers over its whole length. A tighter, shorter, harder-hitting cone.
   proj_spread_rad: 0.5
   aoe_radius: 0.0
-  # --- fire rule (Step E1), the same shape as Shelly's: a shotgun bot wants a physical line, and
-  # holds fire when the fan cannot be trusted to land on a mover. The thresholds are hers unchanged
-  # -- his tighter fan makes them, if anything, conservative, and matching them keeps the one real
+  # --- fire rule, the same shape as Shelly's: a shotgun bot wants a physical line, and holds fire
+  # when the fan cannot be trusted to land on a mover. The thresholds are hers unchanged -- his
+  # tighter fan makes them, if anything, conservative, and matching them keeps the one real
   # difference between the two bots their STATS rather than a second set of hand-tuned heuristics.
   fire_needs_los: true
   fire_range_fraction: 0.9
@@ -580,8 +532,7 @@ bot_bull:                           # BULL -- named for the brawler, not a role 
   # brawler fighting at the edge of its reach with the weakest per-pellet spread it has; 0.6 puts
   # him at 4.2 tiles, where enough of the fan connects to justify the health he is spending.
   desired_range_fraction: 0.6
-  # --- difficulty axes (Phase B). Bases for the per-tier `hero_focus` / `aggression` multipliers
-  # in configs/train.yaml; the glossary at the top of this file says what each drives.
+  # --- difficulty-axis bases, multiplied per tier by configs/train.yaml (glossary above).
   hero_focus: 0.5
   aggression: 1.0
   aim_noise_std_rad: 0.08

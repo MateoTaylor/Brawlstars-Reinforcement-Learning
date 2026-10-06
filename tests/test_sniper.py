@@ -1,6 +1,5 @@
-"""Sniper archetype tests. After Step 41's combat/movement split this file covers FIRE and AIM
-only; the movement behaviors Step 17 originally put in sniper.policy (hold 0.85 of attack_range,
-drift toward bushes when idle, flee below 40% HP) are now personality behaviors and are tested in
+"""Sniper archetype tests: FIRE and AIM only. Movement (holding range, drifting toward bushes
+when idle, fleeing at low HP) is personality behavior and is tested in
 tests/test_personality.py -- the range-holding one as KITE, the bush one as CAMPER/TRAPPER.
 """
 import torch
@@ -13,8 +12,7 @@ from brawl_sim.core import combat, geometry as geo, hero, movement, projectiles,
 
 def _run_tick(state, bank, params, cfg, gen, hero_moves=False, hero_fires=False):
     """One manual tick driven by the REAL dispatcher (policy.all_bot_intents), which already
-    zeroes entity 0's intent itself -- before Step 41 this helper had to mimic that rule by hand
-    because the dispatcher didn't exist when Step 17 was written."""
+    zeroes entity 0's intent itself."""
     intent = policy.all_bot_intents(state, _vis(state, bank, params, cfg), bank, params, cfg, gen)
 
     move_dir = intent.move_dir.clone()
@@ -33,7 +31,7 @@ def _run_tick(state, bank, params, cfg, gen, hero_moves=False, hero_fires=False)
     dmg_ent, _dmg_by, _dmg_box, _heal, _charge = projectiles.step_projectiles(state, bank, params, cfg)
     attacker = torch.ones_like(state.ent_last_hit_by)  # only entity 1 ever fires here
     combat.apply_damage(state, dmg_ent, int(DeathCause.COMBAT), attacker, params, cfg)
-    # Section 4 phase 15. Not optional: all_bot_intents' decision-period gate is
+    # Tick phase 15. Not optional: all_bot_intents' decision-period gate is
     # `(step_count + entity_index) % decision_period == 0`, so a step_count frozen at 0 lets
     # entity 1 fire only if its own period happens to divide 1 -- with bot_sniper's period of 4
     # it would never fire at all, and every acceptance test below would fail for a reason that
@@ -60,7 +58,7 @@ def test_fire_requires_los_even_though_target_is_visible():
     state.ent_pos[0, 1] = torch.tensor([9.5, 10.5])
 
     _vis_m, tgt = build_targeting(state, bank, params, cfg)
-    assert state.ent_target[0, 1].item() == 0  # targeting ignores the wall (Notice 4)
+    assert state.ent_target[0, 1].item() == 0  # targeting ignores the wall
 
     fire, _aim_dir, _aim_point = combat_rules.combat(state, tgt, bank, params, cfg, gen)
     assert not bool(fire[0, 1])  # but firing needs a real physical shot
@@ -109,9 +107,8 @@ def test_no_nan_in_combat_output_ever():
 # ---- full-loop acceptance ----------------------------------------------------------
 
 def test_kiting_sniper_reaches_and_holds_range_and_lands_a_hit():
-    """The Step 17 acceptance test, re-expressed: range-holding is now the KITE personality's
-    job, and the sniper's own preferred fraction of its range comes from the per-kind
-    `desired_range_fraction` param (Step E1; it was policy.RANGE_FRACTION_BY_KIND)."""
+    """Range-holding is the KITE personality's job, and the sniper's own preferred fraction of
+    its range comes from the per-kind `desired_range_fraction` param."""
     cfg, params, gen = cfg_and_params(n_enemies=1)
     state = fresh_state(cfg, params, person=Person.KITE)
     bank = FakeBank(grid(20, 20))
@@ -134,7 +131,7 @@ def test_kiting_sniper_reaches_and_holds_range_and_lands_a_hit():
             hit_tick = step
         if step == 149:
             dist = geo.dist(state.ent_pos[0, 0], state.ent_pos[0, 1]).item()
-            # Wider tolerance than Step 17's +-0.5: the KITE blend also carries a strafe term, so
+            # 2.0 tiles past the deadband: the KITE blend also carries a strafe term, so
             # the bot orbits the ideal radius instead of parking exactly on it.
             assert (desired - deadband - 2.0) <= dist <= (desired + deadband + 2.0)
 

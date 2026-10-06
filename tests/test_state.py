@@ -51,7 +51,7 @@ def test_allocate_shapes_and_dtypes():
     assert state.ent_kills.dtype == torch.int32
     assert state.ent_gadget_cd.shape == (N, E) and state.ent_gadget_cd.dtype == torch.float32
 
-    # observation history rings (Phase H), K = cfg.history_frames deep
+    # observation history rings, K = cfg.history_frames deep
     K = cfg.history_frames
     assert state.hist_valid.shape == (N, K) and state.hist_valid.dtype == torch.bool
     assert state.hist_action.shape == (N, K, 2) and state.hist_action.dtype == torch.int64
@@ -221,6 +221,19 @@ def test_check_invariants_catches_dead_with_nonzero_hp():
         check_invariants(state, cfg, params)
 
 
+def test_check_invariants_catches_two_alive_boxes_on_one_tile():
+    """projectiles._box_grid keeps ONE alive box per tile, so a second one
+    on the same tile would be invisible to every projectile. A dead box may sit anywhere."""
+    cfg, state, params = _valid_state_and_params()
+    state.box_pos[0, 0] = torch.tensor([10.2, 7.9])
+    state.box_pos[0, 1] = torch.tensor([10.8, 7.1])  # both on tile (10, 7)
+    state.box_alive[0, :2] = True
+    with pytest.raises(ValueError, match="share a tile"):
+        check_invariants(state, cfg, params)
+    state.box_alive[0, 1] = False
+    check_invariants(state, cfg, params)  # must not raise
+
+
 def test_check_invariants_catches_cubes_over_max():
     cfg, state, params = _valid_state_and_params()
     state.ent_cubes[0, 0] = int(params.max_cubes[0].item()) + 5
@@ -237,7 +250,7 @@ def test_check_invariants_catches_dash_t_over_duration():
 
 
 def test_check_invariants_catches_a_gadget_cooldown_outside_its_range():
-    """Step G1.4: ent_gadget_cd is a countdown that only hero.tick_timers (clamped at 0) and the
+    """ent_gadget_cd is a countdown that only hero.tick_timers (clamped at 0) and the
     gadget fire path (set to the kind's gadget_cooldown) write, so a fresh state -- all 0, i.e.
     ready -- passes, and either bound failing means a third writer exists."""
     cfg, state, params = _valid_state_and_params()
@@ -282,7 +295,7 @@ def test_snapshot_returns_cpu_numpy_for_one_env():
 
 
 def test_snapshot_is_a_real_copy_not_a_view_on_cpu():
-    """Regression test (found by scripts/record_rollout.py, Step 37): on a CPU-device state,
+    """Regression test (found by scripts/record_rollout.py): on a CPU-device state,
     `.cpu()` is a no-op and `.numpy()` shares memory with the live tensor -- without an explicit
     `.copy()`, a snapshot taken before a later in-place mutation would silently change value
     underneath the caller. This is exactly the bug: take two snapshots, mutate state in between,

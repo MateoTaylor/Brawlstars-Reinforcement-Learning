@@ -1,62 +1,32 @@
-"""The full, unredacted observation package: everything the sim knows, before any fairness
-gating (Phase J / `obs_select.py`) trims it down for the agent. See BRAWL_SIM_BUILD_PLAN.md
-Step 25.
+"""The full, unredacted observation: everything the sim knows, before `obs_select.py` trims it
+to the agent's fair view. Deployment (`brawl_deployment/perception/assemble.py`) builds a
+minimal copy of this dict live and hands it to the same `obs_select.build_agent_obs`, so what a
+field means here is also a contract with deployment.
 
-Layering note (same discipline as `core/zone.py`, Step 23, and `core/spawn.py`, Step 24): this
-module never imports `bots/`. `vis` (`bots/perception.visibility`) and `raw_los`
-(`bots/perception.raw_los`) are precomputed by the caller -- the future `env.py` step loop,
-Section 4 phase 16, which already needs both for bot targeting earlier in the same tick -- and
-handed in as plain tensors. The only two pieces of `bots/perception.py` this module would
-otherwise need are `in_bush` and `team_id`, and both are cheap enough to inline locally rather
-than cross the layering boundary: `team_id` is a one-line `kind.clone()` (Solo Showdown is FFA,
-so "team" is inert forward-compat infrastructure, per `perception.team_id`'s own docstring);
-`_in_bush` below is the same 5-line tile lookup as `perception.in_bush`, duplicated for the same
-reason `core/zone.py`'s `_outside_rect` duplicates `perception.in_zone`'s predicate.
+This module never imports `bots/`: the caller (`env._build_observation`) precomputes `vis`
+(`bots/perception.visibility`) and `raw_los` (`bots/perception.raw_los`) and hands them in, and
+`_in_bush` duplicates `perception.in_bush`. `entities.team` is `ent_kind` cloned, an inert
+placeholder (Solo Showdown is free-for-all). `rank` is not stored: `compute_rank` derives it
+from `ent_alive`/`ent_death_step` each call.
 
-`rank` is NOT a stored state field. Section 4's phase-13 pseudocode ("death resolution ... record
-rank + cause") predates `combat.py` (Step 14), whose actual `resolve_deaths` never grew a rank
-field -- there's no `ent_rank` anywhere in `SimState`. Rather than retrofit Step 14 to store one
-(a schema change to already-tested, already-shipped code, for a value that's fully recoverable
-from fields it already writes), `compute_rank` below derives it live every call from
-`ent_alive`/`ent_death_step`. See its own docstring for the exact tie-breaking rule (and, as of
-Step 27, for the 1-indexed-vs-0-indexed footgun between here and `core/events.py`).
+`_build_grid` rasterizes both `obs["view"]` (the hero-centred `view_h x view_w` crop) and
+`obs["world"]` (origin (0, 0), the whole map). Channels, named in `obs_select._CHANNEL_INDEX`:
+0-3 terrain, 4 the zone (`zone.zone_grid`), 5-11 occupancy counts, then one enemy_hist plane per
+history slot. Terrain reads the PADDED bank tensors with a `+ pad_h`/`+ pad_w` index shift,
+which for the world grid lands exactly on the unpadded map, so one indexing path serves both.
+Counts accumulate in int32 (uint8 has no atomic-add guarantee) and are clamped to [0, 255] on
+the cast to uint8. brawl_deployment/perception/grid.py restates `_view_origin`, these channel
+rules and `_history_drawn`: change them together.
 
-View/world grid unification: `_build_grid` is the one (12 + `history_frames`)-channel
-rasterizer for BOTH
-`obs["view"]` (egocentric, hero-centered, `view_h x view_w`) and `obs["world"]`
-(`origin=(0,0)`, the full map) -- "the same rasterization either way, just a different window",
-exactly the pattern `core/zone.py`'s `zone_grid` (Step 23) already established and that this
-module reuses directly for channel 4. Terrain channels 0-3 always read the PADDED bank tensors
-(`bank.pad_*`, Step 6) with a `+ pad_h`/`+ pad_w` index shift regardless of which grid is being
-built: for `obs["world"]` this shift lands exactly back on the unpadded region (Step 6's own
-`test_build_map_bank_padded_shape_and_blocking` already established
-`pad_tiles[:, pad_h:-pad_h, pad_w:-pad_w] == tiles`), so one indexing path serves both without
-a branch. Occupancy channels 5-11, and the history planes after them, accumulate into a
-separate int32 buffer via `index_put_(accumulate=True)` (uint8 has no atomic-add guarantee)
-and are clamped into `[0, 255]` only at the very end when cast down to the `uint8` the plan
-specifies.
+History: `obs["hist"]` and the enemy_hist planes read core/history.py's rings, newest first.
+Slot k is the observation k+1 decisions back plus the action that answered it; its plane is
+`enemy_hist{k+1}`. Every `hist` field is 0 where `hist.valid` is False: an empty slot's action
+(0, 0) is a real "idle, no attack", so the mask alone tells "no history" from "stood still". The
+enemy_hist planes draw past sightings at their world position in the CURRENT window, with no
+re-centring, and only within `cfg.history_radius_tiles` of the hero's current tile.
 
-History (SIM_OVERHAUL_PLAN.md Phase H, Step H2): `obs["hist"]` and the grid's last
-`cfg.history_frames` channels read core/history.py's rings back, newest first. The rings are
-written at the top of `env.step`, so slot k of an observation is the observation k+1 decisions
-back plus the action that answered it, and the grid names its plane `enemy_hist{k+1}`. Every
-`hist` field is 0 where `hist.valid` is False: an empty slot holds action (0, 0), a real "idle,
-no attack", so the mask is the only thing telling "no history" from "stood still". The
-enemy_hist planes draw past sightings (`hist_enemy_seen`: alive and revealed to the hero back
-then) at their world position in the CURRENT window, with no re-centering, and only within
-`cfg.history_radius_tiles` of the hero's current tile -- see `_history_drawn`.
-
-`build_obs` is a plain function, not a class with buffers preallocated in `__init__`, despite
-the step text's "preallocate every output buffer in `__init__`; `build_obs` allocates nothing"
-line. Every other hot-path module in this codebase (`movement.apply_movement`,
-`combat.melee_hitscan`, `projectiles.step_projectiles`, ...) is a plain function that allocates
-fresh intermediates every call, and "allocates nothing" has consistently meant "steady-state
-resident memory doesn't grow" (verified via memory-delta, not literal zero `torch.zeros` calls)
-ever since Step 21's stricter check established that reading of the phrase. A class that owns
-persistent, in-place-written buffers would matter for `torch.compile`'s cudagraph mode (Step
-31), but nothing before that step needs it, and no other module through Step 24 introduced one
-either -- so this keeps the same shape as its neighbors and defers the buffer-owning class to
-whichever step actually wires up `torch.compile`.
+Many fields are views of `state`'s tensors, so an observation is valid only until the next
+`step()`/`reset()`; `clone_obs` keeps one.
 """
 import torch
 
@@ -68,12 +38,11 @@ from . import stats
 from . import terrain
 from . import zone as zone_mod
 
-_HERO = 0  # entity slot 0 is always the hero (Section 2's "Shapes" rule)
+_HERO = 0  # entity slot 0 is always the hero
 _EPS = 1e-6
 _ARTILLERY = int(ProjClass.ARTILLERY)
-# `_build_grid`'s fixed channels: terrain 0-4 and occupancy 5-11. One enemy_hist plane per
-# history slot follows (Phase H), so a grid has _N_BASE_CHANNELS + cfg.history_frames channels.
-# obs_schema's "C" dim and obs_select._CHANNEL_INDEX restate the 12.
+# `_build_grid`'s fixed channels (terrain and zone 0-4, occupancy 5-11); one enemy_hist plane
+# per history slot follows. obs_schema's "C" dim and obs_select._CHANNEL_INDEX restate the 12.
 _N_BASE_CHANNELS = 12
 
 
@@ -88,17 +57,12 @@ def _in_bush(state, bank) -> torch.Tensor:
 
 
 def compute_rank(alive: torch.Tensor, death_step: torch.Tensor) -> torch.Tensor:
-    """(N,E) i64, 1-INDEXED placement (1 = best). Every currently-alive entity ties at
-    `rank == n_alive` (their eventual finishing order isn't decided until they die, so they're
-    all still "in the running" for any of the top spots). A dead entity's rank is fixed at
-    1 + however many entities ended up outliving it: everyone still alive now, plus anyone who
-    died later (higher death_step). See module docstring for why this is computed live rather
-    than stored.
+    """(N,E) i64, 1-INDEXED placement (1 = best). Every alive entity ties at `rank == n_alive`
+    (its finishing order is not decided yet); a dead one's rank is 1 + the entities that
+    outlived it: everyone alive now, plus anyone with a later death_step.
 
-    Public (promoted on its second use, same pattern as zone.current_dps): core/events.py
-    (Step 27) reuses this for info["hero_rank"] -- 0-INDEXED there (0 = winner) per that step's
-    own acceptance text, so that call site subtracts 1. Two different indexing conventions on
-    the same underlying number is a real footgun; both call sites say so."""
+    core/events.py reuses this for info["hero_rank"], which is 0-INDEXED (0 = winner), so that
+    call site subtracts 1."""
     E = alive.shape[1]
     alive_i = alive.unsqueeze(2)   # (N,E,1)
     alive_j = alive.unsqueeze(1)   # (N,1,E)
@@ -149,7 +113,8 @@ def _scatter_count(
 
 def _onehot(index: torch.Tensor, width: int, valid: torch.Tensor) -> torch.Tensor:
     """(..., width) uint8 one-hot of `index`, zeroed where `valid` is False. By comparison with
-    an arange, so the mask folds into the same expression and nothing can raise on the index."""
+    an arange, so the mask folds into the same expression and nothing can raise on the index.
+    brawl_deployment/perception/assemble.py imports it."""
     hot = index.unsqueeze(-1) == torch.arange(width, device=index.device)
     return (hot & valid.unsqueeze(-1)).to(torch.uint8)
 
@@ -217,31 +182,26 @@ def _build_grid(state, bank, hero_view: torch.Tensor, cfg, origin: torch.Tensor,
 
 
 def clone_obs(node):
-    """Recursively `.clone()`s every tensor leaf, preserving dict structure. `build_obs`'s
-    fields are views/direct references into `state`'s own tensors (zero-copy, matching every
-    other hot-path function's "mutate in place" style, Step 25) -- fine for the routinely
-    returned per-step observation, which is documented as valid only until the next `step()`/
-    `reset()` call (Step 29), but NOT fine for anything that must survive a LATER in-place
-    mutation of `state` within that same call, such as `env.py`'s `info["final_observation"]`/
-    `info["final_info"]`: autoreset's `spawn.reset_envs` mutates `state` in place moments after
-    the "final" obs/info is captured, which would otherwise retroactively corrupt it with the
-    fresh post-reset values instead of the episode's actual last tick (a real bug this exact
-    function was added to fix, not a hypothetical one). Also handles `compute_info`'s output
-    (a flat dict, not nested) identically -- the recursion just bottoms out one level sooner."""
+    """Recursively `.clone()`s every tensor leaf, keeping the dict structure (`compute_info`'s
+    flat dict too). `build_obs`'s fields are views of `state`, so anything that must outlive a
+    later in-place mutation needs a clone: env.py's `info["final_observation"]`/
+    `info["final_info"]`, which autoreset's `spawn.reset_envs` would otherwise overwrite with
+    post-reset values."""
     if isinstance(node, dict):
         return {key: clone_obs(value) for key, value in node.items()}
     return node.clone()
 
 
-def build_obs(state, bank, vis: torch.Tensor, raw_los: torch.Tensor, params, cfg,
+def build_obs(state, bank, vis: torch.Tensor, raw_los: torch.Tensor | None, params, cfg,
               hero_view: torch.Tensor | None = None) -> dict:
-    """Returns the full nested-dict observation (D08/N12) -- every entity/projectile/box/
-    pickup, always present, index-stable, never masked. `vis`/`raw_los`: (N,E,E) bool,
-    precomputed by the caller (see module docstring). `hero_view`: (N,E) bool, what the hero's
-    observation may show -- `vis`'s hero row AND the camera window (`core/camera.hero_view`,
-    OBS_PARITY_PLAN.md §2); computed here when the caller has not (the env passes the one it
-    stashed for `history.push`). Every hero-side reveal field reads it; `hero_revealed_to`
-    stays on `vis`, being what the bots see."""
+    """The full nested-dict observation: every entity/projectile/box/pickup, always present,
+    index-stable, never masked. `vis`/`raw_los`: (N,E,E) bool, precomputed by the caller;
+    `raw_los` is read only under `cfg.obs_include_raw_los` (it feeds `entities.los_from_hero`
+    and `visibility.los`) and may be None otherwise. `hero_view`: (N,E) bool, what the hero's
+    observation may show -- `vis`'s hero row AND the camera window (`core/camera.hero_view`);
+    computed here when the caller passes None (the env passes the one it stashed for
+    `history.push`). Every hero-side reveal field reads it; `hero_revealed_to` stays on `vis`,
+    being what the bots see."""
     N, E = state.ent_pos.shape[:2]
     if hero_view is None:
         hero_view = camera.hero_view(state, vis, cfg)
@@ -269,14 +229,13 @@ def build_obs(state, bank, vis: torch.Tensor, raw_los: torch.Tensor, params, cfg
     super_frac_all = hero_mod.super_charge_frac(state, params)
     long_dash_ready_all = hero_mod.long_dash_ready(state, params)
     long_dash_frac_all = hero_mod.long_dash_charge_frac(state, params)
-    # The mask's own predicate (G3), so `hero.gadget_ready` IS `action_mask.attack[:, 3]`.
+    # The mask's own predicate, so `hero.gadget_ready` IS `action_mask.attack[:, 3]`.
     gadget_ready_all = hero_mod.gadget_ready(state, params)
     gadget_frac_all = hero_mod.gadget_charge_frac(state, params)
     rank_all = compute_rank(state.ent_alive, state.ent_death_step)
 
     revealed_to_hero = hero_view  # hero sees j: concealment AND on screen
     hero_revealed_to = vis[:, :, _HERO]  # j sees hero
-    los_from_hero = raw_los[:, _HERO, :]
     hidden_by_bush = in_bush_all & ~revealed_to_hero
 
     view_origin = _view_origin(state, cfg)             # the grid crop, hero-centred
@@ -319,9 +278,9 @@ def build_obs(state, bank, vis: torch.Tensor, raw_los: torch.Tensor, params, cfg
         "invuln": state.ent_invuln_t[:, _HERO] > 0,
         "in_bush": in_bush_all[:, _HERO],
         "in_zone": in_zone_all[:, _HERO],
-        # The camera has stopped following the hero (it is within the clamp onset of a map
-        # edge), by more than `camera.edge_flag_tiles` on either axis. Live: the player box's
-        # offset from its nominal screen anchor (OBS_PARITY_TASKS.md C6/C7).
+        # The camera has stopped following the hero (near a map edge) by more than
+        # `camera.edge_flag_tiles` on either axis. Live, `assemble._near_edge` thresholds the
+        # player box's offset from its nominal screen anchor at the same cfg number.
         "near_edge": (hero_pos - cam).abs().amax(-1) > cfg.camera_edge_flag_tiles,
         "tile": torch.stack(terrain.to_tile(hero_pos), dim=-1),
         "damage_dealt": state.ent_damage_dealt[:, _HERO],
@@ -331,10 +290,11 @@ def build_obs(state, bank, vis: torch.Tensor, raw_los: torch.Tensor, params, cfg
         "rank": rank_all[:, _HERO],
     }
 
-    # ---- hist: the last K decisions, newest first (Phase H; see module docstring) ----
+    # ---- hist: the last K decisions, newest first (see module docstring) ----
     # Masked field by field: an empty slot's action (0, 0) would one-hot as "idle, no attack"
     # and its zero position would read as a displacement of -hero.pos. hp and ammo are already
     # 0 there (state.zero_), and are masked anyway so the contract does not rest on that.
+    # `assemble._put_history` repeats these expressions: change both together.
     valid = state.hist_valid
     n_move, n_attack = cfg.action_nvec
     obs["hist"] = {
@@ -391,7 +351,7 @@ def build_obs(state, bank, vis: torch.Tensor, raw_los: torch.Tensor, params, cfg
         "dist_rank": dist_rank,
         "revealed_to_hero": revealed_to_hero,
         "hero_revealed_to": hero_revealed_to,
-        "los_from_hero": los_from_hero,
+        **({"los_from_hero": raw_los[:, _HERO, :]} if cfg.obs_include_raw_los else {}),
         "hidden_by_bush": hidden_by_bush,
         "death_step": state.ent_death_step,
         "death_cause": state.ent_death_cause,
@@ -434,8 +394,8 @@ def build_obs(state, bank, vis: torch.Tensor, raw_los: torch.Tensor, params, cfg
         "damage": state.prj_damage,
         "radius": state.prj_radius,
         "aoe": state.prj_aoe,
-        # D13: the agent must be able to tell a stationary 696-per-tick puddle from an incoming
-        # bullet. `lobbed` (a bool) could not express a third class, so it became `class`.
+        # `class` tells a bullet, a lobbed shell and a stationary hazard puddle apart; `lobbed`
+        # is its ARTILLERY-only view.
         "class": state.prj_class,
         "class_onehot": torch.nn.functional.one_hot(state.prj_class, N_PROJ_CLASSES).to(torch.uint8),
         "lobbed": state.prj_class == _ARTILLERY,
@@ -490,34 +450,30 @@ def build_obs(state, bank, vis: torch.Tensor, raw_los: torch.Tensor, params, cfg
         "hi": state.zone_hi,
         "lo_norm": state.zone_lo / map_wh,
         "hi_norm": state.zone_hi / map_wh,
-        "active": state.zone_seen,  # latched by zone.mark_seen once gas has been on screen (C5)
+        "active": state.zone_seen,  # latched by zone.mark_seen once gas has been on screen
         "step": state.zone_step,
         "dps": zone_mod.current_dps(state, params),
         "next_shrink_in": torch.clamp(state.zone_next_t - state.time, min=0.0),
         "hero_margin": hero_margin,
-        # Same four signed distances, seen through a BOUNDED SENSING HORIZON. The sim knows the
-        # safe rect; a camera does not -- brawl_deployment reconstructs these margins by scanning
-        # a sticky map of gas it has actually SEEN, so past `zone_margin_horizon_tiles` its answer
-        # saturates instead of growing. Training on the unclamped field and deploying on the
-        # clamped one is the usual silent lie; this field is the honest shape, and the deployed
-        # estimator clamps at the same number by reading cfg.zone_margin_horizon_tiles out of the
-        # run's own env_config. See BRAWL_DEPLOYMENT_DESIGN.md 9.14/9.15.
-        #
-        # The clamp is symmetric because the failure is symmetric: standing deep in gas, the
-        # nearest clear ground is as unobservable as distant gas is when standing safe.
+        # The same four margins, clamped to +/- `zone_margin_horizon_tiles`: deployment
+        # reconstructs them from the gas it has SEEN, so its answer saturates past that horizon,
+        # and it clamps at the same cfg number (BRAWL_DEPLOYMENT_DESIGN.md 9.14/9.15). Symmetric
+        # because, deep in gas, the nearest clear ground is as unobservable as distant gas.
         "hero_margin_local": torch.clamp(
             hero_margin, -cfg.zone_margin_horizon_tiles, cfg.zone_margin_horizon_tiles
         ),
         "safe_area_frac": (zone_size[:, 0] * zone_size[:, 1]) / map_area,
     }
 
-    # ---- tracker-style slots (core/slots.py; OBS_PARITY_TASKS.md C8/C9) ----
+    # ---- tracker-style slots (core/slots.py) ----
     # Bookkeeping for obs_select's `slots: tracked`, not an observation: `load_agent_spec`
     # refuses `slots.*` in a spec's fields. Slot k holds entity `entity[k] - 1`; 0 is empty.
     obs["slots"] = {"entity": state.slot_ent, "valid": state.slot_ent > 0}
 
     # ---- visibility ----
-    obs["visibility"] = {"vis": vis, "los": raw_los, "dist_matrix": dist_matrix}
+    obs["visibility"] = {
+        "vis": vis, **({"los": raw_los} if cfg.obs_include_raw_los else {}), "dist_matrix": dist_matrix,
+    }
 
     # ---- grids ----
     obs["view"] = _build_grid(state, bank, hero_view, cfg, view_origin, cfg.view_h, cfg.view_w)

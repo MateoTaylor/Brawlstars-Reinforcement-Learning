@@ -49,7 +49,7 @@ contact stays down and only moves when the bin changes; the fire bit does not re
 `Buttons.press` is called once per decision and `ShadowHero.act` queues exactly one attack for the
 next sub-tick. The press is dragged along `ShadowHero.attack_bearing` -- the move bin, or `facing`
 when idle -- because that is where the sim's dash goes, and a bare tap would auto-aim instead.
-The gadget, attack value 3 since SIM_OVERHAUL Step G5, is the one bare tap, because the game aims
+The gadget, attack value 3 since 2026-09-21, is the one bare tap, because the game aims
 it at the nearest enemy exactly as the sim does. None of it is a simplification of the trained
 behaviour -- all of it is it.
 
@@ -83,9 +83,10 @@ from .config import DeploymentConfig, resolve_rates
 from .control import Buttons, Joystick
 from .match_state import Calibration, MatchState
 from .move_mask import MoveMask
-from .perception import (EntityTracker, GridBuilder, GridSpec, LatticePhase, LootMap,
-                         ProjectileTracker, ShadowHero, ShadowParams, ZoneEstimator,
-                         box_occlusion, crate_occlusion, require_loot_classes)
+from .perception import (EntityTracker, GridBuilder, GridSpec, KnownMap, KnownTerrain,
+                         LatticePhase, LootMap, MapLocalizer, ProjectileTracker, ShadowHero,
+                         ShadowParams, ZoneEstimator, box_occlusion, crate_occlusion,
+                         require_loot_classes)
 from .perception.assemble import DecisionSnapshot
 
 # The emulator's HUD, NOT `brawl_vision`'s default. That one is the iOS recordings' layout; on
@@ -158,9 +159,10 @@ class TickRow:
     phase: str = ""
     tick_ms: float = 0.0
     odometry: str = ""
-    # The one tick that pays `VisionStack.warm`'s ~1 s of PTX JIT. Flagged rather than left to
-    # look like a 758 ms overrun in the summary: it happens before the gate opens, exactly so no
-    # gameplay tick eats it, and reporting it inside the budget tail hides the real p95.
+    # The one tick that pays `VisionStack.warm`'s ~1 s of PTX JIT: the run's first (`_warm`).
+    # Flagged rather than left to look like a 758 ms overrun in the summary: it happens before the
+    # gate opens, exactly so no gameplay tick eats it, and reporting it inside the budget tail
+    # hides the real p95.
     warmup: bool = False
     decision: bool = False
     move_bin: int = -1
@@ -183,7 +185,7 @@ class TickRow:
     phase_x: float = 0.0
     phase_y: float = 0.0
     note: str = ""
-    # --- attack cadence (SIM_OVERHAUL_PLAN.md Phase A, Step A2). What the policy was HANDED at
+    # --- attack cadence. What the policy was HANDED at
     # this decision, so `scripts/audit_attack_cadence.py --telemetry` can compute the sim-side
     # audit's five statistics from a live match on identical definitions. All read BEFORE
     # `policy.act`, from the same shadow state the mask came from; `-1` / `-1.0` on a tick with
@@ -192,7 +194,7 @@ class TickRow:
     #
     # `attack_legal`: `ShadowHero.attack_mask()` as a bitmask, bit i = attack column i, so bit 0
     # (no-fire, always legal) is set on every decision row and `attack_legal & 0b10` is "the
-    # dash was legal" -- the audit's `can_attack`. Bit 3 is the gadget since SIM_OVERHAUL Step G5,
+    # dash was legal" -- the audit's `can_attack`. Bit 3 is the gadget since 2026-09-21,
     # so a fresh match's first row reads 0b1011. `attack_cd_shadow` / `attack_idle_t_shadow`
     # are the shadow's two timers the audit reads (phasing loss and long-dash waiting).
     # `enemy_in_reach` is the audit's own criterion applied to the tracks the assembler was given:
@@ -215,13 +217,37 @@ class TickRow:
     # `policy.dead_bin_mask: false` -- a row that says "every bin was legal" and one that says
     # "nothing was checked" must not read the same. Appended last, like the columns above.
     move_legal: int = -1
-    # OBS_PARITY_TASKS.md C7: the player box's tiles from its nominal screen anchor
+    # The player box's tiles from its nominal screen anchor
     # (`TrackerResult.hero_offset`) and the `hero.near_edge` flag the assembler derives from it
     # against the sim config's `camera.edge_flag_tiles`; `-1` on a tick with no decision or no
     # offset yet. Appended last, like the columns above.
     hero_offset_x: float = 0.0
     hero_offset_y: float = 0.0
     near_edge: int = -1
+    # KNOWN_MAP_LOCALIZATION_PLAN.md section 7, filled on every tick of a run with `map.name` set
+    # and left at the defaults otherwise. `map_state` is `MapLocalizer`'s: "search", "confirm",
+    # "fixed" or "mismatch". `map_dx` / `map_dy`: the offset from odometry to the map frame, NaN
+    # without a fix. `map_agree` / `map_margin`: the agreement rate and lead it last judged, NaN
+    # where too few cells counted to judge (a margin can be negative, so no sentinel would do).
+    # `map_crate_resid`: this tick's crate-phase residuals as "dx dy" pairs joined by ";", empty
+    # with no full-height crate in view. Appended last, like the columns above.
+    map_state: str = ""
+    map_dx: float = math.nan
+    map_dy: float = math.nan
+    map_agree: float = math.nan
+    map_margin: float = math.nan
+    map_crate_resid: str = ""
+    # K4: the hero in RAW odometry (the world position minus the shift this tick's frame applied),
+    # NaN on a tick that placed no hero. It is the same whichever frame was handed out, so the
+    # first one after the gate, with the spawn the match started on, is the true odometry-to-map
+    # offset that `scripts/probes/map_localize_report.py` scores every fix against. Appended last.
+    hero_odo_x: float = math.nan
+    hero_odo_y: float = math.nan
+    # K5: while searching or confirming, where the search's leader puts the map, as the offset a
+    # commit on it would take (the one `map_dx` / `map_dy` would then show). NaN while fixed. So a
+    # match that never fixes can still be scored against its spawn. Appended last.
+    map_lead_dx: float = math.nan
+    map_lead_dy: float = math.nan
 
     @classmethod
     def from_record(cls, record: dict) -> "TickRow":
@@ -270,7 +296,7 @@ def dash_reach_tiles(params: ShadowParams, *, kind: str = HERO_KIND,
                      brawlers_path=None, env_config_path=None) -> float:
     """`dash_distance + dash_radius + unit_radius` in tiles: the uncharged dash's "certainly could
     have hit" radius, which is `scripts/audit_attack_cadence.py`'s `enemy_in_reach` criterion
-    (Step A1.1) restated from the deployment's own sources. `dash_distance` is the shadow's
+    restated from the deployment's own sources. `dash_distance` is the shadow's
     (`ShadowParams`, from `configs/brawlers.yaml`); `dash_radius` is read from the same brawler
     block, and `unit_radius` from `entities.unit_radius` in `configs/default.yaml`, the way
     `GridSpec.load` reads that file for the view -- neither is a field the shadow needs, so
@@ -310,6 +336,15 @@ def _reach_radii(kind: str, brawlers_path, env_config_path) -> tuple[float, floa
         if isinstance(raw, (list, tuple, dict)):
             raise ValueError(f"{name} is a randomized range {raw!r}; deployment needs one value")
     return float(dash_radius), float(unit_radius)
+
+
+def _map_thresholds(cfg: DeploymentConfig) -> dict:
+    """`MapLocalizer`'s keyword arguments from the `map:` block: every `map_*` field but the name.
+    A field the localizer does not take raises at construction instead of being dropped."""
+    from dataclasses import fields
+
+    return {f.name[len("map_"):]: getattr(cfg, f.name) for f in fields(cfg)
+            if f.name.startswith("map_") and f.name != "map_name"}
 
 
 def pin_thread_pools(cfg: DeploymentConfig) -> None:
@@ -457,7 +492,7 @@ class Controls:
 
         Every geometry field is carried over by name, the gadget's included. The script used to
         rebuild these itself, positionally, where the gadget becoming a required button
-        (SIM_OVERHAUL Step G5) would have crashed every dry run before its first tick, and
+        would have crashed every dry run before its first tick, and
         nothing offline could have seen it. A test calls this instead.
         """
         j, b = self.joystick, self.buttons
@@ -485,8 +520,8 @@ class DeployLoop:
     fake backend, with no emulator and no GPU.
 
     Everything derived is derived here and nowhere else: the tick period, the decision cadence, the
-    entity slot count and the move-bin count all come from `policy.cfg`, which is the config the
-    checkpoint was trained under. None of them is a setting.
+    entity slot count and slot rule, and the move-bin count all come from `policy.cfg`, which is the
+    config the checkpoint was trained under. None of them is a setting.
     """
 
     def __init__(self, *, capture, guard, match: MatchState, vision: VisionStack, policy,
@@ -515,7 +550,7 @@ class DeployLoop:
                                  n_move_bins=int(self.sim.n_move_bins),
                                  desync_strikes=cfg.shadow_ammo_strikes,
                                  auto_aim=bool(self.sim.auto_aim))
-        # Telemetry only (`TickRow.enemy_in_reach`, Step A2): the cadence audit's "certainly
+        # Telemetry only (`TickRow.enemy_in_reach`): the cadence audit's "certainly
         # could have hit" radius, from the same configs the shadow and the sim read. The SAME
         # kind as the shadow's block: `ShadowParams` does not record which brawler it was loaded
         # for, so this is the one place both defaults are set.
@@ -524,15 +559,39 @@ class DeployLoop:
         # charged, so the per-decision estimate reads no file.
         self._aim_reach = {long: auto_aim_reach_tiles(self.shadow.p, long_dash=long, kind=HERO_KIND)
                            for long in (False, True)}
-        self.tracker = EntityTracker(n_slots=int(self.sim.n_entities) - 1)
+        # The slot rule is the run's (`slots.*`, counted in decisions, as this tracker updates):
+        # the sim's `core/slots.py` trained the policy on those two numbers, and the tracker's own
+        # defaults only happen to equal today's config. `max_misses` also bounds the hero track's
+        # coast, which has no sim counterpart: the tracker keeps one number for both.
+        self.tracker = EntityTracker(n_slots=int(self.sim.n_entities) - 1,
+                                     promote_hits=int(self.sim.slots_promote_hits),
+                                     max_misses=int(self.sim.slots_max_misses))
         self.projectiles = ProjectileTracker()
         self.loot = LootMap()
-        # Not `self.phase`, which is the loop's Phase. This is where the game's tiles are.
-        self.lattice = LatticePhase()
+        # Not `self.phase`, which is the loop's Phase. This is where the game's tiles are, and it
+        # hands every consumer its world frame. With `map.name` set it is `MapLocalizer`, which
+        # hands out the MAP frame once it has found the camera on the label and the lattice's frame
+        # until then, behind the same members (KNOWN_MAP_LOCALIZATION_PLAN.md). `self.localizer` is
+        # the same object, or None, for the calls only a localizer takes.
+        #
+        # `self.terrain` is what the grid and the cell lookups read: the occupancy map, or with a
+        # map named, the label on every tick the localizer hands out the map frame. The occupancy
+        # map still takes every deposit either way, as the fallback and as the after-match check
+        # of the label.
+        self.localizer: MapLocalizer | None = None
+        self.terrain = vision.occupancy
+        self._world_shift = (0.0, 0.0)      # this tick's world minus raw odometry, for telemetry
+        if cfg.map_name is None:
+            self.lattice = LatticePhase()
+        else:
+            known = KnownMap.load(cfg.map_name)
+            self.localizer = self.lattice = MapLocalizer(known, self.sim.camera_clamp_onset,
+                                                         **_map_thresholds(cfg))
+            self.terrain = KnownTerrain(known, vision.occupancy, self.localizer)
         # The grid's channels come from the spec the policy was built with. The no-argument
         # `GridSpec.load()` reads agent_obs_deploy.yaml, which is two channels short of deploy3,
         # and the mismatch would only surface as a shape error in `assemble` on the first decision.
-        self.grid = GridBuilder(vision.occupancy, GridSpec.from_agent_spec(policy.spec, self.sim))
+        self.grid = GridBuilder(self.terrain, GridSpec.from_agent_spec(policy.spec, self.sim))
         # Here rather than in `VisionStack.build`, because it takes both halves: a deploy3 policy
         # on a model with no crate class would read an empty `box` plane forever, silently.
         require_loot_classes(vision.projectiles.names, self.grid.spec.channels)
@@ -550,7 +609,7 @@ class DeployLoop:
         self._blocks_plane = (self.grid.spec.channels.index("blocks_unit")
                               if self.move_mask is not None else -1)
         self.zone = ZoneEstimator(self.sim)
-        # The `hist` group's and the enemy_hist planes' supplier (SIM_OVERHAUL_STEPS.md H4.1): one
+        # The `hist` group's and the enemy_hist planes' supplier: one
         # snapshot per decision that reached the policy, newest first, as many as the checkpoint's
         # config keeps. Its positions are world-frame, so it is dropped where every world-frame
         # consumer is: at the gate, and on a new segment (`_decide`).
@@ -573,6 +632,7 @@ class DeployLoop:
         self._slot_ids: dict[int, int] = {}
         self._last_decision = None
         self._warmed = False
+        self._warm_seconds = 0.0
 
     # -- construction ---------------------------------------------------------
 
@@ -681,6 +741,8 @@ class DeployLoop:
         self._last_grab_t = t_start
 
         try:
+            if not self._warmed:
+                self._warm(frame, row)
             if not self._check_window():
                 row.note = "window"
                 return
@@ -702,7 +764,7 @@ class DeployLoop:
             if not self._check_odometry(odo):
                 row.note = f"odometry {odo.status}"
                 return
-            if not self._gate_transition(gate, frame, row):
+            if not self._gate_transition(gate, frame):
                 return
             detections, world = self._perceive(frame, rect, odo, row)
             if self._is_decision_tick():
@@ -721,7 +783,8 @@ class DeployLoop:
 
         Returns this tick's entity detections, which a decision on the same tick reuses rather
         than running the detector twice on one frame, and the WORLD odometry every consumer was
-        given: `odo` moved onto the game's tile lattice (`perception/lattice.py`).
+        given: `odo` moved onto the game's tile lattice (`perception/lattice.py`), or with a named
+        map and a fix, onto the map itself (`perception/localize.py`).
         """
         from brawl_vision.terrain.zone import detect_zone
 
@@ -730,9 +793,17 @@ class DeployLoop:
         dets = self.vision.projectiles.predict(frame.image)
         # Before anything deposits, because a re-lock on this tick moves this tick's frame. From
         # here on nothing sees `odo`: every consumer gets `world`, whose `segment` is the lattice
-        # epoch, so a re-lock resets them all through their own new-segment path.
-        lattice = self.lattice.update(dets, self.vision.plan, odo)
+        # epoch, so a re-lock resets them all through their own new-segment path. A localizer's
+        # epoch works the same way, except that a cut it confirms keeps the epoch, and with it
+        # the crates and tracks.
+        lattice = located = self.lattice.update(dets, self.vision.plan, odo)
         world = self.lattice.world(odo)
+        self._world_shift = tuple(float(w) - float(o) for w, o in zip(world.position_tiles,
+                                                                       odo.position_tiles))
+        if self.localizer is not None:
+            # A `MapResult`, which carries the lattice's own result for the columns below.
+            self._map_result(located, row)
+            lattice = located.lattice
         if row is not None:
             row.lattice = lattice.status
             row.phase_x, row.phase_y = lattice.phase
@@ -751,16 +822,36 @@ class DeployLoop:
         entities = self.vision.entities.predict(frame.image) if odo.status == "ok" else []
 
         zone = detect_zone(rect, plan, self.vision.cfg)
-        cells, _ = self.vision.classifier.predict(rect, plan)
+        cells, confidence = self.vision.classifier.predict(rect, plan)
         occluded = crate_occlusion(dets, plan) | box_occlusion(entities, plan)
-        self.vision.occupancy.update(cells, world, plan, zone=zone.at_least(0.05),
-                                     occluded=occluded, cfg=self.vision.cfg)
+        gassed = zone.at_least(0.05)
+        self.vision.occupancy.update(cells, world, plan, zone=gassed, occluded=occluded,
+                                     cfg=self.vision.cfg)
+        if self.localizer is not None:
+            # The same cells and masks the occupancy map just took. What this finds applies from
+            # the next tick: the offset only moves in whole jumps, so a tick of lag costs nothing.
+            self._map_result(self.localizer.observe(frame.t, cells, confidence, plan, world,
+                                                    zone=gassed, occluded=occluded), row)
         self.grid.observe_zone(zone, plan, world)
 
         # One model, three classes, and each consumer keeps its own label.
         self.projectiles.update(dets, plan, world, frame.t)
         self.loot.update(dets, plan, world, frame.t)
         return entities, world
+
+    def _map_result(self, result, row: TickRow | None) -> None:
+        """A `MapResult` into the log (its event, if any) and the row's `map_*` columns. Called
+        after `update` and again after `observe`, so the row ends on the tick's last state."""
+        if result.event:
+            self.log(f"map: {result.event}")
+        if row is None:
+            return
+        row.map_state = result.state
+        row.map_dx, row.map_dy = result.offset or (math.nan, math.nan)
+        row.map_lead_dx, row.map_lead_dy = result.leader or (math.nan, math.nan)
+        row.map_agree = math.nan if result.agreement is None else result.agreement
+        row.map_margin = math.nan if result.margin is None else result.margin
+        row.map_crate_resid = ";".join(f"{dx:.3f} {dy:.3f}" for dx, dy in result.crate_resid)
 
     # -- one decision ---------------------------------------------------------
 
@@ -803,6 +894,8 @@ class DeployLoop:
             return
         hero_pos = tracked.hero.pos
         hero_vel = tracked.hero.vel
+        row.hero_odo_x = float(hero_pos[0]) - self._world_shift[0]
+        row.hero_odo_y = float(hero_pos[1]) - self._world_shift[1]
 
         hero_hp = next((r.hp for r in readings if r.label == "player" and r.hp is not None), None)
         if hero_hp is None:
@@ -854,7 +947,7 @@ class DeployLoop:
             hero_offset=tracked.hero_offset,
         )
 
-        # Step A2 cadence columns, written BEFORE the policy call so a policy that raises still
+        # The cadence columns, written BEFORE the policy call so a policy that raises still
         # leaves what it was handed on the row. `legal` is the mask the network gets, read once
         # and used for both, so the bitmask can never disagree with the decision it explains.
         legal = self.shadow.attack_mask()
@@ -933,7 +1026,7 @@ class DeployLoop:
         return ((x - hx) / d, (y - hy) / d)
 
     def _enemy_in_reach(self, hero_pos, enemies) -> bool:
-        """`scripts/audit_attack_cadence.py`'s `enemy_in_reach` (Step A1.1), on the deployment's
+        """`scripts/audit_attack_cadence.py`'s `enemy_in_reach`, on the deployment's
         inputs: any enemy track the assembler was handed within `reach_tiles` of the hero, both
         in WORLD tiles. The sim's "alive and revealed to the hero" is, on this side, "has a track"
         -- the tracker only holds enemies the detector saw (or is coasting for a few ticks), and
@@ -953,7 +1046,7 @@ class DeployLoop:
 
         # The shadow's clip is recorded FIRST, whether or not this frame has a hero box: it exists
         # regardless of the box, and `scripts/audit_attack_cadence.py --telemetry` reads it as the
-        # `ammo` of every decision row (Step A2 review) -- a `-1.0` sentinel next to a valid
+        # `ammo` of every decision row -- a `-1.0` sentinel next to a valid
         # `attack_legal` would reach the audit as a clip size. Recorded BEFORE `check_ammo` and
         # before the resync below, so `ammo_cv` / `ammo_shadow` hold what the two sides actually
         # disagreed about rather than the corrected value (pre-resync on a resync row; the mask
@@ -978,7 +1071,7 @@ class DeployLoop:
         # ever converging. Only a DESYNC verdict reaches here and a DESYNC requires a real read
         # (a miss returns NO_READ, which is not `tripped`), so this is never None in practice.
         self.shadow.resync(reading)
-        # Step A2: the row records that the shadow resynced on this decision and what tripped it,
+        # The row records that the shadow resynced on this decision and what tripped it,
         # whether or not the backend injects -- it is a fact about the shadow, and the audit's
         # "resyncs per minute in fights" is only meaningful on a live backend anyway.
         if row is not None:
@@ -1061,15 +1154,16 @@ class DeployLoop:
     # -- terrain lookups ------------------------------------------------------
 
     def _cell(self, world_xy) -> tuple[int, int] | None:
-        ox, oy = self.vision.occupancy.origin
+        ox, oy = self.terrain.origin
         col = int(np.floor(world_xy[0])) - ox
         row = int(np.floor(world_xy[1])) - oy
-        if 0 <= col < self.vision.occupancy.width and 0 <= row < self.vision.occupancy.height:
+        if 0 <= col < self.terrain.width and 0 <= row < self.terrain.height:
             return (col, row)
         return None
 
     def _in_bush(self, world_xy) -> bool:
-        """Bush from the accumulated map, not from this frame.
+        """Bush from the terrain the grid reads (the accumulated map, or a named map's label while
+        there is a fix), not from this frame.
 
         An UNKNOWN cell reads `False`, which is the same optimistic direction `ZoneEstimator`
         documents and the same one `GridBuilder`'s `unknown_tile=FLOOR` already commits the grid
@@ -1080,7 +1174,7 @@ class DeployLoop:
         cell = self._cell(world_xy)
         if cell is None:
             return False
-        idx = int(self.vision.occupancy.best()[cell[1], cell[0]])
+        idx = int(self.terrain.best()[cell[1], cell[0]])
         return idx != _UNKNOWN and CLASSES[idx] is Tile.BUSH
 
     def _in_gas(self, world_xy) -> bool:
@@ -1091,7 +1185,7 @@ class DeployLoop:
 
     # -- phase and the interlock ----------------------------------------------
 
-    def _gate_transition(self, gate: bool, frame, row: TickRow) -> bool:
+    def _gate_transition(self, gate: bool, frame) -> bool:
         """Apply the match gate. Returns whether the tick should continue into perception."""
         if self.phase is Phase.PLAYING:
             if not gate:
@@ -1105,9 +1199,9 @@ class DeployLoop:
 
         if self.phase is not Phase.WAITING or not gate:
             return False
-        return self._begin_match(frame, row)
+        return self._begin_match(frame)
 
-    def _begin_match(self, frame, row: TickRow) -> bool:
+    def _begin_match(self, frame) -> bool:
         """The gate has opened. Refine it, reset every accumulator, take the contact.
 
         **Refinement is not optional and it is not configurable** (§5). The stored radius was
@@ -1116,10 +1210,6 @@ class DeployLoop:
         gameplay, so the gate is dropped and the loop keeps waiting rather than starting a match
         against a menu.
         """
-        if not self._warmed:
-            self.vision.warm(frame.image)
-            self._warmed = True
-            row.warmup = True        # this row, not telemetry[-1] -- it is appended at tick end
         try:
             score = self.match.refine(frame.image)
         except ValueError as exc:
@@ -1137,6 +1227,9 @@ class DeployLoop:
         self.projectiles.reset(self.lattice.epoch)
         self.loot.reset(self.lattice.epoch)
         self.grid.reset(self.lattice.epoch)
+        # `zone.active`'s latch outlives segment changes, which is why it resets here and nowhere
+        # else: the gas map just above empties on every new segment, the sim's latch does not.
+        self.zone.reset()
         self._history.clear()
         self._history_segment = self.lattice.epoch
         self.vision.health.reset()
@@ -1186,9 +1279,28 @@ class DeployLoop:
         self._stop(reason)
         return False
 
+    def _warm(self, frame, row: TickRow) -> None:
+        """Pay `VisionStack.warm`'s ~1 s of JIT on the run's first frame, whatever is on screen.
+
+        The JIT depends on the input's shape, never its content, so a lobby frame serves, and paid
+        while waiting it holds up no contact and no first decision. It used to run on the tick the
+        gate opened on, which with the gate's own work took 0.9-1.2 s in the first K5 dry runs
+        (2026-09-28) and stopped one of them against the 1.0 s stall guard the moment its match
+        began. For the same reason its cost is taken out of the next tick's stall check: that
+        guard is for a capture that stopped delivering, and this is the loop's own cost, once.
+        """
+        t0 = time.perf_counter()
+        self.vision.warm(frame.image)
+        self._warmed = True
+        self._warm_seconds = time.perf_counter() - t0
+        row.warmup = True            # this row, not telemetry[-1] -- it is appended at tick end
+
     def _check_stall(self, now: float) -> bool:
-        if self._last_grab_t and now - self._last_grab_t > self.cfg.safety_capture_stall_seconds:
-            self._stop(f"capture stalled for {now - self._last_grab_t:.2f}s")
+        # Less the warm-up the last tick paid, if it paid one (`_warm`).
+        gap = now - self._last_grab_t - self._warm_seconds
+        self._warm_seconds = 0.0
+        if self._last_grab_t and gap > self.cfg.safety_capture_stall_seconds:
+            self._stop(f"capture stalled for {gap:.2f}s")
             return False
         return True
 
@@ -1235,6 +1347,8 @@ class DeployLoop:
         from dataclasses import asdict, fields
 
         rows = list(self.telemetry)
+        # Its folder too: this runs after the match, so a missing one would lose the whole ring.
+        Path(path).parent.mkdir(parents=True, exist_ok=True)
         with open(path, "w", newline="", encoding="utf-8") as fh:
             writer = csv.DictWriter(fh, [f.name for f in fields(TickRow)])
             writer.writeheader()

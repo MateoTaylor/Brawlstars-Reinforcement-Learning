@@ -1,53 +1,30 @@
-"""Termination/truncation and the per-tick event package (`info`). See
-BRAWL_SIM_BUILD_PLAN.md Step 27.
+"""Termination/truncation and the per-decision event package (`info`).
 
-`info` holds per-tick EVENTS; `obs` (Step 25) holds per-tick STATE. Episode-cumulative counters
-(ent_kills, ent_damage_dealt, ent_damage_taken, ent_shots_fired, boxes_broken) live in
-`SimState`, are zeroed on reset (state.zero_, Step 9), and are already mirrored into `obs` --
-this module's job is only the THIS-TICK deltas, several of which aren't stored anywhere and
-have to be reconstructed from what a single call gets handed.
+`info` holds EVENTS; `obs` holds STATE. The episode-cumulative counters (ent_kills,
+ent_damage_dealt, ent_damage_taken, ent_shots_fired, boxes_broken) live in `SimState` and are
+zeroed on reset (state.zero_); this module produces only the deltas, several of which are stored
+nowhere and must be handed in by the caller (env.py, accumulated over the decision's sub-ticks):
 
-`compute_info`'s `dmg_by` contract: the caller (the future `env.py` step loop, Step 29) is
-expected to pass the SUM of every combat damage source's own (N,E,E) dmg_by this tick --
-`hero.advance_dash` + `combat.melee_hitscan` + `projectiles.step_projectiles` -- since
-`combat.apply_damage` is invoked once per source (its own docstring: "never mixing causes
-within one call") but `compute_info` only takes one combined matrix. Zone damage has no
-attacker (`combat.py`'s `_NO_ATTACKER = -1` sentinel) and so structurally cannot appear in an
-attacker x victim matrix; it's absent from `damage_matrix`/`damage_dealt_tick`/
-`damage_taken_tick` entirely -- `entities.damage_taken` in `obs` (the cumulative counter) is
-the complete record across all causes including zone, this module's per-tick fields are not.
+- `dmg_by`: the SUM of every combat source's (N,E,E) attacker x victim matrix (dash, melee,
+  projectiles), since `combat.apply_damage` runs once per source. Zone damage has no attacker
+  (`combat._NO_ATTACKER`), so it is absent from `damage_matrix`/`damage_dealt_tick`/
+  `damage_taken_tick`; only the cumulative `entities.damage_taken` covers every cause.
+- `hp_healed`: HP restored by regen, super lifesteal and melee lifesteal, as applied. Healing
+  leaves no matrix and no counter to diff, so only the caller knows it.
+- `attacks_in_reach`: the hero's attacks and supers made with a visible enemy in reach, known
+  only inside env.py's attack phase; training/reward.py's `attack_in_reach` term reads it.
+- `gadget_hits`: landings of the hero's gadget spinner that hurt at least one player (crates
+  never count), known only inside env.py's projectile phase; training/reward.py's `gadget_hit`
+  term reads it.
 
-`hp_healed_tick` has the same "caller must supply it" shape as `dmg_by`, for the opposite
-reason: healing (out-of-combat regen in `combat.apply_regen`, super lifesteal in
-`combat.apply_heal`) leaves no attacker x victim matrix and no cumulative SimState counter to
-diff, so `env.py` collects what those two calls report applying and passes it down. Absent, it
-is zeros.
+`shots_fired_tick` and `dash_hits_tick` are proxies, not exact counts (see their comments).
 
-`attack_in_reach_tick` is caller-supplied too: whether the hero's attack had an enemy in reach is
-known only inside `env.py`'s attack phase, which holds the attack gates and the tick's fair
-visibility. `env.py` counts it over the decision's live sub-ticks and passes the (N,) count down;
-absent, it is zeros. It is the one input of training/reward.py's `attack_in_reach` term
-(SIM_OVERHAUL_PLAN.md §9 R2).
-
-`shots_fired_tick` / `dash_hits_tick` are best-effort, NOT exact, given the signature this step
-specifies -- see their own comments below for exactly what they miss and why. Flagged here as a
-forward pointer: if reward shaping in a later phase needs a true miss-inclusive fire-attempt
-count, `env.py` (Step 29) is the natural place to widen `compute_info`'s signature with an
-explicit `fired_mask` from `all_bot_intents`/`decode_action`, since compute_info as specified
-here has no visibility into an attack that fires and hits nothing.
-
-**Action repeat (`cfg.action_repeat`, `env.py`'s decision loop).** One agent decision now spans
-`action_repeat` SIM TICKS, so "this tick's events" and "this decision's events" are no longer
-the same thing. The per-tick DELTAS above (damage, kills, cubes, boxes) are summed by `env.py`
-across the sub-ticks and handed to `compute_info` pre-accumulated -- nothing in this module has
-to change for those. The per-tick STATE flags cannot be summed that way, so they get their own
-small accumulator here: `new_decision_tally` / `advance_decision_tally` latch the outcome fields
-(`terminated`, `truncated`, `hero_alive`, `hero_rank`) at the sub-tick each env's episode
-actually ended, and count the two flags reward shaping integrates over time (`alive_ticks`,
-`in_zone_ticks`). Latching is not cosmetic: without it, a hero that becomes last-alive on
-sub-tick 2 of 5 keeps taking zone damage for sub-ticks 3-5 and a win silently becomes a death.
-At `action_repeat=1` the tally is exactly one call to `new_decision_tally`, and every field it
-produces equals what this module computed before it existed.
+**Action repeat.** One decision spans `cfg.action_repeat` sim ticks. The deltas above accumulate
+across the sub-ticks; STATE flags cannot, so `new_decision_tally`/`advance_decision_tally` latch
+the outcome fields (`terminated`, `truncated`, `hero_alive`, `hero_rank`) at the sub-tick each
+env's episode ended and count `alive_ticks`/`in_zone_ticks`/`n_ticks`. Without the latch, a hero
+that becomes last-alive on sub-tick 2 of 5 keeps taking zone damage and a win becomes a death.
+At `action_repeat=1` the tally is the current tick's own state.
 """
 import torch
 
@@ -57,10 +34,9 @@ _HERO = 0
 
 
 def compute_done(state, cfg) -> tuple[torch.Tensor, torch.Tensor]:
-    """(terminated (N,) bool, truncated (N,) bool). D16: terminate on hero death or
-    hero-last-alive; truncate on hitting the episode step limit. Independent conditions -- both
-    can be True together only on the exact tick that coincides with both (e.g. the hero wins or
-    dies on the very last allowed step)."""
+    """(terminated (N,) bool, truncated (N,) bool). Terminate on hero death or hero-last-alive;
+    truncate at the episode step limit. Independent: both are True only on a tick that meets
+    both (the hero wins or dies on the last allowed step)."""
     hero_alive = state.ent_alive[:, _HERO]
     terminated = (~hero_alive) | ((state.n_alive == 1) & hero_alive)
     truncated = state.step_count >= cfg.max_episode_steps
@@ -75,12 +51,10 @@ def hero_tick_state(state, cfg) -> dict:
     `core/observation.build_obs` makes; `hero_rank` is 0-INDEXED (0 = won), matching
     `info["hero_rank"]` rather than `observation.compute_rank`'s own 1-indexed return."""
     terminated, truncated = compute_done(state, cfg)
-    # `.clone()` is load-bearing, not defensive habit: `state.ent_alive[:, _HERO]` is a VIEW into
-    # storage that `combat.resolve_deaths` rewrites in place on every later sub-tick, so latching
-    # the view would latch nothing at all -- `advance_decision_tally` would faithfully carry
-    # forward a tensor whose contents had already changed underneath it, and a hero that won and
-    # was then killed by the zone would still read as dead. Every other field here is the result
-    # of an operation and is therefore already a fresh tensor.
+    # `.clone()` is load-bearing: `state.ent_alive[:, _HERO]` is a VIEW that
+    # `combat.resolve_deaths` rewrites on every later sub-tick, so the tally would latch nothing
+    # (a hero that won and was then killed by the zone would read as dead). The other fields are
+    # fresh tensors already.
     alive = state.ent_alive[:, _HERO].clone()
     outside = zone._outside_rect(state.ent_pos[:, _HERO], state.zone_lo, state.zone_hi) & alive
     rank = observation.compute_rank(state.ent_alive, state.ent_death_step)[:, _HERO] - 1
@@ -109,15 +83,12 @@ def new_decision_tally(state, cfg) -> dict:
 def advance_decision_tally(tally: dict, state, cfg) -> dict:
     """Folds one more sub-tick into `tally`, returning a new dict (`tally` is not mutated).
 
-    **Envs whose episode already ended earlier in this same decision are frozen out.** Their
-    four latched outcome fields stop moving and their three counters stop growing, so the
-    leftover sub-ticks of a decision can neither rewrite an outcome that is already settled (a
-    hero that became last-alive on sub-tick 2 must not be killed by the zone on sub-tick 4 and
-    reported as a death) nor keep accruing per-tick reward for an episode that is over. The
-    world itself keeps ticking for those envs -- freezing SimState per-env would mean masking
-    every write in every phase -- so their `final_observation` can be up to `action_repeat - 1`
-    ticks staler than the moment they finished. That staleness is confined to observation
-    fields; every field any outcome, reward, or win-rate signal reads comes from here."""
+    **Envs whose episode already ended earlier in this decision are frozen out**: their four
+    latched outcome fields stop moving and their three counters stop growing, so leftover
+    sub-ticks can neither rewrite a settled outcome nor accrue reward for a finished episode. The
+    world keeps ticking for those envs (freezing SimState per env would mean masking every write
+    in every phase), so their `final_observation` can be up to `action_repeat - 1` ticks staler
+    than the moment they finished; every outcome, reward and win-rate signal reads this tally."""
     tick = hero_tick_state(state, cfg)
     done = tally["done"]
     live = ~done
@@ -137,62 +108,58 @@ def compute_info(
     state, dmg_by: torch.Tensor, newly_dead: torch.Tensor, newly_broken: torch.Tensor,
     cubes_gained: torch.Tensor, cfg, decision: dict | None = None,
     hp_healed: torch.Tensor | None = None, attacks_in_reach: torch.Tensor | None = None,
+    gadget_hits: torch.Tensor | None = None,
 ) -> dict:
-    """(N,)/(N,E)/(N,E,E) device tensors, one dict of THIS DECISION's events -- see module
-    docstring for the `dmg_by` contract and the shots_fired_tick/dash_hits_tick caveat.
+    """(N,)/(N,E)/(N,E,E) device tensors, one dict of THIS DECISION's events; the module
+    docstring gives the contracts of the caller-supplied inputs.
 
     `decision` is the tally `env.py` accumulated over the decision's `cfg.action_repeat`
-    sub-ticks; the four delta arguments must already be summed over those same sub-ticks. Left
-    at `None` (every call site outside `env.py`, including every test written before action
-    repeat existed) it is derived from the current state as a single tick, which is exactly what
-    this function did before the argument existed.
+    sub-ticks, and the four delta arguments must already be accumulated over those same
+    sub-ticks. None derives it from the current state as a single tick.
 
-    `hp_healed` is the (N,E) HP restored over the same sub-ticks -- regen plus super lifesteal,
-    as actually applied (see `combat.apply_heal`/`apply_regen`). Unlike damage there is no
-    matrix to project it out of and nothing in `SimState` records it, so it can only come from
-    the caller; left at `None` it is zeros, which is what every pre-existing call site means.
+    `hp_healed`: (N,E) HP restored over the same sub-ticks by regen, super lifesteal and melee
+    lifesteal, as applied (`combat.apply_regen`/`apply_heal`). None is zeros.
 
-    `attacks_in_reach` is the (N,) int32 count of the hero's attacks and supers made with a
-    visible enemy inside its uncharged dash reach over the same sub-ticks (see `env.py`'s attack
-    phase). Same contract: only the caller can know it, and `None` is zeros."""
+    `attacks_in_reach`: (N,) int32 count of the hero's attacks and supers made with a visible
+    enemy inside its uncharged dash reach over the same sub-ticks (env.py's attack phase). None
+    is zeros.
+
+    `gadget_hits`: (N,) int32 count of the hero's gadget-spinner landings that hurt at least one
+    player over the same sub-ticks (env.py's projectile phase). None is zeros."""
     if decision is None:
         decision = new_decision_tally(state, cfg)
     if hp_healed is None:
         hp_healed = torch.zeros_like(dmg_by[:, :, 0])
     if attacks_in_reach is None:
         attacks_in_reach = torch.zeros_like(decision["n_ticks"])
+    if gadget_hits is None:
+        gadget_hits = torch.zeros_like(decision["n_ticks"])
     terminated, truncated = decision["terminated"], decision["truncated"]
 
     damage_dealt_tick = dmg_by.sum(dim=2)  # (N,E): per attacker, this tick
     damage_taken_tick = dmg_by.sum(dim=1)  # (N,E): per victim, this tick
 
-    # kills_tick: replays combat.resolve_deaths' own credit rule (newly_dead & last_hit_by>=0)
-    # against THIS tick's newly_dead, rather than reading the cumulative ent_kills counter
-    # resolve_deaths already mutated -- there's no "before this tick" snapshot of that counter
-    # to diff against.
+    # kills_tick replays combat.resolve_deaths' credit rule (newly_dead & last_hit_by >= 0): the
+    # cumulative ent_kills has no "before this decision" snapshot to diff against.
     E = state.ent_kind.shape[1]
     credit = newly_dead & (state.ent_last_hit_by >= 0)
     killer_idx = torch.clamp(state.ent_last_hit_by, min=0)
     kills_tick = torch.zeros((state.ent_kind.shape[0], E), dtype=torch.int32, device=state.ent_pos.device)
     kills_tick.scatter_add_(1, killer_idx, credit.to(torch.int32))
 
-    # death_cause_tick: ent_death_cause masked to newly_dead -- the raw state field holds a
-    # PERMANENT historical value once an entity has ever died, meaningless as a "this tick"
-    # signal on its own.
+    # death_cause_tick: masked to newly_dead, since ent_death_cause keeps its value once set.
     death_cause_tick = torch.where(
         newly_dead, state.ent_death_cause, torch.zeros_like(state.ent_death_cause),
     )
 
-    # shots_fired_tick: a LOWER BOUND, not an exact fire-attempt count -- a shot/dash that
-    # fires and hits nothing is invisible here (dmg_by only records connected hits). See
-    # module docstring's forward pointer.
+    # shots_fired_tick is a proxy, not a fire count: 1 where the entity dealt combat damage this
+    # decision. A miss never shows, and a projectile fired earlier that lands now does.
     shots_fired_tick = (damage_dealt_tick > 0).to(torch.int32)
 
-    # dash_hits_tick: dmg_by is a same-tick SUM across dash + melee + projectile damage, so a
-    # hit can't be attributed to its source by value alone -- but dash and other attacks are
-    # mutually exclusive for the same entity on the same tick (N02/N03/R02: dash "fully
-    # replaces" the walk/attack that tick), so any hit dealt by a CURRENTLY DASHING attacker
-    # this tick is unambiguously a dash hit.
+    # dash_hits_tick: (N,) count of (attacker, victim) pairs with damage this decision whose
+    # attacker is still dashing when it ends. dmg_by sums every source, so a projectile of the
+    # dasher's landing meanwhile (a Super bolt, or a gadget spinner thrown mid-dash) counts too,
+    # and a dash that ended within the decision does not.
     is_dashing = (state.ent_dash_t > 0).unsqueeze(2)  # (N,E,1), attacker axis
     dash_hits_tick = ((dmg_by > 0) & is_dashing).sum(dim=(1, 2)).to(torch.int32)
 
@@ -202,11 +169,9 @@ def compute_info(
         "damage_matrix": dmg_by,
         "damage_dealt_tick": damage_dealt_tick,
         "damage_taken_tick": damage_taken_tick,
-        # hp_healed_tick is the mirror image of damage_taken_tick and covers ALL heal sources
-        # (regen + super lifesteal), where damage_taken_tick is COMBAT damage only -- zone damage
-        # has no attacker and cannot appear in dmg_by. So over an episode the two are NOT a
-        # matched pair: healing back a zone burn shows up here with no damage_taken_tick entry
-        # against it. training/reward.py prices that gap deliberately; see its docstring.
+        # Covers every heal source (regen, super and melee lifesteal), while damage_taken_tick
+        # is combat damage only, so healing back a zone burn shows here with no matching
+        # damage entry. training/reward.py prices that gap deliberately; see its docstring.
         "hp_healed_tick": hp_healed,
         "kills_tick": kills_tick,
         "deaths_tick": newly_dead,
@@ -217,14 +182,14 @@ def compute_info(
         "dash_hits_tick": dash_hits_tick,
         # (N,) int32, the HERO's alone -- what training/reward.py's `attack_in_reach` term pays.
         "attack_in_reach_tick": attacks_in_reach,
+        # (N,) int32, the HERO's alone -- what training/reward.py's `gadget_hit` term pays.
+        "gadget_hit_tick": gadget_hits,
         "hero_rank": decision["hero_rank"],
         "terminated": terminated,
         "truncated": truncated,
-        # --- action-repeat fields (see module docstring). At action_repeat=1 these are exactly
-        # the current tick's own hero state, so nothing reading them behaves differently there.
-        # `hero_alive` is LATCHED at the sub-tick the episode ended; `obs["hero"]["alive"]` is
-        # the live post-decision value, and the two can disagree for an env that finished early.
-        # Reward shaping must use this one -- see training/reward.py.
+        # --- action-repeat fields (see module docstring). `hero_alive` is LATCHED at the
+        # sub-tick the episode ended, while `obs["hero"]["alive"]` is the post-decision value;
+        # they can disagree for an env that finished early, and reward shaping must use this one.
         "hero_alive": decision["hero_alive"],
         "alive_ticks": decision["alive_ticks"],
         "in_zone_ticks": decision["in_zone_ticks"],

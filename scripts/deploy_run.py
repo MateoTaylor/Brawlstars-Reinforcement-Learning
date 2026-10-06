@@ -5,6 +5,7 @@
     python scripts/deploy_run.py --matches 0          # keep playing until Ctrl-C
     python scripts/deploy_run.py --run mortis_deploy3 # a different run, by the name it trained as
     python scripts/deploy_run.py --run mortis_deploy3_elite --checkpoint final
+    python scripts/deploy_run.py --map dark_passage   # on a labelled map: localize, label terrain
 
 **`--run` swaps the checkpoint for one invocation** without editing `configs/deployment.yaml`,
 which stays the default. It takes the `run.name` a run was trained under, a directory under
@@ -43,6 +44,7 @@ if str(REPO) not in sys.path:
 
 from brawl_deployment.config import load_deployment_config, resolve_run, validate  # noqa: E402
 from brawl_deployment.loop import DeployLoop, Phase                            # noqa: E402
+from brawl_deployment.perception.known_map import MAPS_DIR, KnownMap          # noqa: E402
 
 # `--checkpoint` shorthands: the two files every run's `scripts/train.py` writes.
 CHECKPOINTS = {"best": "best_model.zip", "final": "final_model.zip"}
@@ -53,12 +55,12 @@ def _log(message: str) -> None:
 
 
 def _config_from_args(args):
-    """`configs/deployment.yaml` with `--run` / `--checkpoint` applied, validated.
+    """`configs/deployment.yaml` with `--run` / `--checkpoint` / `--map` applied, validated.
 
     Through the loader's `overrides` rather than a `dataclasses.replace` afterwards, so a run picked
-    on the command line takes exactly the path a run picked in the YAML does. The checkpoint is
-    checked here, before the window is located or a detector is built: a typo should cost a second,
-    not a startup.
+    on the command line takes exactly the path a run picked in the YAML does. The checkpoint and
+    the map label are checked here, before the window is located or a detector is built: a typo
+    should cost a second, not a startup.
     """
     run = {}
     if args.run is not None:
@@ -68,13 +70,22 @@ def _config_from_args(args):
             raise SystemExit(str(exc)) from None
     if args.checkpoint is not None:
         run["checkpoint"] = CHECKPOINTS.get(args.checkpoint, args.checkpoint)
-    cfg = load_deployment_config(args.config, overrides={"run": run} if run else None)
+    overrides = {"run": run} if run else {}
+    if args.map is not None:
+        overrides["map"] = {"name": args.map}
+    cfg = load_deployment_config(args.config, overrides=overrides or None)
     validate(cfg)
 
     path = Path(cfg.run_dir) / cfg.run_checkpoint
     if not path.is_file():
         have = sorted(p.name for p in Path(cfg.run_dir).glob("*.zip"))
         raise SystemExit(f"no checkpoint {path}; {cfg.run_dir} has {have or 'no .zip files'}")
+    if cfg.map_name is not None:
+        try:
+            KnownMap.load(cfg.map_name)
+        except (OSError, ValueError) as exc:
+            have = sorted(p.stem for p in MAPS_DIR.glob("*.csv"))
+            raise SystemExit(f"map {cfg.map_name!r}: {exc}\nlabelled maps: {have}") from None
     return cfg
 
 
@@ -130,6 +141,9 @@ def main(argv=None) -> int:
                          "as (mortis_deploy3), a directory under runs/, or a path")
     ap.add_argument("--checkpoint", default=None,
                     help="'best', 'final', or a file name in the run (default: run.checkpoint)")
+    ap.add_argument("--map", default=None,
+                    help="the labelled map this session is played on (dark_passage), instead of "
+                         "the config's map.name; the loop then localizes on it")
     ap.add_argument("--dry-run", action="store_true",
                     help="build everything and decide for real, but send no touches")
     ap.add_argument("--matches", type=int, default=1,
@@ -142,6 +156,7 @@ def main(argv=None) -> int:
     cfg = _config_from_args(args)
     _log(f"config {args.config}{' (run from --run)' if args.run else ''}")
     _log(f"run    {cfg.run_dir} ({cfg.run_checkpoint}) on {cfg.policy_device}")
+    _log(f"map    {cfg.map_name or 'none (terrain from the occupancy map)'}")
 
     loop = DeployLoop.from_config(cfg, log=_log)
     if args.dry_run:

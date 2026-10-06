@@ -102,8 +102,8 @@ def test_episode_stats_fires_exactly_once_per_completed_episode_no_staleness():
 
 
 def test_episode_stats_return_accumulates_and_resets():
-    """With a reward_fn that's zero everywhere except a +-1 terminal tick (ExampleReward,
-    Step 28), the accumulated final_episode_return on a done tick must equal exactly that
+    """With a reward_fn that's zero everywhere except a +-1 terminal tick (ExampleReward),
+    the accumulated final_episode_return on a done tick must equal exactly that
     tick's own reward -- every earlier tick in the episode contributed 0."""
     from brawl_sim.core.reward import ExampleReward
     n_envs = 4

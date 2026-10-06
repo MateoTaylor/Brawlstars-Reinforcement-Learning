@@ -1,11 +1,11 @@
-"""Map CSV loading and the device-resident MapBank. See BRAWL_SIM_BUILD_PLAN.md Step 6.
+"""Map CSV loading and the device-resident MapBank.
 
 Runs once at env construction, not in the sim's hot path -- numpy and plain Python are fine
 here (CONVENTIONS.md's no-host-sync rule scopes to BrawlVecEnv.step() and anything it calls).
 
-Critical performance rule (unchanged downstream): never materialize a per-env (N, H, W) map
-slice. Point queries gather-index MapBank's (M, H, W) tensors by map_id; the only per-env grids
-that ever exist are the observation grids, built by scatter into a zeroed buffer (Step 25).
+Performance rule: never materialize a per-env (N, H, W) map slice. Point queries gather-index
+MapBank's (M, H, W) tensors by map_id; the only per-env grids that ever exist are the
+observation grids, built by scatter into a zeroed buffer.
 """
 from collections import deque
 from pathlib import Path
@@ -26,9 +26,9 @@ CSV_DIR = Path(__file__).resolve().parent / "csv"
 
 MAX_SPAWNS = 32
 MAX_BOX_SPOTS = 64
-MIN_SPAWNS = 8  # blank.csv's stated exception to the general >=12 minimum (Step 5)
-MIN_BOX_SPOTS = 8  # blank.csv's stated exception to the general >=16 minimum (Step 5)
-# Bush waypoints for the HUNTER personality (Step 41). Capped at 63 because a bot's visited-set is
+MIN_SPAWNS = 8  # blank.csv's floor; maps/README.md asks >= 12 elsewhere (10 on screenshot maps)
+MIN_BOX_SPOTS = 8  # blank.csv's floor; maps/README.md asks >= 16 elsewhere
+# Bush waypoints for the HUNTER personality. Capped at 63 because a bot's visited-set is
 # a single int64 BITMASK (state.ent_hunt_seen) -- one bit per waypoint, which keeps "everywhere
 # I have already looked" to one scalar per entity instead of a ring buffer of positions.
 MAX_BUSH_WAYPOINTS = 63
@@ -108,7 +108,7 @@ def _tile_points(tiles: np.ndarray, tile_id: int) -> np.ndarray:
 
 def spawn_points(tiles: np.ndarray) -> np.ndarray:
     """(K, 2) f32 tile centers, sorted by angle from the map's geometric center -- the
-    spawner (Step 24) depends on this order to hand out evenly-spaced starting positions."""
+    spawner (core/spawn.py) depends on this order to hand out evenly-spaced starting positions."""
     pts = _tile_points(tiles, Tile.SPAWN)
     h, w = tiles.shape
     cx, cy = w / 2.0, h / 2.0
@@ -126,20 +126,11 @@ def bush_waypoints(tiles: np.ndarray, cell_tiles: int) -> np.ndarray:
     bush tile closest to each cell's own center, skipping cells with no bush in them. Sorted by
     angle from the map center, like spawn_points, purely so the order is stable and readable.
 
-    **Why waypoints exist at all.** The HUNTER personality is supposed to sweep the map looking
-    for players it cannot see, and it was first built on `perception.bush_scan` -- "walk to the
-    nearest bush tile you have not searched yet, within the 4-tile scan radius". Measured on
-    `bushy` (23.7% bush tiles) that produced a hunter which walked 75 tiles in 60 seconds for a
-    NET displacement of 15.7 (ratio 0.29): in a dense bush field there is always another
-    unsearched tile one step away, so hunters shuffled around their spawn instead of going
-    anywhere. Bush-camping at the far side of the map was as safe as it had ever been.
-
-    A coarse per-cell subsample fixes that by construction: consecutive waypoints are `cell_tiles`
-    apart, so "go to the nearest unvisited one" is always a real journey, and the set covers the
-    whole playable map, so a hunter that visits them all has genuinely looked everywhere. It is
-    also far cheaper than a bigger tile scan -- the scan's cost grows with the SQUARE of its
-    radius (a 4-tile radius is 49 probes; a map-sized one would be thousands), while this is a
-    fixed <=63-element gather no matter how large the map is.
+    Why HUNTER sweeps a coarse set rather than a local tile scan like `perception.bush_scan`: in
+    a dense bush field the nearest bush is always a step away, so a hunter steering by it circles
+    its spawn. Consecutive waypoints are `cell_tiles` apart, so "the nearest unvisited one" is
+    always a real journey, and the set covers the whole map. A scan's cost grows with the square
+    of its radius; this is a fixed <= 63-element gather however large the map.
     """
     if cell_tiles < 1:
         raise ValueError(f"cell_tiles must be >= 1, got {cell_tiles}")
@@ -225,8 +216,8 @@ def build_map_bank(cfg, device) -> MapBank:
     bank.n_spawns = torch.as_tensor(n_spawns_np, dtype=torch.int64, device=device)
     bank.box_spots = torch.as_tensor(box_np, dtype=torch.float32, device=device)
     bank.n_box_spots = torch.as_tensor(n_box_np, dtype=torch.int64, device=device)
-    # A map with no bush tiles at all (blank.csv, walled.csv) legitimately gets 0 waypoints; the
-    # HUNTER personality reads that as "nothing to sweep" and falls back to exploring.
+    # A map with no bush tiles at all (blank.csv, walled.csv) legitimately gets 0 waypoints; HUNTER
+    # then falls through to WANDER (bots/personality.py).
     bank.bush_wp = torch.as_tensor(bush_wp_np, dtype=torch.float32, device=device)
     bank.n_bush_wp = torch.as_tensor(n_bush_wp_np, dtype=torch.int64, device=device)
 

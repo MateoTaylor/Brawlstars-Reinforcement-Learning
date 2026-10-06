@@ -1,18 +1,12 @@
-"""Non-dash movement: intent -> terrain slide. See BRAWL_SIM_BUILD_PLAN.md Step 12.
+"""Non-dash movement: intent -> terrain slide.
 
-**Entities do not collide with each other, by design.** Terrain is solid; bodies are not. Two
-units may occupy the same point, walk straight through one another, and stack arbitrarily deep
--- `unit_radius` is a hitbox for projectiles and melee (core/projectiles, core/combat) and a
-spacing constraint for SPAWNING (core/spawn), never a movement obstacle.
-
-This module used to run a "soft separation" pass here: a dense (N,E,E) spring that pushed
-overlapping pairs apart every tick. It was removed deliberately, not lost. It did not implement
-walk-through -- it implemented bumper cars. A unit walking into a stationary one shoved that one
-7+ tiles across the map, and a unit walking into one pinned against a wall sank ~0.14 tiles into
-it and stayed there, since the spring had nowhere to send the pinned body. Neither is a behaviour
-anything wanted, and both were load-bearing enough to need this note: if a future step wants
-bodies to interact, it should say which of "solid" or "springy" it means and build that, rather
-than reintroduce the spring on the assumption it was the collision model.
+**Entities do not collide with each other, by design.** Terrain is solid; bodies are not. Units
+may overlap, walk through one another and stack -- `unit_radius` is a hitbox for projectiles and
+melee (core/projectiles, core/combat), a spacing constraint for SPAWNING (core/spawn) and the
+body's size against terrain, never an obstacle to another unit. A soft-separation spring is not a
+stand-in collision model: it shoves a stationary unit across the map and sinks one pinned against
+a wall into it. Body interaction, if ever wanted, has to be designed as "solid" or "springy" on
+purpose.
 """
 import torch
 
@@ -27,12 +21,9 @@ def apply_movement(state, move_dir: torch.Tensor, bank, params, cfg) -> None:
 
     The length is a throttle. The hero's decoded action is a unit vector or zero, so it always
     walks at full speed; a bot's intent is bots/policy.all_bot_intents's EMA-smoothed steering,
-    which decays toward zero after the bot decides to stop. Renormalising that decaying vector to
-    unit length (the rule until 2026-09-25) made a stopping bot walk at full speed along its old
-    heading until the vector underflowed geometry's epsilon: measured, 47 % of HOLD_STILL ticks
-    at hard were moving, about 6 tiles of coasting per stop (9 at medium, none at elite, whose
-    reaction delay is under one tick). Scaling speed by the length turns that into a decelerating
-    stop of a fraction of a tile."""
+    which decays toward zero after the bot decides to stop. Renormalising that decaying vector
+    would make a stopping bot coast at full speed along its old heading for tiles; scaling speed
+    by the length makes the stop a short deceleration."""
     active = state.ent_alive & (state.ent_dash_t <= 0)  # skipped: dead or dashing
 
     speed = stats.effective_speed(state.ent_kind, params)  # (N,E)
@@ -50,15 +41,10 @@ def apply_movement(state, move_dir: torch.Tensor, bank, params, cfg) -> None:
     state.ent_vel.copy_((pos_final - old_pos) / cfg.dt)
     state.ent_pos.copy_(pos_final)
 
-    # Facing normally tracks movement -- except for an entity mid-SWEEP (Step C2 / D6): Buzz keeps
-    # moving while his five hitscans land, but keeps facing the direction he started the attack in,
-    # so the fan stays anchored where he aimed it. Without this the sweep would smear around
-    # wherever he happened to walk and stop being a readable, dodgeable arc.
-    #
-    # Gated on the KIND being swept, not merely on `ent_attack_cd > 0`: since Step C1 every
-    # brawler has a cooldown running after every attack, so the looser test would freeze all five
-    # brawlers' facing for 0.25 s after every shot -- silently changing dash directions and every
-    # melee cone in the game, far beyond what this step intends.
+    # Facing tracks movement -- except mid-SWEEP: the swinger keeps moving while his hitscans land
+    # but keeps facing the direction he started the attack in, so the fan stays a readable,
+    # dodgeable arc instead of smearing wherever he walks. Gated on the KIND being swept, not on
+    # `ent_attack_cd > 0` alone (see melee_sweep.is_swept).
     sweeping = melee_sweep.is_swept(state, params) & (state.ent_attack_cd > 0)
     move_nonzero = ((move_dir[..., 0] != 0) | (move_dir[..., 1] != 0)) & ~sweeping
     state.ent_facing.copy_(torch.where(move_nonzero, geo.angle_of(move_dir), state.ent_facing))

@@ -1,16 +1,11 @@
 """Assembles a TrainConfig into a ready-to-`learn()` (venv, model) pair.
 
-Kept out of `scripts/train.py` so `tests/test_training.py` can build the exact same objects the
-CLI builds, at `n_envs=2`, without shelling out. `scripts/train.py` is a thin argument parser
-over `build_run`.
+Kept out of `scripts/train.py` so `tests/test_training.py` can build the exact objects the CLI
+builds, at `n_envs=2`, without shelling out.
 
-**The one sharp edge this module exists to handle.** `BrawlVecEnv`'s own docstring warns that a
-`load_config(..., overrides=...)` override touching a SimParams-only field (`base_hp`,
-`zone.dps`, `entities.enemy_hp_mult`, ...) is invisible to `EnvConfig` and is silently lost
-unless the matching merged dict is passed separately as `spec=`. `run.env_overrides` in
-configs/train.yaml is exactly such an override channel, so `build_env` always merges it into
-BOTH the `EnvConfig` and the `spec` dict. Without that, `env_overrides: {boxes: {hp: 1}}` would
-appear to do nothing at all.
+`build_env` merges `run.env_overrides` into BOTH the `EnvConfig` and the `spec` dict. An override
+of a SimParams-only field (`base_hp`, `zone.dps`, `entities.enemy_hp_mult`, ...) never reaches
+`EnvConfig`, so without the `spec` copy `env_overrides: {boxes: {hp: 1}}` would do nothing.
 """
 from pathlib import Path
 
@@ -74,14 +69,10 @@ def sees_pickups(spec: obs_select.AgentObsSpec) -> bool:
 
 
 def check_reward_is_observable(reward, spec: obs_select.AgentObsSpec, spec_path) -> None:
-    """Refuses a run that pays `reward.cube_pickup` under a spec that cannot see pickups.
-
-    Such a run trains an approach behaviour toward something the policy has no input for -- it
-    learns to loiter where cubes tend to be -- and nothing in the run's own curves says so. The
-    reward lives in the shared configs/train.yaml and the spec is chosen per run, so this is the
-    first point where the two are both known; a static test over the files cannot tell a spec that
-    sees cubes from one that does not. One direction only: a spec that sees cubes with the term at
-    0 is a legitimate unshaped run.
+    """Refuses a run that pays `reward.cube_pickup` under a spec that cannot see pickups: the
+    policy would learn to loiter where cubes tend to be, and no curve would show it. Checked here
+    because this is the first point where the reward (train.yaml) and the per-run spec are both
+    known. One direction only: a spec that sees cubes with the term at 0 is a legitimate run.
     """
     if reward.cube_pickup != 0.0 and not sees_pickups(spec):
         raise ValueError(
@@ -96,14 +87,11 @@ def no_image_transpose(venv):
     """`venv` behind SB3's own opt-out from its image heuristic, `VecTransposeImage(skip=True)`
     (SB3 GH issue #671). `build_model` and `scripts/train.py`'s resume hand SB3 the env through it.
 
-    SB3 takes a uint8 [0, 255] Box of rank 3 for an image and guesses its channel axis from its
-    SMALLEST dimension. When it guesses channels-last it wraps the env in a VecTransposeImage that
-    reorders every observation, and says so only in a UserWarning. The grid is
-    (channels, view_h, view_w) by construction and `BrawlFeaturesExtractor` reads it that way, so
-    the guess is right only by accident. deploy4 at the default 13 x 21 view is (13, 13, 21),
-    channels-first on a tie. At debug_tiny's 10 x 14 view it is (13, 10, 14), and SB3 trained
-    `--smoke` on (14, 13, 10), view columns for channels, until 2026-09-21. A skip wrapper already
-    in the chain makes SB3 add none, and it passes observations through untouched."""
+    SB3 guesses a uint8 rank-3 Box's channel axis from its SMALLEST dimension and, on a
+    channels-last guess, transposes every observation with only a UserWarning. The grid is
+    (channels, view_h, view_w) by construction, so the guess is right only by accident:
+    debug_tiny's (13, 10, 14) would be read channels-last. A skip wrapper already in the chain
+    makes SB3 add none, and it passes observations through untouched."""
     return VecTransposeImage(venv, skip=True)
 
 
@@ -169,33 +157,24 @@ def build_policy_kwargs(tcfg: TrainConfig, agent_spec, env_cfg) -> dict:
 
 
 def tensorboard_available() -> bool:
-    """Whether SB3 can actually write TensorBoard events. SB3 imports `SummaryWriter` from
-    `torch.utils.tensorboard` and sets it to None if the import fails -- and that import needs
-    the standalone `tensorboard` PACKAGE, which torch does not pull in. When it's missing,
-    `configure_logger` raises `ImportError` from inside `learn()`, i.e. AFTER env construction
-    and model setup have already run. Checked up front instead so a missing optional dependency
-    degrades to "no TB, everything else still logs" with a clear message, rather than blowing up
-    a run that has already paid its startup cost."""
+    """Whether SB3 can write TensorBoard events: that needs the standalone `tensorboard` package,
+    which torch does not pull in. Checked up front so a missing package degrades to "no TB,
+    everything else still logs" instead of an `ImportError` from inside `learn()` after the
+    startup cost is paid."""
     from stable_baselines3.common.logger import SummaryWriter
     return SummaryWriter is not None
 
 
 def make_logger(tcfg: TrainConfig, log_dir):
-    """An explicit SB3 `Logger` written to `log_dir`, replacing the one `learn()` would
-    otherwise configure for itself (`model.set_logger` marks it custom, so `learn()` leaves it
-    alone).
+    """An explicit SB3 `Logger` written to `log_dir`, replacing the one `learn()` would configure
+    for itself (`model.set_logger` marks it custom, so `learn()` leaves it alone). SB3's default
+    writes no machine-readable file, so this always writes:
 
-    Done by hand because SB3's own default is **stdout only** -- with `tensorboard_log` set it
-    becomes stdout + tensorboard, and in neither case is there a machine-readable file on disk.
-    That's a poor fit for "monitor a run": a scrolling console table can't be replotted, diffed
-    between runs, or read after the terminal is gone. This always writes:
-
-      progress.csv   every logged scalar, one row per dump -- pandas/matplotlib read it directly
-      log.txt        the same human-readable tables the console prints, kept for the record
+      progress.csv   every logged scalar, one row per dump
+      log.txt        the same tables the console prints
       events.*       TensorBoard, when the optional `tensorboard` package is installed
 
-    All three land in one directory, so `tensorboard --logdir runs` still discovers the events
-    (it recurses) without SB3's extra `<Algo>_1` nesting level.
+    All three land in one directory, without SB3's extra `<Algo>_1` nesting level.
     """
     from stable_baselines3.common.logger import configure
 
@@ -215,21 +194,18 @@ def make_logger(tcfg: TrainConfig, log_dir):
 def build_model(tcfg: TrainConfig, venv, agent_spec, env_cfg):
     """`MaskablePPO` (default) or plain `PPO`, wired with both schedules.
 
-    `MaskablePPO` is the right default here: `core/hero.action_mask` already knows exactly when
-    firing is illegal (dead / out of ammo / on cooldown / mid-dash) and `BrawlSB3VecEnv` already
-    exposes it, so masking those actions out costs nothing and stops the policy from spending
-    early training learning that "fire" is a no-op two thirds of the time."""
+    `MaskablePPO` is the default because `core/hero.action_mask` already knows when firing is
+    illegal (dead / out of ammo / on cooldown / mid-dash) and `BrawlSB3VecEnv` exposes it, so
+    masking is free and the policy doesn't spend early training learning that "fire" is often a
+    no-op."""
     algo_cls = PPO
     if tcfg.run.algo == "maskable_ppo":
         from sb3_contrib import MaskablePPO
         algo_cls = MaskablePPO
 
-    # PPO builds a fresh torch.distributions.Categorical every action-selection call, and by
-    # default each one re-validates its own (already policy-guaranteed-valid) logits -- a real
-    # training run profiled this at ~12% of total wall-clock (Distribution.__init__), pure
-    # overhead since a softmax/masked-logits tensor can never fail that check in normal use.
-    # Global and process-wide by design (torch's own default_validate_args is a single flag),
-    # so this only needs to run once per process; calling it again here is a harmless no-op.
+    # PPO builds a fresh Categorical every action-selection call, and each one re-validates
+    # logits the policy already guarantees valid: a measurable share of wall-clock for nothing.
+    # The flag is process-wide, so setting it again is a harmless no-op.
     torch.distributions.Distribution.set_default_validate_args(False)
 
     return algo_cls(

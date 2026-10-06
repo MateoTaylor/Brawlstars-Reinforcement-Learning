@@ -1,4 +1,4 @@
-"""brawl_sim/core/slots.py: tracker-style enemy slots (OBS_PARITY_TASKS.md C8).
+"""brawl_sim/core/slots.py: tracker-style enemy slots.
 
 The scripts below are one string per decision, one character per ENEMY (entity 1 onwards): `x`
 seen by the hero, `.` not. `_run` feeds them to `slots.update` and returns the slot table after

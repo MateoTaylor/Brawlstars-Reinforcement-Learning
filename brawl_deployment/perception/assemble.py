@@ -49,7 +49,7 @@ made-up HP in a column the policy was trained to trust. It costs at most one dec
 #### The `hist` group: the loop's snapshots, through the sim's own expressions
 
 `DeployLoop` keeps one `DecisionSnapshot` per decision that reached the policy, newest first, and
-hands them over as `history` (SIM_OVERHAUL_STEPS.md H4). `_put_history` lays them out as the rings
+hands them over as `history`. `_put_history` lays them out as the rings
 `core/history.py` keeps and then runs `build_obs`'s own `hist` expressions on them,
 `observation._onehot` included. So an empty slot is all zeros, one-hots too, and the displacement
 is the position then minus the position now in float32, exactly as the sim computes it. A snapshot
@@ -225,7 +225,7 @@ class ObservationAssembler:
         self._view = np.zeros((len(self._channel_index), self.cfg.view_h, self.cfg.view_w),
                               np.uint8)
         self._grid_channels = self._channel_indices()
-        # `hero.near_edge` (OBS_PARITY_TASKS.md C7) needs the tracker's `hero_offset`; a spec that
+        # `hero.near_edge` needs the tracker's `hero_offset`; a spec that
         # does not read it (deploy4 and earlier) must not have to supply one.
         self._wants_near_edge = any("hero.near_edge" in g.fields for g in self.spec.groups)
 
@@ -430,7 +430,7 @@ class ObservationAssembler:
 
         full["entities"] = {"alive": alive, "revealed_to_hero": revealed, "rel_pos": rel_pos,
                             "dist": dist, "rel_vel": rel_vel, "hp": hp, "in_bush": in_bush}
-        # The identity permutation for `slots: tracked` (OBS_PARITY_TASKS.md C9): track k sits at
+        # The identity permutation for `slots: tracked`: track k sits at
         # entities index k + 1 and `slots.entity` stores entity + 1, so obs_select's gather maps
         # slot k back to row k. The tracker already IS the slot rule the sim reproduces
         # (core/slots.py), so nothing here reorders. Empty where the row above is: no track, or
@@ -441,9 +441,9 @@ class ObservationAssembler:
 
     def _put_projectiles(self, full, snapshot) -> None:
         """All `max_projectiles` slots, of which `obs_select` keeps the nearest K by
-        `time_to_closest`. The selection has to happen there and not here: `max_slots` is a
-        property of the spec, and doing it twice differently is how deployment and training end up
-        looking at different projectiles.
+        `time_to_closest`, ties by distance. The selection has to happen there and not here:
+        `max_slots` is a property of the spec, and doing it twice differently is how deployment and
+        training end up looking at different projectiles.
 
         `in_view` is not in the spec but IS read, as the projectile group's fairness mask
         (`_FAIRNESS_MASK_FIELD`). Every tracked projectile is one the detector found on screen, so
@@ -461,7 +461,7 @@ class ObservationAssembler:
         if len(snapshot) > p:
             # More live projectiles than the sim can represent. Keeping the nearest is the same
             # rule `max_slots` applies one stage later, so the discard is consistent with it.
-            snapshot = sorted(snapshot, key=lambda s: s[2])[:p]
+            snapshot = sorted(snapshot, key=lambda s: (s[2], math.hypot(*s[0])))[:p]
         for i, (rel, v, t) in enumerate(snapshot):
             alive[0, i] = True
             in_view[0, i] = True

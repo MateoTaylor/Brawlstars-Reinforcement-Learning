@@ -1,7 +1,6 @@
-"""Checks the committed brawl_sim/maps/csv/*.csv files directly against Step 5's acceptance
-criteria. brawl_sim/maps/loader.py (Step 6) doesn't exist yet, so this reads the raw CSV text
-rather than going through a loader -- Step 6 adds a second round of checks on top of this via
-the real MapBank machinery.
+"""Checks the committed brawl_sim/maps/csv/*.csv files directly, reading the raw CSV text rather
+than going through the loader; tests/test_maps.py adds a second round of checks on top of this
+via the real MapBank machinery.
 """
 from collections import deque
 from pathlib import Path
@@ -16,19 +15,34 @@ DIMENSIONS = {
     "blank": (20, 20), "open": (60, 60), "bushy": (60, 60), "walled": (60, 60),
     "skull_creek": (60, 60), "feast_or_famine": (60, 60),
     "scorched_stone": (60, 60), "island_invasion": (60, 60),
-    # The ten generated maps (SIM_OVERHAUL_PLAN.md Step M3; brawl_sim/maps/README.md has the
+    # The ten generated maps (brawl_sim/maps/README.md has the
     # seed table). brawl_sim/maps/generate.py only makes 60x60 grids.
     "broken_wall": (60, 60), "stone_fort": (60, 60), "twin_ponds": (60, 60),
     "cross_creek": (60, 60), "split_river": (60, 60), "narrow_pass": (60, 60),
     "dry_gulch": (60, 60), "thorn_field": (60, 60), "reed_marsh": (60, 60),
     "hollow_ring": (60, 60),
+    # Five maps transcribed from Solo Showdown screenshots and fifteen from the generator
+    # families modeled on them (2026-09-27; both tables in brawl_sim/maps/README.md).
+    "hot_maze": (60, 60), "ghost_point": (60, 60), "shadow_spirits": (60, 60),
+    "crescent_lakes": (60, 60), "twisting_vines": (60, 60),
+    "pond_maze": (60, 60), "canal_maze": (60, 60), "picket_maze": (60, 60),
+    "lagoon_ring": (60, 60), "square_lakes": (60, 60), "bush_halo": (60, 60),
+    "bramble_ponds": (60, 60), "bramble_bend": (60, 60), "bramble_stars": (60, 60),
+    "moon_gate": (60, 60), "half_moon": (60, 60), "moon_pools": (60, 60),
+    "vine_springs": (60, 60), "vine_canal": (60, 60), "vine_hollow": (60, 60),
 }
 ALL_MAPS = list(DIMENSIONS)
 GENERATED_MAPS = [
     "broken_wall", "stone_fort", "twin_ponds", "cross_creek", "split_river", "narrow_pass",
     "dry_gulch", "thorn_field", "reed_marsh", "hollow_ring",
+    "pond_maze", "canal_maze", "picket_maze", "lagoon_ring", "square_lakes", "bush_halo",
+    "bramble_ponds", "bramble_bend", "bramble_stars", "moon_gate", "half_moon", "moon_pools",
+    "vine_springs", "vine_canal", "vine_hollow",
 ]
-MIN_SPAWN = {name: 12 for name in DIMENSIONS} | {"blank": 8}
+# The real maps have one spawn per player, ten, and the spawner needs one per entity (the hero
+# plus default.yaml's nine enemies), so the transcriptions keep exactly ten.
+SCREENSHOT_MAPS = ["hot_maze", "ghost_point", "shadow_spirits", "crescent_lakes", "twisting_vines"]
+MIN_SPAWN = {name: 12 for name in DIMENSIONS} | {"blank": 8} | {name: 10 for name in SCREENSHOT_MAPS}
 MIN_BOX = {name: 16 for name in DIMENSIONS} | {"blank": 8}
 
 UNIT_BLOCKING = {Tile.WALL, Tile.WATER}
@@ -122,7 +136,7 @@ def test_walled_has_water():
 
 @pytest.mark.parametrize("name", GENERATED_MAPS)
 def test_generated_map_has_exactly_sixteen_spawns(name):
-    """The generator places `N_SPAWNS = 16` markers (plan Step M2 item 3) -- a hand edit that
+    """The generator places `N_SPAWNS = 16` markers -- a hand edit that
     drops or duplicates one would still pass the >= 12 minimum above, so the exact count is
     pinned here. The literal 16 is deliberate: reading `generate.N_SPAWNS` would let the test
     follow a changed constant."""

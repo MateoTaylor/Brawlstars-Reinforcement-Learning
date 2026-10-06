@@ -31,9 +31,8 @@ two observable intervals mean different things:
 B is well defined only from full, because below full the reload timer is already running when the
 shot lands and the interval measures whatever was left of it.
 
-So B - A is `attack_cooldown` measured on its own -- the constant `configs/brawlers.yaml` defers
-as "Step C1, paired with the reload pause that gives it meaning" -- and A == B would falsify the
-pause model.
+So B - A is `attack_cooldown` measured on its own -- the pause `configs/brawlers.yaml` models --
+and A == B would falsify the pause model.
 
 **That test is OUT OF SCOPE and not wanted (operator, 2026-09-11).** The pause is Mortis's attack
 animation and stays in the sim. This script is for refitting `reload_seconds` (family A). Family B

@@ -1,7 +1,6 @@
 import torch
 
 from brawl_sim.constants import (
-    BOT_KINDS,
     CHAR_TO_TILE,
     MAP_CHAR_TO_TILE,
     N_KINDS,
@@ -11,9 +10,7 @@ from brawl_sim.constants import (
     PROJ_CLASS_OF,
     TILE_BLOCKS_PROJ,
     TILE_BLOCKS_UNIT,
-    TILE_IS_BOX_SPAWN,
     TILE_IS_BUSH,
-    TILE_IS_SPAWN,
     TILE_IS_WATER,
     TILE_TO_CHAR,
     DeathCause,
@@ -23,7 +20,7 @@ from brawl_sim.constants import (
     Tile,
 )
 
-# Ground truth from BRAWL_SIM_BUILD_PLAN.md Step 2 / Notice 4's pass/block table.
+# Ground truth: BRAWL_SIM_DESIGN.md §6's tile pass/block table.
 EXPECTED_BLOCKS_UNIT = {
     Tile.FLOOR: False, Tile.WALL: True, Tile.BUSH: False, Tile.WATER: True,
     Tile.FENCE: True, Tile.SPAWN: False, Tile.BOX: False,
@@ -45,13 +42,12 @@ def test_enum_values():
     assert (ProjClass.PROJECTILE, ProjClass.ARTILLERY, ProjClass.HAZARD) == (0, 1, 2)
     assert (DeathCause.ALIVE, DeathCause.COMBAT, DeathCause.ZONE) == (0, 1, 2)
     assert (N_TILES, N_KINDS, N_PROJ_KINDS, N_PROJ_CLASSES) == (7, 8, 8, 3)
-    assert BOT_KINDS == (1, 2, 3, 4, 5, 6, 7)
 
 
 def test_every_projectile_kind_has_a_class_row_and_the_spinner_is_artillery():
     """`PROJ_CLASS_OF` is indexed by `Proj`, so a member added without a row would index past
     the table's end at spawn time (or, worse, read the wrong row if one were inserted mid-table).
-    The gadget spinner (Phase G) is ARTILLERY on purpose: nothing in flight, a burst on landing."""
+    The gadget spinner is ARTILLERY on purpose: nothing in flight, a burst on landing."""
     assert len(PROJ_CLASS_OF) == len(Proj)
     assert PROJ_CLASS_OF[Proj.GADGET_SPINNER] is ProjClass.ARTILLERY
     assert PROJ_CLASS_OF[Proj.NONE] is ProjClass.PROJECTILE
@@ -85,19 +81,17 @@ def test_blocks_proj_matches_table():
 
 
 def test_only_wall_blocks_proj():
-    # Notice 4: fence no longer blocks shots, so WALL is the only opaque tile left --
+    # Fence does not block shots, so WALL is the only opaque tile --
     # this is also the tensor every physical-LOS check (melee, sniper/rifle fire-gate)
-    # reuses, since there's no separate vision table anymore.
+    # reuses, since there's no separate vision table.
     assert int(TILE_BLOCKS_PROJ.sum()) == 1
     assert bool(TILE_BLOCKS_PROJ[Tile.WALL]) is True
 
 
-def test_is_bush_water_spawn_boxspawn_are_singletons():
+def test_is_bush_and_is_water_are_singletons():
     for table, tile in (
         (TILE_IS_BUSH, Tile.BUSH),
         (TILE_IS_WATER, Tile.WATER),
-        (TILE_IS_SPAWN, Tile.SPAWN),
-        (TILE_IS_BOX_SPAWN, Tile.BOX),
     ):
         assert bool(table[tile]) is True
         assert int(table.sum()) == 1
@@ -106,7 +100,7 @@ def test_is_bush_water_spawn_boxspawn_are_singletons():
 def test_lookup_tensor_shape_and_dtype():
     for table in (
         TILE_BLOCKS_UNIT, TILE_BLOCKS_PROJ,
-        TILE_IS_BUSH, TILE_IS_WATER, TILE_IS_SPAWN, TILE_IS_BOX_SPAWN,
+        TILE_IS_BUSH, TILE_IS_WATER,
     ):
         assert table.shape == (N_TILES,)
         assert table.dtype == torch.bool
@@ -116,7 +110,7 @@ def test_char_tile_roundtrip():
     assert len(CHAR_TO_TILE) == N_TILES
     for char, tile in CHAR_TO_TILE.items():
         assert TILE_TO_CHAR[tile] == char
-    # every tile used by the Step 5 map CSV legend is covered
+    # every tile has a character
     for tile in (Tile.FLOOR, Tile.WALL, Tile.BUSH, Tile.WATER, Tile.FENCE, Tile.SPAWN, Tile.BOX):
         assert tile in TILE_TO_CHAR
 

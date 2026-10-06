@@ -1,7 +1,7 @@
 # brawlstars-rl
 
-Two halves of one goal: train an agent to play Brawl Stars Solo Showdown, then let it see the
-real game.
+One goal in three packages: train an agent to play Brawl Stars Solo Showdown in a simulator,
+give it eyes on the real game, and play live matches with it.
 
 - **`brawl_sim`** — a batched, GPU-resident approximation of Solo Showdown. Thousands of
   independent matches step in lockstep as one set of tensors, with no Python loop over
@@ -11,33 +11,33 @@ real game.
 - **`brawl_vision`** — the perception side. Takes a screen capture or an mp4 of a real match and
   reconstructs the map: calibrated homography, inverse-perspective rectification, camera
   odometry, per-cell terrain classification, and an accumulated world occupancy grid. The point
-  is that a policy trained in `brawl_sim` should eventually be handed the same view from the
-  real game.
-
-The sim half is built and trains. The vision half runs end to end — recorded match in,
-reconstructed map video out — at 88% per-cell accuracy with zero measured odometry drift; walls
-are the outstanding classifier failure. Nothing yet connects a trained policy to live frames.
+  is that a policy trained in `brawl_sim` is handed the same view from the real game.
+- **`brawl_deployment`** — live play in a BlueStacks emulator: screen capture, a match gate,
+  perception that assembles the trained spec's observation from `brawl_vision`'s readers and a
+  shadow of the hero's own state, the policy at the trained 4 Hz, and touch injection over ADB.
+  `configs/deployment.yaml` names the checkpoint; `BRAWL_DEPLOYMENT_DESIGN.md` is its design doc.
 
 ## What's in the box
 
 | | |
 |---|---|
-| `brawl_sim/core/` | the simulation: movement, combat, projectiles, zone, boxes, spawn, observation |
+| `brawl_sim/core/` | the simulation: hero, movement, terrain, combat, projectiles, zone, boxes, spawn, observation |
 | `brawl_sim/bots/` | bot opponents — one data-driven fire rule, five movement personalities |
 | `brawl_sim/training/` | PPO stack: shaped reward, curriculum, schedules, stationary eval |
 | `brawl_sim/wrappers/` | SB3 `VecEnv`, single-env `gymnasium.Env`, feature extractor |
 | `brawl_sim/render/` | ASCII renderer and a scrubbable matplotlib replay viewer |
-| `brawl_sim/maps/` | eight CSV maps (seven 60x60, one tiny for tests), six in the training rotation |
+| `brawl_sim/maps/` | 38 CSV maps and their generator: 36 in the default rotation, 34 in training, `blank` (20x20) for tests |
 | `brawl_vision/` | frame sources, camera calibration, odometry, terrain, occupancy |
 | `brawl_vision/object_detection/` | third-party YOLO entity detector over the raw frame |
-| `configs/` | every number in the project; nothing is hardcoded |
+| `brawl_deployment/` | live play: capture, match gate, perception to agent obs, policy, ADB control |
+| `configs/` | every tunable number (CONVENTIONS.md lists the constants that stay in code) |
 | `scripts/` | the runnable entry points below |
-| `tests/` | ~60 test modules, CPU by default |
+| `tests/` | ~100 test modules, CPU by default |
 
-A match is 10 players on a 60x60 map, 150 seconds, shrinking zone, loot boxes that drop power
-cubes. The hero is Mortis (dash assassin); the seven bot brawlers are Brock, Grom, Buzz, Shelly,
-Edgar, Spike and Bull. The world ticks at 20 Hz and the agent decides at 4 Hz. See
-`CHARACTER_DETAILS.md` for the roster and `brawl_sim/maps/README.md` for the maps.
+A match is 10 players on a 60x60 map, 150 seconds (training runs 185 s), shrinking zone, loot
+boxes that drop power cubes. The hero is Mortis (dash assassin); the seven bot brawlers are
+Brock, Grom, Buzz, Shelly, Edgar, Spike and Bull. The world ticks at 20 Hz and the agent decides
+at 4 Hz. See `CHARACTER_DETAILS.md` for the roster and `brawl_sim/maps/README.md` for the maps.
 
 ## Setup
 
@@ -46,23 +46,15 @@ pip install -e ".[dev,sb3,render]"
 python scripts/check_install.py
 ```
 
-Extras: `dev` (pytest), `sb3` (Stable-Baselines3 + TensorBoard), `render` (matplotlib),
-`video` (mp4 export), `vision` (OpenCV + screen capture — only needed for `brawl_vision`).
+Extras: `dev` (pytest + pytest-xdist), `sb3` (Stable-Baselines3 + TensorBoard), `render`
+(matplotlib), `video` (mp4 export), `vision` (OpenCV + screen capture — only needed for
+`brawl_vision`).
 
-### Install trap: Blackwell (sm_120) GPUs
-
-On an RTX 50-series card, a plain `pip install torch` can pull a build whose kernels stop at
-`sm_90`. It installs fine and then fails at *runtime* with `no kernel image is available for
-execution on the device`. Install from the CUDA wheel index instead:
-
-```
-pip install torch --index-url https://download.pytorch.org/whl/cu128
-```
-
-(or a newer `cu12x`/`cu13x` channel — check https://pytorch.org/get-started/locally). The
-definitive check is `torch.cuda.get_arch_list()` containing `'sm_120'`, **not**
-`torch.cuda.is_available()`, which returns `True` even on a build that cannot launch a kernel.
-`scripts/check_install.py` checks this for you. Windows-native is fine; no WSL needed.
+**Install trap on Blackwell (RTX 50-series, sm_120):** a plain `pip install torch` can install a
+build whose kernels stop at `sm_90`, which fails only at runtime (`no kernel image is available
+for execution on the device`). Install with `--index-url https://download.pytorch.org/whl/cu128`
+(or a newer channel). The check is `'sm_120'` in `torch.cuda.get_arch_list()`, **not**
+`torch.cuda.is_available()`; `scripts/check_install.py` runs it. Windows-native is fine.
 
 ## Things to run on a fresh clone
 
@@ -70,19 +62,21 @@ Everything here works with no trained model and no game footage:
 
 ```bash
 python scripts/check_install.py           # CUDA, sm_120, and whether sb3/vision import
-pytest tests/ -m "not slow"               # ~1140 tests, CPU (see "Running the tests")
+pytest tests/ -m "not slow"               # CPU (see "Running the tests")
 python scripts/smoke_test.py              # every config variant, 500 random steps, invariants on
 python scripts/benchmark.py               # env-steps/sec, per-phase timing, VRAM, obs footprint
 python scripts/dump_obs_schema.py         # writes docs/OBSERVATION.md and docs/AGENT_OBS.md
 python scripts/sb3_smoke.py               # proves the SB3 plumbing connects (not a training run)
 ```
 
-`dump_obs_schema.py` is worth running first: both docs are generated and gitignored, so a fresh
-clone doesn't have them. They are the field-by-field reference for what the sim observes
-(`docs/OBSERVATION.md`, everything) and what a policy actually receives (`docs/AGENT_OBS.md`).
+Run `dump_obs_schema.py` first: its two docs are gitignored, and they are the field-by-field
+reference for everything the sim observes (`docs/OBSERVATION.md`) and what a policy receives
+(`docs/AGENT_OBS.md`). `--spec configs/agent_obs_deploy5.yaml` renders the spec training uses to
+the tracked `docs/AGENT_OBS_DEPLOY5.md`.
 
-**Play it yourself** — WASD to move, space to fire, `g` to throw the gadget, at the real 20 Hz. The human feel-check for
-Mortis's dash, and the fastest way to understand what the bots do:
+**Play it yourself** — WASD to move, space to fire, `g` to throw the gadget, at the real 20 Hz
+(the super has no key, by user decision). The human feel-check for Mortis's dash, and the fastest
+way to understand what the bots do:
 
 ```bash
 python scripts/play_manual.py
@@ -103,7 +97,7 @@ and diamonds, which is fully functional. `.gif` export needs nothing extra; `.mp
 **Train something:**
 
 ```bash
-python scripts/train.py --smoke     # ~1.5 min CPU wiring check, proves the loop end to end
+python scripts/train.py --smoke     # tiny CPU wiring check, proves the loop end to end
 python scripts/train.py             # the real thing, configs/train.yaml as-is
 tensorboard --logdir runs
 ```
@@ -234,7 +228,7 @@ Two things that trip people up:
   6}}`), not a flat dotted key. It's deep-merged section by section.
 - **`MyReward` is a placeholder.** `BrawlVecEnv`'s default reward is `ZeroReward` — the sim
   ships no opinion on what "good" means. Write your own `__call__(self, obs, info, cfg) ->
-  torch.Tensor` (see `core/reward.py`'s `Reward` protocol, or use `training/reward.py`'s
+  torch.Tensor` (see `core/reward.py`'s `RewardFn` protocol, or use `training/reward.py`'s
   `ShapedReward`).
 
 ### Native or SB3?
@@ -257,19 +251,25 @@ single-env `gymnasium.Env` for `check_env` and interactive play.
 | `CONVENTIONS.md` | **read first if you're writing code here** — the batched-tensor rule, the no-host-sync rule, dtypes, shapes, and the canonical 17-phase tick order |
 | `TRAINING.md` | reward design, curriculum, stationary evaluation, run layout, logging |
 | `CHARACTER_DETAILS.md` | the eight brawlers and how their real kits were converted |
-| `BRAWL_SIM_BUILD_PLAN.md` | the full sim design and build plan; Appendix A is the known divergences, Appendix D the runtime contract (config schema, action space, decision rate, autoreset) |
-| `bot_overhaul.md` | the bot/hero overhaul; §8 is how the shipped bots behave and why |
+| `BRAWL_SIM_DESIGN.md` | the sim as built: open items, decisions in force (§2, incl. the divergences below), architecture and runtime contract (§3), hero, combat, terrain and maps, bots (§7), match flow, observation, reward, training, performance |
+| `BRAWL_DEPLOYMENT_DESIGN.md` | live play in BlueStacks: control, match gate, perception, the hero shadow, and what was measured live |
+| `KNOWN_MAP_LOCALIZATION_PLAN.md` | locating the hero on a known map (Dark Passage first); status block at the top |
 | `Terrain_Perception_Build_Plan.md` | the vision pipeline, phase by phase, with what each measurement actually found |
+| `TERRAIN_RELABEL_2MAPS.md` | the frame list and instructions for the current terrain-classifier labelling set |
+| `EDGAR_HERO_PLAN.md` | archived 2026-09-14, not implemented: Edgar as the agent |
 | `brawl_sim/maps/README.md` | map CSV format, the tile legend, and how to design a map for this sim |
-| `docs/OBSERVATION.md`, `docs/AGENT_OBS.md` | generated — run `scripts/dump_obs_schema.py` |
+| `docs/OBSERVATION.md`, `docs/AGENT_OBS.md` | generated and gitignored — run `scripts/dump_obs_schema.py` |
+| `docs/AGENT_OBS_DEPLOY4.md`, `docs/AGENT_OBS_DEPLOY5.md` | generated and tracked — `dump_obs_schema.py --spec configs/agent_obs_deploy<N>.yaml` |
 
 ## Known divergences from the real game
 
-The short version, from `BRAWL_SIM_BUILD_PLAN.md` Appendix A: no Supers, Gadgets, Star Powers or
-Hypercharges; 16-bin movement with no independent aim; soft unit collision, no knockback, stuns
-or slows; simplified bushes; 20 Hz tick; no cube redistribution or timed spawns; bot policies are
-hand-written heuristics rather than real players (randomize their difficulty or an agent will
-overfit to them); trajectories are deterministic only for a fixed `n_envs`.
+The short version (`BRAWL_SIM_DESIGN.md` §2 has the reasons): only Mortis has a Super and a
+Gadget, and nothing has Star Powers or Hypercharges; 16-bin movement, with the attack aimed along
+the move bin or, under `action.auto_aim`, at the nearest enemy or crate in reach; units never
+collide with each other, and there is no knockback, stun or slow; simplified bushes; 20 Hz tick;
+no cube redistribution or timed spawns; bot policies are hand-written heuristics rather than real
+players (randomize their difficulty or an agent will overfit to them); trajectories are
+deterministic only for a fixed `n_envs`.
 
 One is worth stating outright: **the simulator does not restrict the hero's information by
 itself.** Fairness is a single config flag (`AgentObsSpec.fair`) away from being switched off.
@@ -278,17 +278,17 @@ misconfigured spec can silently train a cheating agent. `tests/test_integration.
 privileged-isolation tests are the guard; keep them green.
 
 The egocentric view is `21x13` tiles, **measured** from the real Solo Showdown camera rather than
-guessed (it was `20x40` before). Two camera divergences remain, both measured and both left in
-place; `Terrain_Perception_Build_Plan.md` Phase K has the derivation and the numbers.
+guessed. Two camera divergences remain, both measured and both left in place;
+`Terrain_Perception_Build_Plan.md` Phase K has the derivation and the numbers.
 
 ## Running the tests
 
 ```bash
 pytest tests/ -n auto             # the whole suite in parallel (pytest-xdist ships in [dev])
-pytest tests/ -m "not slow"       # ~1140 tests, CPU; skips the real-training-loop tests
+pytest tests/ -m "not slow"       # CPU; skips the real-training-loop tests
 pytest tests/test_vision_*.py     # vision only — a few seconds, and siloed from the sim
 ```
 
-Serially the suite takes ~13 minutes, almost all of it `brawl_sim` — `-n auto` is worth it. Markers: `gpu` (needs CUDA —
-these skip rather than fail without one), `slow` (runs a real if tiny training loop), `vision`
-(needs footage under `tests/fixtures/vision/`, so it skips on a fresh clone).
+The serial suite is almost all `brawl_sim` and slow, so `-n auto` is worth it. Markers: `gpu`
+(needs CUDA — these skip rather than fail without one), `slow` (runs a real if tiny training
+loop), `vision` (needs footage under `tests/fixtures/vision/`, so it skips on a fresh clone).

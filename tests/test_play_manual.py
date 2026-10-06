@@ -121,7 +121,7 @@ def test_right_click_does_not_fire():
     assert int(session.action_tensor()[0, 1]) == 0
 
 
-# ---- gadget: `g` is attack-column value 3 (SIM_OVERHAUL Step G3) ---------------------------------
+# ---- gadget: `g` is attack-column value 3 --------------------------------------------------------
 
 def test_g_sets_the_gadget_value_and_release_clears_it():
     session, env, cfg = _session()
@@ -158,7 +158,7 @@ def test_pressing_g_throws_a_spinner_and_the_title_counts_the_cooldown_down():
     # The spinner's 4 ticks of flight fit inside the one 5-tick decision, so it is already gone
     # when `tick()` returns: count it per SUB-tick instead. Projectile kind 7 is
     # `Proj.GADGET_SPINNER`, as a literal. Without this the test passed on an env that started
-    # the cooldown and threw nothing (Step G3 review).
+    # the cooldown and threw nothing.
     spinners, owners = [], set()
 
     def _count(e):
@@ -184,7 +184,7 @@ def test_the_game_window_takes_its_keys_away_from_matplotlibs_default_keymap():
     grid toggle (two `ax.grid` calls and a full redraw while the cursor is over the axes -- which
     it is, since left-click fires) and `s` its save dialog. `connect_input` disconnects it. Real
     `KeyEvent`s through the canvas, not `on_key_press` called by hand: the collision lives in
-    what ELSE is connected to the figure, which a direct call cannot see (Step G3 review)."""
+    what ELSE is connected to the figure, which a direct call cannot see."""
     from matplotlib.backend_bases import KeyEvent
 
     session, env, cfg = _session()

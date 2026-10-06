@@ -124,7 +124,7 @@ def test_default_policy_kwargs_has_normalize_images_false():
 def test_normalize_images_false_is_load_bearing():
     """Regression/documentation test: without normalize_images=False, SB3's own preprocess_obs
     would divide the grid's raw occupancy counts (0-255, not pixel intensities) by 255 before
-    this extractor ever sees them -- exactly the corruption the plan's text warns about."""
+    this extractor ever sees them."""
     from stable_baselines3.common.preprocessing import preprocess_obs
     space, spec, cfg = _space()
     grid_space = space.spaces["grid"]
@@ -142,12 +142,12 @@ def test_float_group_names_excludes_the_uint8_grid_group():
     assert set(names) == {g.name for g in spec.groups if g.name != "grid"}
 
 
-# ---- the deploy specs' input widths, pinned (SIM_OVERHAUL_STEPS.md Step H3) -----------------
+# ---- the deploy specs' input widths, pinned -------------------------------------------------
 
-# Measured at the default config in Step I1, with no extractor change. A checkpoint's first conv
-# and first linear layer are sized from these two numbers, so a change to either is a
-# from-scratch retrain, never a checkpoint swap. Deploy3 is the last trained run's spec and
-# deploy4 the next one's. Written out rather than read from the spec: a test that asked the spec
+# Measured at the default config when deploy4's spec was built, with no extractor change. A
+# checkpoint's first conv and first linear layer are sized from these two numbers, so a change to
+# either is a from-scratch retrain, never a checkpoint swap. Deploy3 is the last trained run's spec
+# and deploy4 the next one's. Written out rather than read from the spec: a test that asked the spec
 # for its own width could not fail.
 DEPLOY_WIDTHS = {
     "configs/agent_obs_deploy3.yaml": (10, 182, {"self": 24, "enemies": 81, "projectiles": 72,

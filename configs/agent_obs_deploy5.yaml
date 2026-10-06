@@ -1,64 +1,56 @@
-# DEPLOYABLE agent view, fifth pass -- configs/agent_obs_deploy4.yaml plus `hero.near_edge` in
-# `self` and `slots: tracked` on `enemies` (OBS_PARITY_PLAN.md rev 3; OBS_PARITY_TASKS.md C1-C10).
-# `projectiles`, `zone`, `history` and `grid` are byte-identical to the parent's, and so is every
-# `enemies` field; tests/test_configs_files.py pins that.
+# DEPLOYABLE agent view, fifth of the deploy line and configs/train.yaml's default:
+# configs/agent_obs_deploy4.yaml plus `hero.near_edge` in `self` and `slots: tracked` on
+# `enemies`. `projectiles`, `zone`, `history` and `grid` are byte-identical to the parent's, and
+# so is every `enemies` field; tests/test_configs_files.py pins that.
 #
 #   python scripts/train.py --set run.agent_obs=configs/agent_obs_deploy5.yaml
 #
-# WHY A SEVENTH FILE RATHER THAN AN EDIT
-# --------------------------------------
-# Same reason as the last four. `runs/*/train.yaml` names its spec BY PATH. agent_obs_deploy4.yaml
-# is what runs/mortis_deploy4-20260921-185945 trained on and what configs/deployment.yaml still
-# serves; widening it would make it mean two different widths depending on when you read it.
-#
-# WHAT CHANGED (2026-09-24)
-# -------------------------
-# Every change closes a place the sim hero knew something the deployed loop could not
-# (OBS_PARITY_PLAN.md, the operator's decisions). Two add or reorder columns; two change what an
-# existing observation means and leave every column where it was.
+# WHAT THIS CHANGES
+# -----------------
+# Each change closes a place where the sim hero knew something the deployed loop could not. Two
+# add or reorder columns; the sim-side ones (window, latch) apply under every spec.
 #   window    (no column) The sim hero sees what the SCREEN shows. `hero_view` is the camera's
 #             ground quad around the CLAMPED camera (core/camera.py; `camera.quad` and
-#             `camera.clamp_onset` in configs/default.yaml, both measured from footage), not a
-#             hero-centred rectangle. Every `*.in_view`, `entities.revealed_to_hero`, the grid's
-#             enemy planes, the history planes and the projectile fairness mask read through it;
-#             the 13 x 21 grid crop itself stays hero-centred. Near a map edge the camera stops
-#             following the hero, so the window goes off-centre exactly as it does on the phone.
+#             `camera.clamp_onset` in configs/default.yaml), not a hero-centred rectangle. Every
+#             `*.in_view`, `entities.revealed_to_hero`, the grid's enemy planes, the history
+#             planes and the projectile fairness mask read through it; the 13 x 21 grid crop
+#             itself stays hero-centred. Near a map edge the camera stops following the hero, so
+#             the window goes off-centre exactly as it does on the phone.
 #   self      + hero.near_edge right after hero.in_zone, so the two "where am I" bits read
 #             together. 1 when the camera has stopped following the hero: |hero - cam| >
 #             `camera.edge_flag_tiles` (2.0) on either axis. It is the only thing on screen that
-#             says "map edge"; the operator's test for it is that the hero must not waste time
+#             says "map edge"; the user's test for it is that the hero must not waste time
 #             trying to run off the map.
 #   enemies   `slots: tracked`. The rows follow the sim's tracker-style slot table (core/slots.py,
 #             `slots:` in configs/default.yaml) instead of entity index: an enemy needs
 #             `promote_hits` (2) consecutive sightings to take the lowest free slot, keeps it
 #             through `max_misses` (3) unseen decisions and loses it on the fourth, and a
 #             returning enemy takes whichever slot is free, so identities shift the way
-#             EntityTracker's do live. Both counts are DECISIONS, because the tracker updates once
-#             per decision. Same shape, (n_enemies, 9). `fair` still zeroes the row of a slotted
-#             enemy that is not revealed this decision, so a coasting slot reads like an empty
-#             one; what the order changes is WHICH row a revealed enemy lands in, and that the
-#             row can move.
+#             EntityTracker's do live. Both counts are DECISIONS, because the tracker updates
+#             once per decision. Same shape, (n_enemies, 9). `fair` still zeroes the row of a
+#             slotted enemy that is not revealed this decision, so a coasting slot reads like an
+#             empty one; what the order changes is WHICH row a revealed enemy lands in, and that
+#             the row can move.
 #   zone      (no column) zone.active is a LATCH: 0 until gas has been on screen at least once in
 #             the episode, then 1 for the rest of it (core/zone.mark_seen), which is what
-#             ZoneEstimator.active means live. It used to read 1 from the first decision whenever
-#             the zone was enabled.
+#             ZoneEstimator.active means live.
 #
 # Normalization is unchanged: near_edge is a bool like in_bush and in_zone, and the enemies rows
 # keep every divisor they had.
 #
-# Six groups is obs_select._MAX_GROUPS: each group is its own device-to-host copy. The next field
+# WIDTHS: self 27 floats (near_edge is column 18; long_dash_ready and everything after it move up
+# one, so the gadget pair is 23 and 24). Every other group keeps its shape, and the extractor
+# takes 13 grid channels and 263 floats. Six groups is obs_select._MAX_GROUPS: the next field
 # joins an existing group; a seventh group will not load.
 #
-# ------------------------------------------------------------------------------------------------
-# DEPLOYABLE (2026-09-24) -- what supplies the new fields
-# ------------------------------------------------------------------------------------------------
-# Every new field passes the deploy rule: the live loop supplies it without a new detector.
-#   hero.near_edge     TrackerResult.hero_offset (OBS_PARITY_TASKS.md C7): the player box's tile
-#                      position against its nominal screen anchor, the viewport centre plus
-#                      camera.HERO_ANCHOR_TILES pushed through the same rectify plan as every
-#                      detection, so the plan's origin_tile cancels. The assembler takes
-#                      |offset| > camera.edge_flag_tiles on either axis, and only when the spec
-#                      names the field; the loop logs the offset and the bit per decision
+# WHAT SUPPLIES THE NEW FIELDS LIVE (no new detector)
+# ---------------------------------------------------
+#   hero.near_edge     TrackerResult.hero_offset: the player box's tile position against where it
+#                      reads while the camera tracks the hero (the viewport centre through the same
+#                      rectify plan as every detection, plus `HERO_ANCHOR_TILES` and the tracker's
+#                      `PLAYER_BOX_FROM_RING_TILES`), so the plan's origin_tile cancels. The
+#                      assembler takes |offset| > camera.edge_flag_tiles on either axis, only when
+#                      the spec names the field; the loop logs the offset and the bit per decision
 #                      (`hero_offset_x/y`, `near_edge` in the tick telemetry).
 #   enemies (tracked)  Nothing new. EntityTracker already promotes on the second sighting, coasts
 #                      three misses and re-uses the lowest free slot; the assembler writes track k
@@ -66,13 +58,8 @@
 #                      rule was fitted to the tracker decision by decision
 #                      (tests/test_deployment_tracker.py).
 #   window, latch      Nothing to supply: they change what the sim shows, not what the loop reads.
-# tests/test_deployment_loop.py and tests/test_deployment_zone.py glob this file and serve it like
-# every other deploy spec; tests/test_deployment_grid.py loads its grid both ways and
-# tests/test_deployment_assemble.py checks the new bit and the slot order against the sim.
-#
-# WIDTH CHANGES: self 26 -> 27 floats (near_edge is column 18; long_dash_ready and everything after
-# it move up one, so the gadget pair is 23 and 24). Every other group keeps its shape, and the
-# extractor takes 13 grid channels and 263 floats. Not a checkpoint swap; train from scratch.
+# tests/test_deployment_grid.py loads its grid both ways, and tests/test_deployment_assemble.py
+# checks the new bit and the slot order against the sim.
 fair: true
 normalize: true
 groups:
@@ -91,7 +78,7 @@ groups:
     per_entity: true
     slots: tracked                      # NEW: row k is the enemy holding tracker slot k (header)
     dtype: float32
-    # Fields unchanged since agent_obs_deploy3.yaml. agent_obs_deploy.yaml's header explains every
+    # Fields as in agent_obs_deploy3.yaml. agent_obs_deploy.yaml's header explains every
     # removal: kind_onehot by lowinfo, cubes/can_attack/dashing as unsuppliable, hp_frac -> hp
     # because cubes move max_hp.
     fields: [entities.alive, entities.revealed_to_hero,

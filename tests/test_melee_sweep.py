@@ -1,4 +1,4 @@
-"""Swept multi-hitscan melee (core/melee_sweep.py, bot_overhaul.md Step C2).
+"""Swept multi-hitscan melee (core/melee_sweep.py).
 
 One test file per module, matching the repo's convention. The bot-side fire gate that decides
 WHEN Buzz starts a sweep lives in tests/test_melee.py with the rest of the archetype's logic.
@@ -78,7 +78,7 @@ def test_sweep_fires_exactly_hitscan_count_sub_swings():
 
 
 def test_sub_swings_are_evenly_spaced_across_the_cooldown():
-    """The cooldown IS the attack's duration (Step C1), so five swings across 1.0s land at
+    """The cooldown IS the attack's duration, so five swings across 1.0s land at
     0.0/0.2/0.4/0.6/0.8 -- the last one strictly inside the window, not on its edge."""
     cfg, params = _cfg_and_params()
     state = _armed_buzz(cfg, params)
@@ -127,10 +127,10 @@ def test_sweep_runs_clockwise():
     assert dirs == sorted(dirs)
 
 
-# ---- damage (bot_overhaul.md D9) --------------------------------------------------------
+# ---- damage -----------------------------------------------------------------------------
 
 def test_at_most_three_sub_swings_can_connect_with_one_target():
-    """D9's whole reason for attack_arc_rad 0.65. CHARACTER_DETAILS: the hitscans "should overlap
+    """The whole reason for attack_arc_rad 0.65. CHARACTER_DETAILS: the hitscans "should overlap
     slightly, but it is unrealistic players are hit by more than 3". Checked across the full fan,
     not just dead centre -- a bearing between two sub-swings is the case that could catch 4."""
     cfg, params = _cfg_and_params()
@@ -148,8 +148,8 @@ def test_at_most_three_sub_swings_can_connect_with_one_target():
         hits = sum(1 for _t, _d, dmg in _run_sweep(state, cfg, params, bank=bank) if dmg > 0)
         worst = max(worst, hits)
 
-    assert worst == 3, f"max sub-swings connecting was {worst}, expected exactly 3 (D9)"
-    assert abs(3 * per_hit - 2520.0) < 1e-3, "D9's 2520 max-damage figure no longer holds"
+    assert worst == 3, f"max sub-swings connecting was {worst}, expected exactly 3"
+    assert abs(3 * per_hit - 2520.0) < 1e-3, "the 2520 max-damage figure no longer holds"
 
 
 def test_a_target_dead_centre_takes_the_full_three_hits():
@@ -198,7 +198,7 @@ def _env_with_a_buzz():
 
 
 def test_a_whole_sweep_costs_exactly_one_ammo():
-    """bot_overhaul.md assumption A1, user-confirmed: Buzz spends 1 ammo to fire all five
+    """BRAWL_SIM_DESIGN.md §5, user-confirmed: Buzz spends 1 ammo to fire all five
     hitscans, not 1 per hitscan. If this ever became 5 his sustained DPS would collapse from
     ~1260 to ~250 and he would stop being a threat, so it is worth pinning explicitly."""
     env = _env_with_a_buzz()
@@ -214,7 +214,7 @@ def test_a_whole_sweep_costs_exactly_one_ammo():
     assert before - after_trigger <= 1.0 + 1e-4, "the trigger pull cost more than one ammo"
 
     # Drive the REST of the sweep with the fire bit DOWN. Ammo must not drop further (no sub-swing
-    # charges ammo) and must not rise either (C1's cooldown pauses the reload).
+    # charges ammo) and must not rise either (the cooldown pauses the reload).
     #
     # Bounded by the cooldown actually still running, not by a fixed step count: one env.step() is
     # `action_repeat` sim ticks = 0.25s, and Buzz's sweep is 1.0s, so a naive "4 more steps"
@@ -231,7 +231,7 @@ def test_a_whole_sweep_costs_exactly_one_ammo():
 
 
 def test_facing_is_frozen_during_a_sweep_but_the_body_still_moves():
-    """D6: Buzz keeps moving, but keeps facing his initial attack direction."""
+    """Buzz keeps moving, but keeps facing his initial attack direction."""
     env = _env_with_a_buzz()
     override = torch.full((1, env.cfg.n_entities, 2), -1, dtype=torch.int64)
     override[0, 1] = torch.tensor([3, 1])  # move bin 3 AND fire
@@ -264,9 +264,9 @@ def test_facing_is_frozen_during_a_sweep_but_the_body_still_moves():
 
 
 def test_a_ranged_kind_still_turns_freely_while_on_cooldown():
-    """The facing freeze is gated on the KIND being swept, not on `ent_attack_cd > 0` -- since
-    Step C1 every brawler has a cooldown running after every shot, so the looser gate would pin
-    all five brawlers' facing for 0.25s after every attack."""
+    """The facing freeze is gated on the KIND being swept, not on `ent_attack_cd > 0` -- every
+    brawler has a cooldown running after every shot, so the looser gate would pin
+    every brawler's facing for 0.25s after every attack."""
     from brawl_sim.env import BrawlVecEnv
     cfg = load_config(
         f"{CONFIGS}/default.yaml",

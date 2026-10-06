@@ -1,7 +1,7 @@
-"""Regenerates docs/OBSERVATION.md from brawl_sim.core.obs_schema.OBS_SCHEMA, and (Step 32)
+"""Regenerates docs/OBSERVATION.md from brawl_sim.core.obs_schema.OBS_SCHEMA, and
 docs/AGENT_OBS.md from configs/agent_obs.yaml via core.obs_select. Run after any change to
-core/observation.py's field set or configs/agent_obs.yaml -- Step 26's acceptance criterion is
-that every build_obs field appears in OBS_SCHEMA and vice versa, and this script's whole job is
+core/observation.py's field set or configs/agent_obs.yaml -- every build_obs field must appear
+in OBS_SCHEMA and vice versa, and this script's whole job is
 to make the checked-in docs a faithful, regeneratable render of those sources of truth. Never
 hand-edit docs/OBSERVATION.md or docs/AGENT_OBS.md; edit OBS_SCHEMA / agent_obs.yaml and rerun
 this instead.
@@ -9,7 +9,7 @@ this instead.
     python scripts/dump_obs_schema.py                                    # the full spec
     python scripts/dump_obs_schema.py --spec configs/agent_obs_deploy4.yaml   # what trains
 
-`--spec` (SIM_OVERHAUL Step I3) renders any sibling spec to its own file, named after the spec:
+`--spec` renders any sibling spec to its own file, named after the spec:
 configs/agent_obs_deploy4.yaml renders docs/AGENT_OBS_DEPLOY4.md. One doc per spec, because each
 narrowing is a different observation WIDTH and a different from-scratch run; a single merged doc
 would have to say which of five layouts a column index belongs to. OBS_SCHEMA is spec-independent,
@@ -130,7 +130,8 @@ def render_agent_obs(spec_path=AGENT_OBS_YAML, config_path=DEFAULT_YAML) -> str:
         if g.max_slots is not None:
             lines.append(
                 f"\n**Not index-stable** -- the {g.max_slots} nearest (by "
-                f"`{g.entity_prefix}.time_to_closest`) live slots, re-selected every tick; "
+                f"`{g.entity_prefix}.time_to_closest`, ties nearest the hero first) live slots, "
+                "re-selected every tick; "
                 "zero-padded when fewer than that many are alive."
             )
         elif getattr(g, "slots", None) == "tracked":

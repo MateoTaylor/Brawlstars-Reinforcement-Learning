@@ -1,4 +1,4 @@
-"""brawl_sim/core/camera.py: the camera window, the clamp and the hero's reveal (OBS_PARITY_TASKS.md C2).
+"""brawl_sim/core/camera.py: the camera window, the clamp and the hero's reveal.
 
 The quad in configs/default.yaml is a number copied from the calibration; the first test here is
 what keeps it honest, by re-deriving it from the shipped homography the way the deployed side
