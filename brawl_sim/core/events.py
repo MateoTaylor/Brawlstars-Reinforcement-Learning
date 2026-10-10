@@ -16,6 +16,9 @@ nowhere and must be handed in by the caller (env.py, accumulated over the decisi
 - `gadget_hits`: landings of the hero's gadget spinner that hurt at least one player (crates
   never count), known only inside env.py's projectile phase; training/reward.py's `gadget_hit`
   term reads it.
+- `move_reversals`: whether this decision's move reversed the last one's (`move_reversals`
+  below), readable only before `history.push` overwrites the last one; training/reward.py's
+  `move_reversal` term reads it.
 
 `shots_fired_tick` and `dash_hits_tick` are proxies, not exact counts (see their comments).
 
@@ -104,11 +107,29 @@ def advance_decision_tally(tally: dict, state, cfg) -> dict:
     }
 
 
+def move_reversals(state, action: torch.Tensor, cfg) -> torch.Tensor:
+    """(N,) int32, 1 where this decision's move bin reverses the previous decision's: both
+    non-idle (bin 0 is idle) and at least 135 degrees apart around the circle, 6 of 16 bins
+    (8 x gap >= 3 x n_move_bins in general). Needs a previous decision on record:
+    `hist_valid[:, 0]` is False after a reset, so the first decision of an episode never counts.
+
+    Reads ring slot 0, so env.step calls it BEFORE `history.push` writes this action there.
+    Per DECISION, like the ring: training/reward.py's `move_reversal` term reads it
+    (SIM_ISSUES_PLAN.md §5.2; user decision, 2026-10-07)."""
+    n = cfg.n_move_bins
+    prev = state.hist_action[:, 0, 0]
+    cur = action[:, 0]
+    ahead = torch.remainder(cur - prev, n)
+    gap = torch.minimum(ahead, n - ahead)
+    reversal = state.hist_valid[:, 0] & (prev > 0) & (cur > 0) & (8 * gap >= 3 * n)
+    return reversal.to(torch.int32)
+
+
 def compute_info(
     state, dmg_by: torch.Tensor, newly_dead: torch.Tensor, newly_broken: torch.Tensor,
     cubes_gained: torch.Tensor, cfg, decision: dict | None = None,
     hp_healed: torch.Tensor | None = None, attacks_in_reach: torch.Tensor | None = None,
-    gadget_hits: torch.Tensor | None = None,
+    gadget_hits: torch.Tensor | None = None, move_reversals: torch.Tensor | None = None,
 ) -> dict:
     """(N,)/(N,E)/(N,E,E) device tensors, one dict of THIS DECISION's events; the module
     docstring gives the contracts of the caller-supplied inputs.
@@ -125,7 +146,10 @@ def compute_info(
     is zeros.
 
     `gadget_hits`: (N,) int32 count of the hero's gadget-spinner landings that hurt at least one
-    player over the same sub-ticks (env.py's projectile phase). None is zeros."""
+    player over the same sub-ticks (env.py's projectile phase). None is zeros.
+
+    `move_reversals`: (N,) int32, 1 where this decision's move reversed the last one's
+    (`move_reversals` above, taken before env.step's `history.push`). None is zeros."""
     if decision is None:
         decision = new_decision_tally(state, cfg)
     if hp_healed is None:
@@ -134,6 +158,8 @@ def compute_info(
         attacks_in_reach = torch.zeros_like(decision["n_ticks"])
     if gadget_hits is None:
         gadget_hits = torch.zeros_like(decision["n_ticks"])
+    if move_reversals is None:
+        move_reversals = torch.zeros_like(decision["n_ticks"])
     terminated, truncated = decision["terminated"], decision["truncated"]
 
     damage_dealt_tick = dmg_by.sum(dim=2)  # (N,E): per attacker, this tick
@@ -184,6 +210,8 @@ def compute_info(
         "attack_in_reach_tick": attacks_in_reach,
         # (N,) int32, the HERO's alone -- what training/reward.py's `gadget_hit` term pays.
         "gadget_hit_tick": gadget_hits,
+        # (N,) int32, 0 or 1 per DECISION -- what training/reward.py's `move_reversal` term pays.
+        "move_reversal_tick": move_reversals,
         "hero_rank": decision["hero_rank"],
         "terminated": terminated,
         "truncated": truncated,

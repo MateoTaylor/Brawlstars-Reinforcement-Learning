@@ -90,6 +90,11 @@ auto-aims at the nearest enemy; the sim dashes along the move bin, or `facing` w
 step per tick. Do not "simplify" it back to a tap: that silently changes where every dash goes. The tap exists as
 its own action, value 4 below, chosen by the policy, never substituted for value 1.
 
+**The one super exception: an idle super is a bare tap** (2026-10-06). The sim aims a super on
+move bin 0 like the game's tap-to-fire (`hero.super_aim_target`: nearest enemy in 11.1 tiles, else
+`facing`), so `ShadowHero.attack_bearing` is None for it and `Buttons.press` taps the super
+button. A super fired while moving is still dragged along the bin.
+
 Apply action masking at inference the way `MaskablePPO` saw it in training — an uncharged super
 means bin 2 is masked, not merely ignored.
 

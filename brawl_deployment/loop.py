@@ -49,9 +49,9 @@ contact stays down and only moves when the bin changes; the fire bit does not re
 `Buttons.press` is called once per decision and `ShadowHero.act` queues exactly one attack for the
 next sub-tick. The press is dragged along `ShadowHero.attack_bearing` -- the move bin, or `facing`
 when idle -- because that is where the sim's dash goes, and a bare tap would auto-aim instead.
-The gadget, attack value 3 since 2026-09-21, is the one bare tap, because the game aims
-it at the nearest enemy exactly as the sim does. None of it is a simplification of the trained
-behaviour -- all of it is it.
+The gadget (value 3), the auto-aimed attack (value 4) and a super on the idle bin are bare taps,
+because the game aims each at the nearest target exactly as the sim does. None of it is a
+simplification of the trained behaviour -- all of it is it.
 
 **Failure routes to one place** (§8). `_stop` releases every contact, drops the gate, and refuses
 to emit again. Occlusion is the single exception: it `_pause`s instead, because a window drawn

@@ -263,6 +263,43 @@ def test_a_fair_projectile_group_admits_only_what_is_on_screen():
     assert rows[5.0][0].any() and not rows[5.0][1:].any()
 
 
+def test_a_projectile_under_the_static_speed_reads_still_and_ranks_on_zero():
+    """`observation.projectile_static_speed` (user decision, 2026-10-07). A Grom shell lobbed short
+    crawls: 1.5 tiles/s, 3 tiles out, straight-line time 2.0 s. Under a 2.0 floor it reads the way
+    the live tracker reports it, vel 0 and time 0, so it ranks among the zeros, nearest first,
+    ahead of a fast shot due in 0.125 s. A shot at exactly 2.0 keeps its velocity, as live, where
+    `speed < STATIC_TILES_S` is still. Off, values and order are the old ones, and either way
+    `full_obs` keeps the true values, since the reward and `info` read it."""
+    path = _write_spec({"fair": False, "normalize": False, "groups": [{
+        "name": "projectiles", "per_entity": True, "max_slots": 4,
+        "fields": ["projectiles.rel_pos", "projectiles.vel", "projectiles.time_to_closest"]}]})
+    # (rel_pos, vel, time_to_closest): fast and moving away, the crawl, fast and incoming, and one
+    # at the floor. Rows come out as (rel x, rel y, vel x, vel y, time_to_closest).
+    live = [((0.0, 2.0), (0.0, 4.0), 0.0), ((3.0, 0.0), (-1.5, 0.0), 2.0),
+            ((1.0, 0.0), (-8.0, 0.0), 0.125), ((5.0, 0.0), (-2.0, 0.0), 2.5)]
+    want = {
+        0.0: [[0, 2, 0, 4, 0], [1, 0, -8, 0, 0.125], [3, 0, -1.5, 0, 2.0], [5, 0, -2, 0, 2.5]],
+        2.0: [[0, 2, 0, 4, 0], [3, 0, 0, 0, 0], [1, 0, -8, 0, 0.125], [5, 0, -2, 0, 2.5]],
+    }
+    try:
+        for floor, rows in want.items():
+            cfg = load_config(CONFIGS_DEFAULT, overrides={"observation": {"projectile_static_speed": floor}})
+            spec = obs_select.load_agent_spec(path, cfg)
+            buffers = obs_select.make_agent_obs_buffers(spec, cfg, n_envs=1, device="cpu")
+            P = cfg.max_projectiles
+            alive = torch.zeros(1, P, dtype=torch.bool)
+            rel_pos, vel, ttc = torch.zeros(1, P, 2), torch.zeros(1, P, 2), torch.zeros(1, P)
+            for slot, (rel, v, t) in zip((7, 2, P - 1, 0), live):
+                alive[0, slot] = True
+                rel_pos[0, slot], vel[0, slot], ttc[0, slot] = torch.tensor(rel), torch.tensor(v), t
+            prj = {"alive": alive, "rel_pos": rel_pos, "vel": vel, "time_to_closest": ttc}
+            out = obs_select.build_agent_obs({"projectiles": prj}, spec, cfg, buffers)["projectiles"][0]
+            assert torch.equal(out, torch.tensor(rows, dtype=torch.float32)), f"floor {floor}:\n{out}"
+            assert vel[0, 2].tolist() == [-1.5, 0.0] and ttc[0, 2] == 2.0, "full_obs is not touched"
+    finally:
+        os.remove(path)
+
+
 # ---- build_agent_obs allocates nothing per call (steady-state memory doesn't grow) --------
 
 def test_build_agent_obs_reuses_the_same_out_buffer_tensors():

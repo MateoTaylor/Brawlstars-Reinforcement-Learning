@@ -827,3 +827,25 @@ def test_an_auto_aimed_attack_is_a_bare_tap_on_the_attack_button():
     assert len(b.log) == 2
     with pytest.raises(ValueError, match="no aim point"):
         btn.aim_point(ATTACK_AUTO, 0.0)
+
+
+def test_a_super_with_no_bearing_is_a_bare_tap_on_the_super_button():
+    """An idle super (2026-10-06): the sim aims it like the game's tap-to-fire, so the shadow
+    hands over no bearing and the press is down on the super button, up on the next settle, never
+    a move. With a bearing it is still the drag. An attack with no bearing is a bug upstream, so
+    it raises rather than tapping, which the game would auto-aim."""
+    b = NullBackend()
+    btn = Buttons(b, attack=(1000.0, 500.0), super_=(1462.5, 900.0), gadget=(1559.9, 901.1))
+    assert btn.press(ATTACK_SUPER, None)
+    assert b.log == [("down", SLOT_TAP, 1462.5, 900.0)]
+    btn.settle()
+    assert b.log[1:] == [("up", SLOT_TAP)]
+    assert not btn.is_held and SLOT_TAP not in b.contacts
+
+    assert btn.press(ATTACK_SUPER, 0.0)
+    btn.settle()
+    assert b.log[-1][0] == "move"
+    btn.settle()
+
+    with pytest.raises(ValueError, match="needs a bearing"):
+        btn.press(ATTACK_FIRE, None)

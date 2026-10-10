@@ -37,7 +37,18 @@ run:
   # no dash i-frames, bots that farm, the 1.3x gas). It ended in the expert stage with every
   # advance forced at the 100M cap; final eval 0.23 at hard, 0.05 at elite, 300 episodes per
   # tier. deploy5 stays playable with `--run mortis_deploy5`.
-  dir: runs/mortis_ppo-20260925-194025
+  # Repointed 2026-10-06 to the 600M run, the first trained with the `gadget_hit` reward, the
+  # 125M curriculum cap and the idle super's tap-to-fire aim, which the live super now mirrors
+  # (a bare tap, control/buttons.py). The 09-25 run stays playable with
+  # `--run runs/mortis_ppo-20260925-194025`.
+  # Repointed 2026-10-08 to the first run trained on SIM_ISSUES_PLAN.md's sim: bots that path
+  # round walls and tap-aim, final-4 campers that hunt, 8000-HP crates hit once per dash, the
+  # 99-cube cap, the `move_reversal` cost, and slow projectiles read as still, as the live tracker
+  # reports them (its train.yaml carries `observation.projectile_static_speed: 2.0`). It ended in
+  # the elite stage, the last two advances forced at the 125M cap. best_model.zip is the 580M
+  # eval: 0.333 across the six tiers, 0.347 at hard, 0.043 at elite, 300 episodes per tier.
+  # The 09-30 run stays playable with `--run runs/mortis_ppo-20260930-182748`.
+  dir: runs/mortis_ppo-20261007-161117
   checkpoint: best_model.zip
 
 policy:

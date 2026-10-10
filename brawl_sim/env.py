@@ -74,7 +74,9 @@ import torch
 import yaml
 
 from .bots import perception, policy
-from .config import EnvConfig, apply_randomization, build_params, load_randomization, validate
+from .config import (
+    EnvConfig, apply_randomization, body_radius_tiles, build_params, load_randomization, validate,
+)
 from .constants import DeathCause
 from .core import boxes, camera, combat, events, geometry as geo, hero, history, melee_sweep, movement
 from .core import observation, projectiles, slots, spawn, stats, zone
@@ -145,7 +147,7 @@ class BrawlVecEnv:
         # every reset.
         self.spec = apply_randomization(base_spec, randomization_spec) if randomization_spec else base_spec
 
-        self.bank = build_map_bank(cfg, device=self.device)
+        self.bank = build_map_bank(cfg, device=self.device, body_radius=body_radius_tiles(self.spec))
         self.params = build_params(cfg, n_envs=n_envs, device=self.device, gen=self.gen, spec=self.spec)
         validate(cfg, self.params)
         self.state = allocate(cfg, n_envs=n_envs, device=self.device, verbose=verbose)
@@ -191,6 +193,8 @@ class BrawlVecEnv:
         if self._obs_hero_view is None:
             self._obs_vis = perception.visibility(self.state, self.bank, self.params, self.cfg)
             self._obs_hero_view = camera.hero_view(self.state, self._obs_vis, self.cfg)
+        # Read slot 0 before the push overwrites it with this action.
+        move_reversals = events.move_reversals(self.state, action, self.cfg)
         history.push(self.state, action, self._obs_hero_view)
 
         (dmg_by_total, newly_dead, newly_broken, cubes_gained, hp_healed, attacks_in_reach,
@@ -198,7 +202,7 @@ class BrawlVecEnv:
 
         obs_before_reset, info, reward = self._observe(
             dmg_by_total, newly_dead, newly_broken, cubes_gained, hp_healed, attacks_in_reach,
-            gadget_hits, decision,
+            gadget_hits, decision, move_reversals,
         )
         # Cloned here, and the local dropped before `_autoreset` rebuilds the observation: this
         # reference would otherwise keep the pre-reset grids (large at thousands of envs) alive
@@ -258,6 +262,7 @@ class BrawlVecEnv:
             move_dir, fire, super_fire, aim_dir, aim_point, gadget_fire, vis, hero_auto=hero_auto)
         self._movement_phase(move_dir)
         dmg_by_dash = self._dash_phase()
+        policy.track_seen_velocity(self.state, self.cfg)  # ent_vel is final once the dash moved
         dmg_by_proj, super_healed, proj_charge_hit, gadget_hit = self._projectile_phase()
         self._zone_phase()
         newly_broken = self._box_phase()
@@ -760,7 +765,7 @@ class BrawlVecEnv:
 
     # -- phase 16 --
     def _observe(self, dmg_by_total, newly_dead, newly_broken, cubes_gained, hp_healed,
-                 attacks_in_reach, gadget_hits, decision):
+                 attacks_in_reach, gadget_hits, decision, move_reversals):
         """Runs ONCE per decision: `reward_fn` sees the summed deltas and latched outcomes of the
         whole decision, once per `step()` whatever `action_repeat` is. Per-tick reward terms
         integrate over `info["alive_ticks"]`/`info["in_zone_ticks"]` rather than firing once
@@ -769,7 +774,7 @@ class BrawlVecEnv:
         info = events.compute_info(
             self.state, dmg_by_total, newly_dead, newly_broken, cubes_gained, self.cfg,
             decision=decision, hp_healed=hp_healed, attacks_in_reach=attacks_in_reach,
-            gadget_hits=gadget_hits,
+            gadget_hits=gadget_hits, move_reversals=move_reversals,
         )
         reward = self.reward_fn(obs, info, self.cfg)
         return obs, info, reward

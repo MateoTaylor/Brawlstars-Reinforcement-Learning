@@ -31,7 +31,8 @@ six-arm ring is the per-kind `split_count` in `core/projectiles.py`.
   longer.
 - **Power cubes** give **+10% damage and a flat +400 max HP** each, the real game's numbers. Flat HP
   means cubes narrow the HP spread rather than widening it: every brawler gains the same amount.
-  Capped at `max_cubes: 16`.
+  Capped at `max_cubes: 16` in `default.yaml`; `configs/train.yaml` uses the game's own cap, 99,
+  from 2026-10-06.
 - **Out-of-combat regen**: after 3 seconds with no attacking and no damage taken, health regenerates
   at 13% of max HP per second. Any attack or hit resets the clock.
 - **The zone** deals 20% of each entity's max HP per second, rising 4 points with every shrink, so

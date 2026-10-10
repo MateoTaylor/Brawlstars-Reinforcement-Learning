@@ -134,6 +134,9 @@ class RewardConfig:
     # x gadget spinners that landed on at least one player (see reward.py). Off by default for
     # the same reason.
     gadget_hit: float = 0.0
+    # x decisions whose move bin reversed the last one's (see reward.py); a cost, so negative.
+    # Off by default for the same reason.
+    move_reversal: float = 0.0
     scale: float = 1.0
 
 

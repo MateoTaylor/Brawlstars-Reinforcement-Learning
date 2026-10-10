@@ -15,7 +15,8 @@ changes.** The delta terms (damage, kills, cubes, attacks in reach, gadget hits)
 fields `env.py` already summed over the decision's sub-ticks, and the two rate terms read
 `info["alive_ticks"]` / `info["in_zone_ticks"]`, which count sub-ticks. So the episode return is
 invariant to `action_repeat`; `gamma` is the one knob that is not, since it discounts per
-decision.
+decision. `move_reversal` is the one exception: it counts DECISIONS (a reversal is a change
+between two of them), so a different `action_repeat` rescales what its weight costs per match.
 
 **Reward-hacking notes.** `damage_dealt` is capped by the hero's ammo and cooldown.
 `survive_per_step` must stay small against `win_bonus + rank_bonus * (n_entities - 1)`, or the
@@ -42,7 +43,7 @@ _HERO = 0
 TERM_NAMES = (
     "damage_dealt", "damage_taken", "hp_healed", "kill", "cube_pickup",
     "survive_per_step", "in_zone_per_step", "win_bonus", "death_penalty", "rank_bonus",
-    "attack_in_reach", "gadget_hit",
+    "attack_in_reach", "gadget_hit", "move_reversal",
 )
 
 
@@ -135,6 +136,16 @@ class ShapedReward:
             # top of what `damage_dealt` pays for the same blast. The 18 s cooldown bounds it: at
             # the shipped 0.3 a match of landed spinners is worth about 3, against 10 for a win.
             self._add(reward, "gadget_hit", info["gadget_hit_tick"], w.gadget_hit)
+
+        # ---- movement shaping (user decision, 2026-10-07; SIM_ISSUES_PLAN.md §5.2) ----
+        if w.move_reversal != 0.0:
+            # A count, 0 or 1 per decision: the move bin swung >= 135 degrees from the last
+            # decision's, both non-idle (core/events.move_reversals). A cost, so a reversal must
+            # buy more than it is charged: the old policy reversed on 26 % of its decisions
+            # (measured 2026-10-07), about 1.2 a 120 s match at the shipped -0.01, while a dodge
+            # that saves one 1300-HP hit is worth 0.13 in `damage_taken` alone, so a real dodge
+            # still pays and idle jitter stops paying.
+            self._add(reward, "move_reversal", info["move_reversal_tick"], w.move_reversal)
 
         if w.scale != 1.0:
             reward.mul_(w.scale)

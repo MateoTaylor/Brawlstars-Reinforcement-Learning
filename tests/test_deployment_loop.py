@@ -2035,6 +2035,39 @@ def test_an_auto_aimed_attack_with_nothing_in_reach_dashes_along_the_move_bin(mo
     assert lp.shadow.observe()["dash_dir"] == pytest.approx((0.0, 1.0), abs=1e-6)
 
 
+@pytest.mark.parametrize("move_bin", [0, 5])
+def test_an_idle_super_is_a_bare_tap_and_a_moving_one_a_drag(monkeypatch, move_bin):
+    """The sim aims an idle super like the game's tap-to-fire and a moving one along the bin
+    (`hero.super_aim_target`), so the device taps the super button on the idle bin, down on the
+    decision tick and up on the next, and drags it along the bin otherwise (bin 5 is +y)."""
+    from brawl_vision.object_detection.hp_detection.hero_bars import SuperReading
+
+    _patch_vision(monkeypatch)
+    monkeypatch.setattr("brawl_vision.object_detection.hp_detection.hero_bars.read_super",
+                        lambda image, det, cfg=None: SuperReading(
+                            charge=1.0, ready=True, state="ready", track_px=118, row=120))
+    lp = _build_loop(_Policy())
+    lp.vision.entities.detections = [_Detection("player", HERO_PX)]
+    _play(lp, lp.decision_every)
+    assert lp.shadow.super_ready
+
+    lp.policy.decision = Decision(move_bin=move_bin, attack=ATTACK_SUPER,
+                                  legal=(True, True, True, True))
+    btn = lp.controls.buttons
+    sx, sy = btn.super_
+    down, *rest = _tap_steps_per_tick(lp, lp.decision_every)
+    assert down == [("down", SLOT_TAP, sx, sy)]
+    assert _decisions(lp)[1].attack == ATTACK_SUPER
+    if move_bin == 0:
+        assert rest[0] == [("up", SLOT_TAP)]
+        assert all(q == [] for q in rest[1:])
+    else:
+        (move,) = rest[0]                     # the bin's angle is float32 in the shadow
+        assert move[:2] == ("move", SLOT_TAP)
+        assert move[2:] == pytest.approx(btn.aim_point(ATTACK_SUPER, math.pi / 2), abs=1e-3)
+        assert rest[1] == [("up", SLOT_TAP)]
+
+
 def test_a_run_trained_without_the_flag_never_taps_an_auto_aimed_attack(loop):
     """The fixture's run has the 4-wide column. A 4 from its policy is an illegal value: the
     shadow refuses it, nothing is tapped, and the row says what was sent."""

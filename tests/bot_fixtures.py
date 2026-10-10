@@ -8,7 +8,7 @@ import yaml
 import torch
 
 from brawl_sim.bots import perception, policy
-from brawl_sim.config import build_params, load_config
+from brawl_sim.config import body_radius_tiles, build_params, load_config
 from brawl_sim.constants import (
     TILE_BLOCKS_PROJ,
     TILE_BLOCKS_UNIT,
@@ -19,6 +19,7 @@ from brawl_sim.constants import (
 )
 from brawl_sim.core import stats
 from brawl_sim.core.state import allocate
+from brawl_sim.maps import nav
 from brawl_sim.maps.loader import bush_waypoints
 
 CONFIGS_DEFAULT = "configs/default.yaml"
@@ -29,15 +30,24 @@ class FakeBank:
 
     Bush waypoints are derived from `tiles` with the REAL maps/loader.bush_waypoints rather than
     hand-listed, so a test map's waypoints are subsampled exactly the way a shipped map's are. A
-    test that needs specific waypoints overrides `bush_wp`/`n_bush_wp` afterward."""
+    test that needs specific waypoints overrides `bush_wp`/`n_bush_wp` afterward.
 
-    def __init__(self, tiles, cell_tiles=10):
+    `nav_cfg` (a cfg with `bots.nav` on) also builds the pathfinding tables with the REAL
+    maps/nav.build_tables, as maps/loader.build_map_bank does for the env, for the body radius in
+    default.yaml (the one `cfg_and_params`'s params hold)."""
+
+    def __init__(self, tiles, cell_tiles=10, nav_cfg=None):
         self.blocks_unit = TILE_BLOCKS_UNIT[tiles].unsqueeze(0)
         self.blocks_proj = TILE_BLOCKS_PROJ[tiles].unsqueeze(0)
         self.is_bush = TILE_IS_BUSH[tiles].unsqueeze(0)
         pts = bush_waypoints(tiles.numpy(), cell_tiles)
         self.bush_wp = torch.as_tensor(pts, dtype=torch.float32).reshape(1, -1, 2)
         self.n_bush_wp = torch.tensor([len(pts)], dtype=torch.int64)
+        if nav_cfg is not None:
+            spec = yaml.safe_load(open(CONFIGS_DEFAULT).read())
+            (self.nav_next, self.nav_anchor_of, self.nav_anchor_tile, self.nav_offsets,
+             self.nav_centre_box) = nav.build_tables(self.blocks_unit, nav_cfg, "cpu",
+                                                     body_radius_tiles(spec))
 
 
 def grid(h, w, fill=Tile.FLOOR):

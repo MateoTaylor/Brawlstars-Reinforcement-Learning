@@ -13,6 +13,7 @@ from pathlib import Path
 import numpy as np
 import torch
 
+from . import nav
 from ..constants import (
     MAP_CHAR_TO_TILE,
     TILE_BLOCKS_PROJ,
@@ -166,6 +167,8 @@ class MapBank:
         "pad_tiles", "pad_blocks_unit", "pad_blocks_proj", "pad_is_bush", "pad_is_water",
         "spawns", "n_spawns", "box_spots", "n_box_spots",
         "bush_wp", "n_bush_wp",
+        # Bot pathfinding (maps/nav.py), present only under `bots.nav`.
+        "nav_next", "nav_anchor_of", "nav_anchor_tile", "nav_offsets", "nav_centre_box",
     )
 
 
@@ -177,7 +180,11 @@ def _pad_slots(points_list: list[np.ndarray], max_slots: int) -> tuple[np.ndarra
     return padded, counts
 
 
-def build_map_bank(cfg, device) -> MapBank:
+def build_map_bank(cfg, device, body_radius: float = 0.0) -> MapBank:
+    """`body_radius` is the bots' body (config.body_radius_tiles(spec)), read only under
+    `bots.nav`: maps/nav.build_tables chooses each goal's anchor by a walk that body clears. The
+    env passes it; the viewer and play_manual never move a bot with their banks, and 0 (the
+    centre line) is what they get."""
     tiles_list, spawn_list, box_list, bush_wp_list = [], [], [], []
     for name in cfg.map_names:
         tiles = load_map_csv(CSV_DIR / f"{name}.csv", cfg)
@@ -220,5 +227,9 @@ def build_map_bank(cfg, device) -> MapBank:
     # then falls through to WANDER (bots/personality.py).
     bank.bush_wp = torch.as_tensor(bush_wp_np, dtype=torch.float32, device=device)
     bank.n_bush_wp = torch.as_tensor(n_bush_wp_np, dtype=torch.int64, device=device)
+
+    if cfg.bots_nav:
+        (bank.nav_next, bank.nav_anchor_of, bank.nav_anchor_tile, bank.nav_offsets,
+         bank.nav_centre_box) = nav.build_tables(bank.blocks_unit, cfg, device, body_radius)
 
     return bank

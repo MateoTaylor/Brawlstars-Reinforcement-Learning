@@ -650,6 +650,32 @@ def test_validate_rejects_a_bad_camera_or_slot_setting(bad, name):
         validate(cfg, _dummy_params(cfg))
 
 
+@pytest.mark.parametrize("bad, name", [
+    ({"bots_nav_anchor_tiles": 1}, "nav_anchor_tiles"),
+    ({"bots_endgame_players": -1}, "endgame_players"),
+    ({"bots_lead_velocity_tau": -0.1}, "lead_velocity_tau"),
+])
+def test_validate_rejects_a_bad_bot_nav_endgame_or_lead_setting(bad, name):
+    cfg = EnvConfig(**bad)
+    with pytest.raises(ValueError, match=name):
+        validate(cfg, _dummy_params(cfg))
+
+
+def test_validate_refuses_nav_for_a_body_a_tile_wide():
+    """bots/policy._walk_clear tests a body's walk with its two edge lines, which cover every
+    tile the body crosses only while the body is narrower than a tile. Without nav the walk is the
+    centre line and the radius does not matter to it."""
+    for nav, radius, ok in ((True, 0.4, True), (True, 0.5, False), (False, 0.5, True)):
+        cfg = EnvConfig(bots_nav=nav)
+        params = _dummy_params(cfg)
+        params.unit_radius = torch.full_like(params.unit_radius, radius)
+        if ok:
+            validate(cfg, params)
+        else:
+            with pytest.raises(ValueError, match="unit_radius"):
+                validate(cfg, params)
+
+
 def test_history_config_loads_from_the_observation_block_and_rejects_zero(config_dir):
     """Both knobs are structural (they size the `hist_*` rings and the history observation), so they
     are EnvConfig fields under `observation:`. This file's DEFAULT_YAML omits them, which must mean
@@ -664,6 +690,19 @@ def test_history_config_loads_from_the_observation_block_and_rejects_zero(config
         cfg = EnvConfig(**bad)
         with pytest.raises(ValueError, match=next(iter(bad))):
             validate(cfg, _dummy_params(cfg))
+
+
+def test_the_projectile_static_speed_loads_from_the_observation_block_and_refuses_a_negative(config_dir):
+    """`observation.projectile_static_speed` (core/obs_select). This file's DEFAULT_YAML omits it,
+    which must mean 0: off, the observation every run trained on until 2026-10-07."""
+    assert load_config(config_dir / "default.yaml").obs_projectile_static_speed == 0.0
+    cfg = load_config(config_dir / "default.yaml",
+                      overrides={"observation": {"projectile_static_speed": 2.0}})
+    assert cfg.obs_projectile_static_speed == 2.0
+    validate(cfg, _dummy_params(cfg))  # must not raise
+    cfg = EnvConfig(obs_projectile_static_speed=-0.5)
+    with pytest.raises(ValueError, match="projectile_static_speed"):
+        validate(cfg, _dummy_params(cfg))
 
 
 def test_build_params_rejects_a_config_using_a_renamed_key(config_dir):

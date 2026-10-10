@@ -81,8 +81,8 @@ rule.
 **Its velocity is noise, so it is reported as zero** (`STATIC_TILES_S`, applied in `snapshot`
 only). The whole-span fit divides the anchor noise by the span, so a still object reports a small
 velocity in a random direction. `closest_approach` then gives it `time_to_closest` 0 when the
-noise points away from the hero, and dist/speed -- often tens of seconds, which no sim entry ever
-reports -- when it points toward. The sim's still entry is `vel = 0`, `time_to_closest = 0`, and
+noise points away from the hero, and dist/speed -- often tens of seconds, for a thing that never
+moves -- when it points toward. The sim's still entry is `vel = 0`, `time_to_closest = 0`, and
 that is what these become. The threshold is measured, not derived, because nothing in the sim
 bounds speed away from zero: a timed lob thrown at a close target crawls. Power-cube crates,
 tracked by this class as a known-static control on the same replay, give the noise:
@@ -196,7 +196,9 @@ DUPLICATE_TILES = 0.3
 
 # A track whose whole-span speed is under this is STILL: the observation gets `vel = (0, 0)`, the
 # sim's own value for a hazard. Measured on power-cube crates, not derived from the sim; see
-# "A projectile that never moves" in the module docstring for the table.
+# "A projectile that never moves" in the module docstring for the table. Training mirrors it as
+# configs/train.yaml's `observation.projectile_static_speed` (core/obs_select, 2026-10-07), so a
+# crawling lob reads still there too; a test pins the two equal, so change both or neither.
 STATIC_TILES_S = 2.0
 
 # A track older than this is retired from the observation. It is the sim's number, not a tuning:

@@ -14,7 +14,7 @@ import pytest
 import torch
 
 from tests.bot_fixtures import FakeBank, build_targeting, cfg_and_params, fresh_state, grid
-from brawl_sim.bots import combat_rules
+from brawl_sim.bots import combat_rules, policy
 from brawl_sim.config import validate
 from brawl_sim.constants import AimModel, Kind, Tile
 
@@ -25,13 +25,14 @@ _SHOOTER_POS = (11.0, 10.0)
 
 
 def _setup(kind=Kind.BOT_SNIPER, wall=False, n_enemies=1, map_h=20, map_w=20,
-           victim=_VICTIM_POS, shooter=_SHOOTER_POS, victim_vel=(0.0, 0.0)):
+           victim=_VICTIM_POS, shooter=_SHOOTER_POS, victim_vel=(0.0, 0.0), overrides=None):
     """A shooter of `kind` at `shooter` with a stationary-or-moving victim at `victim`, no noise.
 
     Noise is zeroed everywhere so aim assertions can be EXACT rather than approximate -- the
     noise models get their own test below, where the distributions are what is being checked.
     """
-    cfg, params, gen = cfg_and_params(n_enemies=n_enemies, map_h=map_h, map_w=map_w)
+    cfg, params, gen = cfg_and_params(n_enemies=n_enemies, map_h=map_h, map_w=map_w,
+                                      overrides=overrides)
     params.aim_noise_std_rad.zero_()
     params.aim_noise_tiles.zero_()
     state = fresh_state(cfg, params, enemy_kind=kind)
@@ -276,6 +277,53 @@ def test_lob_without_a_flight_time_falls_back_to_the_speed_based_intercept():
         params_by_speed[speed] = float(aim_point[0, SHOOTER, 1] - state.ent_pos[0, VICTIM, 1])
 
     assert params_by_speed[3.0] > params_by_speed[30.0] > 0
+
+
+def test_tap_aim_fires_lead_and_lob_kinds_at_the_targets_current_position():
+    """`bots.tap_aim` (user decision, 2026-10-06): the game's bots attack with a tap, whose
+    auto-aim fires at where the target IS. A leading kind stops leading, however fast its target
+    crosses."""
+    for kind, model in ((Kind.BOT_SNIPER, AimModel.LEAD), (Kind.BOT_ARTILLERY, AimModel.LOB)):
+        k = int(kind)
+        for tap in (False, True):
+            cfg, params, gen, state, bank = _setup(kind=kind, victim_vel=(0.0, 6.0),
+                                                   overrides={"bots": {"tap_aim": tap}})
+            params.aim_model[:, k] = int(model)
+            params.lead_target_fraction[:, k] = 1.0
+            _fire, aim_dir, aim_point = _run(state, bank, params, cfg, gen)
+
+            to_target = state.ent_pos[0, VICTIM] - state.ent_pos[0, SHOOTER]
+            straight = torch.allclose(aim_dir[0, SHOOTER], to_target / to_target.norm(), atol=1e-6)
+            assert straight is tap, (kind.name, tap)
+            if tap:
+                assert torch.allclose(aim_point[0, SHOOTER], state.ent_pos[0, VICTIM], atol=1e-5)
+
+
+def test_bots_lead_by_the_low_passed_velocity_under_lead_velocity_tau():
+    """`bots.lead_velocity_tau` (user decision, 2026-10-06): a bot leads by `ent_vel_seen`, a
+    first-order low-pass of the target's velocity, so a target that jinks every decision is not
+    led to wherever its last 50 ms pointed. Tau 0 (default.yaml) reads the raw `ent_vel`."""
+    for tau in (0.0, 0.25):
+        cfg, params, gen, state, bank = _setup(victim_vel=(0.0, 6.0),
+                                               overrides={"bots": {"lead_velocity_tau": tau}})
+        state.ent_target[0, SHOOTER] = VICTIM
+        state.ent_vel_seen[0, VICTIM] = torch.tensor([0.0, 1.0])
+        _idx, _has, _pos, vel = policy.target_info(state, cfg)
+        read = state.ent_vel_seen if tau > 0 else state.ent_vel
+        assert torch.equal(vel[0, SHOOTER], read[0, VICTIM]), tau
+
+    # The low-pass: dt / tau of the gap closes each tick, so after tau seconds a step change in
+    # velocity reads 1 - (1 - dt/tau)^(tau/dt) of the way there (0.67 at dt 0.05, tau 0.25).
+    state.ent_vel_seen.zero_()
+    ticks = round(0.25 / cfg.dt)
+    for _ in range(ticks):
+        policy.track_seen_velocity(state, cfg)
+    want = 6.0 * (1.0 - (1.0 - cfg.dt / 0.25) ** ticks)
+    assert torch.allclose(state.ent_vel_seen[0, VICTIM], torch.tensor([0.0, want]), atol=1e-5)
+
+    cfg, params, gen, state, bank = _setup(victim_vel=(0.0, 6.0))
+    policy.track_seen_velocity(state, cfg)
+    assert not state.ent_vel_seen.any()   # tau 0: never written
 
 
 def test_aim_noise_is_angular_for_lead_and_positional_for_lob():

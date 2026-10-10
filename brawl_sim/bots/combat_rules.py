@@ -25,6 +25,10 @@ The fields, and the reason behind each:
   - **aim_model.** See constants.AimModel. LOB scatters the landing POINT (`aim_noise_tiles`)
     where LEAD scatters the bearing (`aim_noise_std_rad`): the payload is an area landing on a
     point, so a scattered point is what a miss physically means.
+  - **cfg.bots_tap_aim.** Every LEAD and LOB shot aims at where the target IS, lead fraction 0,
+    as the game's bots do: they attack with a tap, whose auto-aim fires at the target's current
+    position and never leads (user decision, 2026-10-06). The per-tier aim noise still applies,
+    so the curriculum's tiers still differ in accuracy.
 
 RNG: each call draws twice from `gen` for all (N,E) entities regardless of kind, first an (N,E)
 angular tensor (LEAD) and then an (N,E,2) positional one (LOB).
@@ -44,8 +48,8 @@ from . import policy as shared
 def combat(state, tgt, bank, params, cfg, gen):
     """(fire (N,E) bool, aim_dir (N,E,2) unit, aim_point (N,E,2)) for every entity, by kind.
 
-    `bank` and `cfg` are unused; they stay in the signature for a future rule that needs a
-    terrain query or a toggle, and every caller already passes them.
+    `bank` is unused; it stays in the signature for a future rule that needs a terrain query,
+    and every caller already passes it.
     """
     pos = state.ent_pos
     kind = state.ent_kind
@@ -90,6 +94,8 @@ def combat(state, tgt, bank, params, cfg, gen):
     # --- AIM --------------------------------------------------------------------------------
     proj_speed = stats.gather_kind(params.proj_speed, kind)
     lead_fraction = stats.gather_kind(params.lead_target_fraction, kind)
+    if cfg.bots_tap_aim:
+        lead_fraction = torch.zeros_like(lead_fraction)
     flight_seconds = stats.gather_kind(params.proj_flight_seconds, kind)
     noise_rad = stats.gather_kind(params.aim_noise_std_rad, kind)
     noise_tiles = stats.gather_kind(params.aim_noise_tiles, kind)

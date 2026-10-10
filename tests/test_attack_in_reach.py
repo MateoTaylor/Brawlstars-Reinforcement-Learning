@@ -217,11 +217,12 @@ def _info(counts):
 
 def test_term_names_append_new_terms_last():
     """Appended, not inserted: `term_means` reports in this order, so a TensorBoard run keeps its
-    existing curves. `gadget_hit` (tests/test_gadget_hit.py) came after this file's term."""
+    existing curves. `gadget_hit` (tests/test_gadget_hit.py) and `move_reversal`
+    (tests/test_move_reversal.py) came after this file's term."""
     assert TERM_NAMES == (
         "damage_dealt", "damage_taken", "hp_healed", "kill", "cube_pickup",
         "survive_per_step", "in_zone_per_step", "win_bonus", "death_penalty", "rank_bonus",
-        "attack_in_reach", "gadget_hit",
+        "attack_in_reach", "gadget_hit", "move_reversal",
     )
 
 

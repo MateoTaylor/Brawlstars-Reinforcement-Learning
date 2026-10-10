@@ -60,6 +60,13 @@ run:
       # agent_obs group reads them, and each obs build would pay a full wall march over every
       # entity pair for them. Turn back on here if an agent_obs group ever consumes them.
       include_raw_los: false
+      # USER SETTING, 2026-10-07 ("#32: go with option C", BRAWL_SIM_DESIGN.md §2). A projectile
+      # slower than 2.0 tiles/s reads as still, `vel` 0 and `time_to_closest` 0, which is how
+      # the live tracker reports it (STATIC_TILES_S; a test pins the two equal). Grom's shell
+      # lands 1.25 s after the throw, so a short lob crawled, and its time_to_closest, unscaled,
+      # could read hundreds of seconds. On screen it now stays under the farthest visible
+      # point over 2 tiles/s (9.2 s mid-map), as it does live.
+      projectile_static_speed: 2.0
     world:
       # THE TRAINING ROTATION: default.yaml's thirty-six maps minus the two in
       # `eval.holdout_maps` below. A list in an override REPLACES the base list, it is not merged
@@ -97,8 +104,40 @@ run:
     # run trained without it keeps default.yaml's `false` in its own frozen train.yaml.
     action:
       auto_aim: true
+    # USER SETTINGS, 2026-10-06 (SIM_ISSUES_PLAN.md, from the issues seen in watch.py). Every
+    # key below keeps the old sim at its default.yaml value, so earlier runs replay unchanged.
+    #
+    # Crates: a dash hits each crate once, as it does each unit, and 8000 HP (the real game's
+    # 4500-8500) takes Mortis 4 dashes at 0-3 cubes, 3 at 4-9 and 2 from 10. Before, a crate
+    # took a hit on every tick of a dash, so one dash broke a 3000-HP crate.
+    boxes:
+      hp: 8000
+      dash_hits_once: true
+    # The game's own cube cap, 99 (Brawl Stars, 2019-09), which no match reaches: the supply is
+    # one cube per crate plus one per death. default.yaml's 16 left a capped hero circling cubes
+    # it could not take, with nothing in the observation to say why.
+    cubes:
+      max_cubes: 99
+    # Bots (the user's 2026-10-06 answers to SIM_ISSUES_PLAN.md §7):
+    #   nav: "bots should get as real pathfinding as possible without compromising training time
+    #     seriously". A shortest walkable path to the enemy, bush or waypoint, out of the gas and
+    #     away when backing off; a kiter with no line of sight closes, and one whose strafe meets
+    #     a wall turns round (2026-10-07). These keys together (boxes, cubes, bots, and the
+    #     reward's move_reversal) cost +9.9 % per env step on CUDA at 4096 envs (311 -> 342 ms on
+    #     an idle machine), part of it the harder game's extra episode resets (SIM_ISSUES_PLAN.md §B).
+    #   endgame_players: "campers should switch to hunting in final 4" (the hero counts).
+    #   tap_aim: the game's bots attack with a tap, whose auto-aim fires at the target's current
+    #     position and never leads, so a LEAD/LOB bot aims there (the tier aim noise still applies).
+    #   lead_velocity_tau: "smoothed bot velocity should be solid". A bot reads its target's
+    #     velocity through a 0.25 s low-pass, one decision period. With tap_aim on, nothing leads,
+    #     so it only steadies Shelly's hold-fire on a fast crosser.
+    bots:
+      nav: true
+      endgame_players: 4
+      tap_aim: true
+      lead_velocity_tau: 0.25
 
-  info_mode: episode            # minimal | episode | full. "episode" is the MINIMUM the
+  info_mode: episode           # minimal | episode | full. "episode" is the MINIMUM the
                                 # curriculum needs -- it is what carries info["outcome"].
   checkpoint_every_steps: 10_000_000   # decisions; 0 disables periodic checkpoints.
                                        # best_model.zip (eval callback) and the LR/clip
@@ -192,6 +231,12 @@ reward:
   # on crates or on nothing. Paid on top of damage_dealt (0.6 for a base 2000 hit). The 18 s
   # cooldown allows about ten throws a match, so about 3 at most, against 10 for a win.
   gadget_hit: 0.3
+  # USER DECISION 2026-10-07 (SIM_ISSUES_PLAN.md §5.2). x decisions whose move bin swung >= 135
+  # degrees from the last one's, both non-idle. The old policy reversed on 26 % of its decisions
+  # (measured), about 1.2 a 120 s match at this weight; a dodge that saves one 1300-HP hit is
+  # worth 0.13 in damage_taken, so a real dodge still pays and jitter with nobody shooting stops
+  # paying. Counts decisions, not ticks, so a different action_repeat changes its price; 0 is off.
+  move_reversal: -0.01
   scale: 1.0                    # multiplies the whole sum; a global volume knob
 
 # Stationary evaluation. Periodically plays a small, FIXED set of matches against each difficulty
@@ -300,8 +345,10 @@ curriculum:
   # unwinnable rather than hard.
   #
   # The elite `hp: 1.5` takes the largest possible normalized `entities.hp` (a 10000-HP Bull or
-  # Buzz at 16 cubes: 10000 x 1.5 + 16 x 400 = 21400) to 1.07. That is just past the 1.0 that
-  # obs_select's _NORM_HP_SCALE (20000) aims for, and nothing clips the value.
+  # Buzz at default.yaml's 16 cubes: 10000 x 1.5 + 16 x 400 = 21400) to 1.07, just past the 1.0
+  # that obs_select's _NORM_HP_SCALE (20000) aims for. This file's 99-cube cap lifts the bound to
+  # 2.73, though the supply keeps matches far below it (a 2026-10-07 smoke's peak, 42 cubes,
+  # caps it at 1.59). Nothing clips the value.
   tiers:
     easy:
       aim_noise: 2.5

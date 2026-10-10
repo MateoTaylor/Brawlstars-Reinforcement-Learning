@@ -484,6 +484,24 @@ def test_the_attack_bearing_is_the_move_bin_or_facing_when_idle():
     assert shadow.observe()["dash_dir"] == pytest.approx((0.0, 1.0), abs=1e-6)
 
 
+def test_an_idle_super_has_no_bearing_and_a_moving_one_follows_the_bin():
+    """The sim aims an idle super like the game's tap-to-fire (`hero.super_aim_target`), so the
+    shadow hands the device no bearing and `Buttons.press` taps; a super fired while moving goes
+    along the bin, as the sim's bolt does. Only the queued super is None: once the sub-tick has
+    consumed it, the idle bin is `facing` again."""
+    shadow = _shadow()
+    shadow.set_super(_super(1.0, True))
+    assert shadow.act(0, ATTACK_SUPER) == ATTACK_SUPER
+    assert shadow.attack_bearing is None
+    shadow.advance(0.05)
+    assert shadow.attack_bearing == 0.0
+
+    shadow = _shadow()
+    shadow.set_super(_super(1.0, True))
+    assert shadow.act(5, ATTACK_SUPER) == ATTACK_SUPER
+    assert shadow.attack_bearing == pytest.approx(math.pi / 2, abs=1e-6)
+
+
 def test_a_dead_hero_cannot_attack_but_its_timers_keep_running():
     shadow = _shadow()
     shadow.act(1, ATTACK_FIRE)

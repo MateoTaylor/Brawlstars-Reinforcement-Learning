@@ -269,6 +269,24 @@ def test_gadget_hit_tick_defaults_to_int32_zeros_and_passes_through_what_env_sup
     assert torch.equal(info["gadget_hit_tick"], counts)
 
 
+# ---- move_reversal_tick -------------------------------------------------------------------
+
+def test_move_reversal_tick_defaults_to_int32_zeros_and_passes_through_what_env_supplies():
+    """The same contract: only env.step, before its history push, still holds the last move."""
+    cfg, params = _cfg_and_params(n_enemies=3)
+    state = _fresh_state(cfg, params)
+    args = (state, _zeros_by(cfg), torch.zeros_like(state.ent_alive),
+            torch.zeros_like(state.box_alive), torch.zeros_like(state.ent_cubes), cfg)
+
+    info = events.compute_info(*args)
+    assert info["move_reversal_tick"].dtype == torch.int32
+    assert info["move_reversal_tick"].tolist() == [0]
+
+    flags = torch.tensor([1], dtype=torch.int32)
+    info = events.compute_info(*args, move_reversals=flags)
+    assert torch.equal(info["move_reversal_tick"], flags)
+
+
 # ---- dash_hits_tick / shots_fired_tick -----------------------------------------------------
 
 def test_dash_hits_tick_only_counts_dashing_attackers():

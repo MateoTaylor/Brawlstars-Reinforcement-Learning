@@ -24,6 +24,9 @@ _ENTITY_FIELDS = (
     ("ent_dash_dir", lambda N, E, P, B, U, L, K: (N, E, 2), F32),
     ("ent_dash_speed", lambda N, E, P, B, U, L, K: (N, E), F32),
     ("ent_dash_hits", lambda N, E, P, B, U, L, K: (N, E, E), BOOL),
+    # The crates this entity's current dash has already damaged, read only under
+    # `boxes.dash_hits_once` (hero.advance_dash); zeroed at dash start and finish like ent_dash_hits.
+    ("ent_dash_box_hits", lambda N, E, P, B, U, L, K: (N, E, B), BOOL),
     ("ent_invuln_t", lambda N, E, P, B, U, L, K: (N, E), F32),
     ("ent_reveal_t", lambda N, E, P, B, U, L, K: (N, E), F32),
     ("ent_react_t", lambda N, E, P, B, U, L, K: (N, E), F32),
@@ -41,6 +44,9 @@ _ENTITY_FIELDS = (
     ("ent_gadget_cd", lambda N, E, P, B, U, L, K: (N, E), F32),
     ("ent_target", lambda N, E, P, B, U, L, K: (N, E), I64),
     ("ent_move_smooth", lambda N, E, P, B, U, L, K: (N, E, 2), F32),
+    # The velocity bots read a target by: ent_vel through a low-pass of `bots_lead_velocity_tau`
+    # seconds (bots/policy.track_seen_velocity, after the dash phase). Unwritten and unread at tau 0.
+    ("ent_vel_seen", lambda N, E, P, B, U, L, K: (N, E, 2), F32),
     # --- bot personality: per-entity and episode-scoped. core/spawn.py initializes them, only
     # bots/ reads them (bots/personality.py advances them). The hero's slot 0 carries them unread,
     # like ent_target/ent_move_smooth.
@@ -51,6 +57,9 @@ _ENTITY_FIELDS = (
     # (maps/loader.bush_waypoints, capped at 63 so one int64 covers them). 0 is the fresh value.
     ("ent_hunt_seen", lambda N, E, P, B, U, L, K: (N, E), I64),
     ("ent_hunt_t", lambda N, E, P, B, U, L, K: (N, E), F32),
+    # The sense, +-1, a bot strafes its target in, written only under `bots.nav`
+    # (bots/personality.advance_strafe); zero_'s 0 reads as the slot's bots/policy.strafe_sign.
+    ("ent_strafe_sign", lambda N, E, P, B, U, L, K: (N, E), F32),
     ("ent_death_step", lambda N, E, P, B, U, L, K: (N, E), I32),
     ("ent_death_cause", lambda N, E, P, B, U, L, K: (N, E), I32),
     ("ent_last_hit_by", lambda N, E, P, B, U, L, K: (N, E), I64),

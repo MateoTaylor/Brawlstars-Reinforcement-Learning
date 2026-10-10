@@ -62,14 +62,14 @@ def _movement_wrap(state, tgt, bank, params, cfg, gen):
     return move_dir, mode
 
 
-def _box_wrap(state, bank, cfg):
-    d, w = _orig_box(state, bank, cfg)
+def _box_wrap(state, bank, params, cfg):
+    d, w = _orig_box(state, bank, params, cfg)
     CAP["box_w"] = w.clone()
     return d, w
 
 
-def _cube_wrap(state, bank, cfg):
-    d, w = _orig_cube(state, bank, cfg)
+def _cube_wrap(state, bank, params, cfg):
+    d, w = _orig_cube(state, bank, params, cfg)
     CAP["cube_w"] = w.clone()
     # Distance at the tick itself: after the step the pickup may already be collected.
     _, dist = perception.nearest_alive(state.pku_pos, state.pku_alive, state.ent_pos)

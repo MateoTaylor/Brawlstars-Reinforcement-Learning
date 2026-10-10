@@ -30,8 +30,21 @@ def strafe(pos: torch.Tensor, target_pos: torch.Tensor, sign) -> torch.Tensor:
     return perp * s
 
 
+def range_band(pos: torch.Tensor, target_pos: torch.Tensor, desired, deadband, max_dist=None):
+    """(too_far (N,E) bool, too_close (N,E) bool): which side of maintain_range's band each entity
+    is on, with seeking winning where both edges hold (see maintain_range). Shared so that a
+    caller choosing a path goal by the side (bots/personality.movement) cannot disagree with the
+    steering it feeds."""
+    dist = geo.safe_norm(target_pos - pos, dim=-1)
+    too_far = dist > (desired + deadband)
+    if max_dist is not None:
+        too_far = too_far | (dist > max_dist)
+    too_close = (dist < (desired - deadband)) & ~too_far
+    return too_far, too_close
+
+
 def maintain_range(pos: torch.Tensor, target_pos: torch.Tensor, desired, deadband,
-                   max_dist=None) -> torch.Tensor:
+                   max_dist=None, approach=None, retreat=None) -> torch.Tensor:
     """(N,E,2). Seeks (unnormalized diff toward target) when dist > desired+deadband, flees
     (negated diff) when dist < desired-deadband, zero inside the deadband. desired/deadband are
     python scalars or (N,E) tensors. `dist` stays (N,E), no keepdim, on purpose: an (N,E,1) dist
@@ -44,15 +57,18 @@ def maintain_range(pos: torch.Tensor, target_pos: torch.Tensor, desired, deadban
     strafe is left and an orbit drifts outward. bots/personality.movement passes each bot's fire
     reach so no kiter parks out of its own range (user decision, 2026-09-21). If both edges hold
     at once (desired - deadband > max_dist) seeking wins and the entity jitters on max_dist, so
-    callers keep desired <= max_dist, as bots/policy.targeting does."""
+    callers keep desired <= max_dist, as bots/policy.targeting does.
+
+    `approach` (optional, (N,E,2)) replaces the seek offset `target_pos - pos` while too far, and
+    `retreat` (optional, (N,E,2)) the flee offset `pos - target_pos` while too close:
+    bots/personality.movement passes bots/policy.path_toward's offsets under `bots.nav`, so a
+    kiter closes along a walkable path and backs off along one (user decision, 2026-10-07)."""
     diff = target_pos - pos
-    dist = geo.safe_norm(diff, dim=-1)
-    too_far = dist > (desired + deadband)
-    if max_dist is not None:
-        too_far = too_far | (dist > max_dist)
-    too_far = too_far.unsqueeze(-1)
-    too_close = (dist < (desired - deadband)).unsqueeze(-1)
-    return torch.where(too_far, diff, torch.where(too_close, -diff, torch.zeros_like(diff)))
+    too_far, too_close = range_band(pos, target_pos, desired, deadband, max_dist)
+    seek = diff if approach is None else approach
+    flee = -diff if retreat is None else retreat
+    return torch.where(too_far.unsqueeze(-1), seek,
+                       torch.where(too_close.unsqueeze(-1), flee, torch.zeros_like(diff)))
 
 
 def escape_zone(pos: torch.Tensor, zone_lo: torch.Tensor, zone_hi: torch.Tensor) -> torch.Tensor:

@@ -104,6 +104,11 @@ class EnvConfig:
     # `visibility.los` and `entities.los_from_hero`: a full-ray wall march over every entity pair
     # on every obs build. Nothing in training reads them, so train.yaml turns them off.
     obs_include_raw_los: bool = True
+    # A projectile slower than this (tiles/s) reads as still in the AGENT's observation: `vel`
+    # (0, 0) and `time_to_closest` 0, before `max_slots` ranks the group (core/obs_select). It
+    # mirrors the live tracker's STATIC_TILES_S, under which a track's velocity is detector noise.
+    # 0 = off, the observation every run trained on until 2026-10-07; train.yaml sets 2.0.
+    obs_projectile_static_speed: float = 0.0
     # --- observation history. The sim keeps the last `history_frames` DECISIONS of the hero's
     # hp, ammo and position, the action it took, and each enemy's position plus whether the hero
     # saw it (core/state `hist_*`, written by core/history.push at the top of env.step).
@@ -128,6 +133,21 @@ class EnvConfig:
     bots_hunt_cell_tiles: int = 10
     bots_hunt_arrive_tiles: float = 2.0
     bots_hunt_timeout_seconds: float = 12.0
+    # --- bot behaviour from SIM_ISSUES_PLAN.md (user decisions, 2026-10-06). Every default is the
+    # old sim; configs/train.yaml turns them on.
+    # Pathfinding (maps/nav.py): bots follow shortest walkable paths instead of steering straight
+    # at a goal behind a wall, and a KITE with no line of sight closes instead of holding range.
+    bots_nav: bool = False
+    bots_nav_anchor_tiles: int = 3
+    # From this many players alive (the hero counts) a CAMPER or TRAPPER plays as a HUNTER
+    # (bots/personality.effective_person). 0 never.
+    bots_endgame_players: int = 0
+    # Seconds of the low-pass a bot reads its target's velocity through (state.ent_vel_seen); the
+    # aim lead and the lateral fire hold use it. 0 reads the raw per-tick velocity.
+    bots_lead_velocity_tau: float = 0.0
+    # Bots aim at where the target IS, as the game's bots do with a tap-to-attack auto-aim; the
+    # per-tier aim noise still applies. False leads the target.
+    bots_tap_aim: bool = False
     zone_enabled: bool = True
     # Sensing horizon for zone.hero_margin_local ONLY -- it changes no dynamics, just how far that
     # one observation field can see. Must equal the clamp the deployed gas estimator uses; see
@@ -141,6 +161,10 @@ class EnvConfig:
     # itself.
     box_scatter_min_tiles: float = 0.0
     box_scatter_max_tiles: float = 0.0
+    # A dash damages each crate at most once (user's rule, 2026-10-06: one hit per target per
+    # dash), as it already does each unit. False is the old sim, where a crate inside the dash
+    # capsule took damage on every tick, 3 to 5 hits per dash.
+    box_dash_hits_once: bool = False
     los_step_tiles: float = 0.5
     max_ray_tiles: float = 24.0
     debug_checks: bool = False
@@ -303,6 +327,7 @@ _ENV_CONFIG_FIELDS = (
     ("observation.include_world_grid", "obs_include_world_grid", bool),
     ("observation.include_privileged", "obs_include_privileged", bool),
     ("observation.include_raw_los", "obs_include_raw_los", bool),
+    ("observation.projectile_static_speed", "obs_projectile_static_speed", float),
     ("observation.history_frames", "history_frames", int),
     ("observation.history_radius_tiles", "history_radius_tiles", int),
     ("bots.break_boxes", "bots_break_boxes", bool),
@@ -320,6 +345,11 @@ _ENV_CONFIG_FIELDS = (
     ("bots.hunt_cell_tiles", "bots_hunt_cell_tiles", int),
     ("bots.hunt_arrive_tiles", "bots_hunt_arrive_tiles", float),
     ("bots.hunt_timeout_seconds", "bots_hunt_timeout_seconds", float),
+    ("bots.nav", "bots_nav", bool),
+    ("bots.nav_anchor_tiles", "bots_nav_anchor_tiles", int),
+    ("bots.endgame_players", "bots_endgame_players", int),
+    ("bots.lead_velocity_tau", "bots_lead_velocity_tau", float),
+    ("bots.tap_aim", "bots_tap_aim", bool),
     ("zone.enabled", "zone_enabled", bool),
     ("zone.margin_horizon_tiles", "zone_margin_horizon_tiles", float),
     ("zone.iframes_block_zone", "iframes_block_zone", bool),
@@ -327,6 +357,7 @@ _ENV_CONFIG_FIELDS = (
     ("cubes.drop_victim_cubes", "drop_victim_cubes", bool),
     ("cubes.box_scatter_min_tiles", "box_scatter_min_tiles", float),
     ("cubes.box_scatter_max_tiles", "box_scatter_max_tiles", float),
+    ("boxes.dash_hits_once", "box_dash_hits_once", bool),
     ("perception.los_step_tiles", "los_step_tiles", float),
     ("perception.max_ray_tiles", "max_ray_tiles", float),
     ("engine.debug_checks", "debug_checks", bool),
@@ -663,6 +694,14 @@ def dash_ray_tiles(spec: dict) -> float:
     )
 
 
+def body_radius_tiles(spec: dict) -> float:
+    """A STATIC upper bound (in tiles) on `entities.unit_radius` across its randomization range.
+    Under `bots.nav`, maps/nav chooses each goal's anchor by a straight walk a body this wide
+    clears, the walk bots/policy._walk_clear tests at run time. Same spec-derived construction as
+    `cone_ray_tiles`, since the tables are built once and outlive every resample."""
+    return _spec_upper(spec.get("entities", {}).get("unit_radius", 0.0))
+
+
 def shot_step_tiles(spec: dict, dt: float) -> float:
     """A STATIC upper bound (in tiles) on how far any shot that a wall or a box can stop moves in
     one tick, across every kind and every value its randomization range can produce: the fastest
@@ -977,6 +1016,19 @@ def validate(cfg: EnvConfig, params: SimParams) -> None:
         raise ValueError(
             f"bots_hunt_timeout_seconds must be > 0, got {cfg.bots_hunt_timeout_seconds}"
         )
+    if cfg.bots_nav_anchor_tiles < 2:
+        # 1 would make every walkable tile an anchor: ~3600 flow fields a map, ~470 MB for the pool.
+        raise ValueError(f"bots_nav_anchor_tiles must be >= 2, got {cfg.bots_nav_anchor_tiles}")
+    if cfg.bots_nav and float(params.unit_radius.max()) >= 0.5:
+        # bots/policy._walk_clear tests a body's walk with its two edge lines, which only covers
+        # every tile the body crosses while the body is narrower than a tile.
+        raise ValueError(
+            f"bots.nav needs entities.unit_radius < 0.5, got {float(params.unit_radius.max())}"
+        )
+    if cfg.bots_endgame_players < 0:
+        raise ValueError(f"bots_endgame_players must be >= 0, got {cfg.bots_endgame_players}")
+    if cfg.bots_lead_velocity_tau < 0:
+        raise ValueError(f"bots_lead_velocity_tau must be >= 0, got {cfg.bots_lead_velocity_tau}")
     if not 0 <= cfg.box_scatter_min_tiles <= cfg.box_scatter_max_tiles:
         raise ValueError(
             f"cubes.box_scatter_min_tiles ({cfg.box_scatter_min_tiles}) and box_scatter_max_tiles "
@@ -1012,6 +1064,10 @@ def validate(cfg: EnvConfig, params: SimParams) -> None:
     if cfg.history_radius_tiles < 1:
         raise ValueError(
             f"observation.history_radius_tiles must be >= 1, got {cfg.history_radius_tiles}"
+        )
+    if cfg.obs_projectile_static_speed < 0:
+        raise ValueError(
+            f"observation.projectile_static_speed must be >= 0, got {cfg.obs_projectile_static_speed}"
         )
 
     # The camera quad must be convex, wound the way core/camera.in_camera assumes (clockwise on

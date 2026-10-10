@@ -14,6 +14,7 @@ import torch
 from ..core import geometry as geo
 from ..core import stats
 from ..core import terrain
+from ..maps import nav
 
 _EPS = 1e-6
 _INF = float("inf")
@@ -222,7 +223,10 @@ def bush_scan(
     Excluding only lethal tiles would send a bot to a bush the next shrink swallows, and let a
     camper fleeing the zone pick the bush it already stands in; with the margin, every bush
     returned is farther from the edge than the flee threshold, so reaching it is real progress.
-    Pass None (or a degenerate rect) to skip the exclusion.
+    Under `cfg.bots_nav` a tile's clearance is counted along its way out (nav.centre_path_dip,
+    the rule bots/policy.zone_clearance applies to the bot itself), so a bush in a pocket whose
+    exit the gas is closing on is not picked. Pass None (or a degenerate rect) to skip the
+    exclusion.
     """
     device = pos.device
     offsets = _bush_offsets(int(cfg.bots_bush_search_tiles), device)  # (K,2)
@@ -253,7 +257,10 @@ def bush_scan(
         # Same degenerate-rect guard as bots/policy.zone_rect: a zero-area rect means "no zone
         # active yet", not "the whole map is lethal".
         rect_active = (hi[..., 0] > lo[..., 0]) & (hi[..., 1] > lo[..., 1])
-        lethal = in_zone(center, lo, hi) | (zone_clearance(center, lo, hi) < zone_margin)
+        room = zone_clearance(center, lo, hi)
+        if cfg.bots_nav:
+            room = room - nav.centre_path_dip(bank, map_id, center, lo, hi, cfg)
+        lethal = in_zone(center, lo, hi) | (room < zone_margin)
         is_bush = is_bush & ~(lethal & rect_active)
 
     dist = geo.dist(pos.unsqueeze(-2), center)  # (N,E,K)
@@ -275,6 +282,9 @@ def hunt_waypoint(
     Cost is a single (N,E,W) gather with W <= 63 regardless of map size; see
     maps/loader.bush_waypoints for why this is a map-scale sweep where a larger `bush_scan`
     radius would not be.
+
+    The zone exclusion is bush_scan's, the along-the-way-out clearance under `cfg.bots_nav`
+    included.
     """
     device = pos.device
     waypoints = bank.bush_wp[map_id]        # (N,W,2)
@@ -302,7 +312,10 @@ def hunt_waypoint(
         lo = zone_lo.unsqueeze(-2)
         hi = zone_hi.unsqueeze(-2)
         rect_active = (hi[..., 0] > lo[..., 0]) & (hi[..., 1] > lo[..., 1])
-        lethal = in_zone(wp, lo, hi) | (zone_clearance(wp, lo, hi) < zone_margin)
+        room = zone_clearance(wp, lo, hi)
+        if cfg.bots_nav:
+            room = room - nav.centre_path_dip(bank, map_id, wp, lo, hi, cfg)
+        lethal = in_zone(wp, lo, hi) | (room < zone_margin)
         exists = exists & ~(lethal & rect_active)
 
     dist = geo.dist(pos.unsqueeze(-2), wp)  # (N,E,W)

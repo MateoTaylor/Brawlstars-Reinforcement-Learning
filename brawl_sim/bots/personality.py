@@ -9,7 +9,8 @@ TRAPPER exist to punish exactly that policy.
 `bots.personality_weights`):
   - RUSH    closes on anything it can see, and explores at random when it can't.
   - CAMPER  sits in a bush and fires only once something can actually see it. Does NOT leave, not
-            even when idle, until the shrinking zone gets within `bots_camper_zone_flee_tiles`.
+            even when idle, until the shrinking zone gets within `bots_camper_zone_flee_tiles`
+            or the endgame below turns it into a HUNTER.
   - HUNTER  engages what it can see, and otherwise SWEEPS THE MAP for what it can't -- walking to
             the nearest BUSH WAYPOINT (maps/loader.bush_waypoints) it has not visited yet, tracked
             per entity as a bitmask in `ent_hunt_seen`. The direct counter to a hidden agent.
@@ -17,7 +18,8 @@ TRAPPER exist to punish exactly that policy.
             anything in range from it, but drifts bush-to-bush (via the same waypoint machinery
             HUNTER uses) while nothing is visible, so its ambush spots don't go stale.
   - KITE    works the open map holding its kind's ideal range (bots/policy.targeting's
-            `desired_range`, capped at its fire reach) from whatever it can see.
+            `desired_range`, capped at its fire reach) from whatever it can see; under `bots.nav`
+            it CLOSEs on a target it has no line of sight to, until it has one.
 
 **Rules that hold for every personality** (the user's specification):
   - Nobody walks into the green zone. bots/policy.zone_avoid_contribution pushes inward from
@@ -31,6 +33,18 @@ TRAPPER exist to punish exactly that policy.
     they spread out and can wander into an ambush the AGENT has set. CAMPER is the one deliberate
     exception (its stay-put rule is what makes it a real threat that has to be cleared); TRAPPER
     relocates between bushes rather than into the open.
+  - Once at most `bots_endgame_players` players are alive (the hero counts), CAMPER and TRAPPER
+    play as HUNTER (bots/policy.effective_person; user decision, 2026-10-06, "campers should
+    switch to hunting in final 4"), so the last bots come looking rather than wait out the gas.
+  - Under `bots.nav` every goal a bot walks to (an enemy it closes on, the approach to its range,
+    a bush, a hunt waypoint, and the point it backs off to in RETREAT or inside a KITE's range
+    band, bots/policy.retreat_goal) is reached along a shortest walkable path
+    (bots/policy.path_toward, maps/nav.py), and the zone terms follow the path to the map centre.
+    Every gas rule (the CAMPER/TRAPPER flee, the inward push, which bushes and waypoints are safe)
+    then counts its clearance along that path out (maps/nav.centre_path_dip), so a pocket whose
+    exit the gas is closing on is left while the exit is open. Wander stays a straight line.
+    Without nav every one of those is a straight line, and a wall in the way pins the bot
+    against it.
 
 **Structure.** Behavior is resolved in two stages, which is what keeps this batched and cheap:
 `_select_mode` maps (personality, world state) to one of seven `Mode`s, then a single
@@ -54,6 +68,9 @@ from . import steering
 
 _EPS = 1e-6
 _WANDER_LOOKAHEAD_TILES = 2.5
+# How far ahead a strafing bot looks for a wall before turning round (advance_strafe): a body's
+# edge (`unit_radius` 0.4) is then 0.6 tiles from the wall, room for the smoothed intent to turn.
+_STRAFE_LOOKAHEAD_TILES = 1.0
 
 # Public: tests assert against these, and they are the two numbers most worth tuning by hand.
 # RANGE_DEADBAND is a property of the KITE behavior, not the weapon; only the ideal distance is
@@ -163,6 +180,28 @@ def advance_wander(state, bank, cfg, gen) -> torch.Tensor:
     return state.ent_wander_dir
 
 
+def advance_strafe(state, bank, cfg, enemy_pos, strafing) -> torch.Tensor:
+    """MUTATES: ent_strafe_sign. Returns the (N,E) sense, +-1, each bot strafes its target in.
+    Called under `bots.nav` only; without it every bot keeps its slot's fixed sense.
+
+    A bot starts in its slot's sense (bots/policy.strafe_sign, which zero_'s 0 reads as) and turns
+    round when its strafe would walk into a wall `_STRAFE_LOOKAHEAD_TILES` ahead and the way back
+    is open (user decision, 2026-10-07, BRAWL_SIM_DESIGN.md #30): inside a KITE's range band the
+    strafe is all that moves it, and a fixed sense held it against the wall until its enemy moved.
+    The sense is kept, not re-chosen each tick, so a bot that has turned does not turn back the
+    moment the wall is out of reach; with both ways walled it keeps its sense. Only bots
+    `strafing` this tick ((N,E) bool) update theirs: an idle bot's "enemy" is a clamped index."""
+    pos = state.ent_pos
+    slot = shared.strafe_sign(pos.shape[1], pos.device).expand_as(state.ent_strafe_sign)
+    sign = torch.where(state.ent_strafe_sign == 0, slot, state.ent_strafe_sign)
+    step = steering.strafe(pos, enemy_pos, sign) * _STRAFE_LOOKAHEAD_TILES
+    blocked_ahead = terrain.sample(bank.blocks_unit, state.map_id, pos + step, cfg)
+    blocked_back = terrain.sample(bank.blocks_unit, state.map_id, pos - step, cfg)
+    turn = strafing & blocked_ahead & ~blocked_back
+    state.ent_strafe_sign.copy_(torch.where(turn, -sign, sign))
+    return state.ent_strafe_sign
+
+
 def advance_hunt(state, hunt, mode: torch.Tensor, cfg) -> None:
     """MUTATES: ent_hunt_seen, ent_hunt_t -- the visited-waypoint bitmask that turns "walk toward
     a bush" into "sweep the map".
@@ -171,7 +210,8 @@ def advance_hunt(state, hunt, mode: torch.Tensor, cfg) -> None:
     when `bots_hunt_timeout_seconds` elapse without arriving. The timeout is what makes this
     robust: without it, a waypoint behind a wall stays "nearest and unvisited" forever and the
     hunter grinds against that wall for the rest of the episode. Marking it searched anyway is a
-    give-up, and give-up is correct -- there is no pathfinder here, only steering.
+    give-up, and give-up is correct: without `bots.nav` there is no pathfinder, only steering,
+    and with it the timeout only ends a leg the bot keeps being pulled off.
 
     **The mask resets once every waypoint has been visited**, so a hunter that has swept the whole
     map starts over rather than degrading into an aimless wanderer for the rest of the episode.
@@ -215,17 +255,19 @@ def _select_mode(state, tgt, scan, hunt, in_bush_now, clearance, aggression, cfg
     aggression`, clamped to [RETREAT_HP_FRACTION_MIN, RETREAT_HP_FRACTION_MAX] so a tier can
     never produce a bot that retreats at full HP or one that fights to the last hit point.
 
-    Reads `state.ent_person` as the source of truth. `cfg.bots_personalities` is NOT consulted
-    here: it controls only what core/spawn.sample_personalities ASSIGNS (all RUSH when off), so a
-    test or a tool that writes ent_person by hand always gets the behavior it asked for."""
-    person = state.ent_person
+    Reads `state.ent_person` as the source of truth, through bots/policy.effective_person (the
+    endgame switch). `cfg.bots_personalities` is NOT consulted here: it controls only what
+    core/spawn.sample_personalities ASSIGNS (all RUSH when off), so a test or a tool that writes
+    ent_person by hand always gets the behavior it asked for."""
+    person = shared.effective_person(state, cfg)
     has_enemy = tgt.has_enemy
     hp_frac = state.ent_hp / torch.clamp(state.ent_max_hp, min=_EPS)
     retreat_below = torch.clamp(
         RETREAT_HP_FRACTION / aggression, RETREAT_HP_FRACTION_MIN, RETREAT_HP_FRACTION_MAX,
     )
     low_hp = hp_frac < retreat_below
-    # "Unless the green zone is 2 or less squares away" (user's rule).
+    # "Unless the green zone is 2 or less squares away" (user's rule), counted along the way out
+    # under nav (bots/policy.zone_clearance).
     zone_pressed = clearance <= cfg.bots_camper_zone_flee_tiles
 
     def mode(m):
@@ -260,9 +302,15 @@ def _select_mode(state, tgt, scan, hunt, in_bush_now, clearance, aggression, cfg
     trapper = torch.where(zone_pressed, mode(Mode.TO_BUSH), trapper)
     trapper = torch.where(scan.found, trapper, rushlike)
 
-    # KITE: never in cover, always at range.
+    # KITE: never in cover, always at range. Under `bots.nav` a kiter with no line of sight to its
+    # target closes along the path until it has one (user decision, 2026-10-06): holding range
+    # through a wall kept it out of the fight with no shot.
+    if cfg.bots_nav:
+        engaged = torch.where(tgt.enemy_los, mode(Mode.HOLD_RANGE), mode(Mode.CLOSE))
+    else:
+        engaged = mode(Mode.HOLD_RANGE)
     kite = torch.where(
-        has_enemy, torch.where(low_hp, mode(Mode.RETREAT), mode(Mode.HOLD_RANGE)), mode(Mode.WANDER),
+        has_enemy, torch.where(low_hp, mode(Mode.RETREAT), engaged), mode(Mode.WANDER),
     )
 
     out = rushlike
@@ -278,8 +326,8 @@ def _select_mode(state, tgt, scan, hunt, in_bush_now, clearance, aggression, cfg
 # ---------------------------------------------------------------------------------------------
 
 def movement(state, tgt, bank, params, cfg, gen):
-    """MUTATES: ent_wander_dir, ent_wander_t, ent_hunt_seen, ent_hunt_t.
-    Returns (move_dir (N,E,2) unit-or-zero, mode (N,E) i64).
+    """MUTATES: ent_wander_dir, ent_wander_t, ent_hunt_seen, ent_hunt_t, and ent_strafe_sign under
+    `bots.nav`. Returns (move_dir (N,E,2) unit-or-zero, mode (N,E) i64).
 
     Computed for ALL (N,E) entities in one pass -- including entity 0, whose result
     bots/policy.all_bot_intents discards (the hero moves via hero.decode_action). Same
@@ -301,7 +349,7 @@ def movement(state, tgt, bank, params, cfg, gen):
         zone_lo=zone_lo, zone_hi=zone_hi, zone_margin=cfg.bots_camper_zone_flee_tiles,
     )
     in_bush_now = perception.in_bush(state, bank)
-    clearance = shared.zone_clearance(state, cfg)
+    clearance = shared.zone_clearance(state, cfg, bank)
     wander_dir = advance_wander(state, bank, cfg, gen)
 
     # Gathered once here (0 read as 1.0 inside the helper); the retreat threshold divides by it.
@@ -314,13 +362,34 @@ def movement(state, tgt, bank, params, cfg, gen):
     # defensive: bots/policy.target_info CLAMPS an absent target index to 0, so tgt.enemy_pos for
     # a bot with no target is the HERO's position. Ungated, every idle bot on the map would walk
     # straight at the agent with no way of having seen it.
-    seek_dir = steering.seek(pos, tgt.enemy_pos)
-    range_dir = steering.maintain_range(pos, tgt.enemy_pos, tgt.desired_range, RANGE_DEADBAND,
-                                        max_dist=tgt.fire_reach)
-    strafe_dir = steering.strafe(pos, tgt.enemy_pos, shared.strafe_sign(E, pos.device))
-    flee_dir = steering.flee(pos, tgt.enemy_pos)
-    bush_dir = steering.seek(pos, scan.pos)
-    hunt_dir = steering.seek(pos, hunt.pos)
+    if cfg.bots_nav:
+        # One path per entity per tick, to the goal of its mode: a mode steers by at most one of
+        # seek, range, flee, bush and hunt (_MODE_WEIGHTS), so one offset serves all five. A bot
+        # backing off, in RETREAT or a HOLD_RANGE inside its band, heads for
+        # bots/policy.retreat_goal (user decision, 2026-10-07): the straight flee pinned it on
+        # any wall behind it.
+        to_bush = (mode == int(Mode.TO_BUSH)).unsqueeze(-1)
+        to_wp = (mode == int(Mode.HUNT_BUSH)).unsqueeze(-1)
+        _too_far, too_close = steering.range_band(pos, tgt.enemy_pos, tgt.desired_range,
+                                                  RANGE_DEADBAND, max_dist=tgt.fire_reach)
+        backing = (mode == int(Mode.RETREAT)) | ((mode == int(Mode.HOLD_RANGE)) & too_close)
+        away = shared.retreat_goal(state, cfg, tgt.enemy_pos)
+        goal = torch.where(to_bush, scan.pos, torch.where(
+            to_wp, hunt.pos, torch.where(backing.unsqueeze(-1), away, tgt.enemy_pos)))
+        path = shared.path_toward(state, bank, params, cfg, goal)
+        seek_dir = bush_dir = hunt_dir = path
+        # The path's direction at the straight flee's length, the distance to the enemy, so the
+        # flee weighs what it did in steering.combine.
+        flee_dir = geo.normalize(path) * geo.safe_norm(pos - tgt.enemy_pos, dim=-1, keepdim=True)
+        range_dir = steering.maintain_range(pos, tgt.enemy_pos, tgt.desired_range, RANGE_DEADBAND,
+                                            max_dist=tgt.fire_reach, approach=path, retreat=flee_dir)
+    else:
+        seek_dir = steering.seek(pos, tgt.enemy_pos)
+        range_dir = steering.maintain_range(pos, tgt.enemy_pos, tgt.desired_range, RANGE_DEADBAND,
+                                            max_dist=tgt.fire_reach)
+        bush_dir = steering.seek(pos, scan.pos)
+        hunt_dir = steering.seek(pos, hunt.pos)
+        flee_dir = steering.flee(pos, tgt.enemy_pos)
 
     # --- weights: one gather, then mask each term by whether its target actually exists ---
     w = _weight_table(pos.device)[mode]  # (N,E,7)
@@ -328,11 +397,18 @@ def movement(state, tgt, bank, params, cfg, gen):
     found_f = scan.found.to(w.dtype)
     hunt_f = hunt.found.to(w.dtype)
 
+    # Under nav a bot's strafe turns round at a wall (advance_strafe); without it, the slot's sense.
+    if cfg.bots_nav:
+        sign = advance_strafe(state, bank, cfg, tgt.enemy_pos, tgt.has_enemy & (w[..., 2] > 0))
+    else:
+        sign = shared.strafe_sign(E, pos.device)
+    strafe_dir = steering.strafe(pos, tgt.enemy_pos, sign)
+
     # --- universal terms, identical for every personality ---
-    zone_dir, zone_w = shared.zone_contribution(state, cfg)
-    avoid_dir, avoid_w = shared.zone_avoid_contribution(state, cfg)
-    box_dir, box_w = shared.box_contribution(state, bank, cfg)
-    cube_dir, cube_w = shared.cube_contribution(state, bank, cfg)
+    zone_dir, zone_w = shared.zone_contribution(state, cfg, bank, params)
+    avoid_dir, avoid_w = shared.zone_avoid_contribution(state, cfg, bank, params)
+    box_dir, box_w = shared.box_contribution(state, bank, params, cfg)
+    cube_dir, cube_w = shared.cube_contribution(state, bank, params, cfg)
     # Loot pulls are off in RETREAT (user decision, 2026-09-25; HOLD_STILL via `mobile` below):
     # a bot leaving a losing fight does not turn back for the cubes lying in it, or walk back to
     # shoot a crate.
@@ -386,8 +462,9 @@ def fire_allowed(state, tgt, aggression, cfg) -> torch.Tensor:
     cover keeps it broken afterward. A camper cannot fire from concealment and stay concealed.
 
     The veto also needs `aggression < CAMPER_FIRE_ON_SIGHT_AGGRESSION`: at or above it a camper
-    fires on sight, so the aggressive tiers' campers are ambushers, not furniture. `aggression` is
+    fires on sight, so the aggressive tiers' campers are ambushers, not furniture. A camper the
+    endgame plays as a HUNTER (bots/policy.effective_person) fires freely. `aggression` is
     the (N,E) value from core/stats.aggression_of (0 already read as 1.0)."""
     patient = aggression < CAMPER_FIRE_ON_SIGHT_AGGRESSION
-    silent = (state.ent_person == int(Person.CAMPER)) & ~tgt.seen_by_other & patient
+    silent = (shared.effective_person(state, cfg) == int(Person.CAMPER)) & ~tgt.seen_by_other & patient
     return ~silent

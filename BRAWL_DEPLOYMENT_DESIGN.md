@@ -408,13 +408,14 @@ that the reachable circle clears the bottom UI strip. And bin 2 landing *down*-r
 up-right is **the no-y-flip convention confirmed empirically**, not just derived. Had the negation
 been there, this is the measurement that would have caught it.
 
-### 4.4 Buttons — REVISED 2026-09-15: aimed drags, not taps; 2026-09-21: the gadget is the one tap
+### 4.4 Buttons — REVISED 2026-09-15: aimed drags, not taps; 2026-09-21: the gadget is the one tap; 2026-10-06: an idle super taps
 
 Attack and super are **aimed drags**. This section used to say they were binary taps needing no
 aim, and that was wrong for this policy: a bare tap auto-aims in the real game, sending Mortis at
 the nearest enemy, while the sim's `hero.start_dash` goes along the decision's move direction, or
-along `facing` when the move bin is idle (`action.dash_on_idle: facing`). The super goes along the
-move direction too. So each press works the attack stick the way the movement stick is worked: a
+along `facing` when the move bin is idle (`action.dash_on_idle: facing`). A super fired while
+moving goes along the move direction too; an idle super is a tap (the last paragraph of this
+section). So each press works the attack stick the way the movement stick is worked: a
 contact goes down on the origin, drags `control.aim_radius_px` (75 px) along
 `ShadowHero.attack_bearing`, and lifts. The lift fires. `attack == 1` presses from the attack
 clearance point (§6.8: the attack stick floats), and `attack == 2` from the super button's centre.
@@ -474,6 +475,17 @@ something the tracker never saw, the modelled direction is wrong for one dash an
 corrects the position after it; the ammo, cooldown and dash timer are right either way.
 `Buttons.aim_point` refuses value 4 as it refuses the gadget, the mask's fifth bit is the
 attack's own, and `scripts/audit_attack_cadence.py` counts a 4 as an attack.
+
+**An idle super is the third bare tap (added 2026-10-06, closing BRAWL_SIM_DESIGN.md §1 #26).**
+Since 2026-09-30 the sim aims a super fired on the idle move bin like the game's tap-to-fire:
+`hero.super_aim_target` takes the nearest alive enemy within the bolt's 11.1-tile reach, off
+screen included, or `facing` with none. Live, that super was still dragged along `facing`, so the
+two agreed only with no enemy in reach. Now `ShadowHero.attack_bearing` is None for a queued super
+on the idle bin, and `Buttons.press` turns a super with no bearing into a tap on the super button,
+down on the decision tick and up on the next, so the game picks the target as the sim does. A
+super fired while moving keeps the drag along the move bin. The shadow models no bolt, so it
+needs no estimate of the game's target, unlike value 4. Still unmeasured live: the game's tap
+reach, and whether it picks enemies in bushes or off screen.
 
 ### 4.5 Calibration — BUILT 2026-09-08, see §6.14
 

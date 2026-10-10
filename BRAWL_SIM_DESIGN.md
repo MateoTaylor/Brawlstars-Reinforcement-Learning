@@ -19,10 +19,11 @@ This document replaces the sim's plan documents: the build plan, the bot overhau
 - A camera-window reveal with tracked enemy slots, `hero.near_edge`, a latched `zone.active` and three decisions of local history.
 - Gas timed from the real game.
 - 38 map CSVs and holdout evaluation.
+- Since 2026-10-07, behind keys only `configs/train.yaml` turns on (SIM_ISSUES_PLAN.md): bot pathfinding, the final-4 endgame switch, 8000-HP crates hit once per dash, the game's 99-cube cap and tap-aimed bots; then gas rules measured along the way out, a retreat goal, a strafe that turns round at a wall and a `move_reversal` reward term; and a projectile under 2.0 tiles/s reading as still in the agent's view, as live reports it. `runs/mortis_ppo-20261007-161117` is the first run trained on them.
 
 **In use.**
 - `configs/train.yaml` trains `configs/agent_obs_deploy5.yaml` for 600M decisions on 4096 envs and 34 maps.
-- `configs/deployment.yaml` serves `runs/mortis_ppo-20260925-194025`.
+- `configs/deployment.yaml` serves `runs/mortis_ppo-20261007-161117` (best_model.zip, the 580M eval), since 2026-10-08.
 
 **Open.** Each item waits on its owner.
 
@@ -50,7 +51,7 @@ This document replaces the sim's plan documents: the build plan, the bot overhau
 | 16 | **A CV reader for the gadget button**, then adding the gadget to `resync`. The trigger is telemetry showing a modelled throw with no damage spike within 0.5 s. | user |
 | 17 | **Replay the live gadget-anchor trace in a test.** Copy the trace under `tests/fixtures/` and replay it through the match gate; only such a test guards against regressions. | unowned (code) |
 | 18 | **The dry run against the gadget spec** (`control.backend: null`) is probably superseded by the 2026-09-28 localization dry runs. Close it or re-run it. | user |
-| 26 | **The idle super aims differently live.** The sim aims it like the game's tap-to-fire, at the nearest enemy in the bolt's 11.1-tile reach (§4); live, `ShadowHero.attack_bearing` still drags it along facing, so the two agree only when no enemy is in reach. Parity needs the idle super pressed as a bare tap, as value 4 already is, and the game's tap-aim rules measured: its reach, and whether it picks enemies in bushes or off screen. Three deployment passages still say the super follows `move_dir` when idle: `attack_bearing`'s docstring, `control/buttons.py`'s module docstring, and BRAWL_DEPLOYMENT_DESIGN.md §4.4. | user |
+| 26 | **The game's super tap-aim is unmeasured.** Since 2026-10-06 the live idle super is a bare tap on the super button, as the sim aims it (tap-to-fire at the nearest enemy in the bolt's 11.1-tile reach, §4; BRAWL_DEPLOYMENT_DESIGN.md §4.4). The game's own tap rules are still unmeasured: its reach, and whether it picks enemies in bushes or off screen. | user |
 
 *Training and experiments*
 
@@ -82,7 +83,7 @@ These are settled. Do not re-open one without new evidence. "User" marks the use
 | No synthetic speed benchmarks. Read speed off a real run's `time/fps`, and hunt unbounded memory or storage growth instead. | Past synthetic numbers ignored 4000+ envs and training time. | user, 2026-08; reaffirmed 2026-09-30 |
 | **Game fidelity** | | |
 | Real game statistics, never rebalanced. | An uneven roster is something to learn, not a bug. Tiers (§11) are a separate difficulty layer. | user, 2026-08-19 |
-| Power cubes give +400 max HP flat and +10 % damage each, capped at 16. | This is the real mechanic. A fractional HP bonus made the tankiest brawlers tankier. | user, 2026-08 |
+| Power cubes give +400 max HP flat and +10 % damage each. `default.yaml` caps them at 16; `train.yaml` uses the game's own cap, 99 (Brawl Stars, 2019), which no match reaches. | This is the real mechanic. A fractional HP bonus made the tankiest brawlers tankier. A hero at 16 circled cubes he could not take, with nothing in the obs to say why. | user, 2026-08; cap 2026-10-06 (SIM_ISSUES_PLAN.md §3) |
 | Regen follows the official rule: 13 % of max HP per second after 3 s without attacking or being hit. | Disengaging to heal is intended; the gas punishes it. | 2026-08-18 |
 | Gas damage is a fraction of each unit's own max HP: 0.20/s, +0.04 per shrink. | Nobody should survive ~5 s in the gas whatever their HP; a flat rate let cube-stacked tanks ignore it. | 2026-08-18 |
 | No attack animations. `attack_cooldown` is a window with no attack and no reload; the floor is 0.25 s (one decision), Mortis has 0.35 and Buzz 1.00. | This removed an animation subsystem. | 2026-08-18 |
@@ -110,8 +111,14 @@ These are settled. Do not re-open one without new evidence. "User" marks the use
 | Bots farm cubes as live lobbies do; there is no clock-based cube grant. | The agent lost live to bots holding 7+ cubes. | user, 2026-09-25 |
 | Loot pulls replace the personality's steering. They need no enemy target within 8 tiles (a cube within 2 tiles is exempt) and are off in RETREAT and HOLD_STILL. | Summed pulls froze bots at weighted midpoints. | 2026-09-25 |
 | Crates stay walkable. A bot shoots one only within `min(attack_range, 5)` tiles, and a CAMPER never does. | This matches the game: nearby crates, not every crate in range. | user, 2026-09-25 |
+| A dash hits each crate once, as it hits each unit (`boxes.dash_hits_once`), and crates have 8000 HP (`boxes.hp`), both in `train.yaml` only. | "Dashes should not be damaging any target more than once." One dash broke a 3000-HP crate; 8000 takes Mortis 4 dashes at 0–3 cubes. | user, 2026-10-06 |
 | Speed scales with the length of the intent, and the gas never takes a kill's last hit. | Coasting bots moved on 47 % of HOLD_STILL ticks; the hero lost kills he finished in the gas. | 2026-09-25 |
-| Bots steer; they never pathfind. | A melee kind that cannot close gets a steering weight, not A*. | original design |
+| Under `bots.nav` (on in `train.yaml`) bots walk shortest walkable paths to their enemy, bush or waypoint and out of the gas (§7), and a KITE with no line of sight closes. Without it they steer straight. | "Bots should get as real pathfinding as possible without compromising training time seriously": pinned on walls in watch.py. With the other bot flags its bot code costs about 3 % of a CUDA env step at 4096 envs (2026-10-07); with train.yaml's full config, the later gas and retreat rules included, an interleaved A/B on an idle machine reads +9.9 % (311 → 342 ms), the rest coming with the harder game, which ends 16 % more episodes per step. | user, 2026-10-06 (was: steer only) |
+| Once at most 4 players are alive, the hero included, CAMPERs and TRAPPERs play as HUNTERs (`bots.endgame_players`, 4 in `train.yaml`). | "Campers should switch to hunting in final 4." | user, 2026-10-06 |
+| Bots aim at where the target is (`bots.tap_aim`), and read its velocity through a 0.25 s low-pass (`bots.lead_velocity_tau`), both in `train.yaml`. Tier aim noise stays. | The game's bots attack with a tap, whose auto-aim never leads. "Smoothed bot velocity should be solid." | user, 2026-10-06 |
+| Under `bots.nav` the gas rules count a bot's room along its way out: its clearance, less how much nearer the gas the centre field's path from its tile comes (`nav.centre_path_dip`). The CAMPER and TRAPPER flee, the gas push's ramp and the bush and waypoint margins all read it. | A pocket's exit closes before the bot's own tile does, and a CAMPER that waited for its own tile was sealed in and died in the gas. "1 tick per bot and bush seems expensive, but I think it's worthwhile." | user, 2026-10-07 |
+| Under `bots.nav` a bot backing off, in RETREAT or a HOLD_RANGE too close to its enemy, paths to `policy.retreat_goal`: 6 tiles straight away from the enemy, kept 1 tile inside the safe rect and on the map. | The straight flee pinned on any wall behind it: RETREAT stalled on 12–24 % of its ticks, and on at most 0.4 % after. "Yes, add a destination." | user, 2026-10-07 |
+| Under `bots.nav` a strafing bot turns its strafe round when the point 1 tile ahead along it blocks a unit and the point 1 tile behind does not (`state.ent_strafe_sign`, latched until the next wall). | A KITE inside its range band, where only the strafe moves it, pushed into a wall until its enemy moved: HOLD_RANGE stalled on 6.5 % of its ticks, 0.6 % after (GPU smoke, 2026-10-07). "Build this as long as it's relatively cheap": two terrain lookups per bot per tick. | user, 2026-10-07 |
 | **Maps** | | |
 | The sim has no fences: the loader refuses `f`, but `Tile.FENCE` stays in the enum. | `brawl_vision`'s classifier and labels still index it. | user brief, 2026-09 |
 | The generated maps are approved, and the holdouts are `split_river` and `hollow_ring`. | The pair is one standard map and one water-border map. | user, 2026-09-21 (maps added 2026-09-27) |
@@ -121,6 +128,7 @@ These are settled. Do not re-open one without new evidence. "User" marks the use
 | `hero.near_edge` means a camera offset over 2 tiles. There is no sim-side dead-bin mask; `policy.dead_bin_mask` is live-only. | Readable on all four sides, which "within N tiles of an edge" is not at the south edge. 2 rather than 1 "to be extra safe". | user, 2026-09-24 |
 | Off-screen projectiles keep their ranked slot with the row blanked, and there is no dropout augmentation. | The empty rows are noise in the direction of the live detector's misses. | user, 2026-09-24 |
 | Tied projectiles go nearest the hero first. | `topk`'s tie order came from the sim's slot layout, which deployment cannot reproduce. | user, 2026-09-30 |
+| Under `observation.projectile_static_speed` (2.0 in `train.yaml`, 0 = off in `default.yaml`) a projectile slower than 2.0 tiles/s reads as still in the agent's view, `vel` 0 and `time_to_closest` 0, before `max_slots` ranks it. A test pins the key to the live tracker's `STATIC_TILES_S`; `full_obs` keeps the true values. | It is how the live tracker reports one. Grom's shell lands 1.25 s after the throw, so a short lob crawled, and its straight-line time, unscaled, read up to 34 s in the agent's view (CPU probe) and 1226 s at a GPU smoke's peak. On screen the time now stays under the farthest visible point over 2 tiles/s, 9.2 s mid-map and 15.8 s in a corner, as it does live. "#32: go with option C". | user, 2026-10-07 |
 | Enemy slots follow the live tracker's promote, coast and reuse rule, and the live tracker takes `slots.*` from the run's config. | Permanent slots let the policy learn "slot 3 is the one I hurt". A tracker on its own defaults would desync silently under a `slots.*` override. | user, 2026-09-24 and 2026-09-30 |
 | `zone.active` latches "gas has been on screen", tested on the window's bounding box; there is no per-side latch. Live, the latch outlives odometry segments and clears only at a match start. | It is what `ZoneEstimator.active` supplies. The box over-counts only two corners. A new segment empties the live gas map, so the map alone would un-latch. | user, 2026-09-24 and 2026-09-30 |
 | HUD-hole terrain, the bush constants and a live tracker without a window stay as they are. | Live reads are unmasked, the occupancy map is world-frame memory, and live the screen is the window. | user, 2026-09-24 |
@@ -133,6 +141,7 @@ These are settled. Do not re-open one without new evidence. "User" marks the use
 | The curriculum keeps its forced advance (`max_timesteps_at_stage`). | A run always reaches elite, even when no gate clears. | user, 2026-09-25 |
 | `reward.attack_in_reach` 0.05. | "A small reward for attacking when in range". | user, 2026-09-21 |
 | `reward.gadget_hit` 0.3, paid per landed gadget that hurts a player; crates alone never count. | "A bonus rwd for the agent if it uses the gadget on another player (not a crate)". | user, 2026-09-30 |
+| `reward.move_reversal` −0.01, charged per decision whose move bin swung 135° or more from the previous decision's, both non-idle. | The policy reversed on about a quarter of its decisions, as often with no enemy in view as with one near. "Add the 0.01 reversal penalty." | user, 2026-10-07 |
 | `n_steps` stays 128 and `gae_lambda` 0.98. Tune the horizon through gamma, critic quality and LR floors, never through shorter rollouts or a lower lambda. | The user wants planning from the start of a match to its end. | user, 2026-09-26 |
 
 **Accepted divergences from the game:**
@@ -143,7 +152,8 @@ These are settled. Do not re-open one without new evidence. "User" marks the use
 - The smallest non-zero latency is one 50 ms tick.
 - No cube redistribution and no timed cube spawns.
 - Bots are heuristic, so their parameters are randomized.
-- Crates have a flat 3000 HP, where the real game's 4500–8500 scales with lobby power.
+- Crates have a flat HP (3000 in `default.yaml`, 8000 in `train.yaml`), where the real game's 4500–8500 scales with lobby power.
+- A bot that dies mid-dash still finishes it: the rest of the dash (at most 0.3 s) can hit a crate, though never a unit. "#31 isn't an issue, no fix needed" (user, 2026-10-07).
 
 ## 3. Architecture
 
@@ -151,7 +161,7 @@ These are settled. Do not re-open one without new evidence. "User" marks the use
 - `brawl_sim/{constants,config,env}.py`.
 - `core/`: state, geometry, terrain, stats, hero, movement, melee_sweep, projectiles, combat, boxes, zone, spawn, camera, slots, history, observation, obs_schema, obs_select, events, reward.
 - `bots/`: perception, steering, combat_rules, personality, policy.
-- `maps/`: loader, generate, `csv/`.
+- `maps/`: loader, generate, nav (bot pathfinding, §7), `csv/`.
 - `wrappers/`: sb3_vecenv, gym_single, sb3_features, episode_stats.
 - `render/`: ascii, viewer.
 - `training/`.
@@ -238,7 +248,7 @@ These are settled. Do not re-open one without new evidence. "User" marks the use
 - It goes 2.67 tiles in 0.30 s with a 0.70 hit radius, along the decision's move bin, or along facing when idle (`action.dash_on_idle: facing`).
 - It replaces that decision's walk and cannot be steered.
 - `attack_cooldown` 0.35 must exceed `dash_duration` 0.30, or the dash would mask the cooldown.
-- Each enemy is hit once per dash (`dash_hits`); crates are hit on every tick.
+- Each enemy is hit once per dash (`dash_hits`). Crates are hit on every tick, or once per dash under `boxes.dash_hits_once` (`ent_dash_box_hits`, on in `train.yaml`).
 - `terrain.body_travel` stops the body at its first wall contact, and the last tick advances only the remaining time.
 
 **Long dash.** After 4.5 s without attacking, the next dash goes twice as far in the same unscaled 0.30 s (5.34 tiles at 17.8 tiles/s). Only an attack or a super resets the stopwatch (`attack_idle_t`); damage and the gadget do not.
@@ -380,10 +390,11 @@ Stat conversions from the game's data: Power 11 = 2 × Power 1; `Speed`/300 = ti
 | CAMPER | Holds a bush and fires only once something can see it (the veto lifts at aggression ≥ 1.25). Leaves only when the gas is within `camper_zone_flee_tiles`. |
 | HUNTER | Sweeps bush waypoints, one per hunt cell. A leg is abandoned after `hunt_timeout_seconds`, and the mask resets once every waypoint is searched. |
 | TRAPPER | Holds a bush and fires freely, moving to an unsat bush when idle. |
-| KITE | Holds range in the open, capped at fire reach. |
+| KITE | Holds range in the open, capped at fire reach. Under `bots.nav` it closes while it has no line of sight, backs off along a path, and turns its strafe round at a wall (below). |
 
 - A bush personality with no safe bush behaves as RUSH.
-- Only HUNTER and KITE retreat, below `0.35 / aggression` HP (clamped to 0.05–0.90).
+- **Endgame** (`bots.endgame_players`, 0 = off): once at most that many players are alive, the hero included, a CAMPER or TRAPPER plays as a HUNTER, in its mode, its targeting and the fire veto (`policy.effective_person`).
+- Only HUNTER and KITE retreat, below `0.35 / aggression` HP (clamped to 0.05–0.90). Under `bots.nav` a retreat paths to a goal (below).
 - Idle bots wander: each holds a random heading for `wander_seconds` (±50 %), re-rolled when a 2.5-tile probe hits a wall or the gas.
 - `min_aggressive: 1` forces at least one RUSH or HUNTER per lobby at a random slot, so no lobby can be beaten by standing still and slot order stays unreadable.
 
@@ -408,19 +419,31 @@ Stat conversions from the game's data: Power 11 = 2 × Power 1; `Speed`/300 = ti
   - LEAD: intercept × `lead_target_fraction`, plus angular noise (Brock, Shelly, Bull).
   - LOB: the closed-form timed lead `pos + vel × lead × flight`, plus positional noise in tiles (Grom, Spike).
 
-  Tier `aim_noise` scales both kinds of noise.
+  Tier `aim_noise` scales both kinds of noise. Under `bots.tap_aim` the lead is 0, so LEAD and LOB aim at the target's current position, as the game's tap auto-aim does; the noise stays.
+- **The velocity a bot reads** (the lead, and the lateral hold) is `ent_vel`, or under `bots.lead_velocity_tau` > 0 `ent_vel_seen`: a first-order low-pass of it with that time constant, updated after the dash phase.
 
 **Aggression** (`stats.aggression_of` reads 0 as 1.0) is read in three places: the retreat threshold, the KITE hold scale, and the CAMPER veto.
 
 **Steering.** Primitives return direction vectors, which the weights balance; `combine()` normalizes once at the end. Gas avoidance is a predictive inward push that starts `zone_avoid_tiles` (4) from the safe edge, before any damage. No loot pull silences it.
 
+**Pathfinding** (`bots.nav`, `maps/nav.py`). Built once per map bank on CPU: about 9 s and 52 MB for 36 maps, cached per map for the process.
+- One anchor per `nav_anchor_tiles` (3) square cell, at its walkable tile nearest the cell centre, and one flow field per anchor: the first step of a shortest 8-connected path from every tile. A diagonal step needs its whole 2×2 block walkable, and ties go to the step nearest the straight bearing, so open ground is crossed on the straight line. One more field leads to the map centre, where `core/zone.py` closes the gas.
+- A clear straight walk is the BODY's: `nav.walk_blocked` tests the two lines `unit_radius` to either side of the centre line, which covers every tile the body crosses while the radius is under half a tile (`config.validate`). Each line is tested exactly (`nav.segment_blocked`: the tile past every grid line it crosses), so a tail of a clear walk is clear; a march, sampled every half tile, read one line clear from one spot and blocked from a spot a step further along it. A centre line passes wall corners the body cannot, and a push along a wall face gives `resolve_move` no axis to slide on. Measured 2026-10-07 under the centre-line test: a bot pulled to a crate past a water corner ground there for 26 s, and a CAMPER closing on an enemy past a wall corner stood in the gas until it died.
+- A goal reads the field of its anchor: the path-nearest anchor among its own and the 8 neighbouring cells from whose centre the body walks straight to the goal tile's centre. A walkable tile with none (an orphan: 56 on the 36 maps, at most 6 on one, bush_halo) is made an anchor itself, with its own field, so the table's slots grow from 401 to 405; a wall tile takes the nearest anchor by straight distance. So every walkable goal tile has a clear body walk from its anchor. Measured 2026-10-07: choosing by the centre line left 3,105 of the 102,935 walkable tiles with that walk blocked, and by the body's sampled walk 24, which fell back to a clear centre line.
+- `policy.path_toward` aims, the first that applies: (1) at the goal, within 8 tiles with a clear straight walk; (2) at the goal tile's centre, on the same terms; (3) along the field; (4) on the field's last tile, its anchor's (`nav.at_anchor`), at that tile's centre; (5) at the goal, where no field leads (another component, or a goal in a wall). Each is scaled to the straight distance, so the steering weights are unchanged. The anchor rule makes 4 hand over to 2 and 2 to 1, and a bot on 1 or 2 stays on it as it walks the line, since a tail of a clear walk is clear. Measured 2026-10-07 with the goal walk alone and the sampled test: a body following `path_toward` from 9 or more tiles out never reached 59 of the 102,935 walkable goal tiles, nor 3 of the 22,424 bush tiles. Each bot cycled a tile or two short of its anchor, the field leading it back and the straight walk out again, every tick, for good; an Edgar chasing a hero who stood at three such spots never came within his 2-tile range. With the chain: 0 and 0, and `tests/test_nav.py` walks a body to every walkable tile of two maps (it fails on the old code). One goal per bot per tick, chosen by mode (enemy, bush or hunt waypoint): one walk test of four lines and four gathers. On the training device (CUDA, train.yaml's 4096 envs, interleaved blocks) the chain costs 11.8 ms per env step, +2.8 % (423.6 → 435.4 ms), and episodes end at the same rate.
+- The field is followed by the body (`nav.step_dir` at `unit_radius`). A body overhanging its tile toward a blocked tile it could clip on the next step first moves to its tile's centre line across that edge; that move only re-enters tiles it already touches. Aiming straight at the next tile's centre, `resolve_move` (an axis's whole step or none) stopped the bot one step short of the corner. Measured 2026-10-07: a bot closing past a water corner stood there 20.6 s, its strafe cancelling the small correction.
+- The gas terms re-aim along the centre field, keeping their length, while the safe rect is centred on the map. In a pocket, where the field's path leaves the rect (`nav.centre_path_inside`, from a per-tile bounding box of that path), the inward push is off and the bot's own steering moves it. Measured 2026-10-07, a CAMPER in a pocket at the rect's edge died both ways the push was tried. Following the field, the push led it into the gas, where the escape (scaled by depth) lost to its pull back to its bush, and it crossed the edge until the gas killed it. Aimed straight at the rect's centre, the push (about 40 against a seek's 12) held it against the pocket's inner wall for 7 s, until the gas arrived. The loot pulls keep their straight line, gated by the body's walk.
+- The gas rules measure a bot's room along its way out (user, 2026-10-07): its clearance less `nav.centre_path_dip`, how much nearer the rect's edge the centre field's path from its tile comes than the tile's own centre, read off the same per-tile box. The CAMPER and TRAPPER flee (`policy.zone_clearance`), the gas push's ramp, and `bush_scan`'s and `hunt_waypoint`'s margins subtract it, so a bot leaves a pocket while its exit is still open, and never picks a bush or waypoint whose exit is closing. The dip is exactly 0 wherever the path comes no nearer the edge than its first tile (all open ground, since a walk to the centre only moves inward) and where the rect is off the map's centre. The probe's one pocket-camper gas death (seed 0, training mode) is gone. Each tick it gathers the box twice per bot (the flee's clearance, the push's ramp), once per tile of each bot's 49-tile bush scan, and once per map waypoint per env.
+- A bot backing off, in RETREAT or in a HOLD_RANGE too close to its enemy, paths to `policy.retreat_goal` (user, 2026-10-07): 6 tiles straight away from the enemy, held 1 tile inside an active safe rect (a rect narrower than 2 tiles keeps its centre line) and on the map. It is the bot's one `path_toward` goal for the tick, and the flee keeps its straight length, so the weights are unchanged. With the straight walk clear it is the old flee's direction. In scripted scenes a straight wall behind the bot did not pin it (the strafe slid it along); a concave pocket did. Probe, 2026-10-07: RETREAT stalled on 0–0.4 % of its ticks, against 12–24 % before, and HOLD_RANGE's backing off on 0 %.
+- A strafing bot (one with an enemy, in a mode whose strafe weight is non-zero: CLOSE, HOLD_RANGE, RETREAT) turns its strafe round when the point 1 tile ahead along the strafe blocks a unit, off the map included, and the point 1 tile behind does not (`personality.advance_strafe`; user, 2026-10-07). The sense is latched in `state.ent_strafe_sign` until the next wall; 0, its reset value, reads as the slot's `policy.strafe_sign`, so on open ground a bot strafes as it did without the turn. The open-behind test stops a bot boxed in on both sides from flipping every tick. It costs two terrain lookups per bot per tick. GPU smoke, 2026-10-07, 1536 envs × 1600 decisions, the same run with the turn off: stalled share of the mode's ticks HOLD_RANGE 0.57 % against 6.49 %, CLOSE 0.14 % against 1.32 %, RETREAT 0.07 % against 0.37 %, every bot 1.00 % against 1.81 %; WANDER (3–3.5 %, no enemy) is now most of what is left. Time per decision did not change beyond noise.
+
 **Loot pulls** (`bots/policy.py`).
 - A crate within 20 tiles pulls at weight 3.0, and a cube within 12 tiles at weight 4.0. Each is a unit direction that replaces the personality's steering while active; only the gas terms compete.
-- Both need no enemy target within 8 tiles (a cube within 2 tiles is exempt, since kill drops land mid-fight), a clear straight walk (`_walk_clear`), and a spot at least 1 tile inside the safe area.
+- Both need no enemy target within 8 tiles (a cube within 2 tiles is exempt, since kill drops land mid-fight), a clear straight walk (`_walk_clear`: the centre line, or the body's under `bots.nav`), and a spot at least 1 tile inside the safe area.
 - A cube pull cancels the crate pull, both are off in RETREAT, and CAMPERs never get the crate pull.
-- These radii and weights make live-like farming: the richest elite bot holds 7+ cubes at 60 s in more than half the matches. The measurements are in BRAWL_DEPLOYMENT_DESIGN.md §9 entries 21–22, and the probes are `scripts/probes/cube_economy_measure.py` and `bot_pull_measure.py`.
+- These radii and weights make live-like farming: the richest elite bot holds 7+ cubes at 60 s in more than half the matches. The measurements are in BRAWL_DEPLOYMENT_DESIGN.md §9 entries 21–22, and the probes are `scripts/probes/cube_economy_measure.py` and `bot_pull_measure.py`. Re-measured 2026-10-07 with configs/train.yaml's new keys on (SIM_ISSUES_PLAN.md: 8000-HP crates hit once per dash, pathfinding, tap-aimed bots), on the 2026-09-30 checkpoint, elite tier, 64 matches. The target still holds, and earlier: a bot held 7+ at 60 s in 5 of the 6 matches still running (12 of 23 before), and at 45 s in 10 of 11. Paths get bots to their crates: pulled decisions stalled more than 1.5 tiles out fell from 32 % to 6 %. The sample is small because that checkpoint now dies by a median 18 s.
 
-**Toggles:** `bots.break_boxes` (the crate pull), `attack_boxes` (the crate target), `collect_cubes`, `avoid_zone`, `personalities`. Every lobby is free-for-all.
+**Toggles:** `bots.break_boxes` (the crate pull), `attack_boxes` (the crate target), `collect_cubes`, `avoid_zone`, `personalities`, `nav`, `tap_aim`, and the numbers `endgame_players` and `lead_velocity_tau` (0 is off). Every lobby is free-for-all.
 
 ## 8. Match flow
 
@@ -441,7 +464,7 @@ Every reset leaves the gadget charged and the history empty, so an episode's fir
 - Filling every spot raised the hero's cubes and win rate markedly.
 - A broken crate's cube lands 0.3–1.8 tiles away (measured from footage). It gets 4 tries before falling back onto the crate.
 
-**Pickups.** The lowest entity index wins ties, and an entity already at the cube cap leaves the cube. Every death drops cubes, gas deaths included.
+**Pickups.** The lowest entity index wins ties, and an entity already at the cube cap (`cubes.max_cubes`: 16, or 99 in `train.yaml`) leaves the cube. Every death drops cubes, gas deaths included.
 
 **Gas.**
 - The safe area is a rect that shrinks about its own centre to a 2×2 minimum, at most one shrink per tick.
@@ -467,7 +490,7 @@ Every reset leaves the gadget charged and the history empty, so an episode's fir
 
 **Latching.** Outcomes latch at the sub-tick the episode ended. The world keeps ticking, so `final_observation` can be up to `action_repeat` − 1 ticks stale; this is accepted.
 
-**Per-decision info:** `damage_matrix`, `damage_dealt_tick`, `damage_taken_tick` (combat only), `hp_healed_tick`, `kills_tick`, `deaths_tick`, `death_cause_tick`, `cubes_gained_tick`, `boxes_broken_tick`, `shots_fired_tick` (a proxy), `dash_hits_tick`, `attack_in_reach_tick`, `gadget_hit_tick`, `hero_rank`, `hero_alive`, `alive_ticks`, `in_zone_ticks`, `n_ticks`.
+**Per-decision info:** `damage_matrix`, `damage_dealt_tick`, `damage_taken_tick` (combat only), `hp_healed_tick`, `kills_tick`, `deaths_tick`, `death_cause_tick`, `cubes_gained_tick`, `boxes_broken_tick`, `shots_fired_tick` (a proxy), `dash_hits_tick`, `attack_in_reach_tick`, `gadget_hit_tick`, `move_reversal_tick` (0 or 1 per decision), `hero_rank`, `hero_alive`, `alive_ticks`, `in_zone_ticks`, `n_ticks`.
 
 ## 9. Observation
 
@@ -489,7 +512,7 @@ Every reset leaves the gadget charged and the history empty, so an episode's fir
 
 **`obs_select`** (`AgentObsSpec`) is the only fairness point.
 - **Gating:** entities drop the hero row and are gated by `revealed_to_hero`. Projectiles are gated by `in_view`. Boxes and pickups pass ungated.
-- **Projectile ranking:** projectiles are ranked by `time_to_closest` over all live projectiles, on screen or not, with ties nearest-first (`_nearest_first`: sort by distance, then stably by `time_to_closest`). An off-screen projectile keeps its slot, blanked. Ties are common, since anything moving away reads 0.
+- **Projectile ranking:** projectiles are ranked by `time_to_closest` over all live projectiles, on screen or not, with ties nearest-first (`_nearest_first`: sort by distance, then stably by `time_to_closest`). An off-screen projectile keeps its slot, blanked. Ties are common, since anything moving away reads 0. Under `observation.projectile_static_speed` (train.yaml), anything slower than 2.0 tiles/s reads 0 too, with `vel` 0, before the ranking, as the live tracker reports it.
 - **Refusals:** under `fair`, `enemy_any` and `enemy_hidden` are refused. So are `entities.privileged.*` and raw `slots.*`, always.
 - **Groups:** at most 6 (`_MAX_GROUPS`), one host copy each. `BrawlFeaturesExtractor` takes at most one uint8 group, so a new field joins an existing group.
 - **Normalizers:** tiles ÷ the larger map dimension, speed ÷ 20, HP ÷ 20000, counts ÷ 20.
@@ -540,7 +563,7 @@ Its live counterpart is `TrackerResult.hero_offset`: the player box's tile minus
 
 **Wiring.** The sim computes none. Training builds `ShapedReward`, and the SB3 adapter installs it as the env's `reward_fn`. The env calls it once per decision, on-device and sync-free. The returned buffer is shared, so treat it as read-only.
 
-**Pricing.** Terms are priced per sim tick: deltas are summed over sub-ticks and rate terms count sub-ticks, so the episode return does not depend on `action_repeat`. `gamma` is per decision.
+**Pricing.** Terms are priced per sim tick: deltas are summed over sub-ticks and rate terms count sub-ticks, so the episode return does not depend on `action_repeat`. `gamma` is per decision. The one exception is `move_reversal`, which counts decisions: a reversal is a change between two of them.
 
 **Terms** (`train.yaml` weights):
 
@@ -558,6 +581,7 @@ Its live counterpart is `TrackerResult.hero_offset`: the player box's tile minus
 | `in_zone_per_step` | −0.05 | Flat, so it reads the same at any gas damage. |
 | `attack_in_reach` | 0.05 | |
 | `gadget_hit` | 0.3 | |
+| `move_reversal` | −0.01 | 0 in `RewardConfig`, so a run without the key never pays it. |
 
 **`attack_in_reach`** counts the hero's attacks and supers made while an enemy he can see stands inside his uncharged dash reach: `dash_distance + dash_radius + unit_radius` = 3.77 tiles, the cadence audit's utilization radius. It is capped at one per decision.
 - `env._attack_phase` computes it before `start_dash`.
@@ -570,11 +594,17 @@ Its live counterpart is `TrackerResult.hero_offset`: the player box's tile minus
 - The 18 s cooldown allows about ten throws a match, so about 3 at most, against 10 for a win.
 - A super bolt that hits the same player on the landing tick hides the spinner's hit on that player (rare).
 
+**`move_reversal`** counts decisions whose move bin swung 135° or more from the previous decision's (6 or more of 16 bins), both non-idle (user, 2026-10-07).
+- `core/events.move_reversals` reads the previous decision off history slot 0 in `env.step`, before `history.push` overwrites it. So an episode's first decision never counts: the reset empties the ring.
+- The 2026-09-30 policy reversed on 26 % of its decisions (measured 2026-10-07), about 1.2 a 120 s match at −0.01. A dodge that saves one 1300-HP hit is worth 0.13 in `damage_taken` alone, so a real dodge still pays and jitter with nobody shooting stops paying.
+- The first run trained with it, `runs/mortis_ppo-20261007-161117`, reverses on 11 % (watch) to 16 % (train) of its decisions, on the probe's count (pairs of non-idle moves). The 2026-09-30 policy reverses on 28 % on the same count and seeds (measured 2026-10-10). The rate was already that low at 200M (MODEL_SIZE_STUDY.md).
+- The policy sees its last three moves (`hist.move_onehot`), so the cost is a function of what it observes.
+
 **Invariants and guards.**
 - The terminal payoff must dominate `survive_per_step`.
 - Raising `hp_healed` far enough makes going into the gas and regenerating afterwards profitable.
 - `builder.check_reward_is_observable` refuses a `cube_pickup` weight under a spec that cannot see pickups.
-- `TERM_NAMES` keeps a stable order, each new term appended (`attack_in_reach`, then `gadget_hit`), so term curves stay comparable across runs.
+- `TERM_NAMES` keeps a stable order, each new term appended (`attack_in_reach`, then `gadget_hit`, then `move_reversal`), so term curves stay comparable across runs.
 
 ## 11. Training
 

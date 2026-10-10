@@ -526,26 +526,31 @@ class ShadowHero:
         return (_F32(dx / norm), _F32(dy / norm))
 
     @property
-    def attack_bearing(self) -> float:
+    def attack_bearing(self) -> float | None:
         """Radians, in the sim's frame: where an attack queued by the last `act` will go. What the
-        loop hands `Buttons.press` to aim the drag.
+        loop hands `Buttons.press` to aim the drag. None when the game aims the press itself.
 
         The same choice `_start_dash` makes on the next sub-tick -- the held move bin, or `facing`
         when it is idle (`action.dash_on_idle: facing`) -- read from the same state. Nothing
         between `act` and that sub-tick can move it: the attack runs in phase 6, before phase 7
         turns `facing` toward the new bin, and an idle bin never turns it.
 
-        The super reads it too. In the sim an idle super goes along a zero `move_dir` and does not
-        travel; the game has no such shot, and `facing` is the nearest thing to what the policy
-        meant. The gadget does not read it: it is a tap, and the game aims it at the nearest
-        enemy, as `hero.gadget_target` does (BRAWL_SIM_DESIGN.md §4). A pending auto-aimed
-        attack with a target reads its `aim`, the direction `_start_dash` will use; it is a tap
-        too, so the device never reads this for it, and telemetry does.
+        A super fired while moving reads it too: the sim sends the bolt along the move bin. A
+        super queued on the idle bin is None: the sim aims it like the game's tap-to-fire, at the
+        nearest enemy in the bolt's reach or along `facing` with none (`hero.super_aim_target`,
+        user decision 2026-09-30), so the device taps the super button and the game picks the
+        target. The shadow does not model the bolt, so nothing here needs the direction. The
+        gadget does not read this: it is a tap, and the game aims it at the nearest enemy, as
+        `hero.gadget_target` does (BRAWL_SIM_DESIGN.md §4). A pending auto-aimed attack with a
+        target reads its `aim`, the direction `_start_dash` will use; it is a tap too, so the
+        device never reads this for it, and telemetry does.
         """
         if self._pending_attack == ATTACK_AUTO and self._aim is not None:
             return math.atan2(float(self._aim[1]), float(self._aim[0]))
         move_dir = self._dir_from_bin(self._move)
         if move_dir is None:
+            if self._pending_attack == ATTACK_SUPER:
+                return None
             return float(self.facing)
         return math.atan2(float(move_dir[1]), float(move_dir[0]))
 

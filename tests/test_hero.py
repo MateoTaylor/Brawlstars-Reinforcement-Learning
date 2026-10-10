@@ -625,29 +625,49 @@ def test_advance_dash_clears_state_on_completion():
     assert not torch.any(state.ent_dash_hits[0, 0])
 
 
-def test_advance_dash_damages_box_in_capsule():
-    cfg, params = _cfg_and_params()
+def _dashes_through_box(extra_overrides, ahead, n_dashes=1):
+    """Crate HP taken by `n_dashes` full Mortis dashes from (2, 10) along +x, through a crate
+    `ahead` tiles down the line, and the HP one hit is worth."""
+    cfg, params = _cfg_and_params(extra_overrides=extra_overrides)
     state = _fresh_state(cfg)
-    state.ent_pos[0, 0] = torch.tensor([2.0, 10.0])
-    state.box_pos[0, 0] = torch.tensor([4.5, 10.0])
+    state.box_pos[0, 0] = torch.tensor([2.0 + ahead, 10.0])
     state.box_alive[0, 0] = True
     state.box_hp[0, 0] = 999999.0
     state.box_max_hp[0, 0] = 999999.0
 
-    tiles = _grid(20, 20)
-    bank = _bank_from_grid(tiles)
+    bank = _bank_from_grid(_grid(20, 20))
     fire = torch.zeros(1, cfg.n_entities, dtype=torch.bool)
     fire[0, 0] = True
     move_dir = torch.zeros(1, cfg.n_entities, 2)
     move_dir[0, 0] = torch.tensor([1.0, 0.0])
-    hero.start_dash(state, fire, move_dir, bank, params, cfg)
-
     n_ticks = int(round(params.dash_duration[0, int(Kind.HERO_MORTIS)].item() / cfg.dt)) + 1
-    total_box_dmg = 0.0
-    for _ in range(n_ticks):
-        _, _, dmg_box = hero.advance_dash(state, params, cfg)
-        total_box_dmg += dmg_box[0, 0].item()
-    assert total_box_dmg > 0.0
+    total = 0.0
+    for _ in range(n_dashes):
+        state.ent_pos[0, 0] = torch.tensor([2.0, 10.0])
+        state.ent_ammo[0, 0] = 3.0
+        hero.start_dash(state, fire, move_dir, bank, params, cfg)
+        for _ in range(n_ticks):
+            _, _, dmg_box = hero.advance_dash(state, params, cfg)
+            total += dmg_box[0, 0].item()
+        assert not state.ent_dash_box_hits.any()  # never carried past the dash that set it
+    return total, params.base_damage[0, int(Kind.HERO_MORTIS)].item()
+
+
+def test_a_dash_hits_a_crate_once_under_dash_hits_once():
+    """The user's rule (2026-10-06): one hit per target per dash, crates included, as units
+    always were (`ent_dash_hits`). The memory is per dash, so the next dash hits again."""
+    once = {"boxes": {"dash_hits_once": True}}
+    taken, hit = _dashes_through_box(once, ahead=1.0)
+    assert taken == pytest.approx(hit)
+    taken, hit = _dashes_through_box(once, ahead=1.0, n_dashes=2)
+    assert taken == pytest.approx(2 * hit)
+
+
+def test_without_dash_hits_once_a_crate_is_hit_on_every_tick_of_the_dash():
+    """The old sim, which default.yaml keeps for every run trained on it: a crate 1 tile ahead
+    sits inside the capsule for 4 ticks and takes 4 hits, enough to break a 3000-HP crate."""
+    taken, hit = _dashes_through_box(None, ahead=1.0)
+    assert taken == pytest.approx(4 * hit)
 
 
 def test_advance_dash_non_dashers_unaffected():

@@ -103,6 +103,10 @@ observation:
   # entity pair, a full-length wall march on every obs build. No agent obs group, reward or
   # callback reads them, so train.yaml turns them off; the viewer draws its own.
   include_raw_los: true
+  # A projectile slower than this many tiles/s reads as still in the agent's observation (`vel`
+  # 0, `time_to_closest` 0), as the live tracker reports one under its STATIC_TILES_S. 0 = off,
+  # the observation every run trained on until 2026-10-07; configs/train.yaml sets 2.0.
+  projectile_static_speed: 0.0
   # History rings: the hero's last `history_frames` DECISIONS (hp, ammo, position, the action
   # taken, every entity's position and whether the hero saw it), kept in core/state's `hist_*`
   # buffers and pushed at the top of every env.step. They feed the hist.* fields and the
@@ -153,7 +157,10 @@ cubes:
 # every shipped map: 16 to 44 crates, 24.2 on average over the 34 training maps. Real showdown
 # maps carry 20 to 30 (BRAWL_SIM_DESIGN.md §8).
 # `hp` is a constant; real crate HP scales 4500-8500 with the lobby's average power level.
-boxes: {n_boxes: 48, hp: 3000}
+# dash_hits_once: a dash damages each crate once, as it does each unit (user's rule, 2026-10-06).
+# false is the old sim, where a crate inside the dash took a hit on every tick (3-5 per dash).
+# configs/train.yaml turns it on with hp 8000; this file keeps what finished runs trained on.
+boxes: {n_boxes: 48, hp: 3000, dash_hits_once: false}
 
 # The zone deals a FRACTION of each entity's own max HP per second, as the real game does, not a
 # flat HP/s: at 0.20 nobody survives more than 5 s inside it, whatever their HP or cubes. Each
@@ -230,6 +237,24 @@ bots:
   zone_avoid_tiles: 4.0         # start steering inward once this close to the safe rect's edge
   camper_zone_flee_tiles: 2.0   # a camper abandons its bush once clearance drops to this
   wander_seconds: 2.5           # explore-heading re-roll period when nothing is visible
+
+  # The five keys below are SIM_ISSUES_PLAN.md's bot changes (2026-10-06). Each value here keeps
+  # the old sim exactly, so every run trained before them replays unchanged; configs/train.yaml
+  # turns them on for the next run.
+  #
+  # Pathfinding (brawl_sim/maps/nav.py): a bot walks a shortest walkable path to its target, bush
+  # or waypoint, and out of the gas, instead of steering straight at it and pinning on any wall
+  # between. Tables built once per map bank on CPU (~8 s and ~52 MB for 36 maps).
+  nav: false
+  nav_anchor_tiles: 3           # one path goal per this-square cell; >= 2 (1 would be ~470 MB)
+  # Once at most this many players are alive (the hero counts), campers and trappers play as
+  # hunters and come looking. 0 never switches.
+  endgame_players: 0
+  # Seconds of low-pass on the target velocity a bot leads by (bots/policy.track_seen_velocity).
+  # 0 leads by the raw per-tick velocity.
+  lead_velocity_tau: 0.0
+  # Every LEAD/LOB bot aims at the target's current position, as the game's tap auto-aim does.
+  tap_aim: false
 
 perception:                     # drives BOT behavior and the revealed_* flags.
   bush_reveal_radius: 2.0       # It never removes data from the observation package.

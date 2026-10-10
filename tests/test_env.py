@@ -568,3 +568,19 @@ def test_without_the_flag_a_4_in_the_attack_column_is_a_silent_no_op():
     env.step(torch.tensor([[5, 4]]))
     assert st.ent_dash_t[0, 0].item() == 0.0
     assert st.ent_shots_fired[0, 0].item() == 0
+
+
+def test_the_env_low_passes_the_velocity_bots_lead_by_only_under_lead_velocity_tau():
+    """env._run_tick advances `ent_vel_seen` once `ent_vel` is final for the tick, after the dash
+    phase (`bots.lead_velocity_tau`, SIM_ISSUES_PLAN.md §5.1); tau 0 never writes it."""
+    for tau in (0.0, 0.25):
+        env = _tiny_env(n_envs=4, overrides={"bots": {"lead_velocity_tau": tau}})
+        env.reset()
+        for _ in range(4):
+            env.step(_idle_action(4))
+        seen, vel = env.state.ent_vel_seen, env.state.ent_vel
+        assert vel.abs().sum() > 0   # the bots have been walking
+        if tau > 0:
+            assert seen.abs().sum() > 0 and not torch.equal(seen, vel)
+        else:
+            assert not seen.any()

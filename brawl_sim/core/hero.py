@@ -406,12 +406,16 @@ def start_dash(state, fire: torch.Tensor, move_dir: torch.Tensor, bank, params, 
 
     row_mask = can_dash.unsqueeze(-1).expand(-1, -1, E)
     state.ent_dash_hits.copy_(torch.where(row_mask, torch.zeros_like(state.ent_dash_hits), state.ent_dash_hits))
+    state.ent_dash_box_hits.masked_fill_(can_dash.unsqueeze(-1), False)
 
 
 def advance_dash(state, params, cfg):
-    """MUTATES: ent_pos, ent_vel, ent_dash_t, ent_dash_dir, ent_dash_speed, ent_dash_hits.
-    Returns (dmg_ent (N,E), dmg_by (N,E,E), dmg_box (N,B)) -- reported here, applied by
-    combat.apply_damage, the same pattern as projectile damage."""
+    """MUTATES: ent_pos, ent_vel, ent_dash_t, ent_dash_dir, ent_dash_speed, ent_dash_hits,
+    ent_dash_box_hits. Returns (dmg_ent (N,E), dmg_by (N,E,E), dmg_box (N,B)) -- reported here,
+    applied by combat.apply_damage, the same pattern as projectile damage.
+
+    A unit is hit once per dash (`ent_dash_hits`). A crate is too under `boxes.dash_hits_once`
+    (`ent_dash_box_hits`); with it off, a crate inside the capsule is hit on every tick."""
     E = state.ent_kind.shape[1]
     is_dashing = state.ent_dash_t > 0
 
@@ -449,6 +453,8 @@ def advance_dash(state, params, cfg):
     box_pos = state.box_pos.unsqueeze(1)  # (N,1,B,2)
     box_inside = geo.capsule_contains(p0, p1, r, box_pos)  # (N,E,B)
     box_hit = box_inside & state.box_alive.unsqueeze(1) & is_dashing.unsqueeze(2)
+    if cfg.box_dash_hits_once:
+        box_hit = box_hit & ~state.ent_dash_box_hits
     box_dmg = torch.where(box_hit, dmg.unsqueeze(2), torch.zeros_like(box_hit, dtype=dmg.dtype))
     dmg_box = box_dmg.sum(dim=1)
 
@@ -467,5 +473,7 @@ def advance_dash(state, params, cfg):
     updated_hits = state.ent_dash_hits | new_hit
     finished_row = finished.unsqueeze(-1).expand(-1, -1, E)
     state.ent_dash_hits.copy_(torch.where(finished_row, torch.zeros_like(updated_hits), updated_hits))
+    if cfg.box_dash_hits_once:
+        state.ent_dash_box_hits.logical_or_(box_hit).masked_fill_(finished.unsqueeze(-1), False)
 
     return dmg_ent, dmg_by, dmg_box

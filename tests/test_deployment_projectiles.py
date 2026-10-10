@@ -430,7 +430,7 @@ def test_snapshot_does_not_order_the_slots():
 def test_a_still_track_reports_what_the_sim_reports_for_a_hazard():
     """Anchor noise on something that is not moving, drifting 0.05 tiles toward the hero over two
     ticks: a whole-span speed of 0.5 tiles/s. Reported raw, `closest_approach` would turn that into
-    a 10 s time-to-closest, a value no sim entry ever takes. The sim's still entry reports
+    a 10 s time-to-closest for a thing that never moves. The sim's still entry reports
     vel (0, 0) and time 0, and so does this."""
     trk = ProjectileTracker()
     run(trk, [[det_at(5.0, 0.0)], [det_at(4.975, 0.0)], [det_at(4.95, 0.0)]])
@@ -529,6 +529,44 @@ def test_the_still_threshold_is_under_every_constant_speed_mover_in_the_sim():
             speeds.append(_num(kit, "split_distance") / _num(kit, "split_seconds"))
     assert min(speeds) == pytest.approx(2.4), "the slowest mover changed; re-read the docstring"
     assert STATIC_TILES_S < min(speeds)
+
+
+def test_training_reads_a_crawl_as_still_exactly_as_this_tracker_does(tmp_path):
+    """configs/train.yaml's `observation.projectile_static_speed` is STATIC_TILES_S mirrored into
+    training (core/obs_select, user decision 2026-10-07), so the run's env config, built the way
+    brawl_deployment/policy.py builds it, must carry the same number. A Grom shell lobbed 2 tiles
+    crawls at 1.6 tiles/s. This tracker reports it still, and training's row for the same shell,
+    from its true velocity and the sim's straight-line time, must come out the same."""
+    import torch
+    import yaml
+    from brawl_sim.config import load_config
+    from brawl_sim.core import geometry, obs_select
+    from brawl_sim.training.config import load_train_config
+
+    tcfg = load_train_config("configs/train.yaml")
+    cfg = load_config(tcfg.run.env_config, overrides=tcfg.run.env_overrides or None)
+    assert cfg.obs_projectile_static_speed == STATIC_TILES_S
+
+    trk = ProjectileTracker()
+    run(trk, [[det_at(5.0 - 1.6 * TICK * i, 0.0)] for i in range(3)])
+    (rel, vel, ttc), = trk.snapshot((0.0, 0.0))
+    assert (vel, ttc) == ((0.0, 0.0), 0.0)
+
+    P = cfg.max_projectiles
+    alive = torch.zeros(1, P, dtype=torch.bool)
+    pos, v = torch.zeros(1, P, 2), torch.zeros(1, P, 2)
+    alive[0, 0], pos[0, 0], v[0, 0] = True, torch.tensor(rel), torch.tensor((-1.6, 0.0))
+    t, _ = geometry.closest_approach(pos, v, torch.zeros_like(pos))     # the hero at the origin
+    assert t[0, 0] > 3.0, "the sim's own straight-line time for the crawl"
+    spec_path = tmp_path / "spec.yaml"
+    spec_path.write_text(yaml.dump({"fair": False, "normalize": False, "groups": [{
+        "name": "projectiles", "per_entity": True, "max_slots": 1,
+        "fields": ["projectiles.rel_pos", "projectiles.vel", "projectiles.time_to_closest"]}]}))
+    spec = obs_select.load_agent_spec(spec_path, cfg)
+    buffers = obs_select.make_agent_obs_buffers(spec, cfg, n_envs=1, device="cpu")
+    full = {"projectiles": {"alive": alive, "rel_pos": pos, "vel": v, "time_to_closest": t}}
+    row = obs_select.build_agent_obs(full, spec, cfg, buffers)["projectiles"][0, 0]
+    assert row.tolist() == pytest.approx([*rel, *vel, ttc])
 
 
 def test_the_age_limit_is_the_longest_any_sim_entry_holds_a_projectile_slot():

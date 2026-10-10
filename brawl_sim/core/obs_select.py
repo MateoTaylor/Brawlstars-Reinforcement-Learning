@@ -23,6 +23,15 @@ row blanked (user decision, 2026-09-24: noise in the same direction as the live 
 misses; the live tracker never holds an off-screen projectile, so it fills those frames
 differently). These rows are NOT index-stable: row k is not the same projectile step to step.
 
+**`observation.projectile_static_speed`** (0 = off, 2.0 in configs/train.yaml): a projectile
+slower than this reads as still, `vel` (0, 0) and `time_to_closest` 0. That is what the sim gives
+a hazard, and what the live tracker reports for any track under its STATIC_TILES_S, where a
+velocity is detector noise. It applies before `max_slots` ranks, so a crawling lob ranks among
+the other zeros, nearest first, as it does live. Only those two fields change, the two velocity
+fields the live tracker supplies, and `full_obs` itself keeps the true values (user decision,
+2026-10-07: a timed lob aimed short crawls, and its straight-line time reached hundreds of
+seconds, unscaled).
+
 **`slots: tracked`** orders an `entities.*` group by the sim's tracker-style slots
 (`core/slots.py`, via `full_obs["slots"]["entity"]`): row k is the entity holding slot k, zero
 while the slot is empty, and the fairness mask is gathered the same way. Row identity follows
@@ -86,11 +95,18 @@ _NORM_SPEED_SCALE = 20.0
 # hero, which the curriculum never scales, tops out at 8000 + 6400 = 14400 and starts at 0.40.
 # `entities.enemy_hp_mult` (1.0 by default) would multiply an enemy's total. Re-derive it, don't
 # nudge it, if base_hp, the tiers or the cube numbers change.
+# Except for one change, kept on purpose: configs/train.yaml lifts `cubes.max_cubes` to the game's
+# 99 (2026-10-06), which raises the ceiling to 15000 + 39600 = 54600 (2.73). Every finished
+# checkpoint, the deployed one included, was trained against 20000, and a value past 1.0 is not
+# clipped anywhere: the float Box is unbounded and every run so far trains with `normalize.obs:
+# false`, so the network reads it as is. The supply keeps it far below 2.73: a 2026-10-07 GPU
+# smoke (18,805 episodes) saw no entity past 42 cubes, which caps the value at 1.59.
 _NORM_HP_SCALE = 20000.0
 
 # Divisor for `normalize: true`'s "count" fields. The largest count a shipped spec reads is
-# `cubes` (`cubes.max_cubes: 16`); `meta.n_enemies_alive` reaches cfg.n_enemies (9) and
-# `hero.ammo_whole` max_ammo (3). Equal to _NORM_SPEED_SCALE by coincidence.
+# `cubes` (`cubes.max_cubes: 16`, or 99 in configs/train.yaml, kept for the same reason as
+# _NORM_HP_SCALE); `meta.n_enemies_alive` reaches cfg.n_enemies (9) and `hero.ammo_whole`
+# max_ammo (3). Equal to _NORM_SPEED_SCALE by coincidence.
 _NORM_COUNT_SCALE = 20.0
 
 _tensor_cache: dict = {}
@@ -413,7 +429,26 @@ def _normalize(raw: torch.Tensor, g: GroupSpec) -> torch.Tensor:
     return raw / scale
 
 
+def _slow_projectiles_still(full_obs: dict, cfg) -> dict:
+    """`full_obs` with every projectile slower than `cfg.obs_projectile_static_speed` read as
+    still: `vel` (0, 0) and `time_to_closest` 0, exactly what `closest_approach` gives a zero
+    velocity. A new dict around new tensors, so `full_obs`, which `info` and the reward read, keeps
+    the true velocity. Off, or with no projectiles in it, it is `full_obs` itself.
+
+    Live it changes nothing: `ProjectileTracker.snapshot` has already zeroed every track under
+    STATIC_TILES_S, by the same norm."""
+    floor = cfg.obs_projectile_static_speed
+    if floor <= 0 or "projectiles" not in full_obs:
+        return full_obs
+    prj = full_obs["projectiles"]
+    moving = torch.linalg.vector_norm(prj["vel"], dim=-1) >= floor             # (N, P)
+    still = {"vel": torch.where(moving.unsqueeze(-1), prj["vel"], 0.0),
+             "time_to_closest": torch.where(moving, prj["time_to_closest"], 0.0)}
+    return {**full_obs, "projectiles": {**prj, **still}}
+
+
 def build_agent_obs(full_obs: dict, spec: AgentObsSpec, cfg, out_buffers: dict) -> dict:
+    full_obs = _slow_projectiles_still(full_obs, cfg)
     for g in spec.groups:
         if g.view_channels is not None:
             out_buffers[g.name].copy_(_build_grid_group(full_obs, g))

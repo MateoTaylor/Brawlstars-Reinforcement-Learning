@@ -106,6 +106,30 @@ def test_maintain_range_max_dist_caps_only_the_seek_edge():
     assert torch.allclose(scalar, new)
 
 
+def test_range_band_names_the_side_maintain_range_steers_by():
+    """One entity per branch, the both-edges case included (desired - deadband 5.3 > max_dist
+    5.0 at 5.2 tiles): seeking wins there, so it is too far and not too close."""
+    pos = torch.zeros(1, 4, 2)
+    target = torch.tensor([[[9.0, 0.0], [7.0, 0.0], [4.0, 0.0], [5.2, 0.0]]])
+    max_dist = torch.tensor([[8.0, 8.0, 8.0, 5.0]])
+    too_far, too_close = steering.range_band(pos, target, 6.8, 1.5, max_dist)
+    assert too_far.tolist() == [[True, False, False, True]]
+    assert too_close.tolist() == [[False, False, True, False]]
+
+
+def test_maintain_range_retreat_replaces_only_the_flee_offset():
+    """bots/personality.movement's path to bots/policy.retreat_goal under nav: it takes the flee
+    branch's place and nothing else, so the seek and deadband branches are untouched."""
+    pos = torch.zeros(1, 3, 2)
+    target = torch.tensor([[[12.0, 0.0], [8.0, 0.0], [3.0, 0.0]]])   # too far, band, too close
+    retreat = torch.tensor([[[0.0, 7.0], [0.0, 7.0], [0.0, 7.0]]])
+    plain = steering.maintain_range(pos, target, 8.0, 1.5)
+    routed = steering.maintain_range(pos, target, 8.0, 1.5, retreat=retreat)
+    assert torch.equal(routed[0, :2], plain[0, :2])
+    assert torch.equal(routed[0, 2], torch.tensor([0.0, 7.0]))
+    assert torch.equal(plain[0, 2], torch.tensor([-3.0, 0.0]))
+
+
 # ---- escape_zone -------------------------------------------------------------------
 
 def test_escape_zone_zero_when_inside():

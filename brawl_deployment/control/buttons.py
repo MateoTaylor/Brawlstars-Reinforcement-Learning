@@ -1,5 +1,5 @@
-"""Attack and Super as aimed drags, the gadget and the auto-aimed attack as bare taps. See
-BRAWL_DEPLOYMENT_DESIGN.md 4.4.
+"""Attack and a moving Super as aimed drags; the gadget, the auto-aimed attack and an idle Super
+as bare taps. See BRAWL_DEPLOYMENT_DESIGN.md 4.4.
 
 **Attack is an AREA, not a button, and this is the fact most likely to be un-learned later.**
 Per the operator: any tap on the right side of the screen fires, as long as it does not overlap
@@ -15,8 +15,8 @@ touch point by CLEARANCE is immune to that whole class of failure, including HUD
 **Attack value 1 is aimed along the move direction, never a bare tap.** A bare tap AUTO-AIMS in
 the real game: it sends Mortis at the nearest enemy, which is not what value 1 trained on (value
 4, below, is exactly that). The sim's `hero.start_dash` sends him along the decision's `move_dir`,
-or along `facing` when the move bin is idle (`action.dash_on_idle: facing`), and the super goes
-along `move_dir` too. So a press here is
+or along `facing` when the move bin is idle (`action.dash_on_idle: facing`), and a super fired
+while moving goes along `move_dir` too. So a press here is
 the attack stick worked by hand, the way the movement stick is: a contact goes down on the origin,
 drags `aim_radius_px` along the bearing, and lifts. **The lift is what fires**, as it is for a
 thumb. The bearing comes from `ShadowHero.attack_bearing`, which reads the same state the shadow's
@@ -59,6 +59,12 @@ direction (`ShadowHero.act`'s `aim`, from the tracks and the loot map); where it
 the game's target differ, the dash direction is wrong for one dash and the odometry corrects the
 position after it.
 
+**An idle Super is the third bare tap (2026-10-06).** The sim aims a super fired on the idle
+move bin like the game's tap-to-fire: at the nearest enemy within the bolt's reach, or along
+`facing` with none (`hero.super_aim_target`, BRAWL_SIM_DESIGN.md §4). So `press` taps the super
+button when `ShadowHero.attack_bearing` is None, which it is for exactly that case, and the game
+picks the target. A super fired while moving keeps the drag along the move bin.
+
 That button is NOT the anchor `match_state.py` watches, and never was (corrected 2026-09-22, design
 5.1). Every button name in `control_calibration.json` sat one disc off, so what this file called
 the gadget was the Super: a commanded gadget pressed the Super, and the gate sat on the Super too.
@@ -98,8 +104,9 @@ class Buttons:
 
     `gadget` is the third origin and a tap: a `down` on the button centre and an `up`, with no
     aim. It is required like the other two, so a `Buttons` that cannot press the gadget fails at
-    construction rather than at the policy's first throw. The auto-aimed attack is the other tap,
-    on the `attack` origin.
+    construction rather than at the policy's first throw. The auto-aimed attack is another tap,
+    on the `attack` origin, and a super pressed with no bearing (the idle bin) a third, on
+    `super_`.
     """
 
     def __init__(self, backend, attack: tuple[float, float], super_: tuple[float, float],
@@ -166,9 +173,10 @@ class Buttons:
                 f"the gadget button ({gx:.0f}, {gy:.0f}) is off a {w}x{h} screen. The backend "
                 f"clamps, so the tap would land on the edge, on whatever is drawn there.")
 
-    def press(self, action: int, bearing: float) -> bool:
-        """Start one press: aimed for an attack or a super, a bare tap for the gadget and for the
-        auto-aimed attack. Returns whether anything was pressed.
+    def press(self, action: int, bearing: float | None) -> bool:
+        """Start one press: aimed for an attack or a super, a bare tap for the gadget, for the
+        auto-aimed attack, and for a super with `bearing` None, which `ShadowHero.attack_bearing`
+        gives an idle super. Returns whether anything was pressed.
 
         Only the down goes out here; `settle()` sends the drag and then the lift, or for a tap
         the lift alone, and a tap never reads `bearing`. A press that
@@ -186,10 +194,13 @@ class Buttons:
             return False
         if self._stage is not _IDLE:
             self._finish()
-        if action == ATTACK_GADGET or action == ATTACK_AUTO:
+        if (action == ATTACK_GADGET or action == ATTACK_AUTO
+                or (action == ATTACK_SUPER and bearing is None)):
             self.backend.down(SLOT_TAP, *origin)
             self._stage = _TAPPED
             return True
+        if bearing is None:
+            raise ValueError(f"action {action} is an aimed drag and needs a bearing")
         aim = self.aim_point(action, bearing)
         self.backend.down(SLOT_TAP, *origin)
         self._aim = aim
@@ -199,8 +210,8 @@ class Buttons:
     def settle(self) -> None:
         """Advance a press by one step. Called once per perception tick by the loop: the tick
         after the down drags to the aim point, and the tick after that lifts, which fires. A
-        tap (the gadget, the auto-aimed attack) has no drag, so the tick after its down lifts
-        it."""
+        tap (the gadget, the auto-aimed attack, an idle super) has no drag, so the tick after its
+        down lifts it."""
         if self._stage is _DOWN:
             self.backend.move(SLOT_TAP, *self._aim)
             self._stage = _AIMED
