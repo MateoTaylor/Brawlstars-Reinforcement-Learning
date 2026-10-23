@@ -198,10 +198,11 @@ detector:                 # brawl_vision/object_detection -- third-party YOLO ov
   # instead of RGB the same footage yields 44 teammate boxes where correct input yields none (see
   # detector.py). Empty this list when debugging the detector rather than using it.
   ignore: [teammate]
-  # auto | cpu | cuda. 'auto' takes CUDA when the onnxruntime-gpu build is installed and CPU
-  # otherwise; 'cuda' fails loudly instead. Measured at 12.9 ms/frame on CPU for a 2002x1126
-  # frame, against the 250 ms decision budget -- so CPU is not the constraint here, and this
-  # exists for the deploy-time case where the GPU is free and the terrain classifier is not.
+  # auto | cpu | cuda. 'auto' takes CUDA when the onnxruntime-gpu build is installed and a device
+  # can run it, and CPU otherwise; 'cuda' fails loudly instead. Measured at 12.9 ms/frame on CPU
+  # for a 2002x1126 frame, against the 250 ms decision budget -- so CPU is not the constraint
+  # here, and this exists for the deploy-time case where the GPU is free and the terrain
+  # classifier is not.
   device: auto
   # Where in a detection box the brawler's FEET are, as a fraction of box height up from the
   # BOTTOM edge. The bottom edge itself (0.0) is wrong and it is worth knowing why: these boxes
@@ -258,7 +259,7 @@ projectile:               # object_detection/projectile_detection -- OUR model, 
   # difference ~0 over six clips neither model saw), so the sweep carries over to it.
   conf: 0.30
   # auto | cpu | cuda, resolved exactly as detector.device is -- 'auto' takes CUDA when the
-  # onnxruntime-gpu build is present, 'cuda' fails loudly if it is not.
+  # onnxruntime-gpu build is present and a device can run it, 'cuda' fails loudly if not.
   #
   # There is no `iou` key here and that is deliberate rather than an omission: YOLO26 runs no NMS
   # at all, so an overlap threshold would be a setting nothing reads. It matters for projectiles

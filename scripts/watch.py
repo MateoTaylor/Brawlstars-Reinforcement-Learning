@@ -292,6 +292,9 @@ def _parse_args(argv=None):
     p.add_argument("--video", default=None,
                    help="also write the LAST match to this .mp4 or .gif, e.g. --video match.mp4 "
                         "(see brawl_sim.render.viewer.ReplayViewer.save for what .mp4 needs)")
+    p.add_argument("--dpi", type=int, default=150,
+                   help="--video resolution: the figure is at most 12 x 12 in (4 tiles an inch), "
+                        "so 150 gives up to 1800 x 1800 px and 300 up to 3600 x 3600")
     p.add_argument("--no-view", action="store_true", help="stats only; skip the viewer entirely")
     return p.parse_args(argv)
 
@@ -342,7 +345,7 @@ def main(argv=None) -> int:
         from brawl_sim.render.viewer import ReplayViewer
         viewer = ReplayViewer(frames, sim.bank, env_cfg, fps=args.fps)
         if args.video:
-            viewer.save(args.video, fps=args.fps)
+            viewer.save(args.video, fps=args.fps, dpi=args.dpi)
             print(f"[watch] rollout -> {args.video}")
         if not args.no_view:
             print("\n[watch] opening viewer -- space pauses, left/right scrub, q quits")

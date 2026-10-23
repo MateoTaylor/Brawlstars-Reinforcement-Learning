@@ -1,7 +1,7 @@
 import numpy as np
 import yaml
 
-from brawl_sim.config import load_config
+from brawl_sim.config import _deep_merge, load_config
 from brawl_sim.maps.loader import build_map_bank
 from brawl_sim.render.ascii import render_ascii
 from scripts import record_rollout
@@ -13,7 +13,7 @@ CONFIGS_TINY = yaml.safe_load(open("configs/presets/debug_tiny.yaml").read())
 def _cfg(overrides=None):
     merged = dict(CONFIGS_TINY)
     if overrides:
-        merged = {**merged, **overrides}
+        merged = _deep_merge(merged, overrides)  # the preset's other keys in a section stay
     return load_config(CONFIGS_DEFAULT, overrides=merged)
 
 

@@ -293,12 +293,19 @@ def test_select_target_is_sticky_no_oscillation_between_equidistant():
     first_pick = state.ent_target[0, 0].item()
     assert first_pick in (1, 2)
 
-    # run select_target repeatedly under the exact same equidistant conditions -- a
-    # non-sticky implementation could flip-flop between argmin ties; this must not.
+    # Ties alone cannot show stickiness: argmin breaks a tie the same way every call, so a rule
+    # that re-picked the nearest each tick would hold too. Move the other one strictly nearer
+    # (1.9 < 2.0): the pick must still hold while it stays valid...
+    other = 3 - first_pick
+    state.ent_pos[0, other] = state.ent_pos[0, 0] + 0.95 * (state.ent_pos[0, other] - state.ent_pos[0, 0])
     for _ in range(20):
         vis = perception.visibility(state, bank, params, cfg)
         perception.select_target(state, vis, params, cfg)
         assert state.ent_target[0, 0].item() == first_pick
+    # ...and a fresh pick from the same positions takes the nearer one, which is what it overrode
+    state.ent_target.fill_(-1)
+    perception.select_target(state, perception.visibility(state, bank, params, cfg), params, cfg)
+    assert state.ent_target[0, 0].item() == other
 
 
 def test_select_target_switches_when_current_dies():

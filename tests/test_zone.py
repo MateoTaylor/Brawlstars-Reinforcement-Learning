@@ -1,3 +1,4 @@
+import copy
 from pathlib import Path
 
 import torch
@@ -9,18 +10,18 @@ from brawl_sim.core.state import allocate, zero_
 
 CONFIGS_DEFAULT = "configs/default.yaml"
 CONFIGS = Path(__file__).resolve().parent.parent / "configs"
+#: default.yaml + brawlers.yaml, parsed once; every `_cfg_and_params` call gets its own deep copy.
+_BASE_SPEC = {
+    **yaml.safe_load((CONFIGS / "default.yaml").read_text()),
+    **yaml.safe_load((CONFIGS / "brawlers.yaml").read_text()),
+}
 
 
 def _cfg_and_params(n_envs=1, **overrides):
     cfg = load_config(CONFIGS_DEFAULT, overrides=overrides or None)
-    import yaml
-    spec = {
-        **yaml.safe_load(open(CONFIGS_DEFAULT).read()),
-        **yaml.safe_load(open("configs/brawlers.yaml").read()),
-    }
     gen = torch.Generator(device="cpu")
     gen.manual_seed(0)
-    params = build_params(cfg, n_envs=n_envs, device="cpu", gen=gen, spec=spec)
+    params = build_params(cfg, n_envs=n_envs, device="cpu", gen=gen, spec=copy.deepcopy(_BASE_SPEC))
     return cfg, params, gen
 
 
@@ -80,8 +81,7 @@ def test_first_shrink_at_exact_configured_time():
     # broke the moment configs/default.yaml's start_fraction was tuned 0.2 -> 0.1 -- a legitimate
     # balance change failing a test that was only ever checking the arithmetic.
     cfg, params, gen = _cfg_and_params(n_envs=1)
-    spec = yaml.safe_load((CONFIGS / "default.yaml").read_text())
-    expected = float(spec["zone"]["start_fraction"]) * cfg.max_episode_steps * cfg.dt
+    expected = float(_BASE_SPEC["zone"]["start_fraction"]) * cfg.max_episode_steps * cfg.dt
 
     state = _fresh_state(cfg)
     mask = torch.ones(1, dtype=torch.bool)

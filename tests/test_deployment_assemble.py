@@ -5,19 +5,24 @@ outputs into the tensor the checkpoint expects, and every way of getting that wr
 column swapped, an enemy slot shifted by the hero row, a grid plane permuted, a divisor missed.
 None of it raises and none of it shows up in a shape assertion.
 
-So `test_assemble_reproduces_the_sims_own_agent_obs` runs a real `BrawlVecEnv`, pulls out of its
-observation exactly the quantities the deployed suppliers would produce, feeds them through
-`assemble`, and demands the result equal what `obs_select.build_agent_obs` makes of the same
-frame. If the two agree column-for-column on a real observation, the wiring is right -- and that
-is an assertion about the deployed path, since `build_agent_obs` is the training path.
+So `test_deploy6_assembles_every_actor_group_and_leaves_the_critic_at_zero` runs a real
+`BrawlVecEnv`, pulls out of its observation exactly the quantities the deployed suppliers would
+produce, feeds them through `assemble`, and demands the result equal what
+`obs_select.build_agent_obs` makes of the same frame. If the two agree column-for-column on a real
+observation, the wiring is right -- and that is an assertion about the deployed path, since
+`build_agent_obs` is the training path. The sim side always builds into buffers of its own: the
+assembler returns copies, but `build_agent_obs` returns views of the buffers it is handed, so a
+`want` read out of the assembler's buffers is rewritten by the `assemble` it is compared with.
 
 The `history` group gets the same treatment twice. `test_synthetic_snapshots_give_the_sims_history_
 vector_byte_for_byte` writes the sim's rings by hand and demands the same bytes from snapshots of
-the same numbers, and `test_deploy4_assembles_whole` runs the spec
-that has it against a live env, with the snapshots `DeployLoop` would have taken.
+the same numbers, and `test_deploy6_assembles_whole` runs the spec against a live env, with the
+snapshots `DeployLoop` would have taken.
 
+Every test reads `configs/agent_obs_deploy6.yaml`, the one deploy spec in `configs/`; where only a
+different spec would reach a branch of the assembler, a temp-file variant of deploy6 reaches it.
 The rest of the file covers the decisions the module makes that the sim has no opinion about: the
-`entities.hp` promotion rule (6.5), the refusal to invent a missing supplier (9.8), and the view
+enemy HP promotion rule (6.5), the refusal to invent a missing supplier (9.8), and the view
 scatter into the sim's 15 channels.
 """
 from collections import deque
@@ -34,13 +39,18 @@ from brawl_deployment.perception.assemble import (DecisionSnapshot, MapFrame,
 
 CONFIGS = "configs/default.yaml"
 TINY = yaml.safe_load(open("configs/presets/debug_tiny.yaml").read())
-# The preset disables the zone; both deploy specs have a zone group, so put it back. The small
-# map, two enemies and short episode are all still wanted -- this is the fast-suite config.
+# The preset disables the zone; deploy6 has a zone group, so put it back. The small map, two
+# enemies and short episode are all still wanted -- this is the fast-suite config.
 TINY["zone"] = {"enabled": True}
-SPECS = ("configs/agent_obs_deploy.yaml", "configs/agent_obs_deploy2.yaml")
-# The one spec with the `history` group and the enemy_hist planes. Kept out of SPECS because the
-# parity test there hands every step an empty history, which only a spec without them can take.
-DEPLOY4 = "configs/agent_obs_deploy4.yaml"
+# Tracked enemy MEMORY rows, the `history` group and enemy_hist planes, and a privileged critic
+# (archive/CRITIC_AND_MEMORY_PLAN.md). The deploy specs before it are in archive/configs/.
+DEPLOY6 = "configs/agent_obs_deploy6.yaml"
+
+
+def _sim_buffers(spec, cfg):
+    """Buffers for the sim side's `build_agent_obs`, apart from the assembler's (see the module
+    docstring)."""
+    return obs_select.make_agent_obs_buffers(spec, cfg, n_envs=1, device="cpu")
 
 
 def _assembler(spec_path, cfg=None):
@@ -69,26 +79,41 @@ def _all_projectiles_on_screen(full, env_i=0) -> bool:
 
 
 class _Track:
-    """What `EntityTracker` hands `assemble`: a world position, a velocity and `seen_now`."""
+    """What `EntityTracker` hands `assemble`: a world position, a velocity, `seen_now`, and
+    `misses`, the unseen decisions it has coasted through."""
 
-    def __init__(self, pos, vel, seen_now):
-        self.pos, self.vel, self.seen_now = pos, vel, seen_now
+    def __init__(self, pos, vel, seen_now, misses=0):
+        self.pos, self.vel, self.seen_now, self.misses = pos, vel, seen_now, misses
 
 
-def _suppliers_from(full, cfg, spec, env_i=0, history=(), tracked=False):
+def _rebuild(env, cfg):
+    """The env's observation of its current state, rebuilt WITHOUT a decision of `slots.update`
+    (which `env._build_observation` runs), so a slot table set by hand is read as set."""
+    from brawl_sim.bots import perception
+    from brawl_sim.core import observation
+    los = perception.raw_los(env.state, env.bank, cfg) if cfg.obs_include_raw_los else None
+    return observation.build_obs(env.state, env.bank, env._obs_vis, los, env.params, cfg,
+                                 hero_view=env._obs_hero_view)
+
+
+def _suppliers_from(full, cfg, spec, env_i=0, history=()):
     """The deployed suppliers' outputs, read off a sim observation instead of off a screen.
 
     Every line here is a claim about which real supplier produces which sim field, and they are
     the claims BRAWL_DEPLOYMENT_DESIGN.md 6.3--6.5 make: the shadow owns the hero's timers, the
     tracker owns enemy identity and velocity, `HealthTracker` owns both HP columns, `hud.py` owns
-    the brawler count, and the terrain map owns the two `in_bush` lookups.
+    the brawler count, the terrain map owns the two `in_bush` lookups, and `ZoneEstimator` owns
+    the zone pair.
 
     `history` is the one supplier an observation cannot give back: it is `DeployLoop`'s record of
     the decisions BEFORE this one, so the caller keeps it, with `_snapshot_of`.
+
+    The tracks are what the tracker holds for deploy6's `memory.*` rows: slot k's entity from the
+    slot table, there while it holds the slot, coasting included, at its LAST SIGHTING, which is
+    what a coasting track's `pos`, `vel` and committed HP are live.
     """
     at = lambda t: t[env_i]                                              # noqa: E731
-    hero, ent, prj, zone, meta = (full["hero"], full["entities"], full["projectiles"],
-                                  full["zone"], full["meta"])
+    hero, prj, zone, meta = full["hero"], full["projectiles"], full["zone"], full["meta"]
 
     shadow = {
         "facing_vec": tuple(at(hero["facing_vec"]).tolist()),
@@ -114,22 +139,23 @@ def _suppliers_from(full, cfg, spec, env_i=0, history=(), tracked=False):
     cam = camera.camera_centre(hero["pos"][env_i:env_i + 1], cfg)[0]
     hero_offset = tuple((at(hero["pos"]) - cam).tolist())
 
-    # Enemy slot k of the tracker is entities index k + 1; only alive enemies exist as tracks.
-    # With `tracked`, slot k holds whichever entity the sim's slot table says (core/slots.py):
-    # what a `slots: tracked` group reads there, and what the tracker's own slots are live.
+    # Slot k of the tracker holds whichever entity the sim's slot table says (core/slots.py):
+    # what a `slots: tracked` group reads there, and what the tracker's own slots are live. An
+    # empty slot (entity 0) has no track.
     enemies, enemy_hp, enemy_bush = [], {}, {}
-    held = (at(full["slots"]["entity"]).tolist() if tracked
-            else [k + 2 for k in range(cfg.n_entities - 1)])
-    for slot, e in enumerate(held):
-        i = e - 1
-        if e == 0 or not bool(at(ent["alive"])[i]):
+    mem = full["memory"]
+    for slot, e in enumerate(at(full["slots"]["entity"]).tolist()):
+        if e == 0:
             enemies.append(None)
             continue
-        enemies.append(_Track(tuple(at(ent["pos"])[i].tolist()),
-                              tuple(at(ent["vel"])[i].tolist()),
-                              bool(at(ent["revealed_to_hero"])[i])))
-        enemy_hp[slot] = float(at(ent["hp"])[i])
-        enemy_bush[slot] = bool(at(ent["in_bush"])[i])
+        i = e - 1
+        rel, rel_v = at(mem["rel_pos"])[i].tolist(), at(mem["rel_vel"])[i].tolist()
+        enemies.append(_Track((rel[0] + hero_pos[0], rel[1] + hero_pos[1]),
+                              (rel_v[0] + hero_vel[0], rel_v[1] + hero_vel[1]),
+                              bool(at(mem["seen"])[i]),
+                              misses=round(float(at(mem["age_s"])[i]) / cfg.agent_dt)))
+        enemy_hp[slot] = float(at(mem["hp"])[i])
+        enemy_bush[slot] = bool(at(mem["in_bush"])[i])
 
     # Only the projectiles the camera shows: the live `ProjectileTracker` has no track for an
     # off-screen one (assemble._put_projectiles marks every track `in_view`). The sim path still
@@ -140,11 +166,9 @@ def _suppliers_from(full, cfg, spec, env_i=0, history=(), tracked=False):
     projectiles = [(tuple(at(prj["rel_pos"])[j].tolist()), tuple(at(prj["vel"])[j].tolist()),
                     float(at(prj["time_to_closest"])[j])) for j in alive_p]
 
-    zone_kw = {"hero_margin": tuple(at(zone["hero_margin"]).tolist()),
-               "hero_margin_local": tuple(at(zone["hero_margin_local"]).tolist()),
-               "active": bool(at(zone["active"])),
-               "safe_area_frac": float(at(zone["safe_area_frac"])),
-               "next_shrink_in": float(at(zone["next_shrink_in"]))}
+    # The two keys `ZoneEstimator.estimate` returns, and nothing it does not.
+    zone_kw = {"hero_margin_local": tuple(at(zone["hero_margin_local"]).tolist()),
+               "active": bool(at(zone["active"]))}
 
     grid_group = next(g for g in spec.groups if g.view_channels is not None)
     grid = at(full["view"])[list(grid_group.channel_idx)].numpy().astype(np.uint8)
@@ -160,28 +184,14 @@ def _suppliers_from(full, cfg, spec, env_i=0, history=(), tracked=False):
     )
 
 
-def _near_edge_spec() -> str:
-    """deploy4's groups with `hero.near_edge` after `hero.in_zone` in the self group, written to
-    a temp file: the shape deploy5 takes."""
+def _without_near_edge_spec() -> str:
+    """deploy6 with `hero.near_edge` dropped from its self group, written to a temp file: the
+    shape every spec before deploy5 had, and the only one that needs no `hero_offset`."""
     import tempfile
-    doc = yaml.safe_load(open(DEPLOY4).read())
+    doc = yaml.safe_load(open(DEPLOY6).read())
     for g in doc["groups"]:
-        if "hero.in_zone" in g.get("fields", ()):
-            g["fields"].insert(g["fields"].index("hero.in_zone") + 1, "hero.near_edge")
-    path = tempfile.mktemp(suffix=".yaml")
-    with open(path, "w") as f:
-        yaml.dump(doc, f)
-    return path
-
-
-def _tracked_spec() -> str:
-    """deploy4 with `slots: tracked` on its enemies group, written to a temp file: the other half
-    of what deploy5 changes."""
-    import tempfile
-    doc = yaml.safe_load(open(DEPLOY4).read())
-    (g,) = [g for g in doc["groups"]
-            if g.get("per_entity") and all(f.startswith("entities.") for f in g.get("fields", ()))]
-    g["slots"] = "tracked"
+        if "hero.near_edge" in g.get("fields", ()):
+            g["fields"].remove("hero.near_edge")
     path = tempfile.mktemp(suffix=".yaml")
     with open(path, "w") as f:
         yaml.dump(doc, f)
@@ -208,13 +218,13 @@ def test_near_edge_assembles_to_the_sims_bit(hero_xy, want):
     off its anchor (past the 2-tile flag) and one at x 10 is 0.35. The whole `self` group must
     still match the sim's."""
     env, cfg = _env()
-    asm = _assembler(_near_edge_spec(), cfg)
-    spec, buffers = asm.spec, asm.buffers
+    asm = _assembler(DEPLOY6, cfg)
+    spec = asm.spec
     env.reset()
     env.state.ent_pos[0, 0] = torch.tensor(hero_xy)
     full = env._build_observation()
     idx = obs_select.agent_obs_index_map(spec, cfg)["self"]["hero.near_edge"][0]
-    sim = obs_select.build_agent_obs(full, spec, cfg, buffers)["self"][0].clone().numpy()
+    sim = obs_select.build_agent_obs(full, spec, cfg, _sim_buffers(spec, cfg))["self"][0].numpy()
     got = asm.assemble(**_suppliers_from(full, cfg, spec))["self"]
     assert bool(sim[idx]) is want and got[idx] == sim[idx]
     np.testing.assert_allclose(got, sim, atol=1e-5)
@@ -223,7 +233,7 @@ def test_near_edge_assembles_to_the_sims_bit(hero_xy, want):
 def test_hero_offset_is_only_required_by_a_spec_that_reads_near_edge():
     env, cfg = _env()
     full = env.reset()
-    for spec_path, needs in ((DEPLOY4, False), (_near_edge_spec(), True)):
+    for spec_path, needs in ((_without_near_edge_spec(), False), (DEPLOY6, True)):
         asm = _assembler(spec_path, cfg)
         kw = _suppliers_from(full, cfg, asm.spec)
         kw.pop("hero_offset")
@@ -232,86 +242,6 @@ def test_hero_offset_is_only_required_by_a_spec_that_reads_near_edge():
                 asm.assemble(**kw)
         else:
             asm.assemble(**kw)
-
-
-def test_tracked_slots_assemble_to_the_sims_rows(tracked_action_steps=8):
-    """deploy4 with `slots: tracked` on the enemies group: the sim
-    orders rows by its slot table, the assembler is handed the tracks in that order and writes
-    the identity permutation, and the `enemies` group comes out the same at every decision."""
-    env, cfg = _env()
-    asm = _assembler(_tracked_spec(), cfg)
-    spec, buffers = asm.spec, asm.buffers
-    full = env.reset()
-    gen = torch.Generator().manual_seed(0)
-    populated = 0
-    for step in range(tracked_action_steps):
-        want = obs_select.build_agent_obs(full, spec, cfg, buffers)["enemies"][0].clone().numpy()
-        got = asm.assemble(**_suppliers_from(full, cfg, spec, tracked=True))["enemies"]
-        np.testing.assert_allclose(got, want, atol=1e-5, err_msg=f"enemies differ at step {step}")
-        populated += int(bool(full["slots"]["valid"][0].any()))
-        action = torch.stack([torch.randint(0, cfg.n_move_bins + 1, (1,), generator=gen),
-                              torch.randint(0, 2, (1,), generator=gen)], dim=1)
-        full, *_ = env.step(action)
-    assert populated >= 4, "the slot table filled during the run, so the rows were really gathered"
-
-
-def test_a_swapped_slot_table_reaches_the_assembler_in_slot_order():
-    """Slot 0 <- entity 2 and slot 1 <- entity 1, set by hand: the sim's tracked rows swap, the
-    tracks are handed over swapped, and the two still agree -- against the plain build, which
-    keeps entity order, to show the swap happened."""
-    env, cfg = _env()
-    asm = _assembler(_tracked_spec(), cfg)
-    plain = _assembler(DEPLOY4, cfg)
-    full = env.reset()
-    env.state.slot_ent[0] = torch.tensor([3, 2])         # `full["slots"]["entity"]` is this tensor
-    env.state.ent_slot[0] = torch.tensor([0, 2, 1])
-    full["slots"]["valid"] = env.state.slot_ent > 0
-    full["entities"]["revealed_to_hero"][0, 1:] = True
-    want = obs_select.build_agent_obs(full, asm.spec, cfg, asm.buffers)["enemies"][0].clone().numpy()
-    ordered = obs_select.build_agent_obs(full, plain.spec, cfg, plain.buffers)["enemies"][0].clone().numpy()
-    assert np.array_equal(want[0], ordered[1]) and np.array_equal(want[1], ordered[0])
-    assert ordered.any(axis=1).all(), "both rows are live, so the swap is visible"
-    got = asm.assemble(**_suppliers_from(full, cfg, asm.spec, tracked=True))["enemies"]
-    np.testing.assert_allclose(got, want, atol=1e-5)
-
-
-@pytest.mark.parametrize("spec_path", SPECS)
-def test_assemble_reproduces_the_sims_own_agent_obs(spec_path):
-    """The load-bearing test. Same frame, two paths, every column equal.
-
-    Tolerance is exact for the grid (uint8) and 1e-5 for the float groups -- the only arithmetic
-    between the two paths is `assemble` round-tripping through Python floats, which is lossless at
-    float32 for everything here except `dist`, recomputed with `math.hypot` where the sim used
-    `safe_norm`.
-    """
-    env, cfg = _env()
-    asm = _assembler(spec_path, cfg)    # the tiny preset, so both paths see one config
-    spec, buffers = asm.spec, asm.buffers   # and one set of buffers, so `want` must be cloned
-
-    full = env.reset()
-    gen = torch.Generator().manual_seed(0)
-    projectile_frames = 0
-    for step in range(6):
-        want = obs_select.build_agent_obs(full, spec, cfg, buffers)
-        want = {k: v[0].clone().numpy() for k, v in want.items()}
-        got = asm.assemble(**_suppliers_from(full, cfg, spec))
-
-        assert got.keys() == want.keys()
-        comparable = _all_projectiles_on_screen(full)
-        for name in want:
-            if name == "projectiles" and not comparable:
-                continue  # the kept ranking quirk; see _suppliers_from
-            if name == "grid":
-                assert np.array_equal(got[name], want[name]), f"{name} differs at step {step}"
-            else:
-                np.testing.assert_allclose(got[name], want[name], atol=1e-5,
-                                           err_msg=f"{name} differs at step {step}")
-        if comparable and bool(full["projectiles"]["alive"][0].any()):
-            projectile_frames += 1
-        action = torch.stack([torch.randint(0, cfg.n_move_bins + 1, (1,), generator=gen),
-                              torch.randint(0, 2, (1,), generator=gen)], dim=1)
-        full, *_ = env.step(action)
-    assert projectile_frames > 0, "no frame with live projectiles was compared"
 
 
 def test_parity_survives_a_frame_with_live_projectiles():
@@ -323,10 +253,13 @@ def test_parity_survives_a_frame_with_live_projectiles():
 
     Frames with an off-screen live projectile are skipped: the sim ranks it into the 12 slots
     and blanks its row (a quirk kept by decision, BRAWL_SIM_DESIGN.md §9), while the tracker
-    never holds it, so the two paths differ there by design."""
+    never holds it, so the two paths differ there by design. Until 2026-10-21 `want` here was
+    read out of the assembler's own buffers, so `assemble` rewrote it to its own answer: a
+    0.5-tile shift of every projectile passed all 28 compared frames."""
     env, cfg = _env(n_envs=1, seed=3)
-    asm = _assembler(SPECS[0], cfg)
-    spec, buffers = asm.spec, asm.buffers
+    asm = _assembler(DEPLOY6, cfg)
+    spec = asm.spec
+    buffers = _sim_buffers(spec, cfg)
 
     full = env.reset()
     gen = torch.Generator().manual_seed(1)
@@ -349,18 +282,19 @@ def test_parity_survives_a_frame_with_live_projectiles():
 VALID_BY_DECISION = ([0.0, 0.0, 0.0], [1.0, 0.0, 0.0], [1.0, 1.0, 0.0], [1.0, 1.0, 1.0])
 
 
-def test_deploy4_assembles_whole():
-    """deploy4 through `assemble` against a live env: the gadget pair, the `history`
+def test_deploy6_assembles_whole():
+    """deploy6 through `assemble` against a live env: the gadget pair, the `history`
     group from the snapshots `DeployLoop` would have taken, and the thirteen-plane grid.
 
     The first action throws the gadget. A charged gadget reads (True, 1.0), which a swapped pair
     reproduces exactly; after the throw the sim reads (False, 0.2 / 18), and only the right
     wiring reproduces that. The same throw is slot 0's attack one-hot a decision later. Six
     decisions, so the ring fills and then drops its oldest slot twice. The history is compared
-    as bytes."""
+    as bytes. The critic groups are left to the test below."""
     env, cfg = _env()
-    asm = _assembler(DEPLOY4, cfg)
-    spec, buffers = asm.spec, asm.buffers
+    asm = _assembler(DEPLOY6, cfg)
+    spec = asm.spec
+    buffers = _sim_buffers(spec, cfg)
 
     full = env.reset()
     gen = torch.Generator().manual_seed(2)
@@ -373,19 +307,111 @@ def test_deploy4_assembles_whole():
         assert got["history"].tobytes() == want["history"].tobytes(), (
             f"history differs at step {step}\ngot  {got['history']}\nwant {want['history']}")
         assert np.array_equal(got["grid"], want["grid"]), f"grid differs at step {step}"
-        for name in want:
-            np.testing.assert_allclose(got[name], want[name], atol=1e-5,
-                                       err_msg=f"{name} differs at step {step}")
+        for g in spec.groups:
+            np.testing.assert_allclose(got[g.name], want[g.name], atol=1e-5,
+                                       err_msg=f"{g.name} differs at step {step}")
         assert got["history"][:3].tolist() == VALID_BY_DECISION[min(step, 3)]
-        if step == 1:        # the frame after the throw; deploy4's header puts the pair at 22, 23
-            assert got["self"][22] == 0.0
-            assert got["self"][23] == pytest.approx(0.0111111, abs=1e-6)
+        if step == 1:        # the frame after the throw; the pair is self 23, 24 on deploy6
+            assert got["self"][23] == 0.0
+            assert got["self"][24] == pytest.approx(0.0111111, abs=1e-6)
             assert got["history"][57] == 1.0      # attack one-hots start at 54; slot 0 threw
         move = int(torch.randint(0, cfg.n_move_bins + 1, (1,), generator=gen))
         attack = 3 if step == 0 else int(torch.randint(0, 2, (1,), generator=gen))
         history.appendleft(_snapshot_of(full, move, attack))
         full, _, terminated, truncated, _ = env.step(torch.tensor([[move, attack]], dtype=torch.int64))
         assert not bool(terminated[0] or truncated[0]), "a reset would clear the sim's ring"
+
+
+def test_deploy6_assembles_every_actor_group_and_leaves_the_critic_at_zero():
+    """deploy6 against a live env at the run's 12-miss coast: every actor group equals the sim's
+    at every decision, `enemies` included, read from memory -- a coasting slot's last sighting
+    and its age -- and both critic groups stay zero, since the assembler builds with
+    critic=False. The sim side gets its own buffers: its build fills the critic groups, and
+    sharing the assembler's would hand those values back through `assemble`."""
+    from brawl_sim.env import BrawlVecEnv
+
+    cfg = load_config(CONFIGS, overrides={**TINY, "slots": {"max_misses": 12}})
+    env = BrawlVecEnv(cfg, n_envs=1, device="cpu", seed=0)
+    asm = _assembler(DEPLOY6, cfg)
+    spec = asm.spec
+    sim_buffers = _sim_buffers(spec, cfg)
+    assert [g.name for g in spec.critic_groups] == ["critic_enemies", "critic_world"]
+
+    full = env.reset()
+    gen = torch.Generator().manual_seed(4)
+    history = deque(maxlen=3)
+    coasting = projectile_frames = 0
+    for step in range(40):
+        want = obs_select.build_agent_obs(full, spec, cfg, sim_buffers)
+        want = {k: v[0].clone().numpy() for k, v in want.items()}
+        got = asm.assemble(**_suppliers_from(full, cfg, spec, history=history))
+        assert got.keys() == want.keys()
+        comparable = _all_projectiles_on_screen(full)
+        for g in spec.groups:
+            if g.name == "projectiles" and not comparable:
+                continue  # the kept ranking quirk; see _suppliers_from
+            np.testing.assert_allclose(got[g.name], want[g.name], atol=1e-5,
+                                       err_msg=f"{g.name} differs at step {step}")
+        for g in spec.critic_groups:
+            assert not got[g.name].any(), f"{g.name} reached the live observation at step {step}"
+        projectile_frames += int(comparable and bool(full["projectiles"]["alive"][0].any()))
+        mem = full["memory"]
+        coasting += int(bool((mem["tracked"][0] & ~mem["seen"][0]).any()))
+        if step == 8:
+            # The camera window covers nearly all of this 20-tile map, so nothing walks out of
+            # view: kill entity 1 instead. Dead is unseen, so its slot coasts its 12 decisions.
+            env.state.ent_alive[0, 1] = False
+        move = int(torch.randint(0, cfg.n_move_bins + 1, (1,), generator=gen))
+        attack = int(torch.randint(0, 2, (1,), generator=gen))
+        history.appendleft(_snapshot_of(full, move, attack))
+        full, _, terminated, truncated, _ = env.step(torch.tensor([[move, attack]], dtype=torch.int64))
+        if bool(terminated[0] or truncated[0]):
+            history.clear()                     # the reset cleared the sim's ring too
+    assert coasting >= 10, f"a slot coasted in only {coasting} decisions of 40"
+    assert projectile_frames > 0, "no frame with live projectiles was compared"
+
+
+def test_a_coasting_memory_row_assembles_to_the_sims_row():
+    """A slot table set by hand, so every kind of row is in one frame: slot 0 holds entity 2 on
+    its 5th unseen decision, its last sighting nowhere near where it is now; slot 1 holds entity
+    1, seen this decision; slot 2 is empty. The sim's deploy6 rows read exactly that, and the
+    assembler, handed the tracks the tracker would hold, writes the same rows."""
+    from brawl_sim.env import BrawlVecEnv
+
+    cfg = load_config(CONFIGS, overrides={**TINY, "entities": {"n_enemies": 3},
+                                          "slots": {"max_misses": 12}})
+    env = BrawlVecEnv(cfg, n_envs=1, device="cpu", seed=0)
+    asm = _assembler(DEPLOY6, cfg)
+    env.reset()
+    st = env.state
+    st.slot_ent[0] = torch.tensor([3, 2, 0])
+    st.ent_slot[0] = torch.tensor([0, 2, 1, 0])
+    st.ent_misses[0] = torch.tensor([0, 0, 5, 0], dtype=torch.int32)
+    st.ent_seen_pos[0, 1], st.ent_seen_vel[0, 1] = st.ent_pos[0, 1], st.ent_vel[0, 1]
+    st.ent_seen_hp[0, 1] = st.ent_hp[0, 1]
+    st.ent_seen_pos[0, 2] = torch.tensor([4.5, 15.5])
+    st.ent_seen_vel[0, 2] = torch.tensor([1.0, -0.5])
+    st.ent_seen_hp[0, 2] = 1234.0
+    assert float((st.ent_pos[0, 2] - st.ent_seen_pos[0, 2]).norm()) > 1.0
+    full = _rebuild(env, cfg)
+
+    spec = asm.spec
+    want = obs_select.build_agent_obs(full, spec, cfg,
+                                      _sim_buffers(spec, cfg))["enemies"][0].numpy()
+    col = {f: slice(*c) for f, c in obs_select.agent_obs_index_map(spec, cfg)["enemies"].items()}
+    scale = float(max(cfg.map_w, cfg.map_h))
+    hero = st.ent_pos[0, 0]
+    assert want[0, col["memory.tracked"]].tolist() == [1.0]
+    assert want[0, col["memory.seen"]].tolist() == [0.0]
+    assert want[0, col["memory.age_s"]].tolist() == [1.25]
+    np.testing.assert_allclose(want[0, col["memory.rel_pos"]],
+                               ((torch.tensor([4.5, 15.5]) - hero) / scale).numpy(), atol=1e-6)
+    assert want[0, col["memory.hp"]] == pytest.approx(1234.0 / 20000.0)
+    assert want[1, col["memory.seen"]].tolist() == [1.0] and want[1, col["memory.age_s"]] == 0.0
+    assert not want[2].any()
+
+    got = asm.assemble(**_suppliers_from(full, cfg, spec))["enemies"]
+    np.testing.assert_allclose(got, want, atol=1e-5)
 
 
 # Three decisions' worth of hand-picked numbers, newest first: (move_bin, attack, hp, ammo_frac,
@@ -402,7 +428,7 @@ def test_synthetic_snapshots_give_the_sims_history_vector_byte_for_byte(n):
     with in-range garbage behind them, and `build_obs` + `obs_select` make the `history` group
     of that. `n` snapshots of the same numbers go through `assemble`. Same bytes, or it fails."""
     env, cfg = _env()
-    asm = _assembler(DEPLOY4, cfg)
+    asm = _assembler(DEPLOY6, cfg)
     full = env.reset()
     assert float(full["hero"]["ammo_frac"][0]) == 1.0, "a hero spawns full; max_ammo reads off it"
     state = env.state
@@ -423,7 +449,8 @@ def test_synthetic_snapshots_give_the_sims_history_vector_byte_for_byte(n):
                                           pos=pos, enemies=()))
     full = env._build_observation()
 
-    want = obs_select.build_agent_obs(full, asm.spec, cfg, asm.buffers)["history"][0].clone().numpy()
+    want = obs_select.build_agent_obs(full, asm.spec, cfg,
+                                      _sim_buffers(asm.spec, cfg))["history"][0].numpy()
     got = asm.assemble(**_suppliers_from(full, cfg, asm.spec, history=snapshots))["history"]
     assert got.dtype == want.dtype == np.float32 and got.shape == want.shape == (78,)
     assert got.tobytes() == want.tobytes(), f"\ngot  {got}\nwant {want}"
@@ -443,7 +470,7 @@ def test_synthetic_snapshots_give_the_sims_history_vector_byte_for_byte(n):
 def test_more_history_than_the_config_keeps_is_refused():
     """The loop's deque is sized from the same `history_frames`, so a fourth snapshot means the
     two were built from different configs. Truncating would hide that."""
-    asm = _assembler(DEPLOY4)
+    asm = _assembler(DEPLOY6)
     snap = DecisionSnapshot(move_bin=0, attack=0, hp=8000.0, ammo_frac=1.0, pos=(10.0, 10.0),
                             enemies=())
     with pytest.raises(ValueError, match="history holds 4 decisions and the config keeps 3"):
@@ -460,37 +487,26 @@ def test_a_tracked_enemy_with_no_hp_yet_is_not_promoted_to_a_slot():
 
     The alternative is a made-up HP in a column the policy was trained to trust. An empty slot is
     a state the sim produces constantly; a fabricated HP is one it never produces at all."""
-    asm = _assembler(SPECS[0])
+    asm = _assembler(DEPLOY6)
     tracks = [None] * (asm.cfg.n_entities - 1)
     tracks[0] = _Track((12.0, 9.0), (1.0, 0.0), True)
     tracks[1] = _Track((14.0, 9.0), (1.0, 0.0), True)
 
     obs = asm.assemble(**_base_kwargs(asm, enemies=tracks, enemy_hp={0: 5400}))
-    alive = obs["enemies"][:, 0]
-    assert alive[0] == 1.0, "slot 0 has a committed HP and must be visible"
-    assert alive[1] == 0.0, "slot 1 has no HP yet, so it is not an enemy the policy is told about"
+    col = obs_select.agent_obs_index_map(asm.spec, asm.cfg)["enemies"]["memory.tracked"][0]
+    tracked = obs["enemies"][:, col]
+    assert tracked[0] == 1.0, "slot 0 has a committed HP and must be visible"
+    assert tracked[1] == 0.0, "slot 1 has no HP yet, so it is not an enemy the policy is told about"
     assert not obs["enemies"][1].any(), "an unpromoted slot must be entirely zero, not partly filled"
 
 
-def test_an_unrevealed_enemy_is_masked_exactly_as_fairness_masked_it_in_training():
-    """`fair: true` multiplies each enemy row by `revealed_to_hero`, so a coasting track
-    contributes nothing. Left to `obs_select` rather than reimplemented -- this pins that it is
-    still reached, because a tracker that set `seen_now` wrong would otherwise leak a position the
-    trained policy was never allowed to see."""
-    asm = _assembler(SPECS[0])
-    tracks = [None] * (asm.cfg.n_entities - 1)
-    tracks[0] = _Track((12.0, 9.0), (1.0, 0.0), False)
-    obs = asm.assemble(**_base_kwargs(asm, enemies=tracks, enemy_hp={0: 5400}))
-    assert not obs["enemies"][0].any()
-
-
 @pytest.mark.parametrize("missing", ["hero_hp", "n_enemies_alive", "hero_in_bush", "zone",
-                                     "history"])
+                                     "history", "hero_offset"])
 def test_a_missing_supplier_raises_rather_than_becoming_a_zero(missing):
-    """The rule the whole `agent_obs_deploy*.yaml` family exists to enforce, at the last point it
-    can still be enforced. A field in the spec has a supplier; if that supplier produced nothing
-    this tick, the loop's answer is to fail closed, not to substitute a plausible number."""
-    asm = _assembler(SPECS[0])
+    """The rule a deploy spec exists to enforce, at the last point it can still be enforced. A
+    field in the spec has a supplier; if that supplier produced nothing this tick, the loop's
+    answer is to fail closed, not to substitute a plausible number."""
+    asm = _assembler(DEPLOY6)
     kwargs = _base_kwargs(asm)
     kwargs[missing] = None
     with pytest.raises(ValueError, match="no value supplied"):
@@ -498,26 +514,22 @@ def test_a_missing_supplier_raises_rather_than_becoming_a_zero(missing):
 
 
 def test_a_zone_field_the_spec_needs_cannot_be_silently_omitted():
-    """`_put_zone` is driven by the loaded spec, because two spec versions are live at once and
-    they want different zone fields (9.16). Handing deploy2's dict to a deploy assembler must
-    raise, not quietly produce a shorter group."""
-    asm = _assembler(SPECS[0])
+    """`_put_zone` is driven by the loaded spec, because the zone group has changed under a
+    retrain before (9.16): the first deploy spec read the unclamped `hero_margin`. Handing that
+    spec's dict to a deploy6 assembler must raise, not quietly produce a shorter group."""
+    asm = _assembler(DEPLOY6)
     kwargs = _base_kwargs(asm)
-    kwargs["zone"] = {"hero_margin_local": (1.0, 1.0, 1.0, 1.0), "active": True}
-    with pytest.raises(ValueError, match="zone.hero_margin"):
+    kwargs["zone"] = {"hero_margin": (1.0, 1.0, 1.0, 1.0), "active": True}
+    with pytest.raises(ValueError, match="zone.hero_margin_local"):
         asm.assemble(**kwargs)
 
 
-@pytest.mark.parametrize("spec_path,unfilled_want", [
-    (SPECS[0], {5, 7, 9, 10, 12, 13, 14}),   # enemy_any, enemy_hidden, box, pickup, enemy_hist1..3
-    (DEPLOY4, {5, 7}),                       # enemy_any, enemy_hidden
-])
-def test_the_view_scatter_puts_each_plane_at_its_canonical_sim_channel(spec_path, unfilled_want):
+def test_the_view_scatter_puts_each_plane_at_its_canonical_sim_channel():
     """The grid group is `index_select` over the sim's view, 12 base channels and then one
     enemy_hist plane per history slot, so a plane written to the wrong index is read as a
     different channel entirely -- walls arriving as bushes. Marking each plane with its own value
     makes a permutation visible; equal planes would not."""
-    asm = _assembler(spec_path)
+    asm = _assembler(DEPLOY6)
     assert asm._view.shape[0] == 15
     grid = np.zeros((len(asm._grid_channels), asm.cfg.view_h, asm.cfg.view_w), np.uint8)
     for i in range(grid.shape[0]):
@@ -526,7 +538,7 @@ def test_the_view_scatter_puts_each_plane_at_its_canonical_sim_channel(spec_path
     assert list(obs["grid"][:, 0, 0]) == list(range(1, grid.shape[0] + 1))
     # and the channels nothing supplies were never touched
     unfilled = set(range(15)) - set(asm._grid_channels)
-    assert unfilled == unfilled_want
+    assert unfilled == {5, 7}                                    # enemy_any, enemy_hidden
     assert not asm._view[sorted(unfilled)].any()
 
 
@@ -534,7 +546,7 @@ def test_time_frac_is_clamped_because_the_sim_truncates_at_one():
     """Running short is harmless -- the policy just never sees the top of the range, exactly as
     when a sim episode ends early. Running LONG is out-of-distribution: the column's entire
     training range is bounded by 1, and a 200-second match would feed it 1.33 (9.6)."""
-    asm = _assembler(SPECS[0])
+    asm = _assembler(DEPLOY6)
     idx = obs_select.agent_obs_index_map(asm.spec, asm.cfg)["self"]["meta.time_frac"][0]
     for elapsed, want in ((0.0, 0.0), (75.0, 0.5), (150.0, 1.0), (400.0, 1.0)):
         obs = asm.assemble(**_base_kwargs(asm, elapsed_s=elapsed))
@@ -546,14 +558,14 @@ def test_the_map_frame_is_the_only_thing_that_reads_absolute_position():
     `MapFrame` is where that is quarantined. Moving it must change those two columns and NOTHING
     else -- if it ever moves another column, absolute position has leaked into a relative field
     and the leak is worth finding immediately."""
-    asm = _assembler(SPECS[0])
+    asm = _assembler(DEPLOY6)
     a = asm.assemble(**_base_kwargs(asm))
     asm.map_frame = MapFrame(origin=(7.0, -3.0), extent=(80.0, 80.0))
     b = asm.assemble(**_base_kwargs(asm))
 
     assert not np.allclose(a["self"][:2], b["self"][:2])
     np.testing.assert_allclose(a["self"][2:], b["self"][2:], atol=0)
-    for name in ("enemies", "projectiles", "zone", "grid"):
+    for name in ("enemies", "projectiles", "zone", "history", "grid"):
         assert np.array_equal(a[name], b[name]), f"{name} moved with the map frame"
 
 
@@ -564,7 +576,7 @@ def test_the_default_map_frame_centres_odometry_and_keeps_the_sims_scale():
     the extent must stay the sim's own: odometry is in tiles, `hero.pos` is in tiles, and dividing
     by the sim's map size makes one tile of real movement produce exactly the column movement it
     produced in training. This pins both halves of that."""
-    asm = ObservationAssembler.from_paths(SPECS[0], CONFIGS)
+    asm = ObservationAssembler.from_paths(DEPLOY6, CONFIGS)
     cfg = asm.cfg
     assert asm.map_frame.extent == (float(cfg.map_w), float(cfg.map_h))
     assert asm.map_frame.pos_norm((0.0, 0.0)) == (0.5, 0.5), "odometry's start belongs at the centre"
@@ -586,8 +598,9 @@ def test_the_map_frame_does_not_clamp_an_impossible_position():
 
 def _base_kwargs(asm, **overrides):
     """A complete, valid supplier set. Deliberately not a fixture: every test that overrides one
-    field wants to see the other fourteen are present, since the thing under test is often that a
-    missing one is fatal. `history` is a match's first decision: empty, and still supplied."""
+    field wants to see the other fifteen are present, since the thing under test is often that a
+    missing one is fatal. `history` is a match's first decision: empty, and still supplied. The
+    zone is the pair `ZoneEstimator.estimate` returns."""
     shadow = {"facing_vec": (1.0, 0.0), "ammo_frac": 0.83, "ammo_whole": 2.0, "attack_cd": 0.1,
               "can_attack": True, "dashing": False, "dash_t": 0.0, "dash_dir": (0.0, 0.0),
               "invuln": False, "long_dash_ready": True, "long_dash_frac": 1.0,
@@ -598,11 +611,10 @@ def _base_kwargs(asm, **overrides):
         n_enemies_alive=4.0, elapsed_s=42.0, hero_in_bush=False, hero_in_zone=False,
         enemies=[None] * (asm.cfg.n_entities - 1), enemy_hp={}, enemy_in_bush={},
         projectiles=[],
-        zone={"hero_margin": (5.0, 12.0, -1.0, 30.0),
-              "hero_margin_local": (5.0, 10.0, -1.0, 10.0), "active": True,
-              "safe_area_frac": 0.4, "next_shrink_in": 0.0},
+        zone={"hero_margin_local": (5.0, 10.0, -1.0, 10.0), "active": True},
         history=(),
         grid=np.zeros((len(asm._grid_channels), asm.cfg.view_h, asm.cfg.view_w), np.uint8),
+        hero_offset=(0.0, 0.0),
     )
     kwargs.update(overrides)
     return kwargs

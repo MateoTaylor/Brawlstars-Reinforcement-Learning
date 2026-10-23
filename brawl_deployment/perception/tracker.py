@@ -1,11 +1,11 @@
 """Anonymous per-frame boxes -> identified entities with velocity. BRAWL_DEPLOYMENT_DESIGN.md 6.1.
 
 **The problem this solves is identity, and the observation spec is what creates it.**
-`configs/agent_obs_deploy.yaml` asks for `entities.rel_vel` (a difference across time, so
-something must know that box_t and box_t+1 are the same enemy) and declares enemy slots
-"index-stable within an episode" (so slot 3 must mean the same enemy for as long as it lives). A
-detector supplies neither: `Detection` carries a label, a confidence and a box, and nothing that
-survives a frame boundary.
+`configs/agent_obs_deploy6.yaml` asks for `memory.rel_vel` (a difference across time, so
+something must know that box_t and box_t+1 are the same enemy) and reads its enemy rows in
+tracker-slot order (`slots: tracked`, so slot 3 must mean the same enemy for as long as it holds
+the slot). A detector supplies neither: `Detection` carries a label, a confidence and a box, and
+nothing that survives a frame boundary.
 
 **Association happens in TILE space, not pixel space, and that is the whole reason this can work
 at 4 Hz.** The camera pans constantly, so in pixels every enemy on screen moves whenever the hero
@@ -74,6 +74,25 @@ PLAYER_BOX_FROM_RING_TILES = (-0.08, -0.78)
 # plainly rather than burying in one combined constant.
 GATE_NOISE_TILES = 1.0
 
+# The longest gap a constant-velocity prediction extrapolates across, in seconds. 1.0 s is the
+# longest gap a 3-miss coast can match across at nominal timing (three misses plus the decision
+# that finds it), so up to there a prediction is what it always was. A track coasting longer (the
+# memory slots, `slots.max_misses` 12) is where a constant-velocity guess walks out of the area
+# the enemy could have reached; past the cap it stays put and the gate, which keeps growing with
+# the gap, covers where the enemy could have gone.
+MAX_PREDICT_S = 1.0
+
+# An `enemy` box whose ground point lands this close to a crate the loot map holds is dropped
+# before association. The entity detector boxes power-cube crates as `enemy` (the crate carries the
+# same red HP bar an enemy brawler does), around its own confidence cutoff, so a crate became an
+# enemy track that flickered in and out next to the hero, and a close enemy dropping out is what
+# the policy learned a kill looks like: it stopped attacking a crate that was still standing.
+# Measured 2026-10-20 on 15 Dark Passage replays (deploy6): 25 of 82 enemy tracks were crates;
+# against the loot map's crate cells, 0.7 tiles drops 75% of 272 crate-track sightings and 2.2% (16)
+# of 725 moving-brawler sightings. Not tighter, because the two boxes anchor at different heights:
+# a crate's phantom sits a median 0.46 tiles off its cell centre, p90 1.46. 0 turns it off.
+CRATE_VETO_TILES = 0.7
+
 
 @dataclass
 class Track:
@@ -88,10 +107,13 @@ class Track:
     misses: int = 0
     t: float = 0.0
     seen_now: bool = True          # detected THIS tick, as opposed to coasting on a prediction
+    # (unseen decisions, tiles moved) when the last match ended a coast, None when it did not.
+    # Telemetry only (`TickRow.reacquired`).
+    reacquired: tuple[int, float] | None = None
     history: list = field(default_factory=list, repr=False)
 
     def predict(self, t: float) -> tuple[float, float]:
-        dt = max(0.0, t - self.t)
+        dt = min(max(0.0, t - self.t), MAX_PREDICT_S)
         return (self.pos[0] + self.vel[0] * dt, self.pos[1] + self.vel[1] * dt)
 
 
@@ -108,6 +130,7 @@ class TrackerResult:
     segment: int
     n_detections: int
     hero_offset: tuple[float, float] | None = None
+    n_crate_vetoed: int = 0        # enemy boxes dropped this tick as sitting on a crate
 
 
 @dataclass(frozen=True)
@@ -123,8 +146,9 @@ class _Point:
         return (self.xyxy[0], self.xyxy[1])
 
 
-def _greedy_match(tracks, points, gate: float):
-    """`({track_index: point_index}, unmatched_point_indices)`, nearest pair first.
+def _greedy_match(tracks, points, gate):
+    """`({track_index: point_index}, unmatched_point_indices)`, nearest pair first. `gate` is one
+    radius for every track, or a sequence with one radius per track.
 
     **Globally greedy, not per-track greedy.** Iterating tracks in order and giving each its own
     nearest point lets whichever track happens to be first claim a point that is a much better fit
@@ -136,11 +160,12 @@ def _greedy_match(tracks, points, gate: float):
     when every point must be assigned; here points appear and vanish constantly, and the optimal
     total can be bought by pairing two entities badly rather than leaving one unmatched.
     """
+    gates = [gate] * len(tracks) if isinstance(gate, (int, float)) else gate
     pairs = []
     for ti, (tx, ty) in enumerate(tracks):
         for pi, (px, py) in enumerate(points):
             d = math.hypot(px - tx, py - ty)
-            if d <= gate:
+            if d <= gates[ti]:
                 pairs.append((d, ti, pi))
     pairs.sort()
     used_t, used_p, matched = set(), set(), {}
@@ -159,11 +184,19 @@ class EntityTracker:
     `promote_hits` exists because a single spurious box should not consume a slot: the observation
     has `n_enemies` of them and they are index-stable, so a slot handed to noise stays wrong until
     that noise track ages out. Two consecutive detections is cheap insurance at 4 Hz.
+
+    `max_misses` is the enemies' coast, the run's `slots.max_misses`. The hero coasts
+    `hero_max_misses` whatever that is: the loop takes the hero track's position as the hero's on
+    every decision, so a memory-length coast (3 s at 12) would hold the hero on a stale position.
     """
 
+    hero_max_misses = 3        # decisions, 0.75 s: the coast the hero has always had
+
     def __init__(self, n_slots: int = 9, max_misses: int = 3, promote_hits: int = 2,
-                 vel_alpha: float = 0.5, anchor_frac: float | None = None):
+                 vel_alpha: float = 0.5, anchor_frac: float | None = None,
+                 crate_veto_tiles: float = CRATE_VETO_TILES):
         self.n_slots = n_slots
+        self.crate_veto_tiles = crate_veto_tiles
         self.max_misses = max_misses
         self.promote_hits = promote_hits
         # EMA weight on each new finite difference. At 4 Hz a raw difference divides ~1 tile of
@@ -186,9 +219,10 @@ class EntityTracker:
 
     # -- the tick ------------------------------------------------------------
 
-    def update(self, detections, plan, odometry, t: float) -> TrackerResult:
+    def update(self, detections, plan, odometry, t: float, crates=()) -> TrackerResult:
         """`detections` are `Detection`s in viewport pixels; `plan` the `RectifyPlan` they were
-        produced under; `odometry` that frame's `OdometryResult`; `t` its timestamp in seconds.
+        produced under; `odometry` that frame's `OdometryResult`; `t` its timestamp in seconds;
+        `crates` the loot map's crate cells in the same world frame, for `CRATE_VETO_TILES`.
 
         **Odometry gates this exactly as it gates terrain deposits, and for the same reason.**
         `occupancy.update` refuses anything but `status == "ok"` because `uncertain` has a world
@@ -221,9 +255,13 @@ class EntityTracker:
             # shift of `origin_tile` cancels.
             nx, ny = self._nominal_tile(plan)
             self._hero_offset = (self.hero.pos[0] - px - nx, self.hero.pos[1] - py - ny)
-        self._update_enemies([p for d, p in world if d.label == "enemy"], t)
+        enemies = [p for d, p in world if d.label == "enemy"]
+        kept = [p for p in enemies
+                if not any(math.hypot(p[0] - cx, p[1] - cy) <= self.crate_veto_tiles
+                           for cx, cy in crates)]
+        self._update_enemies(kept, t)
         return TrackerResult(self.hero, self.slots(), "ok", self._segment, len(detections),
-                             self._hero_offset)
+                             self._hero_offset, len(enemies) - len(kept))
 
     def _nominal_tile(self, plan) -> tuple[float, float]:
         """Where the player box reads when the camera is tracking the hero, in the plan's
@@ -250,7 +288,7 @@ class EntityTracker:
             if self.hero is not None:
                 self.hero.misses += 1
                 self.hero.seen_now = False
-                if self.hero.misses > self.max_misses:
+                if self.hero.misses > self.hero_max_misses:
                     self.hero = None
             return
         if self.hero is None:
@@ -262,8 +300,8 @@ class EntityTracker:
 
     def _update_enemies(self, points, t: float) -> None:
         live = list(self.enemies.values()) + self._pending
-        gate = self.gate_for(t, live)
-        matched, fresh = _greedy_match([tr.predict(t) for tr in live], points, gate)
+        gates = [self.gate_for(t, [tr]) for tr in live]
+        matched, fresh = _greedy_match([tr.predict(t) for tr in live], points, gates)
         for ti, pi in matched.items():
             self._advance(live[ti], points[pi], t)
         for ti, tr in enumerate(live):
@@ -286,6 +324,8 @@ class EntityTracker:
             vy = (pos[1] - tr.pos[1]) / dt
             a = self.vel_alpha if tr.hits > 1 else 1.0   # first measurement has nothing to blend
             tr.vel = (a * vx + (1 - a) * tr.vel[0], a * vy + (1 - a) * tr.vel[1])
+        tr.reacquired = (tr.misses, math.hypot(pos[0] - tr.pos[0], pos[1] - tr.pos[1])) \
+            if tr.misses else None
         tr.pos = pos
         tr.t = t
         tr.hits += 1
@@ -324,7 +364,10 @@ class EntityTracker:
     # -- interface -----------------------------------------------------------
 
     def gate_for(self, t: float, tracks) -> float:
-        """Association radius in tiles, for the largest gap any live track is spanning.
+        """Association radius in tiles, for the largest gap any of `tracks` is spanning.
+        `_update_enemies` asks once per track, so each gate is sized from that track's own gap: a
+        long-lost enemy must not widen a fresh track's gate (one coasting 3 s would give every
+        visible enemy a 9-tile gate).
 
         Scales with the ACTUAL elapsed time rather than a nominal 0.25 s: a dropped frame or a
         slow decision widens the true step, and a gate sized for the nominal rate would then

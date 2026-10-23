@@ -41,14 +41,22 @@ run:
   # 125M curriculum cap and the idle super's tap-to-fire aim, which the live super now mirrors
   # (a bare tap, control/buttons.py). The 09-25 run stays playable with
   # `--run runs/mortis_ppo-20260925-194025`.
-  # Repointed 2026-10-08 to the first run trained on SIM_ISSUES_PLAN.md's sim: bots that path
-  # round walls and tap-aim, final-4 campers that hunt, 8000-HP crates hit once per dash, the
+  # Repointed 2026-10-08 to the first run trained on archive/SIM_ISSUES_PLAN.md's sim: bots that
+  # path round walls and tap-aim, final-4 campers that hunt, 8000-HP crates hit once per dash, the
   # 99-cube cap, the `move_reversal` cost, and slow projectiles read as still, as the live tracker
   # reports them (its train.yaml carries `observation.projectile_static_speed: 2.0`). It ended in
   # the elite stage, the last two advances forced at the 125M cap. best_model.zip is the 580M
   # eval: 0.333 across the six tiers, 0.347 at hard, 0.043 at elite, 300 episodes per tier.
   # The 09-30 run stays playable with `--run runs/mortis_ppo-20260930-182748`.
-  dir: runs/mortis_ppo-20261007-161117
+  # Repointed 2026-10-13 to the first deploy6 run (archive/CRITIC_AND_MEMORY_PLAN.md): last-seen
+  # enemy rows with an age under `memory.*`, kept by tracks that coast 12 decisions (3 s, its
+  # train.yaml's `slots.max_misses`, which the loop hands the tracker), and a privileged critic the
+  # live loop never feeds -- its inputs stay zero, and only the actor decides. 400M steps at the 83M
+  # curriculum cap, ending in the elite stage. best_model.zip is the 400M eval: 0.424 across the
+  # six tiers, 0.53 at hard, 0.06 at elite, 0.391 on the holdout maps, 300 episodes per tier; the
+  # critic's explained variance reached 0.70 against the old runs' ~0.48 plateau. The 10-08 run
+  # stays playable with `--run runs/mortis_ppo-20261007-161117`.
+  dir: runs/mortis_ppo-20261012-082348
   checkpoint: best_model.zip
 
 policy:
@@ -198,7 +206,7 @@ telemetry:
   # survive into an unattended run.
   frame_dump: 0
 
-map:                      # KNOWN_MAP_LOCALIZATION_PLAN.md
+map:                      # archive/KNOWN_MAP_LOCALIZATION_PLAN.md
   # The hand-labelled map the match is played on, brawl_deployment/data/maps/<name>.csv. null
   # keeps the map-agnostic terrain: the occupancy map, in odometry's frame on the crate lattice.
   # Named, the loop finds the camera on the label, hands out the map frame (world = map tile - 30)

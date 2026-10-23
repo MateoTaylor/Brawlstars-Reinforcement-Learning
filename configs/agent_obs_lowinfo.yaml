@@ -13,7 +13,9 @@
 #
 # This file applies the rule to enemy KIND and projectile TYPE only. The fields it keeps that fail
 # the rule field by field (hero.cubes, entities.cubes / can_attack / dashing, and hp_frac on both
-# sides) are what configs/agent_obs_deploy.yaml removes or replaces.
+# sides) are what the deploy specs remove or replace. configs/agent_obs_deploy6.yaml is the one in
+# use, and tests/test_configs_files.py pins it against this file (the five before it are in
+# archive/configs/).
 #
 # Relative to configs/agent_obs.yaml, exactly two groups differ:
 #

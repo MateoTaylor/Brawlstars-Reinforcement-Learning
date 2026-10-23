@@ -9,10 +9,12 @@ deployment.
 resolves each `GroupSpec.shape` against a real `cfg` through `obs_schema.obs_spec(cfg)`.
 
 **Per-entity groups** take their axis from the fields' one shared dotted prefix, never from the
-group name. `entities.*` drops hero slot 0 (`E - 1` rows); any other axis keeps every slot.
-Under `fair: true` only the prefixes in `_FAIRNESS_MASK_FIELD` are gated: `entities.*` by
-`entities.revealed_to_hero`, `projectiles.*` by `projectiles.in_view`. Any other axis
-(`boxes.*`, `pickups.*`) passes ungated, although it has an `in_view` field.
+group name. `entities.*` and `memory.*` drop hero slot 0 (`E - 1` rows); any other axis keeps
+every slot. Under `fair: true` only the prefixes in `_FAIRNESS_MASK_FIELD` are gated:
+`entities.*` by `entities.revealed_to_hero`, `memory.*` by `memory.tracked`, `projectiles.*` by
+`projectiles.in_view`. Any other axis (`boxes.*`, `pickups.*`) passes ungated, although it has an
+`in_view` field. `memory.*` is the hero's last sighting of each enemy (core/observation.py), so
+its gate keeps a row for as long as the enemy holds its slot, seen or not.
 
 **`max_slots`** keeps the K rows with the smallest `<prefix>.time_to_closest` (it and
 `<prefix>.rel_pos` must exist; checked at load). Ties are the common case, since everything
@@ -37,7 +39,15 @@ seconds, unscaled).
 while the slot is empty, and the fairness mask is gathered the same way. Row identity follows
 the live `EntityTracker` (a slot is taken on the `cfg.slots_promote_hits`-th consecutive
 sighting and kept through `cfg.slots_max_misses` unseen decisions); deployment writes the
-identity permutation (`assemble._put_entities`). Hero axis only, and never with `max_slots`.
+identity permutation (`assemble._put_entities`). `entities.*` or `memory.*` only, never with
+`max_slots`, and required for `memory.*`, whose rows exist only for slotted enemies.
+
+**`critic:`** is a second list of groups, in the same syntax, for the value head only
+(wrappers/sb3_policy.py). They may read `entities.privileged.*`, skip the fair gate (a per-entity
+row is multiplied by its axis's `alive` instead, so a dead entity reads 0), are float32 rows in
+entity order (no `slots`, `max_slots` or `view_channels`), and are named `critic_*`.
+`build_agent_obs(critic=False)`, which deployment uses, never writes them: live play leaves them
+at the zeros `make_agent_obs_buffers` made, and nothing on the action side reads them.
 
 **`normalize: true`** divides four units by one constant each, chosen so the largest value the
 sim produces lands near 1.0 (the derivations sit beside the constants):
@@ -66,6 +76,7 @@ import yaml
 from . import obs_schema
 
 _MAX_GROUPS = 6  # each group costs its own device->host copy (wrappers/sb3_vecenv.py)
+_MAX_CRITIC_GROUPS = 2  # the same copy, for the value head's inputs
 
 # The 12 base `_build_grid` channels (core/observation.py), by name -> index; `channel_index(cfg)`
 # appends "enemy_hist1".."enemy_histK" (K = cfg.history_frames). `fair: true` specs may not name
@@ -79,8 +90,10 @@ _CHANNEL_INDEX = {
 _UNFAIR_GRID_CHANNELS = ("enemy_any", "enemy_hidden")
 _HISTORY_CHANNEL_PREFIX = "enemy_hist"  # brawl_deployment/perception/grid.py imports it
 
-_HERO_AXIS_PREFIX = "entities"  # the only per-entity axis with a hero slot to drop
-_FAIRNESS_MASK_FIELD = {"entities": "entities.revealed_to_hero", "projectiles": "projectiles.in_view"}
+_HERO_AXIS_PREFIXES = ("entities", "memory")  # the per-entity axes with a hero slot to drop
+_FAIRNESS_MASK_FIELD = {
+    "entities": "entities.revealed_to_hero", "memory": "memory.tracked", "projectiles": "projectiles.in_view",
+}
 
 _NORM_DIVISOR_TILES = lambda cfg: float(max(cfg.map_w, cfg.map_h))
 # Divisor for `normalize: true`'s "tiles/s" fields, from configs/brawlers.yaml: Mortis's charged
@@ -137,6 +150,7 @@ class GroupSpec:
     channel_idx: tuple | None = None               # resolved view-channel indices, grid groups only
     entity_prefix: str | None = None                # shared dotted prefix of `fields`, per_entity groups only
     norm_scale: tuple | None = None                 # per-output-column normalize divisor, if spec.normalize
+    critic: bool = False                            # a `critic:` group: value head only, never gated by fair
 
 
 @dataclass(frozen=True)
@@ -144,6 +158,11 @@ class AgentObsSpec:
     fair: bool
     groups: tuple
     normalize: bool
+    critic_groups: tuple = ()                       # the spec's `critic:` section, value head only
+
+    @property
+    def all_groups(self) -> tuple:
+        return self.groups + self.critic_groups
 
 
 def _entity_prefix(fields: tuple) -> str:
@@ -170,89 +189,113 @@ def load_agent_spec(path, cfg) -> AgentObsSpec:
     normalize = bool(raw["normalize"])
     spec_fields = obs_schema.obs_spec(cfg)
 
-    groups = []
-    seen_names = set()
-    for g in raw["groups"]:
-        name = g["name"]
-        if name in seen_names:
-            raise ValueError(f"duplicate agent_obs group name {name!r}")
-        seen_names.add(name)
-        dtype = g.get("dtype", "float32")
-        if dtype not in ("float32", "uint8"):
-            raise ValueError(f"group {name!r}: dtype must be 'float32' or 'uint8', got {dtype!r}")
-
-        view_channels = g.get("view_channels")
-        if view_channels is not None:
-            groups.append(_load_grid_group(name, dtype, view_channels, fair, cfg))
-            continue
-
-        fields = tuple(g["fields"])
-        for f in fields:
-            if f.startswith("entities.privileged."):
-                raise ValueError(
-                    f"group {name!r}: field {f!r} is under entities.privileged and must NEVER "
-                    "be exposed to the agent"
-                )
-            if f.startswith("slots."):
-                raise ValueError(
-                    f"group {name!r}: field {f!r} is the slot bookkeeping `slots: tracked` reads "
-                    "(core/slots.py), not an observation"
-                )
-            if f not in spec_fields:
-                raise ValueError(f"group {name!r}: unknown field {f!r} (not present in obs_spec(cfg))")
-
-        per_entity = bool(g.get("per_entity", False))
-        max_slots = g.get("max_slots")
-        entity_prefix = _entity_prefix(fields) if per_entity else None
-        slots = g.get("slots")
-        if slots is not None:
-            if slots != "tracked":
-                raise ValueError(f"group {name!r}: slots must be omitted or 'tracked', got {slots!r}")
-            if not per_entity or entity_prefix != _HERO_AXIS_PREFIX:
-                raise ValueError(
-                    f"group {name!r}: slots: tracked is only defined for a per_entity "
-                    f"{_HERO_AXIS_PREFIX}.* group (core/slots.py slots enemies, nothing else)"
-                )
-            if max_slots is not None:
-                raise ValueError(f"group {name!r}: slots: tracked and max_slots are both row orders; pick one")
-        if max_slots is not None:
-            if not per_entity:
-                raise ValueError(f"group {name!r}: max_slots is only meaningful when per_entity: true")
-            for key in ("time_to_closest", "rel_pos"):  # the sort key, then its tie-break
-                sort_field = f"{entity_prefix}.{key}"
-                if sort_field not in spec_fields:
-                    raise ValueError(
-                        f"group {name!r}: max_slots requires a {sort_field!r} field to sort by")
-
-        width = sum(_field_width(spec_fields[f].shape, per_entity) for f in fields)
-        if per_entity:
-            axis_full = spec_fields[fields[0]].shape[1]
-            n_slots = max_slots if max_slots is not None else (
-                axis_full - 1 if entity_prefix == _HERO_AXIS_PREFIX else axis_full
-            )
-            shape = (n_slots, width)
-        else:
-            shape = (width,)
-
-        norm_scale = None
-        if normalize and dtype == "float32":
-            scale = []
-            for f in fields:
-                divisor = _norm_divisor(spec_fields[f].units, cfg)
-                scale.extend([divisor] * _field_width(spec_fields[f].shape, per_entity))
-            norm_scale = tuple(scale)
-
-        groups.append(GroupSpec(
-            name=name, dtype=dtype, shape=shape, fields=fields, per_entity=per_entity,
-            max_slots=max_slots, slots=slots, entity_prefix=entity_prefix, norm_scale=norm_scale,
-        ))
+    names = set()
+    groups = tuple(_load_group(g, names, fair, normalize, spec_fields, cfg, critic=False)
+                   for g in raw["groups"])
+    critic_groups = tuple(_load_group(g, names, fair, normalize, spec_fields, cfg, critic=True)
+                          for g in raw.get("critic") or ())
 
     if len(groups) > _MAX_GROUPS:
         raise ValueError(f"agent_obs spec has {len(groups)} groups; keep it <= {_MAX_GROUPS} (each group is one host copy per step)")
     if not groups:
         raise ValueError("agent_obs spec has no groups")
+    if len(critic_groups) > _MAX_CRITIC_GROUPS:
+        raise ValueError(f"agent_obs spec has {len(critic_groups)} critic groups; keep it <= {_MAX_CRITIC_GROUPS}")
 
-    return AgentObsSpec(fair=fair, groups=tuple(groups), normalize=normalize)
+    return AgentObsSpec(fair=fair, groups=groups, normalize=normalize, critic_groups=critic_groups)
+
+
+def _load_group(g: dict, names: set, fair: bool, normalize: bool, spec_fields: dict, cfg,
+                critic: bool) -> GroupSpec:
+    """One `groups:` entry, or one `critic:` entry when `critic` (module docstring). MUTATES
+    `names`, which keeps group names unique across both lists."""
+    name = g["name"]
+    if name in names:
+        raise ValueError(f"duplicate agent_obs group name {name!r}")
+    names.add(name)
+    dtype = g.get("dtype", "float32")
+    if dtype not in ("float32", "uint8"):
+        raise ValueError(f"group {name!r}: dtype must be 'float32' or 'uint8', got {dtype!r}")
+    if critic:
+        if not name.startswith("critic_"):
+            raise ValueError(f"critic group {name!r}: a critic group's name must start with 'critic_'")
+        refused = [key for key in ("slots", "max_slots", "view_channels") if g.get(key) is not None]
+        if refused or dtype != "float32":
+            raise ValueError(
+                f"critic group {name!r}: critic groups are float32 rows in entity order, so "
+                f"{refused or ['dtype ' + dtype]} is refused")
+
+    view_channels = g.get("view_channels")
+    if view_channels is not None:
+        return _load_grid_group(name, dtype, view_channels, fair, cfg)
+
+    fields = tuple(g["fields"])
+    for f in fields:
+        if f.startswith("entities.privileged.") and not critic:
+            raise ValueError(
+                f"group {name!r}: field {f!r} is under entities.privileged and must NEVER "
+                "be exposed to the agent"
+            )
+        if f.startswith("slots."):
+            raise ValueError(
+                f"group {name!r}: field {f!r} is the slot bookkeeping `slots: tracked` reads "
+                "(core/slots.py), not an observation"
+            )
+        if f not in spec_fields:
+            raise ValueError(f"group {name!r}: unknown field {f!r} (not present in obs_spec(cfg))")
+
+    per_entity = bool(g.get("per_entity", False))
+    max_slots = g.get("max_slots")
+    entity_prefix = _entity_prefix(fields) if per_entity else None
+    slots = g.get("slots")
+    if slots is not None:
+        if slots != "tracked":
+            raise ValueError(f"group {name!r}: slots must be omitted or 'tracked', got {slots!r}")
+        if not per_entity or entity_prefix not in _HERO_AXIS_PREFIXES:
+            raise ValueError(
+                f"group {name!r}: slots: tracked is only defined for a per_entity entities.* or "
+                "memory.* group (core/slots.py slots enemies, nothing else)"
+            )
+        if max_slots is not None:
+            raise ValueError(f"group {name!r}: slots: tracked and max_slots are both row orders; pick one")
+    elif entity_prefix == "memory":
+        raise ValueError(
+            f"group {name!r}: a memory.* group needs slots: tracked (its rows exist only for "
+            "slotted enemies, and live has no entity order to reproduce)")
+    if max_slots is not None:
+        if not per_entity:
+            raise ValueError(f"group {name!r}: max_slots is only meaningful when per_entity: true")
+        for key in ("time_to_closest", "rel_pos"):  # the sort key, then its tie-break
+            sort_field = f"{entity_prefix}.{key}"
+            if sort_field not in spec_fields:
+                raise ValueError(
+                    f"group {name!r}: max_slots requires a {sort_field!r} field to sort by")
+    if critic and per_entity and f"{entity_prefix}.alive" not in spec_fields:
+        raise ValueError(f"critic group {name!r}: its rows are masked by {entity_prefix}.alive, which does not exist")
+
+    width = sum(_field_width(spec_fields[f].shape, per_entity) for f in fields)
+    if per_entity:
+        axis_full = spec_fields[fields[0]].shape[1]
+        n_slots = max_slots if max_slots is not None else (
+            axis_full - 1 if entity_prefix in _HERO_AXIS_PREFIXES else axis_full
+        )
+        shape = (n_slots, width)
+    else:
+        shape = (width,)
+
+    norm_scale = None
+    if normalize and dtype == "float32":
+        scale = []
+        for f in fields:
+            divisor = _norm_divisor(spec_fields[f].units, cfg)
+            scale.extend([divisor] * _field_width(spec_fields[f].shape, per_entity))
+        norm_scale = tuple(scale)
+
+    return GroupSpec(
+        name=name, dtype=dtype, shape=shape, fields=fields, per_entity=per_entity,
+        max_slots=max_slots, slots=slots, entity_prefix=entity_prefix, norm_scale=norm_scale,
+        critic=critic,
+    )
 
 
 def channel_index(cfg) -> dict:
@@ -298,7 +341,7 @@ def _norm_divisor(units: str, cfg) -> float:
 
 def agent_space(spec: AgentObsSpec, cfg) -> gym.spaces.Dict:
     spaces = {}
-    for g in spec.groups:
+    for g in spec.all_groups:
         if g.dtype == "uint8":
             spaces[g.name] = gym.spaces.Box(low=0, high=255, shape=g.shape, dtype=np.uint8)
         else:
@@ -311,7 +354,8 @@ def make_agent_obs_buffers(spec: AgentObsSpec, cfg, n_envs: int, device) -> dict
     (`wrappers/sb3_vecenv.py`, `wrappers/gym_single.py`, brawl_deployment's assemble.py) and
     reused every call, so the output tensors are never reallocated."""
     torch_dtype = {"float32": torch.float32, "uint8": torch.uint8}
-    return {g.name: torch.zeros((n_envs, *g.shape), dtype=torch_dtype[g.dtype], device=device) for g in spec.groups}
+    return {g.name: torch.zeros((n_envs, *g.shape), dtype=torch_dtype[g.dtype], device=device)
+            for g in spec.all_groups}
 
 
 def agent_obs_index_map(spec: AgentObsSpec, cfg) -> dict:
@@ -320,7 +364,7 @@ def agent_obs_index_map(spec: AgentObsSpec, cfg) -> dict:
     not read by build_agent_obs itself (which reconstructs the same concatenation directly)."""
     spec_fields = obs_schema.obs_spec(cfg)
     out = {}
-    for g in spec.groups:
+    for g in spec.all_groups:
         if g.view_channels is not None:
             out[g.name] = {f"view[{ch}]": (i, i + 1) for i, ch in enumerate(g.view_channels)}
             continue
@@ -373,7 +417,7 @@ def _nearest_first(priority: torch.Tensor, rel_pos: torch.Tensor, k: int) -> tor
 
 
 def _build_entity_group(full_obs: dict, g: GroupSpec, fair: bool) -> torch.Tensor:
-    drop_hero = g.entity_prefix == _HERO_AXIS_PREFIX
+    drop_hero = g.entity_prefix in _HERO_AXIS_PREFIXES
     parts = []
     for f in g.fields:
         t = _ensure_trailing_dim(_get_field(full_obs, f), per_entity=True)
@@ -399,15 +443,17 @@ def _build_entity_group(full_obs: dict, g: GroupSpec, fair: bool) -> torch.Tenso
         valid = (ent > 0).to(torch.float32).unsqueeze(-1)
         out = torch.gather(out, 1, idx.unsqueeze(-1).expand(-1, -1, out.shape[-1])) * valid
 
-    if fair:
-        mask_field = _FAIRNESS_MASK_FIELD.get(g.entity_prefix)
-        if mask_field is not None:
-            mask = _get_field(full_obs, mask_field)
-            if drop_hero:
-                mask = mask[:, 1:]
-            if idx is not None:
-                mask = torch.gather(mask, 1, idx)
-            out = out * mask.to(torch.float32).unsqueeze(-1)
+    if g.critic:   # the true state, for the value head: every living entity, seen or not
+        mask_field = f"{g.entity_prefix}.alive"
+    else:
+        mask_field = _FAIRNESS_MASK_FIELD.get(g.entity_prefix) if fair else None
+    if mask_field is not None:
+        mask = _get_field(full_obs, mask_field)
+        if drop_hero:
+            mask = mask[:, 1:]
+        if idx is not None:
+            mask = torch.gather(mask, 1, idx)
+        out = out * mask.to(torch.float32).unsqueeze(-1)
 
     return out
 
@@ -447,9 +493,12 @@ def _slow_projectiles_still(full_obs: dict, cfg) -> dict:
     return {**full_obs, "projectiles": {**prj, **still}}
 
 
-def build_agent_obs(full_obs: dict, spec: AgentObsSpec, cfg, out_buffers: dict) -> dict:
+def build_agent_obs(full_obs: dict, spec: AgentObsSpec, cfg, out_buffers: dict,
+                    critic: bool = True) -> dict:
+    """Writes every group into `out_buffers` and returns it. `critic`: the spec's critic groups
+    too. Deployment passes False: its full obs has no true state, and those buffers stay zero."""
     full_obs = _slow_projectiles_still(full_obs, cfg)
-    for g in spec.groups:
+    for g in (spec.all_groups if critic else spec.groups):
         if g.view_channels is not None:
             out_buffers[g.name].copy_(_build_grid_group(full_obs, g))
             continue

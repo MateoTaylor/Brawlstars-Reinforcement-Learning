@@ -3,9 +3,9 @@
 `projectile_detection/detect.py` names the gap this fills, in its own words: *"projectiles are the
 one thing in this game where a track across frames carries information the single frame does not
 -- direction, speed, and therefore where it will be in 250 ms. This class deliberately does not
-attempt that."* Two of the four fields `configs/agent_obs_deploy.yaml` asks for --
-`projectiles.vel` and `projectiles.time_to_closest` -- are that information and nothing else. No
-detector can supply either.
+attempt that."* Two of the four fields `configs/agent_obs_deploy6.yaml`'s projectile group asks
+for -- `projectiles.vel` and `projectiles.time_to_closest` -- are that information and nothing
+else. No detector can supply either.
 
 #### Why this is not `EntityTracker` with different constants
 
@@ -129,8 +129,8 @@ What these rules do not catch:
 
 #### What is deliberately NOT here
 
-No kind, no owner, no damage, no radius. `agent_obs_deploy.yaml` asks for four fields and calls a
-projectile *"a moving dot and nothing more"*; the detector says only "Projectile" and could not
+No kind, no owner, no damage, no radius. The spec asks for four fields (the first deploy spec called
+a projectile *"a moving dot and nothing more"*); the detector says only "Projectile" and could not
 supply more if the spec wanted it. The model's other two classes, crates and dropped cubes, are
 `loot.py`'s: the loop hands both consumers the same list and each keeps its own label.
 """

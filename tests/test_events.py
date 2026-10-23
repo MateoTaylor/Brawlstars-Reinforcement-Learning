@@ -138,27 +138,25 @@ def test_damage_matrix_row_sums_equal_damage_dealt_tick():
 
 # ---- kills_tick matches a manual count over a scripted rollout (acceptance) --------------
 
-def test_kills_tick_matches_manual_count_over_scripted_rollout():
+def test_kills_tick_credits_each_kill_to_its_killer_and_a_zone_death_to_no_one():
+    """A scripted roster: bot 1 kills bot 3, bot 2 dies to the zone, then the hero kills bot 1,
+    each death written the way apply_damage leaves one (hp 0, last_hit_by the killer or -1). The
+    tally must be [1, 1, 0, 0], summed over every tick, quiet ones included, and the cumulative
+    ent_kills must agree. Until 2026-10-20 every scripted kill was the hero's and none was a zone
+    death, and the only check was parity with ent_kills, whose credit rule events.py replays
+    line for line -- so crediting every kill to the hero, or dropping the `last_hit_by >= 0`
+    mask (a zone death then lands on entity 0 via clamp(-1, min=0)), passed."""
     cfg, params = _cfg_and_params(n_enemies=3)
     state = _fresh_state(cfg, params)
-    n_envs = 1
+    total_kills_tick = torch.zeros(1, cfg.n_entities, dtype=torch.int32)
+    script = {40: (3, 1), 80: (2, -1), 120: (1, 0)}   # step: (victim, last_hit_by)
 
-    torch.manual_seed(0)
-    total_kills_tick = torch.zeros(n_envs, cfg.n_entities, dtype=torch.int32)
-
-    for step in range(500):
+    for step in range(121):
         state.step_count.fill_(step)
-        # every ~40 ticks, entity (step//40 % 3)+1 "kills" a random other alive victim by
-        # zeroing its hp and crediting last_hit_by, mimicking what apply_damage would have done
-        if step % 40 == 0 and step > 0:
-            alive_idx = torch.nonzero(state.ent_alive[0], as_tuple=False).squeeze(-1)
-            if alive_idx.numel() >= 2:
-                killer = alive_idx[0].item()
-                victim = alive_idx[-1].item()
-                if killer != victim:
-                    state.ent_hp[0, victim] = 0.0
-                    state.ent_last_hit_by[0, victim] = killer
-
+        if step in script:
+            victim, killer = script[step]
+            state.ent_hp[0, victim] = 0.0
+            state.ent_last_hit_by[0, victim] = killer
         newly_dead = combat.resolve_deaths(state, cfg)
         info = events.compute_info(
             state, _zeros_by(cfg), newly_dead, torch.zeros_like(state.box_alive),
@@ -166,11 +164,9 @@ def test_kills_tick_matches_manual_count_over_scripted_rollout():
         )
         total_kills_tick += info["kills_tick"]
 
-        if not bool(state.ent_alive[0, 0]) or int(state.n_alive[0]) <= 1:
-            break
-
+    assert int(state.n_alive[0]) == 1 and bool(state.ent_alive[0, 0])
+    assert total_kills_tick[0].tolist() == [1, 1, 0, 0]
     assert torch.equal(total_kills_tick, state.ent_kills)
-    assert int(total_kills_tick.sum()) > 0  # sanity: the scripted rollout actually killed someone
 
 
 def test_deaths_tick_and_death_cause_tick():

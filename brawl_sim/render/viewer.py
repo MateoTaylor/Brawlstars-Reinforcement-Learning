@@ -582,6 +582,9 @@ def _parse_args(argv=None):
     p.add_argument("--video", default=None,
                    help="write the replay to this .mp4 or .gif instead of opening the "
                         "interactive viewer (see ReplayViewer.save for what .mp4 needs)")
+    p.add_argument("--dpi", type=int, default=150,
+                   help="--video resolution: the figure is at most 12 x 12 in (4 tiles an inch), "
+                        "so 150 gives up to 1800 x 1800 px and 300 up to 3600 x 3600")
     return p.parse_args(argv)
 
 
@@ -599,7 +602,7 @@ def main(argv=None) -> int:
 
     viewer = ReplayViewer(frames, bank, cfg, fps=args.fps)
     if args.video:
-        viewer.save(args.video, fps=args.fps)
+        viewer.save(args.video, fps=args.fps, dpi=args.dpi)
         print(f"[viewer] wrote {args.video}")
     else:
         viewer.show()

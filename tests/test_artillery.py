@@ -5,6 +5,9 @@ ported: `artillery._cover_direction` no longer exists. It was movement, it cost 
 n_envs=1024, and steering artillery into cover made it a third archetype that broke contact
 instead of applying pressure -- see bots/personality.py's module docstring for the full
 reasoning.
+
+The no-NaN loop that lived here is one all-kinds test in tests/test_combat_rules.py since
+2026-10-20.
 """
 import torch
 
@@ -96,27 +99,6 @@ def test_lead_uses_the_shell_s_fixed_flight_time_not_its_speed():
         assert torch.allclose(aim_point[0, 1], expected, atol=1e-4)
 
 
-def test_no_nan_in_combat_output_ever():
-    cfg, params, gen = cfg_and_params(n_envs=8, n_enemies=3)
-    state = fresh_state(cfg, params, n_envs=8, enemy_kind=Kind.BOT_ARTILLERY)
-    tiles = grid(20, 20)
-    tiles[9, 9] = Tile.WALL
-    bank = FakeBank(tiles)
-
-    for _ in range(300):
-        state.ent_pos.uniform_(1, 19)
-        state.ent_hp.uniform_(0, 1)
-        state.ent_hp.mul_(state.ent_max_hp)
-        state.ent_alive.copy_(torch.rand(state.ent_alive.shape) > 0.3)
-        state.ent_ammo.uniform_(0, 5)
-        state.ent_target.random_(-1, cfg.n_entities)
-
-        _vis, tgt = build_targeting(state, bank, params, cfg)
-        _fire, aim_dir, aim_point = combat_rules.combat(state, tgt, bank, params, cfg, gen)
-        for t in (aim_dir, aim_point):
-            assert torch.all(torch.isfinite(t))
-
-
 # ---- full-loop acceptance ----------------------------------------------------------
 
 def test_kiting_artillery_reaches_and_holds_range_and_lands_a_hit():
@@ -143,26 +125,40 @@ def test_kiting_artillery_reaches_and_holds_range_and_lands_a_hit():
             dist = geo.dist(state.ent_pos[0, 0], state.ent_pos[0, 1]).item()
             assert (desired - 4.0) <= dist <= (desired + 4.0)
 
-    assert hit_tick is not None and hit_tick < 200
+    assert hit_tick is not None, "the kiting artillery never landed a hit"
 
 
 def test_never_misses_stationary_target_at_half_range_with_zero_noise():
+    """ONE shell, and its blast lands on the target for the shell's full damage. Shards are
+    switched off so the damage read is the blast alone.
+
+    `_run_tick` books no ammo or cooldown (env._attack_phase does that), so the single shot is
+    enforced here by emptying the clip once the bot fires. Until 2026-10-20 it was not: the bot
+    fired every decision tick, and this passed if any of ~20 shells connected."""
     cfg, params, gen = cfg_and_params(n_enemies=1)
     state = fresh_state(cfg, params, enemy_kind=Kind.BOT_ARTILLERY)
     bank = FakeBank(grid(20, 20))
-    params.aim_noise_tiles[:, int(Kind.BOT_ARTILLERY)] = 0.0
+    k = int(Kind.BOT_ARTILLERY)
+    params.aim_noise_tiles[:, k] = 0.0
+    params.split_damage_fraction[:, k] = 0.0  # no shards: the blast is the shot being checked
 
-    attack_range = params.attack_range[0, int(Kind.BOT_ARTILLERY)].item()
+    attack_range = params.attack_range[0, k].item()
     state.ent_pos[0, 0] = torch.tensor([10.0, 10.0])
     state.ent_pos[0, 1] = torch.tensor([10.0, 10.0 + 0.5 * attack_range])
 
-    hit = False
+    fired, damage = False, 0.0
     for _ in range(80):
-        _intent, dmg_ent = _run_tick(state, bank, params, cfg, gen)
-        if dmg_ent[0, 0].item() > 0:
-            hit = True
+        intent, dmg_ent = _run_tick(state, bank, params, cfg, gen)
+        if not fired and bool(intent.fire[0, 1]):
+            fired = True
+            state.ent_ammo[0, 1] = 0.0          # that was the shot: no ammo, and no reload
+            params.reload_seconds[:, k] = 1e9
+        damage = dmg_ent[0, 0].item()
+        if damage > 0:
             break
         state.ent_pos[0, 0] = torch.tensor([10.0, 10.0])
         state.ent_pos[0, 1] = torch.tensor([10.0, 10.0 + 0.5 * attack_range])
 
-    assert hit
+    assert fired, "the artillery never fired"
+    full = stats.effective_damage(state.ent_kind, state.ent_cubes, params)[0, 1].item()
+    assert abs(damage - full) < 1e-3, f"the one shell's blast dealt {damage}, not its full {full}"

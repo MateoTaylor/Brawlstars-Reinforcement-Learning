@@ -85,7 +85,7 @@ def test_snapshot_is_cpu_numpy():
 
 def test_action_latency_ring_buffer_mechanics():
     # dt=0.05 -> action_latency_seconds=0.1 gives exactly 2 ticks of delay, L=3.
-    env = _tiny_env(n_envs=4, overrides={"sim": {"action_latency_seconds": 0.1}})
+    env = _tiny_env(n_envs=4, overrides=_sim(action_latency_seconds=0.1))
     assert env.cfg.action_latency_ticks == 2
     env.reset()
     assert env.state.act_buf.shape[1] == 3
@@ -98,9 +98,12 @@ def test_action_latency_ring_buffer_mechanics():
     eff1 = env._pop_action_buffer(a1)
     eff2 = env._pop_action_buffer(a2)  # should surface a0, written 2 ticks ago
 
+    # the first two reads hit the slots reset zeroed: idle, never a not-yet-due action
+    assert not eff0.any() and not eff1.any()
     assert torch.equal(eff2, a0)
+    assert torch.equal(env._pop_action_buffer(a0), a1)  # the head wrapped: still 2 behind
     # at 0 ticks it's a pass-through
-    env2 = _tiny_env(n_envs=4, overrides={"sim": {"action_latency_seconds": 0.0}})
+    env2 = _tiny_env(n_envs=4, overrides=_sim(action_latency_seconds=0.0))
     assert env2.cfg.action_latency_ticks == 0
     env2.reset()
     eff = env2._pop_action_buffer(a0)
@@ -191,20 +194,20 @@ def test_override_drives_a_non_hero_entity_exactly():
 
 
 def test_override_with_negative_one_sentinel_is_a_no_op():
+    """Two envs built alike step bit-identically (tests/test_integration.py pins that), so an
+    all-sentinel override must leave every state tensor exactly where `override=None` does."""
     env = _tiny_env(n_envs=4, overrides={"entities": {"n_enemies": 2}})
-    env.reset()
-    E = env.cfg.n_entities
-    override_all_off = torch.full((4, E, 2), -1, dtype=torch.int64)
-    obs1, *_ = env.step(_idle_action(4), override=None)
     env2 = _tiny_env(n_envs=4, overrides={"entities": {"n_enemies": 2}})
+    env.reset()
     env2.reset()
-    obs2, *_ = env2.step(_idle_action(4), override=override_all_off)
-    # both runs use different envs (different RNG state histories aren't identical anyway since
-    # env vs env2 are separate instances) -- just check override=None and an all-sentinel
-    # override don't error and produce a structurally valid obs either way.
-    from brawl_sim.core import obs_schema
-    obs_schema.validate_obs(obs1, env.cfg)
-    obs_schema.validate_obs(obs2, env2.cfg)
+    override_all_off = torch.full((4, env.cfg.n_entities, 2), -1, dtype=torch.int64)
+    gen = torch.Generator().manual_seed(0)
+    for _ in range(3):
+        action = _random_action(4, gen)
+        env.step(action.clone(), override=None)
+        env2.step(action.clone(), override=override_all_off)
+    for name in env.state.__slots__:
+        assert torch.equal(getattr(env.state, name), getattr(env2.state, name)), name
 
 
 # ---- reveal on attack ------------------------------------------------------------------------
@@ -308,9 +311,11 @@ def test_a_hero_out_of_combat_heals_to_full_and_stops_there():
     # ~2500 HP/s against regen's 1600, so the heal never completes; worse, the hero pinned at 25%
     # can DIE inside a step, and the autoreset then re-samples params -- wiping the two fill_()
     # lines below and leaving the test measuring the shipped 0.13 rate against a 0.2 expectation.
+    # A short delay and a fast rate (they were 4.0 s and 0.2/s, 135 ticks; 2026-10-20): the
+    # curve's shape -- nothing inside the delay, a linear climb, a clamp at max -- is the same.
     env.params.base_damage[:, 1:] = 0.0
-    env.params.regen_delay.fill_(4.0)
-    env.params.regen_fraction_per_second.fill_(0.2)
+    env.params.regen_delay.fill_(0.5)
+    env.params.regen_fraction_per_second.fill_(1.0)
 
     max_hp = env.state.ent_max_hp[0, 0].item()
     env.state.ent_hp[0, 0] = 0.25 * max_hp
@@ -319,14 +324,14 @@ def test_a_hero_out_of_combat_heals_to_full_and_stops_there():
     idle = torch.tensor([[0, 0]], dtype=torch.int64)
     # Through the delay, nothing happens. Re-pin HP each tick so a stray bot shot can't confuse
     # the "is it healing yet" check.
-    for _ in range(int(3.0 / env.cfg.dt)):
+    for _ in range(int(0.4 / env.cfg.dt)):
         env.state.ent_hp[0, 0] = 0.25 * max_hp
         env.step(idle)
     assert env.state.ent_hp[0, 0].item() == pytest.approx(0.25 * max_hp, rel=1e-3)
 
-    # Now let it run: 0.2 of max per second means full from 25% in about 4 seconds.
+    # Now let it run: all of max per second means full from 25% in about 0.75 seconds.
     env.state.ent_out_of_combat_t[0, 0] = 99.0
-    for _ in range(int(6.0 / env.cfg.dt)):
+    for _ in range(int(1.0 / env.cfg.dt)):
         env.state.ent_out_of_combat_t[0, 0] = 99.0
         env.step(idle)
         if env.state.ent_hp[0, 0].item() >= max_hp:
@@ -409,7 +414,10 @@ def test_hero_last_alive_terminates_as_a_win():
     assert torch.all(info["hero_rank"] == 0)
 
 
-def test_truncation_at_step_limit():
+def test_truncation_latches_when_the_cap_is_crossed_on_a_decisions_first_tick():
+    """The cap is crossed on the FIRST of the decision's five ticks, which a count stepped from 0
+    only meets when max_episode_steps is not a multiple of action_repeat. The clock test below
+    covers caps met on a decision's last tick, and tests/test_action_repeat.py the boundary."""
     n_envs = 2
     env = _tiny_env(n_envs=n_envs)
     env.reset()
@@ -420,42 +428,92 @@ def test_truncation_at_step_limit():
     assert torch.all(obs["meta"]["step_count"] == 0)  # autoreset happened
 
 
-def test_episode_never_exceeds_step_limit_plus_one():
+def _full_width_action(env, gen, without=()):
+    """Random moves and the attack column over its WHOLE width (`cfg.action_nvec`), so supers
+    and gadgets fire too -- `_random_action` draws attacks from {0, 1} only. `without` takes
+    attack values out of the draw."""
+    n_move, n_attack = env.cfg.action_nvec
+    values = torch.tensor([v for v in range(n_attack) if v not in without])
+    return torch.stack([torch.randint(0, n_move, (env.n_envs,), generator=gen),
+                        values[torch.randint(0, len(values), (env.n_envs,), generator=gen)]], dim=1)
+
+
+def test_episode_never_runs_past_the_decision_that_crosses_the_step_limit():
+    """Every decision runs its whole `action_repeat` window, and only a finished env is reset
+    to 0: no episode outlasts the decision that crosses `max_episode_steps`, and a clock-only
+    end (truncated, not terminated) lands exactly at that decision's last tick. Two episode
+    lengths of decisions, so every env finishes at least twice."""
     n_envs = 4
     env = _tiny_env(n_envs=n_envs)
     env.reset()
+    repeat = env.cfg.action_repeat
+    last_tick = env.cfg.max_agent_steps * repeat
     gen = torch.Generator().manual_seed(0)
-    max_seen_before_reset = torch.zeros(n_envs, dtype=torch.int64)
-    prev_step_count = env.state.step_count.clone()
+    prev = env.state.step_count.to(torch.int64).clone()
+    n_done = torch.zeros(n_envs, dtype=torch.int64)
+    clock_only = 0
 
-    for _ in range(1000):
-        env.step(_random_action(n_envs, gen))
-        grew = env.state.step_count.to(torch.int64) - prev_step_count.to(torch.int64)
-        # step_count either grew by 1 (continuing) or dropped to 0 (autoreset)
-        continuing = env.state.step_count > 0
-        max_seen_before_reset = torch.maximum(max_seen_before_reset, prev_step_count.to(torch.int64))
-        prev_step_count = env.state.step_count.clone()
+    for _ in range(2 * env.cfg.max_agent_steps):
+        _obs, _reward, terminated, truncated, info = env.step(_random_action(n_envs, gen))
+        done = terminated | truncated
+        ended = info["final_observation"]["meta"]["step_count"].to(torch.int64)
+        now = env.state.step_count.to(torch.int64)
+        assert torch.equal(ended, prev + repeat)
+        assert torch.equal(now, torch.where(done, torch.zeros_like(now), ended))
+        assert torch.all(ended[done] <= last_tick)
+        assert torch.all(ended[truncated & ~terminated] == last_tick)
+        n_done += done.to(torch.int64)
+        clock_only += int((truncated & ~terminated).sum())
+        prev = now.clone()
 
-    assert int(max_seen_before_reset.max()) <= env.cfg.max_episode_steps + 1
+    assert int(n_done.min()) >= 2, n_done.tolist()
+    assert clock_only > 0, "every episode ended in a death or a win: the clock assert never ran"  # 3 at seed 0
 
 
 # ---- debug_checks invariants over a rollout -----------------------------------------------
 
 def test_debug_checks_invariants_hold_over_rollout():
-    env = _tiny_env(n_envs=8, overrides={"engine": {"debug_checks": True}})
+    """`check_invariants` after every decision raises on any violation. Wide rather than long:
+    64 envs for two episode lengths of decisions take every env through two full episodes and
+    their autoresets -- about the env-decisions 8 envs for 1000 decisions did, at a third of
+    the cost, since a decision costs nearly the same at 64 envs as at 8.
+
+    The attack column draws the gadget (value 3) as well as the attack, and the test counts the
+    throws so its path provably ran under the checks (~190 here, measured 2026-10-20). The super
+    (value 2) stays out: its piercing bolt can fly past the map border before its range runs
+    out, which `check_invariants` flags. The user accepted that bolt, unfixed (2026-10-21,
+    BRAWL_SIM_DESIGN.md §2's accepted divergences), so the super stays out of this draw."""
+    n_envs = 64
+    env = _tiny_env(n_envs=n_envs, overrides={"engine": {"debug_checks": True}})
+    assert env.cfg.debug_checks is True  # a misspelled override would make this test vacuous
+    assert env.cfg.action_nvec[1] >= 4  # 3 is the gadget: it must be drawable below
     env.reset()
     gen = torch.Generator().manual_seed(0)
-    for _ in range(1000):
-        env.step(_random_action(8, gen))  # raises on any invariant violation
+    throws = 0
+    cd_prev = env.state.ent_gadget_cd[:, 0].clone()
+    for _ in range(2 * env.cfg.max_agent_steps):
+        env.step(_full_width_action(env, gen, without=(2,)))
+        cd = env.state.ent_gadget_cd[:, 0]
+        throws += int((cd > cd_prev).sum())  # a throw is the one write that raises the timer
+        cd_prev = cd.clone()
+    assert throws > 0
 
 
 # ---- batched / no-NaN smoke, real (non-tiny) config ----------------------------------------
 
 def test_batched_smoke_default_config():
+    """Every float in the observation and the reward stays finite over two full episodes of the
+    real config (the whole map rotation, zone on). The reward is train.yaml's shaped one: the
+    env's default ZeroReward returned zeros, so its finiteness check could not fail."""
+    from brawl_sim.training.config import load_train_config
+    from brawl_sim.training.reward import ShapedReward
+
     cfg = load_config(CONFIGS_DEFAULT, overrides={"sim": {"max_episode_steps": 200}})
-    env = BrawlVecEnv(cfg, n_envs=16, device="cpu", seed=3)
+    reward_fn = ShapedReward(load_train_config("configs/train.yaml").reward)
+    env = BrawlVecEnv(cfg, n_envs=16, device="cpu", seed=3, reward_fn=reward_fn)
     env.reset()
     gen = torch.Generator().manual_seed(0)
+    nonzero = 0
 
     def _assert_finite(node):
         if isinstance(node, dict):
@@ -464,13 +522,15 @@ def test_batched_smoke_default_config():
         elif torch.is_tensor(node) and node.is_floating_point():
             assert torch.isfinite(node).all()
 
-    for _ in range(300):
-        obs, reward, terminated, truncated, info = env.step(_random_action(16, gen))
+    for _ in range(2 * cfg.max_agent_steps):
+        obs, reward, terminated, truncated, info = env.step(_full_width_action(env, gen))
         _assert_finite(obs)
         _assert_finite(reward)
+        nonzero += int((reward != 0).sum())
+    assert nonzero > 0   # ~490 of the 1280 env-decisions, measured 2026-10-20
 
 
-# ---- super charge vs the gadget ------------------------------------------------------------
+# ---- super charge: dash hits charge it -----------------------------------------------------
 
 def _one_enemy_duel(enemy_at):
     """A per-tick tiny env with bot 2 dead, the hero at (10,10), bot 1 at `enemy_at` at its full
@@ -487,35 +547,13 @@ def _one_enemy_duel(enemy_at):
     return env, st.ent_hp[0, 1].item()
 
 
-def test_a_gadget_only_hit_deals_damage_but_does_not_charge_the_super():
-    """Through the real tick: the spinner's 2000 lands in `ent_damage_dealt`, and the hero's
-    super charge stays where it was. The spinner is spawned into the env's state by hand and the
-    env is stepped idle until it lands."""
-    from brawl_sim.core import projectiles, stats
-
-    env, hp_before = _one_enemy_duel([11.5, 10.0])
-    st, params, cfg = env.state, env.params, env.cfg
-
-    fire = torch.zeros(1, cfg.n_entities, dtype=torch.bool)
-    fire[0, 0] = True
-    direction = torch.zeros(1, cfg.n_entities, 2)
-    direction[0, 0] = torch.tensor([1.0, 0.0])
-    travel = torch.zeros(1, cfg.n_entities)
-    travel[0, 0] = 1.5
-    damage = stats.effective_gadget_damage(st.ent_kind, st.ent_cubes, params)
-    projectiles.spawn_gadget(st, fire, st.ent_pos.clone(), direction, travel, damage, params, cfg)
-
-    for _ in range(5):  # 4 ticks of flight, one to spare
-        env.step(_idle_action(1))
-
-    assert hp_before - st.ent_hp[0, 1].item() == 2000.0
-    assert st.ent_damage_dealt[0, 0].item() == 2000.0
-    assert int(st.ent_super_charge[0, 0]) == 0
-
+# A gadget hit's damage without super charge is pinned through the real throw (attack value 3)
+# by tests/test_gadget.py's test_env_revealed_enemy_at_one_and_a_half_tiles...; this file's copy
+# spawned the spinner by hand and was removed on 2026-10-20.
 
 def test_a_dash_hit_still_charges_the_super():
-    """The other half of the pin above: a dash hit does charge the super. Move bin 1 is +x
-    (geo.dir_from_bin(0)), straight into the enemy 0.3 tiles east."""
+    """The other half of test_gadget.py's no-charge pin: a dash hit does charge the super. Move
+    bin 1 is +x (geo.dir_from_bin(0)), straight into the enemy 0.3 tiles east."""
     env, hp_before = _one_enemy_duel([10.3, 10.0])
     st = env.state
     st.ent_ammo[0, 0] = 3.0
@@ -572,7 +610,7 @@ def test_without_the_flag_a_4_in_the_attack_column_is_a_silent_no_op():
 
 def test_the_env_low_passes_the_velocity_bots_lead_by_only_under_lead_velocity_tau():
     """env._run_tick advances `ent_vel_seen` once `ent_vel` is final for the tick, after the dash
-    phase (`bots.lead_velocity_tau`, SIM_ISSUES_PLAN.md §5.1); tau 0 never writes it."""
+    phase (`bots.lead_velocity_tau`, archive/SIM_ISSUES_PLAN.md §5.1); tau 0 never writes it."""
     for tau in (0.0, 0.25):
         env = _tiny_env(n_envs=4, overrides={"bots": {"lead_velocity_tau": tau}})
         env.reset()

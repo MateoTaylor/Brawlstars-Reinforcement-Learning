@@ -1,6 +1,9 @@
 """Sniper archetype tests: FIRE and AIM only. Movement (holding range, drifting toward bushes
 when idle, fleeing at low HP) is personality behavior and is tested in
 tests/test_personality.py -- the range-holding one as KITE, the bush one as CAMPER/TRAPPER.
+
+The no-NaN loop that lived here is one all-kinds test in tests/test_combat_rules.py since
+2026-10-20.
 """
 import torch
 
@@ -82,28 +85,6 @@ def test_fire_requires_target_within_attack_range():
     assert bool(fire[0, 1])
 
 
-def test_no_nan_in_combat_output_ever():
-    cfg, params, gen = cfg_and_params(n_envs=8, n_enemies=3)
-    state = fresh_state(cfg, params, n_envs=8)
-    tiles = grid(20, 20)
-    tiles[5, 5] = Tile.BUSH
-    bank = FakeBank(tiles)
-
-    for _ in range(300):
-        state.ent_pos.uniform_(1, 19)
-        state.ent_hp.uniform_(0, 1)
-        state.ent_hp.mul_(state.ent_max_hp)
-        state.ent_alive.copy_(torch.rand(state.ent_alive.shape) > 0.3)
-        state.ent_ammo.uniform_(0, 5)
-        state.ent_target.random_(-1, cfg.n_entities)
-
-        _vis_m, tgt = build_targeting(state, bank, params, cfg)
-        _fire, aim_dir, aim_point = combat_rules.combat(state, tgt, bank, params, cfg, gen)
-
-        for t in (aim_dir, aim_point):
-            assert torch.all(torch.isfinite(t))
-
-
 # ---- full-loop acceptance ----------------------------------------------------------
 
 def test_kiting_sniper_reaches_and_holds_range_and_lands_a_hit():
@@ -135,27 +116,39 @@ def test_kiting_sniper_reaches_and_holds_range_and_lands_a_hit():
             # the bot orbits the ideal radius instead of parking exactly on it.
             assert (desired - deadband - 2.0) <= dist <= (desired + deadband + 2.0)
 
-    assert hit_tick is not None and hit_tick < 200
+    assert hit_tick is not None, "the kiting sniper never landed a hit"
 
 
 def test_never_misses_stationary_target_at_half_range_with_zero_noise():
+    """ONE shot, and it connects for the sniper's full damage.
+
+    `_run_tick` books no ammo or cooldown (env._attack_phase does that), so the single shot is
+    enforced here by emptying the clip once the bot fires. Until 2026-10-20 it was not: the bot
+    fired every decision tick, and this passed if any of ~15 rockets connected."""
     cfg, params, gen = cfg_and_params(n_enemies=1)
     state = fresh_state(cfg, params)
     bank = FakeBank(grid(20, 20))
-    params.aim_noise_std_rad[:, int(Kind.BOT_SNIPER)] = 0.0
+    k = int(Kind.BOT_SNIPER)
+    params.aim_noise_std_rad[:, k] = 0.0
 
-    attack_range = params.attack_range[0, int(Kind.BOT_SNIPER)].item()
+    attack_range = params.attack_range[0, k].item()
     state.ent_pos[0, 0] = torch.tensor([10.0, 10.0])
     state.ent_pos[0, 1] = torch.tensor([10.0, 10.0 + 0.5 * attack_range])
 
-    hit = False
+    fired, damage = False, 0.0
     for _ in range(60):  # generous upper bound on travel time across half range
-        _intent, dmg_ent = _run_tick(state, bank, params, cfg, gen)
-        if dmg_ent[0, 0].item() > 0:
-            hit = True
+        intent, dmg_ent = _run_tick(state, bank, params, cfg, gen)
+        if not fired and bool(intent.fire[0, 1]):
+            fired = True
+            state.ent_ammo[0, 1] = 0.0          # that was the shot: no ammo, and no reload
+            params.reload_seconds[:, k] = 1e9
+        damage = dmg_ent[0, 0].item()
+        if damage > 0:
             break
         # keep both stationary so this stays a pure "does a fired shot connect" check
         state.ent_pos[0, 0] = torch.tensor([10.0, 10.0])
         state.ent_pos[0, 1] = torch.tensor([10.0, 10.0 + 0.5 * attack_range])
 
-    assert hit
+    assert fired, "the sniper never fired"
+    full = stats.effective_damage(state.ent_kind, state.ent_cubes, params)[0, 1].item()
+    assert abs(damage - full) < 1e-3, f"the one shot dealt {damage}, not its full {full}"

@@ -232,13 +232,13 @@ class BrawlVecEnv:
 
     # ---- internals --------------------------------------------------------------------
 
-    def _build_observation(self) -> dict:
+    def _build_observation(self, slot_envs: torch.Tensor | None = None) -> dict:
         vis = perception.visibility(self.state, self.bank, self.params, self.cfg)
         hero_view = camera.hero_view(self.state, vis, self.cfg)  # concealment AND the camera window
         self._obs_vis, self._obs_hero_view = vis, hero_view       # read by step() -> history.push
         # Tracker-style enemy slots, promoted on this decision's sighting as the live tracker
-        # does; `build_obs` reads them after the update.
-        slots.update(self.state, hero_view, self.cfg)
+        # does; `build_obs` reads them after the update. `slot_envs`: see `_autoreset`.
+        slots.update(self.state, hero_view, self.cfg, envs=slot_envs)
         # zone.active is a latch: gas has been on screen at least once.
         zone.mark_seen(self.state, camera.camera_centre(self.state.ent_pos[:, 0], self.cfg), self.cfg)
         # Only the two obs fields it feeds read it, and train.yaml turns those off.
@@ -792,5 +792,7 @@ class BrawlVecEnv:
         done = terminated | truncated
         spawn.reset_envs(self.state, done, self.bank, self.params, self.cfg, self.gen,
                          self.spec, self.params_hook)
-        obs = self._build_observation()
+        # Only the reset envs start a decision in this build: `_observe` already moved the rest
+        # on, and `slots.update` counts a sighting or a miss every time it runs.
+        obs = self._build_observation(slot_envs=done)
         return obs, terminated, truncated

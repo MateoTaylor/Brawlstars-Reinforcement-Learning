@@ -1,5 +1,5 @@
 """`brawl_deployment.perception.localize`: finding and keeping a fix on a known map.
-KNOWN_MAP_LOCALIZATION_PLAN.md step K2.
+archive/KNOWN_MAP_LOCALIZATION_PLAN.md step K2.
 
 Each view is cut from a map label at the camera's true place, then damaged the way a classified
 frame is:

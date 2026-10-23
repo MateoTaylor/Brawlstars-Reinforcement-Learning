@@ -1,7 +1,9 @@
+import copy
+
 import torch
 import yaml
 
-from brawl_sim.config import build_params, load_config
+from brawl_sim.config import _deep_merge, build_params, load_config
 from brawl_sim.constants import (
     AGGRESSIVE_PERSONS,
     N_PERSONS,
@@ -14,19 +16,27 @@ from brawl_sim.core.state import allocate
 from brawl_sim.maps.loader import build_map_bank
 
 CONFIGS_DEFAULT = "configs/default.yaml"
+_BASE_SPEC = {
+    **yaml.safe_load(open(CONFIGS_DEFAULT).read()),
+    **yaml.safe_load(open("configs/brawlers.yaml").read()),
+}
+# Banks by the cfg fields build_map_bank reads: the bank is read-only map data (~130 ms a build),
+# and every test here builds the same one.
+_BANKS: dict = {}
 
 
 def _cfg_params_bank(n_envs=1, seed=0, **overrides):
     cfg = load_config(CONFIGS_DEFAULT, overrides=overrides or None)
-    spec = {
-        **yaml.safe_load(open(CONFIGS_DEFAULT).read()),
-        **yaml.safe_load(open("configs/brawlers.yaml").read()),
-    }
+    # the overrides reach the spec too: build_params reads its SimParams-only fields from it
+    spec = _deep_merge(copy.deepcopy(_BASE_SPEC), overrides)
     gen = torch.Generator(device="cpu")
     gen.manual_seed(seed)
     params = build_params(cfg, n_envs=n_envs, device="cpu", gen=gen, spec=spec)
-    bank = build_map_bank(cfg, device="cpu")
-    return cfg, params, bank, gen, spec
+    key = (tuple(cfg.map_names), cfg.map_h, cfg.map_w, cfg.view_h, cfg.view_w,
+           cfg.bots_hunt_cell_tiles, cfg.bots_nav)
+    if key not in _BANKS:
+        _BANKS[key] = build_map_bank(cfg, device="cpu")
+    return cfg, params, _BANKS[key], gen, spec
 
 
 def _fresh_state(cfg, n_envs=1):
@@ -42,7 +52,7 @@ def test_sample_map_ids_uniform_covers_all_maps_and_in_range():
     assert ids.shape == (2000,)
     assert int(ids.min()) >= 0
     assert int(ids.max()) < len(cfg.map_names)
-    assert torch.unique(ids).numel() == len(cfg.map_names)  # all 3 maps show up given 2000 draws
+    assert torch.unique(ids).numel() == len(cfg.map_names)  # every map (36) shows up in 2000 draws
 
 
 def test_sample_map_ids_fixed_is_constant():
@@ -147,11 +157,15 @@ def test_spawn_positions_only_needs_reset_mask_for_shape():
     cfg, params, bank, gen, spec = _cfg_params_bank(
         n_envs=4, world={"map_selection": "fixed", "fixed_map": "open"},
     )
-    mask = torch.ones(4, dtype=torch.bool)
-    map_ids = spawn.sample_map_ids(mask, bank, cfg, gen)
-    pos = spawn.sample_spawn_positions(mask, map_ids, bank, cfg, gen)
-    assert pos.shape == (4, cfg.n_entities, 2)
-    assert not torch.any(torch.isnan(pos))
+    map_ids = spawn.sample_map_ids(torch.ones(4, dtype=torch.bool), bank, cfg, gen)
+    # a partial mask gives every row too, the same rows a full one gives from the same seed: the
+    # mask sets only the output's size and device, never which rows are computed
+    full = spawn.sample_spawn_positions(torch.ones(4, dtype=torch.bool), map_ids, bank, cfg,
+                                        torch.Generator().manual_seed(1))
+    part = spawn.sample_spawn_positions(torch.tensor([True, False, True, False]), map_ids, bank, cfg,
+                                        torch.Generator().manual_seed(1))
+    assert full.shape == (4, cfg.n_entities, 2)
+    assert torch.equal(full, part) and torch.isfinite(full).all()
 
 
 # ---- sample_personalities -------------------------------------------------------------
@@ -194,9 +208,26 @@ def test_sample_personalities_honors_the_aggression_floor_in_every_env():
         is_aggressive |= persons == person
     counts = is_aggressive.sum(dim=1)
     assert torch.all(counts >= 2)
-    # Exactly the floor, not more: the weights make every other draw non-aggressive, so this also
-    # proves the forcing never converts a slot that was already aggressive (which would waste one).
+    # Exactly the floor: with no aggressive draws, the forcing converts exactly the deficit.
     assert torch.all(counts == 2)
+
+    # ...and it converts only slots that were not aggressive already. Half the draws are rushes
+    # here and the floor is the whole lobby, so a conversion spent on a rush leaves a camper.
+    cfg, _params, _bank, gen, _spec = _cfg_params_bank(
+        n_envs=256,
+        entities={"n_enemies": 9},
+        bots={
+            "personality_weights": {
+                "rush": 0.5, "camper": 0.5, "hunter": 0.0, "trapper": 0.0, "kite": 0.0,
+            },
+            "min_aggressive": 9,
+        },
+    )
+    persons = spawn.sample_personalities(torch.ones(256, dtype=torch.bool), cfg, gen)[:, 1:]
+    is_aggressive = torch.zeros_like(persons, dtype=torch.bool)
+    for person in AGGRESSIVE_PERSONS:
+        is_aggressive |= persons == person
+    assert torch.all(is_aggressive)
 
 
 def test_sample_personalities_does_not_always_force_the_same_entity_slot():
@@ -240,6 +271,15 @@ def test_reset_envs_full_reset_sets_expected_fields():
     )
     state = _fresh_state(cfg, n_envs)
     mask = torch.ones(n_envs, dtype=torch.bool)
+    # dirtied first: a fresh allocate is all zeros already, so the zero checks below would pass
+    # without reset_envs clearing anything
+    state.ent_cubes.fill_(3)
+    state.time.fill_(9.0)
+    state.step_count.fill_(7)
+    state.prj_alive.fill_(True)
+    state.pku_alive.fill_(True)
+    state.ent_hunt_seen.fill_(5)
+    state.zone_lo.fill_(4.0)
 
     spawn.reset_envs(state, mask, bank, params, cfg, gen, spec)
 

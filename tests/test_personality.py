@@ -5,8 +5,10 @@ the system.
 Movement assertions read `personality.movement`'s RAW output, not `policy.all_bot_intents`'
 output: the dispatcher low-passes movement through ent_move_smooth (an EMA with a per-archetype
 reaction delay), so a single-tick assertion through the dispatcher measures the EMA's ramp rather
-than the steering decision. Tests that genuinely need the smoothed, integrated behavior run many
-ticks through the real env instead (see the acceptance section at the bottom).
+than the steering decision. The smoothing itself is pinned over many ticks in
+tests/test_bot_dispatch.py (test_move_smooth_converges_toward_raw_target_over_many_ticks), and the
+tests that need integrated behavior walk the raw steering through core/movement.apply_movement
+(`_walk_bot`, near the bottom).
 """
 import torch
 
@@ -915,7 +917,8 @@ def test_kite_walks_in_to_its_own_fire_reach_rather_than_parking_outside_it():
 
 
 # =============================================================================================
-# pathfinding (bots.nav) and the endgame (bots.endgame_players), SIM_ISSUES_PLAN.md §1 and §2
+# pathfinding (bots.nav) and the endgame (bots.endgame_players),
+# archive/SIM_ISSUES_PLAN.md §1 and §2
 # =============================================================================================
 
 def _walk_bot(state, bank, params, cfg, gen, ticks, until):

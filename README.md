@@ -71,8 +71,8 @@ python scripts/sb3_smoke.py               # proves the SB3 plumbing connects (no
 
 Run `dump_obs_schema.py` first: its two docs are gitignored, and they are the field-by-field
 reference for everything the sim observes (`docs/OBSERVATION.md`) and what a policy receives
-(`docs/AGENT_OBS.md`). `--spec configs/agent_obs_deploy5.yaml` renders the spec training uses to
-the tracked `docs/AGENT_OBS_DEPLOY5.md`.
+(`docs/AGENT_OBS.md`). `--spec configs/agent_obs_deploy6.yaml` renders the spec training uses to
+`docs/AGENT_OBS_DEPLOY6.md`, which is kept in the repo rather than gitignored.
 
 **Play it yourself** — WASD to move, space to fire, `g` to throw the gadget, at the real 20 Hz
 (the super has no key, by user decision). The human feel-check for Mortis's dash, and the fastest
@@ -253,13 +253,11 @@ single-env `gymnasium.Env` for `check_env` and interactive play.
 | `CHARACTER_DETAILS.md` | the eight brawlers and how their real kits were converted |
 | `BRAWL_SIM_DESIGN.md` | the sim as built: open items, decisions in force (§2, incl. the divergences below), architecture and runtime contract (§3), hero, combat, terrain and maps, bots (§7), match flow, observation, reward, training, performance |
 | `BRAWL_DEPLOYMENT_DESIGN.md` | live play in BlueStacks: control, match gate, perception, the hero shadow, and what was measured live |
-| `KNOWN_MAP_LOCALIZATION_PLAN.md` | locating the hero on a known map (Dark Passage first); status block at the top |
 | `Terrain_Perception_Build_Plan.md` | the vision pipeline, phase by phase, with what each measurement actually found |
-| `TERRAIN_RELABEL_2MAPS.md` | the frame list and instructions for the current terrain-classifier labelling set |
-| `EDGAR_HERO_PLAN.md` | archived 2026-09-14, not implemented: Edgar as the agent |
 | `brawl_sim/maps/README.md` | map CSV format, the tile legend, and how to design a map for this sim |
 | `docs/OBSERVATION.md`, `docs/AGENT_OBS.md` | generated and gitignored — run `scripts/dump_obs_schema.py` |
-| `docs/AGENT_OBS_DEPLOY4.md`, `docs/AGENT_OBS_DEPLOY5.md` | generated and tracked — `dump_obs_schema.py --spec configs/agent_obs_deploy<N>.yaml` |
+| `docs/AGENT_OBS_DEPLOY6.md` | generated, kept in the repo — the layout of the spec training and deployment use (`dump_obs_schema.py --spec configs/agent_obs_deploy6.yaml`) |
+| `archive/` | finished and parked work: known-map localization, the critic + memory plan, the 10-06 sim issues, the model size study, the terrain relabel worklist (38 of its 100 frames labelled, none since 09-17), the unbuilt Edgar plan, the 10-20 test audit, the older sim and obs overhauls, the deploy4/deploy5 obs docs, and the five deploy specs before deploy6 (`archive/configs/`, frozen with the runs that name them) |
 
 ## Known divergences from the real game
 

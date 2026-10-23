@@ -18,25 +18,26 @@ from brawl_sim.config import load_config
 from brawl_sim.core import obs_select
 from brawl_deployment.policy import ATTACK_SUPER, DeployedPolicy, Decision, check_spaces
 
-RUN = "runs/mortis_deploy-20260907-041522"
-SPEC = "configs/agent_obs_deploy.yaml"
+SPEC = "configs/agent_obs_deploy6.yaml"
 CONFIGS = "configs/default.yaml"
 
 # The run `scripts/deploy_run.py` loads by default, and every other local run it could be pointed
-# at with `--run`. The end-to-end test used to cover RUN alone, so pointing configs/deployment.yaml
-# at a newer spec was never exercised offline -- and the first live decision on it is where a
-# missing supplier surfaced.
+# at with `--run`. The end-to-end test once covered a single old run, so pointing
+# configs/deployment.yaml at a newer spec was never exercised offline -- and the first live
+# decision on it is where a missing supplier surfaced.
 DEPLOYED_RUN = yaml.safe_load(open("configs/deployment.yaml").read())["run"]["dir"]
 
 
 def _deployable_runs() -> list[str]:
-    """RUN, DEPLOYED_RUN, and every run under runs/ whose train.yaml names a deploy spec."""
+    """DEPLOYED_RUN, and every run under runs/ whose train.yaml names a deploy spec still in
+    configs/. A run trained on one of the five specs in archive/configs/ no longer loads by the
+    path its train.yaml names, so it is not a run `--run` can deploy."""
     from pathlib import Path
 
-    found = {RUN, DEPLOYED_RUN}
+    found = {DEPLOYED_RUN}
     for train_yaml in Path("runs").glob("*/train.yaml"):
         spec = ((yaml.safe_load(train_yaml.read_text()) or {}).get("run") or {}).get("agent_obs")
-        if spec and Path(spec).name.startswith("agent_obs_deploy"):
+        if spec and Path(spec).name.startswith("agent_obs_deploy") and Path(spec).exists():
             found.add(train_yaml.parent.as_posix())
     return sorted(found)
 
@@ -118,14 +119,19 @@ def test_the_guards_fire_before_the_checkpoint_is_opened(tmp_path):
             DeployedPolicy.from_run(_run_dir(tmp_path / f"empty{i}", **patch))
 
 
-def test_a_checkpoint_whose_observation_does_not_match_the_spec_is_refused():
-    """The failure mode `agent_obs_deploy2.yaml` exists to avoid. The two deploy specs differ by
-    two columns in one group, so a checkpoint paired with the wrong one gets a `zone` group of the
-    wrong width -- caught here -- or, if a future edit ever preserved the width, a silently shifted
-    one. This is the check that makes the first case loud."""
+def test_a_checkpoint_whose_observation_does_not_match_the_spec_is_refused(tmp_path):
+    """The failure mode each deploy spec went into a NEW file to avoid: a checkpoint paired with a
+    spec that changed after it trained. This one trained on deploy6 with one more `zone` column
+    (`zone.safe_area_frac`, which deploy2 dropped), so it gets a `zone` group of the wrong width --
+    caught here -- or, if a future edit ever preserved the width, a silently shifted one. This is
+    the check that makes the first case loud."""
     cfg = load_config(CONFIGS)
     spec = obs_select.load_agent_spec(SPEC, cfg)
-    other = obs_select.load_agent_spec("configs/agent_obs_deploy2.yaml", cfg)
+    doc = yaml.safe_load(open(SPEC, encoding="utf-8").read())
+    next(g for g in doc["groups"] if g["name"] == "zone")["fields"].append("zone.safe_area_frac")
+    (tmp_path / "wider_zone.yaml").write_text(yaml.safe_dump(doc), encoding="utf-8")
+    other = obs_select.load_agent_spec(tmp_path / "wider_zone.yaml", cfg)
+    assert obs_select.agent_space(other, cfg)["zone"].shape == (6,)
 
     check_spaces(_StubModel(space=obs_select.agent_space(spec, cfg)), spec, cfg, label="ok")
     with pytest.raises(ValueError, match="NEW file"):

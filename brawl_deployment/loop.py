@@ -124,6 +124,12 @@ _CONFIGS_DIR = Path(__file__).resolve().parents[1] / "configs"
 # Only Mortis deploys today; a second kind would make this a `DeploymentConfig` field.
 HERO_KIND = "hero_mortis"
 
+# The longest coast, in decisions, after which an enemy track still counts as where the enemy is:
+# for the auto-aimed attack's target (`_auto_aim`) and the `enemy_in_reach` telemetry. It is the
+# 0.75 s coast both always had. A memory slot coasts `slots.max_misses` (3 s at 12), and an enemy
+# can walk 8 tiles in that time, so a ghost that old marks where it was, not a target.
+AIM_MAX_MISSES = 3
+
 # Cells `occupancy.best()` has never observed. Mirrors `terrain.occupancy.UNKNOWN` rather than
 # importing it, so a terrain-side rename fails a test here instead of silently reading class 255.
 _UNKNOWN = -1
@@ -224,13 +230,13 @@ class TickRow:
     hero_offset_x: float = 0.0
     hero_offset_y: float = 0.0
     near_edge: int = -1
-    # KNOWN_MAP_LOCALIZATION_PLAN.md section 7, filled on every tick of a run with `map.name` set
-    # and left at the defaults otherwise. `map_state` is `MapLocalizer`'s: "search", "confirm",
-    # "fixed" or "mismatch". `map_dx` / `map_dy`: the offset from odometry to the map frame, NaN
-    # without a fix. `map_agree` / `map_margin`: the agreement rate and lead it last judged, NaN
-    # where too few cells counted to judge (a margin can be negative, so no sentinel would do).
-    # `map_crate_resid`: this tick's crate-phase residuals as "dx dy" pairs joined by ";", empty
-    # with no full-height crate in view. Appended last, like the columns above.
+    # archive/KNOWN_MAP_LOCALIZATION_PLAN.md section 7, filled on every tick of a run with
+    # `map.name` set and left at the defaults otherwise. `map_state` is `MapLocalizer`'s: "search",
+    # "confirm", "fixed" or "mismatch". `map_dx` / `map_dy`: the offset from odometry to the map
+    # frame, NaN without a fix. `map_agree` / `map_margin`: the agreement rate and lead it last
+    # judged, NaN where too few cells counted to judge (a margin can be negative, so no sentinel
+    # would do). `map_crate_resid`: this tick's crate-phase residuals as "dx dy" pairs joined by
+    # ";", empty with no full-height crate in view. Appended last, like the columns above.
     map_state: str = ""
     map_dx: float = math.nan
     map_dy: float = math.nan
@@ -248,6 +254,16 @@ class TickRow:
     # match that never fixes can still be scored against its spawn. Appended last.
     map_lead_dx: float = math.nan
     map_lead_dy: float = math.nan
+    # Enemy memory (archive/CRITIC_AND_MEMORY_PLAN.md A9), on decision rows. `n_ghosts`: slotted
+    # tracks coasting at this decision, i.e. memory rows with `seen` 0; -1 on a tick with no
+    # decision. `reacquired`: every slotted track matched again this tick after a coast, as
+    # "gap:jump" pairs joined by ";" -- the unseen decisions it coasted and the tiles between its
+    # last sighting and the detection that took it. Appended last.
+    n_ghosts: int = -1
+    reacquired: str = ""
+    # `enemy` boxes the tracker dropped this decision as sitting on a crate the loot map holds
+    # (`tracker.CRATE_VETO_TILES`); -1 on a tick the tracker did not run. Appended last.
+    n_crate_vetoed: int = -1
 
     @classmethod
     def from_record(cls, record: dict) -> "TickRow":
@@ -561,8 +577,8 @@ class DeployLoop:
                            for long in (False, True)}
         # The slot rule is the run's (`slots.*`, counted in decisions, as this tracker updates):
         # the sim's `core/slots.py` trained the policy on those two numbers, and the tracker's own
-        # defaults only happen to equal today's config. `max_misses` also bounds the hero track's
-        # coast, which has no sim counterpart: the tracker keeps one number for both.
+        # defaults only happen to equal today's config. The hero track's coast has no sim
+        # counterpart and stays the tracker's own `hero_max_misses` whatever `max_misses` is.
         self.tracker = EntityTracker(n_slots=int(self.sim.n_entities) - 1,
                                      promote_hits=int(self.sim.slots_promote_hits),
                                      max_misses=int(self.sim.slots_max_misses))
@@ -571,8 +587,8 @@ class DeployLoop:
         # Not `self.phase`, which is the loop's Phase. This is where the game's tiles are, and it
         # hands every consumer its world frame. With `map.name` set it is `MapLocalizer`, which
         # hands out the MAP frame once it has found the camera on the label and the lattice's frame
-        # until then, behind the same members (KNOWN_MAP_LOCALIZATION_PLAN.md). `self.localizer` is
-        # the same object, or None, for the calls only a localizer takes.
+        # until then, behind the same members (archive/KNOWN_MAP_LOCALIZATION_PLAN.md).
+        # `self.localizer` is the same object, or None, for the calls only a localizer takes.
         #
         # `self.terrain` is what the grid and the cell lookups read: the occupancy map, or with a
         # map named, the label on every tick the localizer hands out the map frame. The occupancy
@@ -588,12 +604,13 @@ class DeployLoop:
             self.localizer = self.lattice = MapLocalizer(known, self.sim.camera_clamp_onset,
                                                          **_map_thresholds(cfg))
             self.terrain = KnownTerrain(known, vision.occupancy, self.localizer)
-        # The grid's channels come from the spec the policy was built with. The no-argument
-        # `GridSpec.load()` reads agent_obs_deploy.yaml, which is two channels short of deploy3,
-        # and the mismatch would only surface as a shape error in `assemble` on the first decision.
+        # The grid's channels come from the spec the policy was built with, never from the file
+        # the no-argument `GridSpec.load()` reads: a policy trained on any other spec would get a
+        # grid that only fails as a shape error in `assemble` on the first decision.
         self.grid = GridBuilder(self.terrain, GridSpec.from_agent_spec(policy.spec, self.sim))
-        # Here rather than in `VisionStack.build`, because it takes both halves: a deploy3 policy
-        # on a model with no crate class would read an empty `box` plane forever, silently.
+        # Here rather than in `VisionStack.build`, because it takes both halves: a policy whose grid
+        # has `box` (deploy6's does) on a model with no crate class would read an empty plane
+        # forever, silently.
         require_loot_classes(vision.projectiles.names, self.grid.spec.channels)
         # The dead-bin move mask (`move_mask.py`): the sim's own collision rule on the
         # `blocks_unit` plane the grid hands the policy, so a bin that would walk into a wall is
@@ -887,7 +904,9 @@ class DeployLoop:
         image = frame.image
         row.n_detections = len(detections)
         readings = self.vision.health.update(image, detections)
-        tracked = self.tracker.update(detections, self.vision.plan, odo, frame.t)
+        tracked = self.tracker.update(detections, self.vision.plan, odo, frame.t,
+                                      crates=self.loot.crates())
+        row.n_crate_vetoed = tracked.n_crate_vetoed
 
         if tracked.hero is None:
             row.note = "no hero box"
@@ -955,6 +974,10 @@ class DeployLoop:
         row.attack_cd_shadow = float(self.shadow.attack_cd)
         row.attack_idle_t_shadow = float(self.shadow.attack_idle_t)
         row.enemy_in_reach = self._enemy_in_reach(hero_pos, tracked.enemies)
+        slotted = [t for t in tracked.enemies if t is not None]
+        row.n_ghosts = sum(not t.seen_now for t in slotted)
+        row.reacquired = ";".join(f"{t.reacquired[0]}:{t.reacquired[1]:.2f}" for t in slotted
+                                  if t.seen_now and t.reacquired is not None)
         # The move half (`move_mask.py`), from the very plane the policy is about to read and in
         # that plane's own units -- the hero relative to the crop's origin tile. On the row before
         # the call, for the same reason as `attack_legal`.
@@ -1006,7 +1029,7 @@ class DeployLoop:
         from the hero to the nearest enemy track or confirmed crate within the auto-aimed dash's
         reach (`auto_aim_reach_tiles`, the long dash included when the shadow has it charged),
         or None when nothing is in reach. Nearest by centre distance across both lists, as the
-        sim ranks them. Every track counts, coasting ones included: the sim ignores visibility
+        sim ranks them. Coasting tracks count up to `AIM_MAX_MISSES`: the sim ignores visibility
         here on purpose (the lead wants the flag to reach an enemy out of view), and a track the
         detector lost a few ticks ago is the closest thing this side has to one. What the game
         actually picks can differ when it auto-aims at something the tracker never saw; the
@@ -1014,7 +1037,8 @@ class DeployLoop:
         enemy_reach, crate_reach = self._aim_reach[bool(self.shadow.long_dash_ready)]
         hx, hy = float(hero_pos[0]), float(hero_pos[1])
         best = None
-        candidates = [(tr.pos, enemy_reach) for tr in enemies if tr is not None]
+        candidates = [(tr.pos, enemy_reach) for tr in enemies
+                      if tr is not None and tr.misses <= AIM_MAX_MISSES]
         candidates += [(pos, crate_reach) for pos in self.loot.crates()]
         for (x, y), reach in candidates:
             d = math.hypot(float(x) - hx, float(y) - hy)
@@ -1028,13 +1052,13 @@ class DeployLoop:
     def _enemy_in_reach(self, hero_pos, enemies) -> bool:
         """`scripts/audit_attack_cadence.py`'s `enemy_in_reach`, on the deployment's
         inputs: any enemy track the assembler was handed within `reach_tiles` of the hero, both
-        in WORLD tiles. The sim's "alive and revealed to the hero" is, on this side, "has a track"
-        -- the tracker only holds enemies the detector saw (or is coasting for a few ticks), and
-        those are exactly the enemies the observation carries. Telemetry only; nothing acts on it.
+        in WORLD tiles. The sim's "alive and revealed to the hero" is, on this side, "has a track
+        seen within `AIM_MAX_MISSES` decisions" -- the tracker only holds enemies the detector saw,
+        and a longer coast is a memory, not an enemy in reach. Telemetry only; nothing acts on it.
         """
         hx, hy = hero_pos
         for tr in enemies:
-            if tr is None:
+            if tr is None or tr.misses > AIM_MAX_MISSES:
                 continue
             if np.hypot(tr.pos[0] - hx, tr.pos[1] - hy) <= self.reach_tiles:
                 return True

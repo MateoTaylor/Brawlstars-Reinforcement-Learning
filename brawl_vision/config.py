@@ -173,7 +173,8 @@ class VisionConfig:
     detector_ignore: tuple[str, ...] = ("teammate",)
     # auto | cpu | cuda. Unlike classifier_device this is not a straight device string: ONNX
     # Runtime picks by execution PROVIDER, and CUDA is only available at all if the
-    # onnxruntime-gpu build is installed. 'auto' takes it when present, 'cuda' insists.
+    # onnxruntime-gpu build is installed. 'auto' takes it when present and a device can run it,
+    # the CPU otherwise; 'cuda' insists.
     detector_device: str = "auto"
     # Where inside a box the brawler's FEET are, as a fraction of box height up from the bottom
     # edge. Not 0: a YOLO box here encloses the nameplate, health bar, ammo pips, sprite and any

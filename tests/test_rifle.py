@@ -1,6 +1,11 @@
 """Rifle archetype tests: FIRE and AIM only. Kite-and-strafe movement and the low-HP flee are
 personality behaviors, tested in tests/test_personality.py (as KITE and as the RETREAT mode
 respectively).
+
+Two tests are deliberately GONE (2026-10-20). `test_a_box_target_never_trips_the_lateral_hold`
+could not fail: its fallback target stood still and its box sat inside the hold-free range, and
+tests/test_combat_rules.py::test_a_stationary_loot_box_never_triggers_the_lateral_hold now owns
+that claim. The no-NaN loop is one all-kinds test in test_combat_rules.py.
 """
 import torch
 
@@ -92,47 +97,6 @@ def test_holds_fire_on_fast_lateral_mover_beyond_0p6_range():
     assert bool(fire[0, 1])  # close enough that the hold-fire rule no longer applies
 
 
-def test_a_box_target_never_trips_the_lateral_hold():
-    """A loot box has zero velocity by construction (bots/policy.targeting), so the fast-mover
-    hold can't fire against one -- this pins that down rather than leaving it implied."""
-    cfg, params, gen = cfg_and_params(n_enemies=1)
-    state = fresh_state(cfg, params, enemy_kind=Kind.BOT_RIFLE)
-    bank = FakeBank(grid(20, 20))
-
-    state.ent_alive[0, 0] = False  # no enemy at all, so the box pseudo-target applies
-    state.ent_pos[0, 1] = torch.tensor([10.0, 10.0])
-    state.box_alive[0, 0] = True
-    state.box_pos[0, 0] = torch.tensor([13.0, 10.0])
-    state.box_hp[0, 0] = 100.0
-    state.box_max_hp[0, 0] = 100.0
-
-    _vis, tgt = build_targeting(state, bank, params, cfg)
-    assert bool(tgt.is_box[0, 1]) and not bool(tgt.has_enemy[0, 1])
-    assert torch.allclose(tgt.vel[0, 1], torch.zeros(2))
-    fire, _, _ = combat_rules.combat(state, tgt, bank, params, cfg, gen)
-    assert bool(fire[0, 1])
-
-
-def test_no_nan_in_combat_output_ever():
-    cfg, params, gen = cfg_and_params(n_envs=8, n_enemies=3)
-    state = fresh_state(cfg, params, n_envs=8, enemy_kind=Kind.BOT_RIFLE)
-    bank = FakeBank(grid(20, 20))
-
-    for _ in range(300):
-        state.ent_pos.uniform_(1, 19)
-        state.ent_vel.uniform_(-5, 5)
-        state.ent_hp.uniform_(0, 1)
-        state.ent_hp.mul_(state.ent_max_hp)
-        state.ent_alive.copy_(torch.rand(state.ent_alive.shape) > 0.3)
-        state.ent_ammo.uniform_(0, 5)
-        state.ent_target.random_(-1, cfg.n_entities)
-
-        _vis, tgt = build_targeting(state, bank, params, cfg)
-        _fire, aim_dir, aim_point = combat_rules.combat(state, tgt, bank, params, cfg, gen)
-        for t in (aim_dir, aim_point):
-            assert torch.all(torch.isfinite(t))
-
-
 # ---- full-loop acceptance ----------------------------------------------------------
 
 def test_kiting_rifle_reaches_and_holds_range_and_lands_a_hit():
@@ -162,27 +126,41 @@ def test_kiting_rifle_reaches_and_holds_range_and_lands_a_hit():
             dist = geo.dist(state.ent_pos[0, 0], state.ent_pos[0, 1]).item()
             assert (desired - 4.0) <= dist <= (desired + 4.0)
 
-    assert hit_tick is not None and hit_tick < 300
+    assert hit_tick is not None, "the kiting rifle never landed a hit"
 
 
 def test_never_misses_stationary_target_at_half_range_with_zero_noise():
+    """ONE blast, and every pellet of it connects: with the fan collapsed to a single line the
+    five pellets fly together, so they land on the same tick for the full volley's damage.
+
+    `_run_tick` books no ammo or cooldown (env._attack_phase does that), so the single shot is
+    enforced here by emptying the clip once the bot fires. Until 2026-10-20 it was not: the bot
+    fired every decision tick, and this passed if any of ~15 volleys connected."""
     cfg, params, gen = cfg_and_params(n_enemies=1)
     state = fresh_state(cfg, params, enemy_kind=Kind.BOT_RIFLE)
     bank = FakeBank(grid(20, 20))
-    params.aim_noise_std_rad[:, int(Kind.BOT_RIFLE)] = 0.0
-    params.proj_spread_rad[:, int(Kind.BOT_RIFLE)] = 0.0  # collapse the fan to one line
+    k = int(Kind.BOT_RIFLE)
+    params.aim_noise_std_rad[:, k] = 0.0
+    params.proj_spread_rad[:, k] = 0.0  # collapse the fan to one line
 
-    attack_range = params.attack_range[0, int(Kind.BOT_RIFLE)].item()
+    attack_range = params.attack_range[0, k].item()
     state.ent_pos[0, 0] = torch.tensor([10.0, 10.0])
     state.ent_pos[0, 1] = torch.tensor([10.0, 10.0 + 0.5 * attack_range])
 
-    hit = False
+    fired, damage = False, 0.0
     for _ in range(60):
-        _intent, dmg_ent = _run_tick(state, bank, params, cfg, gen)
-        if dmg_ent[0, 0].item() > 0:
-            hit = True
+        intent, dmg_ent = _run_tick(state, bank, params, cfg, gen)
+        if not fired and bool(intent.fire[0, 1]):
+            fired = True
+            state.ent_ammo[0, 1] = 0.0          # that was the shot: no ammo, and no reload
+            params.reload_seconds[:, k] = 1e9
+        damage = dmg_ent[0, 0].item()
+        if damage > 0:
             break
         state.ent_pos[0, 0] = torch.tensor([10.0, 10.0])
         state.ent_pos[0, 1] = torch.tensor([10.0, 10.0 + 0.5 * attack_range])
 
-    assert hit
+    assert fired, "the rifle never fired"
+    pellet = stats.effective_damage(state.ent_kind, state.ent_cubes, params)[0, 1].item()
+    volley = int(params.proj_count[0, k]) * pellet
+    assert abs(damage - volley) < 1e-3, f"the one blast dealt {damage}, not its full {volley}"

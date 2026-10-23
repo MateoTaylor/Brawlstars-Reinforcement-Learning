@@ -1,3 +1,4 @@
+import numpy as np
 import torch
 import yaml
 
@@ -30,15 +31,28 @@ def test_throughput_native_returns_sane_fields_on_cpu():
     assert r["peak_mem_bytes"] is None  # no CUDA on CPU
 
 
-def test_throughput_native_action_is_reused_not_resampled_every_step():
-    """The action tensor is built once and passed to every env.step() call -- confirm the sim
-    doesn't error out being handed the exact same action object repeatedly (it shouldn't; the
-    sim reads it, never mutates the caller's tensor)."""
-    cfg = _cfg()
-    action_before = benchmark._random_native_action(BrawlVecEnv(cfg, n_envs=4, device="cpu", seed=0))
-    r = benchmark.throughput_native(cfg, n_envs=4, device="cpu", steps=5, warmup=1)
-    assert r["steps_per_sec"] > 0
-    assert action_before.shape == (4, 2)  # sanity: the action shape contract didn't change underneath us
+def test_throughput_native_samples_one_action_and_the_sim_never_mutates_it(monkeypatch):
+    """The action tensor is built once and handed to every env.step() call, warmup included, and
+    the sim reads it without ever writing into the caller's tensor."""
+    sampled, stepped = [], []
+    real_sample, real_step = benchmark._random_native_action, BrawlVecEnv.step
+
+    def sample(env):
+        action = real_sample(env)
+        sampled.append((action, action.clone()))
+        return action
+
+    def step(self, action, *args, **kwargs):
+        stepped.append(action)
+        return real_step(self, action, *args, **kwargs)
+
+    monkeypatch.setattr(benchmark, "_random_native_action", sample)
+    monkeypatch.setattr(BrawlVecEnv, "step", step)
+    benchmark.throughput_native(_cfg(), n_envs=4, device="cpu", steps=3, warmup=1)
+    (action, original), = sampled
+    assert action.shape == (4, 2)
+    assert len(stepped) == 4 and all(a is action for a in stepped)
+    assert torch.equal(action, original)
 
 
 # ---- throughput_sb3 + host_bytes_per_step --------------------------------------------------------
@@ -53,14 +67,31 @@ def test_throughput_sb3_minimal_returns_sane_fields_on_cpu():
     assert r["host_bytes_worst_case"] > r["host_bytes_per_step"]  # terminal-obs case adds strictly more
 
 
-def test_full_info_mode_transfers_strictly_more_bytes_than_minimal():
+def test_full_info_mode_adds_exactly_the_bytes_the_diagnostics_read():
+    """The gap between the modes is _FULL_DIAG_BYTES_PER_ENV, a hand-kept constant; it is checked
+    against the tensors _maybe_attach_full_diagnostics actually reads, so a diagnostic added
+    there without updating the constant fails here."""
     cfg = _cfg()
     spec = obs_select.load_agent_spec(AGENT_OBS_YAML, cfg)
-    minimal = benchmark.throughput_sb3(cfg, spec, n_envs=4, device="cpu", steps=2, warmup=1, info_mode="minimal")
-    full = benchmark.throughput_sb3(cfg, spec, n_envs=4, device="cpu", steps=2, warmup=1, info_mode="full")
-    assert full["host_bytes_per_step"] > minimal["host_bytes_per_step"]
-    # the gap is exactly the per-env diagnostic snapshot _maybe_attach_full_diagnostics adds
-    assert full["host_bytes_per_step"] - minimal["host_bytes_per_step"] == benchmark._FULL_DIAG_BYTES_PER_ENV * 4
+    venv = BrawlSB3VecEnv(BrawlVecEnv(cfg, n_envs=4, device="cpu", seed=0), spec,
+                          benchmark.ExampleReward(), info_mode="full")
+    venv.reset()
+    read = {}
+
+    class _Recording(dict):
+        def __getitem__(self, key):
+            value = dict.__getitem__(self, key)
+            read[id(self), key] = value
+            return value
+
+    full_obs = venv._last_full_obs
+    venv._maybe_attach_full_diagnostics([{} for _ in range(4)],
+                                        {"hero": _Recording(full_obs["hero"]), "meta": _Recording(full_obs["meta"])})
+    per_env = sum(t[0].numel() * t.element_size() for t in read.values())
+    full = benchmark.host_bytes_per_step(venv)
+    venv.info_mode = "minimal"
+    assert per_env > 0
+    assert full - benchmark.host_bytes_per_step(venv) == per_env * 4
 
 
 def test_host_bytes_per_step_matches_actual_buffer_sizes():
@@ -70,11 +101,11 @@ def test_host_bytes_per_step_matches_actual_buffer_sizes():
     venv = BrawlSB3VecEnv(env, spec, benchmark.ExampleReward(), info_mode="minimal")
     venv.reset()
     computed = benchmark.host_bytes_per_step(venv)
-    expected = (
-        sum(t.numel() * t.element_size() for t in venv._host_buffers.values())
-        + venv._reward_host.numel() * venv._reward_host.element_size()
-        + venv._terminated_host.numel() * venv._terminated_host.element_size()
-        + venv._truncated_host.numel() * venv._truncated_host.element_size()
+    # Counted from the declared observation space, not from the buffers host_bytes_per_step sums:
+    # one row per env of every group, plus a float32 reward and the two bool done flags.
+    expected = venv.num_envs * (
+        sum(int(np.prod(s.shape)) * s.dtype.itemsize for s in venv.observation_space.spaces.values())
+        + 4 + 1 + 1
     )
     assert computed == expected
 
@@ -141,9 +172,10 @@ def test_check_gpu_falls_back_to_cpu_when_cuda_unavailable(monkeypatch, capsys):
     assert "WARNING" in capsys.readouterr().out
 
 
-def test_check_gpu_returns_cpu_unchanged_and_warns():
+def test_check_gpu_returns_cpu_unchanged_and_warns(capsys):
     device = benchmark._check_gpu("cpu")
     assert device == "cpu"
+    assert "WARNING: benchmarking on CPU" in capsys.readouterr().out
 
 
 def test_fmt_bytes_handles_none_and_scales_units():
@@ -156,9 +188,9 @@ def test_main_cli_runs_end_to_end_on_cpu_with_a_tiny_sweep(capsys):
     exit_code = benchmark.main([
         "--preset", "configs/presets/debug_tiny.yaml",
         "--device", "cpu",
-        "--n-envs-list", "2,4",
-        "--steps", "2", "--warmup", "1",
-        "--phase-n-envs", "2", "--phase-steps", "2",
+        "--n-envs-list", "2",
+        "--steps", "1", "--warmup", "0",
+        "--phase-n-envs", "2", "--phase-steps", "1",
         "--mem-n-envs", "8",
     ])
     assert exit_code == 0

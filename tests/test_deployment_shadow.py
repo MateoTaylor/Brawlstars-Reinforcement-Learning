@@ -1021,6 +1021,12 @@ def test_observe_covers_every_self_field_the_deploy_spec_asks_of_it(spec_path):
         assert field.split(".", 1)[1] in keys, field
 
 
+def test_the_self_field_coverage_reaches_the_spec_in_use():
+    """The glob above has one match since the five older deploy specs went to archive/configs/
+    (2026-10-21), and an empty parameter set skips a test rather than failing it."""
+    assert CONFIGS / "agent_obs_deploy6.yaml" in CONFIGS.glob("agent_obs_deploy*.yaml")
+
+
 # ---------------------------------------------------------------------------
 # the auto-aimed attack (action.auto_aim, attack value 4; the lead, 2026-09-26)
 # ---------------------------------------------------------------------------

@@ -36,6 +36,7 @@ def test_enum_values():
     assert (Tile.FENCE, Tile.SPAWN, Tile.BOX) == (4, 5, 6)
     assert (Kind.HERO_MORTIS, Kind.BOT_SNIPER, Kind.BOT_ARTILLERY) == (0, 1, 2)
     assert (Kind.BOT_MELEE, Kind.BOT_RIFLE) == (3, 4)
+    assert (Kind.BOT_EDGAR, Kind.BOT_SPIKE, Kind.BOT_BULL) == (5, 6, 7)
     assert (Proj.NONE, Proj.SNIPER_BOLT, Proj.ARTILLERY_SHELL, Proj.RIFLE_ARROW) == (0, 1, 2, 3)
     assert Proj.SUPER_BOLT == 4
     assert (Proj.SPIKE_SHELL, Proj.BULL_SLUG, Proj.GADGET_SPINNER) == (5, 6, 7)

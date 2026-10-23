@@ -257,14 +257,16 @@ def test_through_the_env_an_in_reach_attack_pays_0_05_and_the_idle_decision_afte
     assert reward.tolist() == [0.0]
 
 
+@pytest.mark.gpu
 def test_the_flag_and_its_sum_are_sync_free_on_cuda():
     """Every env attacks an enemy 1.5 tiles away on every decision under
     `set_sync_debug_mode("error")`, so a data-dependent branch anywhere on the new path (the
     reach, the `live` gate, the int32 sum) raises. The scene is re-armed between decisions with
-    device-side copies; the count is accumulated ON DEVICE and read once, after the window."""
+    device-side copies; the count is accumulated ON DEVICE and read once, after the window.
+    The re-armed scene makes every decision alike, so eight show what thirty did (2026-10-20)."""
     if not torch.cuda.is_available():
         pytest.skip("CUDA not available")
-    n_envs, decisions = 64, 30
+    n_envs, decisions = 64, 8
     env = _env(action_repeat=5, n_envs=n_envs, device="cuda", debug_checks=False)  # check_invariants syncs
     st = env.state
     E = env.cfg.n_entities
@@ -298,4 +300,4 @@ def test_the_flag_and_its_sum_are_sync_free_on_cuda():
         torch.cuda.synchronize()
         torch.cuda.set_sync_debug_mode("default")
 
-    assert int(counted) == 1920                  # 64 envs x 30 decisions, every one in reach
+    assert int(counted) == 512                   # 64 envs x 8 decisions, every one in reach

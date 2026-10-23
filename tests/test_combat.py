@@ -1,3 +1,4 @@
+import copy
 import dataclasses
 from pathlib import Path
 
@@ -11,6 +12,13 @@ from brawl_sim.core import combat, hero, stats, terrain
 from brawl_sim.core.state import allocate
 
 CONFIGS = Path(__file__).resolve().parent.parent / "configs"
+# The brawler spec, parsed once per module: until 2026-10-20 every `_cfg_and_params` call re-read
+# both YAML files (~16 ms a call). Each call gets its own deep copy, so nothing one test does to
+# the spec it was handed can reach the next.
+_SPEC = {
+    **yaml.safe_load((CONFIGS / "default.yaml").read_text()),
+    **yaml.safe_load((CONFIGS / "brawlers.yaml").read_text()),
+}
 
 
 class _FakeBank:
@@ -41,10 +49,7 @@ def _cfg_and_params(n_envs=1, map_h=20, map_w=20, extra_overrides=None):
     if extra_overrides:
         overrides = {**overrides, **extra_overrides}
     cfg = load_config(CONFIGS / "default.yaml", overrides=overrides)
-    spec = {
-        **yaml.safe_load((CONFIGS / "default.yaml").read_text()),
-        **yaml.safe_load((CONFIGS / "brawlers.yaml").read_text()),
-    }
+    spec = copy.deepcopy(_SPEC)
     gen = torch.Generator(device="cpu")
     gen.manual_seed(0)
     params = build_params(cfg, n_envs=n_envs, device="cpu", gen=gen, spec=spec)
@@ -71,9 +76,14 @@ def _fresh_state(cfg, params, n_envs=1):
 # ---- apply_damage -------------------------------------------------------------
 
 def test_apply_damage_basic_updates():
+    """One hit: HP, damage taken, kill credit, and the victim's out-of-combat stopwatch restarts
+    (the regen delay counts from the last hit). The stopwatches start RUNNING, because allocate()
+    zero-inits them: until 2026-10-20 they started at 0, so `== 0.0` held before the call and the
+    reset was never tested. Entity 1 takes nothing and must keep its 5 s."""
     cfg, params = _cfg_and_params()
     state = _fresh_state(cfg, params)
     state.ent_hp[0, 0] = 1000.0
+    state.ent_out_of_combat_t[0, :2] = 5.0
     dmg = torch.zeros(1, cfg.n_entities)
     dmg[0, 0] = 100.0
     attacker = torch.full((1, cfg.n_entities), -1, dtype=torch.int64)
@@ -84,7 +94,8 @@ def test_apply_damage_basic_updates():
     assert state.ent_hp[0, 0].item() == 900.0
     assert state.ent_damage_taken[0, 0].item() == 100.0
     assert state.ent_last_hit_by[0, 0].item() == 2
-    assert state.ent_out_of_combat_t[0, 0].item() == 0.0
+    assert state.ent_out_of_combat_t[0, 0].item() == 0.0  # the victim's stopwatch restarts...
+    assert state.ent_out_of_combat_t[0, 1].item() == 5.0  # ...and nobody else's
 
 
 def test_apply_damage_hp_clamps_at_zero():
@@ -102,8 +113,9 @@ def test_apply_damage_hp_clamps_at_zero():
 def test_dashing_hero_takes_full_combat_and_zone_damage():
     """The dash grants no i-frames (the lead, 2026-09-25: it is an attack animation Mortis can
     be hit throughout). Until then `start_dash` seeded `ent_invuln_t` and this test asserted the
-    combat hit was zeroed. `apply_damage` still honours `ent_invuln_t` (the next test sets it by
-    hand); nothing in the sim seeds it any more."""
+    combat hit was zeroed. `apply_damage` still honours `ent_invuln_t`
+    (test_iframes_block_combat_but_not_zone_by_default and test_iframes_block_zone_when_configured
+    set it by hand); nothing in the sim seeds it any more."""
     cfg, params = _cfg_and_params()
     state = _fresh_state(cfg, params)
     tiles = _grid(20, 20)
@@ -172,6 +184,34 @@ def test_the_gas_does_not_steal_the_finishers_credit():
     combat.resolve_deaths(state, cfg)
     assert state.ent_death_cause[0, 1].item() == int(DeathCause.ZONE)
     assert torch.all(state.ent_kills == 0)
+
+
+def test_iframes_block_combat_but_not_zone_by_default():
+    """The default i-frame gate: a COMBAT hit on an entity with `ent_invuln_t > 0` is zeroed -- no
+    HP lost, nothing recorded, no kill credit -- while the gas still lands
+    (`zone.iframes_block_zone` defaults to false). Dormant in the sim, since nothing seeds
+    `ent_invuln_t`, so only this pins it: until 2026-10-20 no test did, the one below turning
+    `iframes_block_zone` on and sending only zone damage."""
+    cfg, params = _cfg_and_params()
+    assert not cfg.iframes_block_zone, "this test is about the default"
+    state = _fresh_state(cfg, params)
+    state.ent_hp[0, 0] = 1000.0
+    state.ent_invuln_t[0, 0] = 1.0
+
+    combat_dmg = torch.zeros(1, cfg.n_entities)
+    combat_dmg[0, 0] = 500.0
+    attacker = torch.full((1, cfg.n_entities), -1, dtype=torch.int64)
+    attacker[0, 0] = 1
+    combat.apply_damage(state, combat_dmg, int(DeathCause.COMBAT), attacker, params, cfg)
+    assert state.ent_hp[0, 0].item() == 1000.0
+    assert state.ent_damage_taken[0, 0].item() == 0.0
+    assert state.ent_last_hit_by[0, 0].item() == -1  # the blocked hit credits nobody
+
+    zone_dmg = torch.zeros(1, cfg.n_entities)
+    zone_dmg[0, 0] = 300.0
+    zone_attacker = torch.full((1, cfg.n_entities), -1, dtype=torch.int64)
+    combat.apply_damage(state, zone_dmg, int(DeathCause.ZONE), zone_attacker, params, cfg)
+    assert state.ent_hp[0, 0].item() == 700.0  # the gas ignores i-frames
 
 
 def test_iframes_block_zone_when_configured():
@@ -330,16 +370,25 @@ def test_melee_los_budget_matches_full_budget_ray():
 
 
 def test_melee_never_hits_self_or_non_firing():
+    """A swing never lands on the swinger, and an entity that is not firing hits nobody.
+    `geometry.point_in_cone` admits the cone's own origin (distance 0 is inside any arc), so
+    without melee_hitscan's `not_self` every swing would hit its own swinger. Until 2026-10-20
+    nobody fired here, so `attacker_ok` alone zeroed everything and `not_self` was never
+    exercised; now entity 1 swings at entity 2, who does not swing back."""
     cfg, params = _cfg_and_params()
     state = _fresh_state(cfg, params)
     tiles = _grid(20, 20)
     bank = _bank_from_grid(tiles)
     state.ent_pos[0, 1] = torch.tensor([10.0, 10.0])
-    state.ent_pos[0, 2] = torch.tensor([10.5, 10.0])
+    state.ent_facing[0, 1] = 0.0  # facing east...
+    state.ent_pos[0, 2] = torch.tensor([10.5, 10.0])  # ...at entity 2, 0.5 tiles away
 
-    fire_mask = torch.zeros(1, cfg.n_entities, dtype=torch.bool)  # nobody firing
-    dmg_ent, _, _ = combat.melee_hitscan(state, fire_mask, bank, params, cfg)
-    assert torch.all(dmg_ent == 0)
+    fire_mask = torch.zeros(1, cfg.n_entities, dtype=torch.bool)
+    fire_mask[0, 1] = True  # entity 1 swings; entity 2, standing in that swing, does not
+    _, dmg_by, _ = combat.melee_hitscan(state, fire_mask, bank, params, cfg)
+    assert dmg_by[0, 1, 2].item() > 0.0  # the swing is live and connects...
+    assert dmg_by[0, 1, 1].item() == 0.0  # ...but never with the swinger itself
+    assert torch.all(dmg_by[0, 2] == 0)  # the non-firing entity deals nothing
 
 
 # ---- resolve_deaths --------------------------------------------------------------

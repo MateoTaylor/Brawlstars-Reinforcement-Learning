@@ -12,7 +12,7 @@ transfer to BlueStacks unmodified (§9.4); both detectors run on the GPU, and th
 is what set the perception rate at **12 Hz**, decisions staying at the trained 4 Hz (§6.13). **Every field in the observation spec now has a supplier** — every CV one has a reader and
 every proprioceptive one has the shadow, which is checked field-for-field against a live
 `BrawlVecEnv`. The policy that will consume them exists too: `runs/mortis_deploy-20260907-041522`
-trained 300M steps against `configs/agent_obs_deploy.yaml`. **`assemble.py` is BUILT and
+trained 300M steps against `archive/configs/agent_obs_deploy.yaml`. **`assemble.py` is BUILT and
 proven against the sim** (§6.6) — `tests/test_deployment_assemble.py` runs a real
 `BrawlVecEnv`, feeds the assembler the same frame through the deployed suppliers' interfaces,
 and asserts the result equals `obs_select.build_agent_obs`'s column-for-column, on both deploy
@@ -30,7 +30,7 @@ stale by six seconds, margins clamped to what the camera reaches — at 0–4 pp
 standard error. **Operator's call: deploy on the current checkpoint**, supplying `hero_margin` as
 local directional distances, `next_shrink_in` pinned, `safe_area_frac` lived with. The retrain
 stays a lever rather than a prerequisite, and the sim side of it is now built and waiting:
-`zone.hero_margin_local` plus `configs/agent_obs_deploy2.yaml` (§9.16) train the next model on the
+`zone.hero_margin_local` plus `archive/configs/agent_obs_deploy2.yaml` (§9.16) train the next model on the
 shape the live loop can actually produce, so pulling that lever is a run, not a design task.
 The GPU blocker is gone: ONNX Runtime now runs both detectors on CUDA at 3.6–4.4× the CPU
 numbers, after four separate faults (§9.12). Sibling of
@@ -470,7 +470,8 @@ nothing in reach the dash follows the move bin, or `facing` when idle, as value 
 device it is a bare tap on the attack point, down on the decision tick and up on the next, no
 drag, because a bare tap is precisely what the game auto-aims. The shadow models the dash along
 the loop's own estimate of the game's target, `DeployLoop._auto_aim`: the nearest enemy track,
-coasting ones included, or confirmed crate within `auto_aim_reach_tiles`. Where the game picks
+coasting ones included (through `AIM_MAX_MISSES`, 3 misses, whatever the run's `slots.max_misses`;
+2026-10-12), or confirmed crate within `auto_aim_reach_tiles`. Where the game picks
 something the tracker never saw, the modelled direction is wrong for one dash and the odometry
 corrects the position after it; the ammo, cooldown and dash timer are right either way.
 `Buttons.aim_point` refuses value 4 as it refuses the gadget, the mask's fifth bit is the
@@ -831,6 +832,34 @@ short coast for missed detections. Constant-velocity predict-then-gate, globally
 than per-track greedy, no Kalman filter: with ≤10 entities and a gate that must be wider than the
 step anyway, a filter's covariance would carry less information than its parameters imply.
 
+**Gates are per track (2026-10-12, archive/CRITIC_AND_MEMORY_PLAN.md A8).** A track's gate is
+`GATE_NOISE_TILES + MAX_WALK_TILES_S × (t − track.t)`, sized by its own gap, so an enemy coasting
+through deploy6's 3 s memory (`slots.max_misses` 12) cannot widen a fresh track's gate. The
+prediction stops at `MAX_PREDICT_S` (1.0 s): past that, a constant-velocity guess walks out of the
+area the enemy could have reached, and the growing gate covers it anyway. The hero track keeps its
+own 3-decision coast (`EntityTracker.hero_max_misses`) whatever the run's `slots.max_misses`,
+because the loop takes the hero's position from it on every decision.
+
+**Enemy boxes on a crate are dropped (2026-10-20, BUILT).** The entity detector boxes power-cube
+crates as `enemy`: a crate carries the same red HP bar an enemy brawler does, and the box flickers
+around the 0.5 cutoff. On 15 Dark Passage replays (deploy6) 25 of 82 enemy tracks were crates, 63
+of 192 apparent close-quarters decisions were next to one, and every flicker left a coasting row
+beside the hero, which is what the sim taught the policy a kill looks like (81-87% of close
+coasting rows there are an enemy dead in the last 0.75 s): it stopped attacking a crate that was
+still standing. `EntityTracker.update` now takes the loot map's crate cells and drops any `enemy`
+box whose ground point lands within `CRATE_VETO_TILES` (0.7, the user's pick) of one, before
+association. Measured on the same replays: 75% of crate-track sightings dropped, 2.2% (16 of 725)
+of moving-brawler sightings. The radius is not tighter because the two boxes anchor at different
+heights, so a crate's phantom sits a median 0.46 tiles off its cell centre (p90 1.46). Live only;
+the sim has no detector. Unconfirmed crates veto nothing, so a phantom can hold a slot for the
+fraction of a second before its crate's third sighting. `TickRow.n_crate_vetoed` counts the drops
+per decision. Re-replayed through the real loop with the veto on: crate tracks 25 → 8 (the p90
+tail), crate-side close-quarters decisions 63 → 8, and attacks chosen with a crate in dash reach
+and no enemy within 8 tiles 5% of 129 → 15% of 148, against 14% in the sim. Fights against real
+brawlers did not move (attack 53% → 55%, gadget 18% → 16% of legal decisions). 300 boxes were
+dropped over 1617 decisions. These are the replay's choices on recorded frames; whether each
+press fired in game is for a `--telemetry` match to show.
+
 **The world frame is `camera_relative + odometry.position_tiles`** — taken from
 `occupancy.update`, which is tested and does exactly this, rather than re-derived. Confirmed
 independently by regressing each track's world displacement on the camera's: the flipped sign
@@ -983,11 +1012,11 @@ free once §6.1 lands.
 > still pays `cube_pickup: 0.5` for a pickup the agent would no longer be able to see.
 >
 > **RESOLVED — dropped, and `cube_pickup` zeroed with them.** §9.11. The grid group in
-> `configs/agent_obs_deploy.yaml` is now the eight covered channels and the shape is
+> `archive/configs/agent_obs_deploy.yaml` is now the eight covered channels and the shape is
 > `(8, 13, 21)`; the operator will add crate and pickup detection in a later pass. So §6.2 is
 > **unblocked**: every remaining channel has a supplier on disk.
 >
-> **REVERSED for training 2026-09-11 (§9.18):** `configs/agent_obs_deploy3.yaml` trains on `box`
+> **REVERSED for training 2026-09-11 (§9.18):** `archive/configs/agent_obs_deploy3.yaml` trains on `box`
 > and `pickup` again, with `cube_pickup` restored. This module still refuses both by name, so a
 > deploy3 checkpoint cannot be deployed until a crate and cube detector and their suppliers exist.
 >
@@ -1040,7 +1069,9 @@ the hero cannot see appears in NO grid channel — `enemy_any` and `enemy_hidden
 would carry it and `obs_select` refuses both. So a coasted track, carried forward on a
 constant-velocity prediction because the detector missed it, must not be deposited. That is also
 exactly the rule `entities.revealed_to_hero` uses in the `enemies` group, so the two halves of the
-observation cannot disagree about who is visible.
+observation cannot disagree about who is visible. deploy6's `enemies` group reads `memory.*`
+instead (2026-10-12): a coasting track keeps its row, holding its last sighting and its age, with
+`memory.seen` 0. So the two halves still agree on who is visible, and the rows add who was.
 
 **The gas is accumulated, not read per frame.** The poison closes inward and never recedes, so a
 cell seen gassed is gassed for the rest of the match; `GasMap` latches it. This is not a
@@ -1169,7 +1200,7 @@ largest blocker in this design. The earlier reading of it — seven unrecoverabl
 narrowed spec and a from-scratch run — was wrong; it treated the loop as a spectator.
 
 One field does leave the group, and for an unrelated reason: `hero.cubes` is dropped in
-`configs/agent_obs_deploy.yaml` by operator decision, not because proprioception failed to reach
+`archive/configs/agent_obs_deploy.yaml` by operator decision, not because proprioception failed to reach
 it (§9.8). And a retrain *is* now happening — driven by the three `entities.*` fields, none of
 which this section's argument covers. What stands is that no `self` field forced it.
 
@@ -1390,7 +1421,7 @@ letting the call site guess, since the error it prevents is a plausible integer 
 
 #### The `history` group of deploy4, BUILT 2026-09-21
 
-`configs/agent_obs_deploy4.yaml` adds a 78-float `history` group: the last
+`archive/configs/agent_obs_deploy4.yaml` adds a 78-float `history` group: the last
 three decisions, newest first, laid out the way the sim's `core/history.py` rings hold them. It
 needs no new reader. Every column is either our own action or a number the decision already
 assembled, which is why it sits with the proprioception fields:
@@ -1844,7 +1875,7 @@ group; a checkpoint handed the wrong one gets a shape error if it is lucky and a
 spec object*, so the two cannot disagree — which is why §6.6's constructor now takes objects
 rather than paths.
 
-Four guards, in order:
+Five guards, in order:
 
 1. **`algo != maskable_ppo` → refuse.** Not because `predict` would raise on `action_masks`, but
    because an unmasked policy can request a super it has not charged.
@@ -1862,6 +1893,12 @@ Four guards, in order:
    still matches. *2026-09-21:* this holds as written again. The gadget change first also
    accepted the pre-gadget `(n_move_bins + 1, 3)`; its 2026-09-21 amendment retired that, and
    a pre-gadget checkpoint is now refused with a message that names it as one.
+5. **A spec with `critic:` groups and a checkpoint without the split → refuse** (2026-10-12). The
+   assembler never writes the critic groups (`build_agent_obs(critic=False)`), so they are zero
+   live, which is harmless only while the policy head cannot read them. The extractor's
+   `critic_keys` must equal the spec's critic group names, and the policy's `mlp_extractor` must
+   be a `SplitMlpExtractor`, whose pi net reads the actor columns alone
+   (`brawl_sim/wrappers/sb3_policy.py`).
 
 Guards 1 and 2 fire **before** `MaskablePPO.load`, which is what makes the whole set testable from
 a temp directory holding nothing but a `train.yaml` — `runs/` is gitignored, so a test that needed
@@ -2188,6 +2225,13 @@ odometry.position_tiles`, the frame `GasMap` deposits in.
 | `active` | a latch over `gassed.any()`, held until the next match | truthful; `GasMap` alone would un-latch, since a new segment empties it (corrected 2026-09-30) |
 | `safe_area_frac` | `1 − gassed cells / (map_w · map_h)` over the map block | the group's weak column, knowingly |
 | `next_shrink_in` | pinned at `0.0` | a lie, priced at ≤1 SE, recorded, reversible |
+
+**REVISED 2026-10-21: two fields, not four.** Only the first deploy spec read `hero_margin`,
+`safe_area_frac` and `next_shrink_in`; deploy2 swapped the first for `hero_margin_local` and
+dropped the other two (§9.16), and every spec since has kept that pair. With the five deploy specs
+before deploy6 in `archive/configs/`, `estimate` returns `hero_margin_local` and `active` only:
+the first row's scan, under the name the sim clamps to the same horizon, and the latch. The last
+two rows, item 1 below and the `safe_area_frac` paragraph record the supplier as it was built.
 
 **Three things about it are easy to misread later, so they are pinned by tests.**
 
@@ -2812,7 +2856,7 @@ what the policy was handed: `attack_legal` (the shadow's `attack_mask()` as a bi
 attack column i, so `& 0b10` is "the dash was legal"), `attack_cd_shadow` and `attack_idle_t_shadow`
 (the shadow's two timers at the decision), `enemy_in_reach` (any enemy track within
 `dash_distance + dash_radius + unit_radius` tiles of the hero, `loop.dash_reach_tiles` from the
-configs), and `resync` / `resync_error` (the ammo canary tripped on this decision, with the CV-minus-
+configs; since 2026-10-12 a track coasting past `AIM_MAX_MISSES`, 3 misses, does not count), and `resync` / `resync_error` (the ammo canary tripped on this decision, with the CV-minus-
 shadow error that tripped it; the mask on that row is the post-resync one). `-1` / `-1.0` where there
 was no decision. The audit's `ammo` is the existing `ammo_shadow`, which the loop now writes on every
 decision that reaches the bars, hero box or not (the shadow always has a clip; a sentinel beside a
@@ -2822,6 +2866,14 @@ because the reseeded cooldown makes it neither an opportunity nor phased. `scrip
 audit's rows and computes the same five statistics plus resyncs per minute inside fights; a CSV from
 before the columns still loads (`TickRow.from_record` defaults what a file lacks) but the audit
 refuses it by name.
+
+**Memory columns on `TickRow` (2026-10-12).** `n_ghosts` counts the enemy tracks coasting at the
+decision, −1 on a tick with no decision. `reacquired` lists each coasting track a detection took
+back on this tick, as `gap:jump` pairs joined by `;`: the unseen decisions it coasted, and the
+tiles between its last sighting and that detection. `scripts/probes/replay_clip.py --max-misses
+12` prints every coast from the track ids (archive/CRITIC_AND_MEMORY_PLAN.md C3). `n_crate_vetoed`
+(2026-10-20) counts the `enemy` boxes the tracker dropped as sitting on a confirmed crate, −1 on a
+tick the tracker did not run.
 
 ### 7.1 Timing, measured
 
@@ -3050,7 +3102,7 @@ stopped agent is recoverable by hand; an agent mashing inputs into a menu is not
    in the same position as one nobody can. Dropping it is what keeps that honest — the one thing
    not on the table is leaving it in the spec and feeding it zero. This narrows the observation
    and so invalidates the current checkpoint; it is a retrain, not a swap, and it belongs in a
-   new file — `configs/agent_obs_deploy.yaml`, written and tested — rather than an edit to
+   new file — `archive/configs/agent_obs_deploy.yaml`, written and tested — rather than an edit to
    `agent_obs_lowinfo.yaml`, which the existing run's `train.yaml` still points at by path.
    `tests/test_configs_files.py` pins the new file's relationship to its parent in both
    directions: nothing added, and exactly these four removed.
@@ -3065,7 +3117,7 @@ stopped agent is recoverable by hand; an agent mashing inputs into a menu is not
    The ablation is not an argument for keeping it either — it could not detect the policy using
    the field at all. What decides it is cost: the column is already built and free to supply, and
    it is the only enemy field carrying motion, which is what any future need to lead a target
-   would be built on. **One line in `configs/agent_obs_deploy.yaml` reverses this** if the
+   would be built on. **One line in `archive/configs/agent_obs_deploy.yaml` reverses this** if the
    operator would rather narrow further; the file marks the line.
 
 10. ~~**`hero.hp_frac` / `entities.hp_frac` — the denominator nobody can see.**~~ **Resolved —
@@ -3483,7 +3535,7 @@ stopped agent is recoverable by hand; an agent mashing inputs into a menu is not
     checkpoint) and asked for the sim to be updated anyway, so that whenever a retrain happens it
     trains on the shape the live loop can produce rather than on ground truth. That is this item.
     It changes nothing about the checkpoint being deployed now, which still reads
-    `configs/agent_obs_deploy.yaml`.
+    `archive/configs/agent_obs_deploy.yaml`.
 
     **The new field.** `zone.hero_margin_local`, registered in `core/obs_schema.py` and produced
     by `core/observation.py`'s zone block:
@@ -3516,7 +3568,7 @@ stopped agent is recoverable by hand; an agent mashing inputs into a menu is not
     until it stops clamping — a no-op horizon silently restores the unbounded field while the
     estimator keeps saturating, and the spec still names the right column.
 
-    **The new spec: `configs/agent_obs_deploy2.yaml`.** A fourth file, per the standing rule —
+    **The new spec: `archive/configs/agent_obs_deploy2.yaml`.** A fourth file, per the standing rule —
     `runs/mortis_deploy-20260907-041522/train.yaml` names `agent_obs_deploy.yaml` by path, and
     that is the checkpoint being deployed this week. Identical to its parent in every group but
     `zone`, which goes **7 columns → 5**:
@@ -3629,7 +3681,7 @@ stopped agent is recoverable by hand; an agent mashing inputs into a menu is not
     that item said it would be: *the agent cannot see how many cubes an enemy or it has collected,
     but it should be able to physically see them on the map before they are picked up.*
 
-    **The spec.** `configs/agent_obs_deploy3.yaml` is `deploy2` with the grid's `box` and `pickup`
+    **The spec.** `archive/configs/agent_obs_deploy3.yaml` is `deploy2` with the grid's `box` and `pickup`
     channels restored, at lowinfo's positions: `(8, 13, 21)` → `(10, 13, 21)`, every other group
     byte-identical. Both halves of the operator's rule were already true of those two channels, so
     nothing else changed. `box` counts intact crates per cell. `pickup` counts pickup **objects**
@@ -3683,7 +3735,7 @@ stopped agent is recoverable by hand; an agent mashing inputs into a menu is not
     The run:
 
     ```
-    .venv/Scripts/python.exe scripts/train.py --set run.name=mortis_deploy3 --set run.agent_obs=configs/agent_obs_deploy3.yaml
+    .venv/Scripts/python.exe scripts/train.py --set run.name=mortis_deploy3 --set run.agent_obs=archive/configs/agent_obs_deploy3.yaml
     ```
 
 19. **BUILT 2026-09-24 — `agent_obs_deploy5.yaml`: the sim hero sees the screen, not a
@@ -3734,7 +3786,7 @@ stopped agent is recoverable by hand; an agent mashing inputs into a menu is not
     meaning. Live, the latch held only within one odometry segment until 2026-09-30, when it
     moved into `ZoneEstimator` itself (§6.12).
 
-    **The spec.** `configs/agent_obs_deploy5.yaml` is deploy4 plus `hero.near_edge` and
+    **The spec.** `archive/configs/agent_obs_deploy5.yaml` is deploy4 plus `hero.near_edge` and
     `slots: tracked`: `self` 26 → 27 floats, the extractor 262 → 263, every other group
     byte-identical (`tests/test_configs_files.py` pins both directions). `configs/train.yaml` still names
     deploy4 (the run passes deploy5 with `--set`, below); `configs/deployment.yaml` names the
@@ -3744,7 +3796,7 @@ stopped agent is recoverable by hand; an agent mashing inputs into a menu is not
     The run:
 
     ```
-    .venv/Scripts/python.exe scripts/train.py --set run.name=mortis_deploy5 --set run.agent_obs=configs/agent_obs_deploy5.yaml
+    .venv/Scripts/python.exe scripts/train.py --set run.name=mortis_deploy5 --set run.agent_obs=archive/configs/agent_obs_deploy5.yaml
     ```
 
 20. **BUILT 2026-09-25 — the gas schedule timed from the game, trained at 1.3× its pace.**

@@ -526,7 +526,10 @@ def test_env_enemy_behind_a_wall_at_one_and_a_half_tiles_takes_0():
     assert _throw_and_land(env, override, hp_before)[-1] == [0.0, 2000.0, 0.0]
 
 
-def test_env_firing_sets_the_cooldown_to_18_and_the_mask_refuses_for_360_ticks():
+def test_env_firing_sets_the_cooldown_to_18_and_the_mask_refuses_until_it_runs_out():
+    """The timer falls by dt a tick from 18.0, and the mask refuses the gadget until the tick it
+    reads 0. The countdown is sampled by writing the timer rather than walked (it walked all 360
+    ticks until 2026-10-20): a few points along it, then the last two ticks, 0.1 -> 0.05 -> 0."""
     env, override, _hp = _duel([11.5, 10.0])
     st = env.state
     obs, *_ = _act(env, override, _GADGET)
@@ -536,15 +539,18 @@ def test_env_firing_sets_the_cooldown_to_18_and_the_mask_refuses_for_360_ticks()
 
     obs, *_ = _act(env, override, 0)
     assert st.ent_gadget_cd[0, 0].item() == pytest.approx(17.95, abs=1e-4)
+    assert not bool(obs["action_mask"]["attack"][0, 3])
 
-    legal = [bool(obs["action_mask"]["attack"][0, 3])]
-    for _ in range(360):
+    for left in (12.0, 6.0, 1.0, 0.1):
+        st.ent_gadget_cd[0, 0] = left
         obs, *_ = _act(env, override, 0)
-        legal.append(bool(obs["action_mask"]["attack"][0, 3]))
-    # Index k = the observation k+1 ticks after the throw. 18.0 s / 0.05 s = 360 ticks.
-    assert legal[:359] == [False] * 359
-    assert legal[359] is True and legal[360] is True
+        assert not bool(obs["action_mask"]["attack"][0, 3]), f"legal with {left - 0.05:.2f} s left"
+    assert st.ent_gadget_cd[0, 0].item() == pytest.approx(0.05, abs=1e-6)
+    obs, *_ = _act(env, override, 0)
     assert st.ent_gadget_cd[0, 0].item() == 0.0
+    assert bool(obs["action_mask"]["attack"][0, 3])
+    obs, *_ = _act(env, override, 0)
+    assert bool(obs["action_mask"]["attack"][0, 3])                # and it stays legal
 
     # ...and ready means it really can be thrown again.
     _act(env, override, _GADGET)
@@ -926,16 +932,19 @@ def test_env_at_the_shipped_decision_rate_the_gadget_rearms_on_the_73rd_observat
     assert float(st.ent_damage_dealt[0, 0]) == 4000.0
 
 
+@pytest.mark.gpu
 def test_a_gadget_thrown_every_decision_is_sync_free_on_cuda():
     """tests/test_integration.py's sync test draws the attack column from {0, 1}, so it never
     throws a gadget: it sees `_attack_phase`'s gadget block only with `gadget_fire` all False.
     Here every env throws on every decision (the cooldown is zeroed between steps, on device)
     under `set_sync_debug_mode("error")`, so a data-dependent branch on the firing path raises.
     The throw counts are accumulated ON DEVICE and read once, after the window closes.
-    Bots are frozen by the override, so nobody dies and 43 decisions fit one 2000-tick episode."""
+    Bots are frozen by the override, so nobody dies inside the one episode. Eight decisions: a
+    spinner lives 4 of a decision's 5 ticks, so slot use is steady from the first throw (the
+    window was 40 until 2026-10-20)."""
     if not torch.cuda.is_available():
         pytest.skip("CUDA not available")
-    n_envs, decisions = 64, 40
+    n_envs, decisions = 64, 8
     env = _env(action_repeat=5, n_envs=n_envs, device="cuda", debug_checks=False)  # check_invariants syncs
     st = env.state
     action = torch.tensor([[0, _GADGET]], dtype=torch.int64, device="cuda").repeat(n_envs, 1)
@@ -964,5 +973,5 @@ def test_a_gadget_thrown_every_decision_is_sync_free_on_cuda():
         torch.cuda.set_sync_debug_mode("default")
         env.tick_hook = None
 
-    assert int(throws) == 2560                   # 64 envs x 40 decisions, every one a throw
-    assert int(sightings) == 7680                # each spinner is alive after sub-ticks 1-3 of 5
+    assert int(throws) == 512                    # 64 envs x 8 decisions, every one a throw
+    assert int(sightings) == 1536                # each spinner is alive after sub-ticks 1-3 of 5

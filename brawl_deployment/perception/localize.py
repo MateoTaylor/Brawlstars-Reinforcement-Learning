@@ -1,4 +1,5 @@
-"""Where the camera is on a known map. KNOWN_MAP_LOCALIZATION_PLAN.md sections 6 and 7, step K2.
+"""Where the camera is on a known map.
+archive/KNOWN_MAP_LOCALIZATION_PLAN.md sections 6 and 7, step K2.
 
 `MapLocalizer` stands where `LatticePhase` stands in the deploy loop and hands out the world frame,
 behind the same four members (`reset`, `update`, `world`, `epoch`). With a fix, that frame is the

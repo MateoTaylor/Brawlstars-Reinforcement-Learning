@@ -1,4 +1,5 @@
-"""K4's report on a known-map run: KNOWN_MAP_LOCALIZATION_PLAN.md step K4, and K5 on a live CSV.
+"""K4's report on a known-map run:
+archive/KNOWN_MAP_LOCALIZATION_PLAN.md step K4, and K5 on a live CSV.
 
 Reads the telemetry `replay_clip.py --csv` and `deploy_run.py --telemetry` write (the `map_*` and
 `hero_odo_*` columns) and prints, for each file:

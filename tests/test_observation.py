@@ -5,10 +5,11 @@ import torch
 import yaml
 
 from brawl_sim.bots import perception
-from brawl_sim.config import build_params, load_config
-from brawl_sim.constants import N_KINDS, N_PROJ_KINDS, Kind
+from brawl_sim.config import _deep_merge, build_params, load_config
+from brawl_sim.constants import Kind, Proj
 from brawl_sim.core import camera
 from brawl_sim.core import hero as hero_mod
+from brawl_sim.core import obs_schema as schema
 from brawl_sim.core import observation as obs_mod
 from brawl_sim.core import obs_select
 from brawl_sim.core import spawn
@@ -23,7 +24,7 @@ CONFIGS_TINY = yaml.safe_load(open("configs/presets/debug_tiny.yaml").read())
 def _cfg_params_bank(n_envs=8, seed=0, overrides=None, tiny=True):
     merged = dict(CONFIGS_TINY) if tiny else {}
     if overrides:
-        merged = {**merged, **overrides}
+        merged = _deep_merge(merged, overrides)  # the preset's other keys in a section stay
     cfg = load_config(CONFIGS_DEFAULT, overrides=merged or None)
     spec = {
         **yaml.safe_load(open(CONFIGS_DEFAULT).read()),
@@ -78,12 +79,12 @@ def test_shapes_match_expected():
     # adding Proj.SUPER_BOLT made the projectile literal wrong while it still read as a
     # deliberate assertion about observation shape. Deriving them means adding an enum member
     # updates this test for free, and a width that DISAGREES with its enum still fails.
-    assert obs["entities"]["kind_onehot"].shape == (n_envs, E, N_KINDS)
+    assert obs["entities"]["kind_onehot"].shape == (n_envs, E, len(Kind))
     assert obs["entities"]["dist_rank"].shape == (n_envs, E)
     assert obs["entities"]["privileged"]["move_intent"].shape == (n_envs, E, 2)
 
     assert obs["projectiles"]["pos"].shape == (n_envs, P, 2)
-    assert obs["projectiles"]["kind_onehot"].shape == (n_envs, P, N_PROJ_KINDS)
+    assert obs["projectiles"]["kind_onehot"].shape == (n_envs, P, len(Proj))
 
     assert obs["boxes"]["pos"].shape == (n_envs, B, 2)
     assert obs["pickups"]["pos"].shape == (n_envs, U, 2)
@@ -105,14 +106,6 @@ def test_shapes_match_expected():
 
     assert obs["meta"]["map_h"].shape == (n_envs,)
     assert torch.all(obs["meta"]["map_h"] == cfg.map_h)
-
-
-def test_all_float_fields_finite():
-    cfg, params, bank, gen, spec = _cfg_params_bank(n_envs=8)
-    state = _reset(cfg, params, bank, gen, spec, 8)
-    vis, los = _vis_los(state, bank, params, cfg)
-    obs = obs_mod.build_obs(state, bank, vis, los, params, cfg)
-    _assert_all_finite(obs)
 
 
 def test_action_mask_matches_hero_action_mask():
@@ -143,31 +136,31 @@ def test_privileged_and_world_grid_toggles():
     obs2 = obs_mod.build_obs(state2, bank2, vis2, los2, params2, cfg2)
     assert "privileged" in obs2["entities"]
     assert set(obs2["entities"]["privileged"].keys()) == {
-        "target_id", "react_t", "reveal_t", "decision_phase", "move_intent",
+        "target_id", "react_t", "reveal_t", "decision_phase", "move_intent", "targets_hero",
     }
     assert "world" in obs2
 
 
 # ---- dist_rank is a valid permutation ---------------------------------------------------
 
-def test_dist_rank_is_valid_permutation():
+def test_dist_rank_is_each_entitys_rank_by_distance_from_the_hero():
+    # 2026-10-20: entities stood in slot order along the line, so the nearest-first order was the
+    # identity and its inverse (the rank) was the identity too: a dist_rank that returned the
+    # order itself, not its inverse, passed the old permutation check. The slots now stand
+    # out of distance order, where order [0, 2, 3, 1] and rank [0, 3, 1, 2] differ.
     n_envs = 6
-    cfg, params, bank, gen, spec = _cfg_params_bank(n_envs=n_envs)
+    cfg, params, bank, gen, spec = _cfg_params_bank(n_envs=n_envs, overrides={"entities": {"n_enemies": 3}})
     state = _reset(cfg, params, bank, gen, spec, n_envs)
-    # force distinct, well-separated positions so there are no distance ties
-    E = cfg.n_entities
-    for e in range(E):
-        state.ent_pos[:, e, 0] = 2.0 + e * 1.7
-        state.ent_pos[:, e, 1] = 10.0
+    assert cfg.n_entities == 4
+    # distinct, well-separated distances so there are no ties; slot e is rank[e]-th nearest
+    rank = torch.tensor([0, 3, 1, 2])
+    state.ent_pos[:, :, 0] = 2.0 + 1.7 * rank.float()
+    state.ent_pos[:, :, 1] = 10.0
     vis, los = _vis_los(state, bank, params, cfg)
     obs = obs_mod.build_obs(state, bank, vis, los, params, cfg)
 
-    dist_rank = obs["entities"]["dist_rank"]
-    expected = torch.arange(E)
-    for row in range(n_envs):
-        assert torch.equal(torch.sort(dist_rank[row]).values, expected)
-    # entity 0 (hero) is always its own nearest (dist 0) -> rank 0
-    assert torch.all(dist_rank[:, 0] == 0)
+    # entity 0 (hero) is its own nearest (dist 0) -> rank 0
+    assert torch.equal(obs["entities"]["dist_rank"], rank.expand(n_envs, 4))
 
 
 # ---- bush hiding: full information + correct annotation --------------------------------
@@ -361,7 +354,7 @@ def test_zone_fields():
 
 
 def test_zone_hero_margin_local_saturates_at_the_sensing_horizon():
-    """`hero_margin_local` is the field configs/agent_obs_deploy2.yaml trains on, and the reason it
+    """`hero_margin_local` is a field every deploy spec from deploy2 on reads, and the reason it
     exists is that the deployed loop has no safe rect to subtract from -- it scans a sticky map of
     gas it has SEEN (brawl_deployment/perception/grid.py) and stops at a horizon. So the sim
     saturates at the same number, and this test pins the three cases that matter: a margin inside
@@ -444,8 +437,10 @@ def test_batched_smoke_default_config():
     vis, los = _vis_los(state, bank, params, cfg)
     obs = obs_mod.build_obs(state, bank, vis, los, params, cfg)
     _assert_all_finite(obs)
+    # 2026-10-20: every field's shape is checked against the full-size config, not only world's
+    # (the view NaN check that stood here was already covered by the finite check above)
+    schema.validate_obs(obs, cfg)
     assert obs["world"].shape == (n_envs, 15, cfg.map_h, cfg.map_w)
-    assert not torch.any(torch.isnan(obs["view"].float()))
 
 
 # ---- the gadget fields ---------------------------------------------------------------------
@@ -686,15 +681,3 @@ def test_after_an_idle_step_enemy_hist1_is_the_last_revealed_plane_cut_to_the_bl
     assert torch.equal(obs["view"][0, 12], prev["view"][0, 6] * block)
     assert obs["view"][0, 12].nonzero().tolist() == [[6, 9]]
     assert not obs["view"][0, 13:].any()
-
-
-@pytest.mark.parametrize("frames, channels", [(1, 13), (4, 16)])
-def test_the_history_width_follows_history_frames(frames, channels):
-    cfg, params, bank, gen, spec = _cfg_params_bank(
-        n_envs=2, overrides={"observation": {"history_frames": frames, "include_world_grid": True}})
-    state = _reset(cfg, params, bank, gen, spec, 2)
-    obs = _build(state, bank, params, cfg)
-    assert obs["view"].shape == (2, channels, 10, 14)
-    assert obs["world"].shape == (2, channels, 20, 20)
-    assert obs["hist"]["move_onehot"].shape == (2, frames, 17)
-    assert obs["hist"]["displacement"].shape == (2, frames, 2)

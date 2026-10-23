@@ -17,6 +17,7 @@ from tests.bot_fixtures import FakeBank, build_targeting, cfg_and_params, fresh_
 from brawl_sim.bots import combat_rules, policy
 from brawl_sim.config import validate
 from brawl_sim.constants import AimModel, Kind, Tile
+from brawl_sim.core import stats
 
 # The victim is entity 0 and the shooter entity 1, on a clear east-west line.
 SHOOTER, VICTIM = 1, 0
@@ -158,12 +159,18 @@ def test_lateral_speed_limit_of_zero_disables_the_hold_entirely():
 def test_a_stationary_loot_box_never_triggers_the_lateral_hold():
     """Targeting reports zero velocity for a box, so the hold falls out arithmetically rather
     than needing its own branch -- pinned because a box's `vel` comes from a `torch.where` that
-    could silently start passing the enemy's velocity through."""
-    cfg, params, gen, state, bank = _setup(kind=Kind.BOT_RIFLE, map_h=30, map_w=30)
+    could silently start passing the enemy's velocity through.
+
+    The victim is dead but still carries a crossing velocity: with no enemy target, targeting's
+    clamped fallback index (`ent_target` -1 -> row 0) reads the VICTIM's row, so without the
+    guard the box inherits exactly that 6 tiles/s. Until 2026-10-20 the victim stood still, so
+    the passed-through velocity was zero too and dropping the guard changed nothing here."""
+    cfg, params, gen, state, bank = _setup(kind=Kind.BOT_RIFLE, map_h=30, map_w=30,
+                                           victim_vel=(0.0, 6.0))
     k = int(Kind.BOT_RIFLE)
     params.fire_lateral_speed_limit[:, k] = 0.01     # anything moving at all would be held
     params.fire_lateral_hold_range_fraction[:, k] = 0.0
-    # No visible enemy: put the victim far away and out of the picture, leave a box in reach.
+    # No enemy target: the victim is dead (its row keeps the velocity above), a box is in reach.
     state.ent_alive[0, VICTIM] = False
     state.box_alive[0, 0] = True
     state.box_pos[0, 0] = torch.tensor([_SHOOTER_POS[0] - 2.0, _SHOOTER_POS[1]])
@@ -411,30 +418,90 @@ def test_a_kind_can_be_redefined_into_a_different_archetype_from_params_alone():
 def test_shipped_roster_rules_match_the_documented_table():
     """Pins each brawler's rule SHAPE (does it need a line, how does it aim), not its tuned
     numbers -- those are game statistics and are meant to move. See BRAWL_SIM_DESIGN.md §7's roster table.
+
+    Until 2026-10-20 the table stopped at the first four bots, so Edgar's and Spike's rules
+    (Spike's `fire_needs_los: true` is the one deliberate difference from Grom's) were pinned
+    nowhere and Bull was missing from the shotgun rows. It now covers every bot kind, and says
+    so, so the next brawler cannot slip past it the same way.
     """
     cfg, params, _gen = cfg_and_params(map_h=40, map_w=40)
-    expected_los = {Kind.BOT_SNIPER: 1, Kind.BOT_ARTILLERY: 0, Kind.BOT_MELEE: 0, Kind.BOT_RIFLE: 1}
+    expected_los = {Kind.BOT_SNIPER: 1, Kind.BOT_ARTILLERY: 0, Kind.BOT_MELEE: 0, Kind.BOT_RIFLE: 1,
+                    Kind.BOT_EDGAR: 0, Kind.BOT_SPIKE: 1, Kind.BOT_BULL: 1}
     expected_aim = {Kind.BOT_SNIPER: AimModel.LEAD, Kind.BOT_ARTILLERY: AimModel.LOB,
-                    Kind.BOT_MELEE: AimModel.DIRECT, Kind.BOT_RIFLE: AimModel.LEAD}
+                    Kind.BOT_MELEE: AimModel.DIRECT, Kind.BOT_RIFLE: AimModel.LEAD,
+                    Kind.BOT_EDGAR: AimModel.DIRECT, Kind.BOT_SPIKE: AimModel.LOB,
+                    Kind.BOT_BULL: AimModel.LEAD}
+    assert set(expected_los) == {k for k in Kind if k is not Kind.HERO_MORTIS}, \
+        "a bot kind is missing from this table"
     for kind, los in expected_los.items():
         assert int(params.fire_needs_los[0, int(kind)]) == los, kind
         assert int(params.aim_model[0, int(kind)]) == int(expected_aim[kind]), kind
 
-    # Only the shotgun holds fire on distance or on crossers; every other kind's rule is bare.
-    for kind in (Kind.BOT_SNIPER, Kind.BOT_ARTILLERY, Kind.BOT_MELEE):
+    # Only the shotguns (Shelly, Bull) hold fire on distance or on crossers; every other kind's
+    # rule is bare.
+    for kind in (Kind.BOT_SNIPER, Kind.BOT_ARTILLERY, Kind.BOT_MELEE, Kind.BOT_EDGAR,
+                 Kind.BOT_SPIKE):
         assert float(params.fire_range_fraction[0, int(kind)]) == 0.0, kind
         assert float(params.fire_lateral_speed_limit[0, int(kind)]) == 0.0, kind
-    assert 0 < float(params.fire_range_fraction[0, int(Kind.BOT_RIFLE)]) < 1.0
-    assert float(params.fire_lateral_speed_limit[0, int(Kind.BOT_RIFLE)]) > 0
+    for kind in (Kind.BOT_RIFLE, Kind.BOT_BULL):
+        assert 0 < float(params.fire_range_fraction[0, int(kind)]) < 1.0, kind
+        assert float(params.fire_lateral_speed_limit[0, int(kind)]) > 0, kind
 
     # The cone gate is derived, so exactly the kinds with an arc are the kinds that swing one.
-    for kind in (Kind.BOT_SNIPER, Kind.BOT_ARTILLERY, Kind.BOT_RIFLE):
+    for kind in (Kind.BOT_SNIPER, Kind.BOT_ARTILLERY, Kind.BOT_RIFLE, Kind.BOT_SPIKE,
+                 Kind.BOT_BULL):
         assert float(params.attack_arc_rad[0, int(kind)]) == 0.0, kind
-    assert float(params.attack_arc_rad[0, int(Kind.BOT_MELEE)]) > 0
+    for kind in (Kind.BOT_MELEE, Kind.BOT_EDGAR):
+        assert float(params.attack_arc_rad[0, int(kind)]) > 0, kind
 
     # Every bot has a preferred engagement distance for KITE to hold; the hero's is never read.
-    for kind in (Kind.BOT_SNIPER, Kind.BOT_ARTILLERY, Kind.BOT_MELEE, Kind.BOT_RIFLE):
+    for kind in expected_los:
         assert 0 < float(params.desired_range_fraction[0, int(kind)]) <= 1.0, kind
+
+
+# =================================================================================================
+# robustness: every kind, any state
+# =================================================================================================
+
+def test_no_nan_in_combat_output_for_any_kind_in_any_state():
+    """300 random states through the real targeting preamble and `combat`, with one bot of EVERY
+    kind in each env and a bush and a wall on the grid: positions, velocities, HP, deaths, ammo,
+    facings, stale targets and zone rects all randomized together. Whatever the rule decides
+    about FIRE, its aim outputs must stay finite, since a NaN aim reaches spawn_volley.
+
+    Until 2026-10-20 this was four single-kind copies (test_sniper, test_artillery, test_melee,
+    test_rifle), each randomizing a different subset of these fields from the unseeded global
+    RNG, and none covered Edgar, Spike or Bull."""
+    torch.manual_seed(0)  # every draw below comes from the global RNG
+    bot_kinds = [k for k in Kind if k is not Kind.HERO_MORTIS]
+    n_envs = 8
+    cfg, params, gen = cfg_and_params(n_envs=n_envs, n_enemies=len(bot_kinds))
+    state = fresh_state(cfg, params, n_envs=n_envs)
+    for e, kind in enumerate(bot_kinds, start=1):
+        state.ent_kind[:, e] = int(kind)
+    # fresh_state sized max HP for its single enemy_kind, and the HP draw below scales by it.
+    state.ent_max_hp.copy_(stats.effective_max_hp(state.ent_kind, state.ent_cubes, params))
+    tiles = grid(20, 20)
+    tiles[5, 5] = Tile.BUSH
+    tiles[9, 9] = Tile.WALL
+    bank = FakeBank(tiles)
+
+    for _ in range(300):
+        state.ent_pos.uniform_(1, 19)
+        state.ent_vel.uniform_(-5, 5)
+        state.ent_hp.uniform_(0, 1)
+        state.ent_hp.mul_(state.ent_max_hp)
+        state.ent_alive.copy_(torch.rand(state.ent_alive.shape) > 0.3)
+        state.ent_ammo.uniform_(0, 5)
+        state.ent_facing.uniform_(-3.14, 3.14)
+        state.ent_target.random_(-1, cfg.n_entities)
+        state.zone_lo.uniform_(0, 5)
+        state.zone_hi.uniform_(5, 20)
+
+        _vis, tgt = build_targeting(state, bank, params, cfg)
+        _fire, aim_dir, aim_point = combat_rules.combat(state, tgt, bank, params, cfg, gen)
+        for t in (aim_dir, aim_point):
+            assert torch.all(torch.isfinite(t))
 
 
 # =================================================================================================

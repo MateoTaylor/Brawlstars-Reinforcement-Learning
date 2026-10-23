@@ -1,4 +1,5 @@
 from pathlib import Path
+import copy
 import math
 
 import torch
@@ -10,6 +11,13 @@ from brawl_sim.core import movement, stats, terrain
 from brawl_sim.core.state import allocate
 
 CONFIGS = Path(__file__).resolve().parent.parent / "configs"
+# The brawler spec, parsed once per module: until 2026-10-20 every `_cfg_and_params` call re-read
+# both YAML files (~16 ms a call). Each call gets its own deep copy, so nothing one test does to
+# the spec it was handed can reach the next.
+_SPEC = {
+    **yaml.safe_load((CONFIGS / "default.yaml").read_text()),
+    **yaml.safe_load((CONFIGS / "brawlers.yaml").read_text()),
+}
 
 
 class _FakeBank:
@@ -35,10 +43,7 @@ def _cfg_and_params(n_envs=1, map_h=30, map_w=30, extra_overrides=None):
     if extra_overrides:
         overrides = {**overrides, **extra_overrides}
     cfg = load_config(CONFIGS / "default.yaml", overrides=overrides)
-    spec = {
-        **yaml.safe_load((CONFIGS / "default.yaml").read_text()),
-        **yaml.safe_load((CONFIGS / "brawlers.yaml").read_text()),
-    }
+    spec = copy.deepcopy(_SPEC)
     gen = torch.Generator(device="cpu")
     gen.manual_seed(0)
     params = build_params(cfg, n_envs=n_envs, device="cpu", gen=gen, spec=spec)
@@ -71,8 +76,11 @@ def test_walking_into_wall_stops_and_slides():
     for _ in range(20):
         movement.apply_movement(state, move_dir, bank, params, cfg)
 
-    # x is stopped near the wall face (x=6.0), y keeps advancing -- the "slide"
-    assert state.ent_pos[0, 0, 0].item() < 6.0
+    # x is stopped with the body clear of the wall face (x=6.0), y keeps advancing -- the "slide".
+    # The bound is the face minus the body's radius: until 2026-10-20 it was `x < 6.0`, which let
+    # the body sink up to a radius into the wall.
+    face = 6.0
+    assert state.ent_pos[0, 0, 0].item() <= face - params.unit_radius[0].item() + 1e-4
     assert state.ent_pos[0, 0, 0].item() > 5.4
     assert state.ent_pos[0, 0, 1].item() > 6.0  # y moved well past its start
 
@@ -92,7 +100,8 @@ def test_walking_straight_into_wall_stops_dead():
         movement.apply_movement(state, move_dir, bank, params, cfg)
 
     assert state.ent_pos[0, 0, 1].item() == 5.5  # no y drift
-    assert state.ent_pos[0, 0, 0].item() < 6.0
+    face = 6.0  # the body stops a radius short of the face, as in the slide test above
+    assert state.ent_pos[0, 0, 0].item() <= face - params.unit_radius[0].item() + 1e-4
 
 
 # ---- units do NOT collide with each other ---------------------------------------
@@ -214,43 +223,28 @@ def test_walls_still_stop_a_walk():
     for _ in range(120):
         movement.apply_movement(state, move_dir, bank, params, cfg)
 
-    # Passed through entity 1 at x=13, then stopped dead at the wall face at x=14.
+    # Passed through entity 1 at x=13, then stopped dead at the wall face at x=14, a body radius
+    # short of it (until 2026-10-20 the bound was `< 14.0`, which allowed a radius of overlap).
     assert state.ent_pos[0, 0, 0].item() > 13.0, "the walker was blocked by a body, not the wall"
-    assert state.ent_pos[0, 0, 0].item() < 14.0, "the walker went through a WALL"
-
-
-def test_dashers_pass_through_bodies_too():
-    """Mortis's dash through enemies is handled by hero.advance_dash, which never consulted
-    bodies either. Asserted here so "dash passes through" and "walk passes through" are pinned
-    by the same file: they are now the same rule, not two separate exemptions."""
-    cfg, params = _cfg_and_params(map_h=30, map_w=30)
-    state = _pair_setup(cfg, walker_x=13.0, other_x=13.2)
-    state.ent_dash_t[0, 1] = 0.2  # entity 1 is mid-dash, sitting on entity 0
-    bank = _bank_from_grid(_grid(30, 30))
-
-    dasher_start = state.ent_pos[0, 1].clone()
-    move_dir = torch.zeros(1, cfg.n_entities, 2)
-    move_dir[0, 0] = torch.tensor([1.0, 0.0])
-    for _ in range(20):
-        movement.apply_movement(state, move_dir, bank, params, cfg)
-
-    assert state.ent_pos[0, 0, 0].item() > dasher_start[0].item() + 0.5, "a mid-dash entity blocked a walker"
-    assert torch.equal(state.ent_pos[0, 1], dasher_start), "apply_movement moved a dashing entity"
+    face = 14.0
+    assert state.ent_pos[0, 0, 0].item() <= face - params.unit_radius[0].item() + 1e-4, \
+        "the walker's body went into a WALL"
 
 
 # ---- stress: never inside a wall -------------------------------------------------
 
 def test_10k_random_ticks_never_inside_a_wall():
-    cfg, params = _cfg_and_params(n_envs=4, map_h=25, map_w=25)
-    state = _fresh_state(cfg, n_envs=4)
+    n_envs = 16
+    cfg, params = _cfg_and_params(n_envs=n_envs, map_h=25, map_w=25)
+    state = _fresh_state(cfg, n_envs=n_envs)
     tiles = _grid(25, 25)
     tiles[10, :] = Tile.WALL  # an internal wall to make bouncing off something likely
     tiles[10, 12] = Tile.FLOOR  # one gap so the map stays connected
     bank = _bank_from_grid(tiles)
 
     torch.manual_seed(0)
-    state.ent_pos[:, :, 0] = torch.rand(4, cfg.n_entities) * 20 + 2
-    state.ent_pos[:, :, 1] = torch.rand(4, cfg.n_entities) * 20 + 2
+    state.ent_pos[:, :, 0] = torch.rand(n_envs, cfg.n_entities) * 20 + 2
+    state.ent_pos[:, :, 1] = torch.rand(n_envs, cfg.n_entities) * 20 + 2
 
     radius = params.unit_radius.unsqueeze(-1)  # (N,1), broadcasts against (N,E)
     # A uniform-random initial y can land inside the injected wall row [10, 11) purely by luck of
@@ -263,9 +257,11 @@ def test_10k_random_ticks_never_inside_a_wall():
     blocked0 = terrain.circle_blocked(bank.blocks_unit, state.map_id, state.ent_pos, radius, cfg)
     safe_y = torch.full_like(state.ent_pos[..., 1], 5.0)  # comfortably outside [10, 11)
     state.ent_pos[..., 1] = torch.where(blocked0, safe_y, state.ent_pos[..., 1])
-    n_ticks = 10_000 // 4  # scale down per-env count; total move calls stay in the thousands
+    # 10k env-ticks, spread over 16 envs: the same entity-ticks as 2500 serial ticks of 4 envs (the
+    # shape until 2026-10-20, ~3 s), in a quarter of the Python-loop iterations.
+    n_ticks = 10_000 // n_envs
     for _ in range(n_ticks):
-        move_dir = torch.randn(4, cfg.n_entities, 2)
+        move_dir = torch.randn(n_envs, cfg.n_entities, 2)
         movement.apply_movement(state, move_dir, bank, params, cfg)
         blocked = terrain.circle_blocked(bank.blocks_unit, state.map_id, state.ent_pos, radius, cfg)
         assert not torch.any(blocked), "an entity ended up inside a blocks_unit tile"
@@ -327,7 +323,9 @@ def test_dashers_are_untouched_by_movement():
 
     state.ent_pos[0, 0] = torch.tensor([10.0, 10.0])
     state.ent_dash_t[0, 0] = 0.2
-    state.ent_facing[0, 0] = 0.75  # arbitrary, should also stay fixed per the active gate...
+    # Facing is deliberately not asserted: apply_movement's facing update is not behind the
+    # `active` gate, so a dasher with a walk input turns toward it. Until 2026-10-20 this seeded a
+    # facing whose comment said it "should also stay fixed", and never checked it.
     before_pos = state.ent_pos[0, 0].clone()
     before_vel = state.ent_vel[0, 0].clone()
 

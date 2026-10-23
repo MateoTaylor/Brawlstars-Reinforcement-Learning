@@ -9,7 +9,9 @@ import pytest
 import torch
 
 from brawl_deployment.perception import EntityTracker
-from brawl_deployment.perception.tracker import GATE_NOISE_TILES, MAX_WALK_TILES_S, _greedy_match
+from brawl_deployment.perception.tracker import (CRATE_VETO_TILES, GATE_NOISE_TILES,
+                                                  MAX_PREDICT_S, MAX_WALK_TILES_S, Track,
+                                                  _greedy_match)
 from brawl_vision.object_detection.detector import Detection
 
 PPT = 48
@@ -229,6 +231,43 @@ def test_untrusted_odometry_does_not_move_tracks():
     assert dict((s, (e.pos, e.vel)) for s, e in trk.enemies.items()) == before
 
 
+# ---------------------------------------------------------------- crates read as enemies
+
+def test_an_enemy_box_on_a_crate_never_takes_a_slot():
+    """The entity detector boxes power-cube crates as `enemy` (`CRATE_VETO_TILES`). A box that
+    lands within the radius of a crate the loot map holds is dropped before association on every
+    tick, and counted. In WORLD tiles: the camera has moved, and the crate is where the map says."""
+    trk = EntityTracker()
+    for i in range(6):
+        # camera at (2, 1), so camera-relative (3.1, 3.5) is world (5.1, 4.5), 0.6 off the crate
+        res = trk.update([det_at(3.1, 3.5)], StubPlan(), StubOdo(position=(2.0, 1.0)),
+                         t=i * 0.25, crates=[(4.5, 4.5)])
+        assert res.n_crate_vetoed == 1
+    assert all(e is None for e in res.enemies) and trk._pending == []
+
+
+def test_a_brawler_beside_a_crate_is_still_tracked():
+    trk = EntityTracker()
+    for i in range(3):
+        res = trk.update([det_at(4.5 + CRATE_VETO_TILES + 0.05, 4.5)], StubPlan(), StubOdo(),
+                         t=i * 0.25, crates=[(4.5, 4.5)])
+    assert res.n_crate_vetoed == 0
+    assert len([e for e in res.enemies if e]) == 1
+
+
+def test_the_crate_veto_spares_the_hero_and_turns_off_at_zero():
+    trk = EntityTracker()
+    res = trk.update([det_at(4.5, 4.5, label="player")], StubPlan(), StubOdo(), t=0.0,
+                     crates=[(4.5, 4.5)])
+    assert res.hero is not None and res.n_crate_vetoed == 0
+    trk = EntityTracker(crate_veto_tiles=0.0)
+    for i in range(3):
+        res = trk.update([det_at(4.6, 4.5)], StubPlan(), StubOdo(), t=i * 0.25,
+                         crates=[(4.5, 4.5)])
+    assert res.n_crate_vetoed == 0
+    assert len([e for e in res.enemies if e]) == 1
+
+
 # ---------------------------------------------------------------- the hero
 
 def test_the_hero_is_tracked_separately_from_the_slots():
@@ -378,3 +417,58 @@ def test_the_sims_slot_rule_reproduces_the_trackers_slot_table():
         sim = [v - 1 for v in state.slot_ent[0].tolist()]
         assert sim == live, f"decision {d}: sim {sim} tracker {live}"
     assert sim == [2, 1, -1, 4]
+
+
+# ---------------------------------------------------------------- the memory coast (12 misses)
+
+def test_a_lost_enemy_does_not_widen_a_fresh_tracks_gate():
+    """B is lost for 10 decisions while A stays in view; then the only box is 4 tiles from A.
+    One gate for all, sized from B's 2.75 s gap (8.5 tiles), would hand that box to A, an
+    identity jump; A's own gate is one decision's 1.68 tiles, so the box starts a pending track
+    and A coasts."""
+    trk = EntityTracker(max_misses=12)
+    for i in range(3):
+        trk.update([det_at(5.0, 5.0), det_at(20.0, 5.0)], StubPlan(), StubOdo(), t=i * 0.25)
+    for i in range(3, 13):
+        trk.update([det_at(5.0, 5.0)], StubPlan(), StubOdo(), t=i * 0.25)
+    a = next(tr for tr in trk.enemies.values() if tr.pos[0] < 10.0)
+    b = next(tr for tr in trk.enemies.values() if tr.pos[0] > 10.0)
+    assert b.misses == 10
+    assert trk.gate_for(3.25, [b]) > 4.0 > trk.gate_for(3.25, [a])
+    trk.update([det_at(9.0, 5.0)], StubPlan(), StubOdo(), t=3.25)
+    assert a.pos == pytest.approx((5.0, 5.0)) and a.misses == 1 and not a.seen_now
+    assert len(trk._pending) == 1 and trk._pending[0].pos == pytest.approx((9.0, 5.0))
+
+
+def test_a_prediction_extrapolates_no_further_than_max_predict_s():
+    tr = Track(id=0, slot=0, label="enemy", pos=(0.0, 0.0), vel=(2.0, -1.0), t=0.0)
+    assert tr.predict(0.5) == pytest.approx((1.0, -0.5))
+    assert tr.predict(3.0) == tr.predict(MAX_PREDICT_S) == pytest.approx((2.0, -1.0))
+
+
+def test_the_hero_keeps_its_own_coast_when_the_enemies_coast_for_three_seconds():
+    """The loop reads the hero's position off the hero track every decision, so a 12-decision
+    coast would hold the hero still for 3 s. It drops after `hero_max_misses`, 3."""
+    trk = EntityTracker(max_misses=12)
+    assert trk.hero_max_misses == 3
+    for i in range(2):
+        trk.update([det_at(5.0, 5.0, label="player")], StubPlan(), StubOdo(), t=i * 0.25)
+    for i in range(2, 5):
+        assert trk.update([], StubPlan(), StubOdo(), t=i * 0.25).hero is not None
+    assert trk.update([], StubPlan(), StubOdo(), t=1.25).hero is None
+
+
+def test_reacquired_records_the_coast_a_match_ended():
+    """`TickRow.reacquired`'s source: (unseen decisions, tiles moved) on the match that ends a
+    coast, None on a match that follows a sighting."""
+    trk = EntityTracker(max_misses=12)
+    for i in range(3):
+        trk.update([det_at(5.0, 5.0)], StubPlan(), StubOdo(), t=i * 0.25)
+    (tr,) = trk.enemies.values()
+    assert tr.reacquired is None
+    for i in range(3, 6):
+        trk.update([], StubPlan(), StubOdo(), t=i * 0.25)
+    trk.update([det_at(5.0, 6.5)], StubPlan(), StubOdo(), t=1.5)
+    assert tr.reacquired == (3, pytest.approx(1.5))
+    trk.update([det_at(5.0, 6.5)], StubPlan(), StubOdo(), t=1.75)
+    assert tr.reacquired is None

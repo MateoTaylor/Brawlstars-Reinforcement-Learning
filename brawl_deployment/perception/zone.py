@@ -1,43 +1,22 @@
-"""`GasMap` -> the fields a deploy spec's `zone` group wants. See BRAWL_DEPLOYMENT_DESIGN.md 9.14-9.16.
+"""`GasMap` -> the fields deploy6's `zone` group wants. See BRAWL_DEPLOYMENT_DESIGN.md 9.14-9.16.
 
-**This is the group with no honest full supplier, and that was priced and decided rather than
-worked around.** Two ablation passes put the whole group at 10.4 pp (7 standard errors -- the only
-large reproducible effect in either pass) and every realistic degradation of it at 0-4 pp against a
-1.5 pp standard error. The operator's call (§9.15) was to deploy on the checkpoint of the day, which
-read `configs/agent_obs_deploy.yaml`, and to supply the group like this:
+The group is the honest pair the second deploy spec settled on and every spec since has kept:
 
 | field | supplier here | honesty |
 |---|---|---|
-| `hero_margin` | four ray scans over observed gas | recoverable **out to a horizon**; saturates past it |
-| `hero_margin_local` | the same four scans | the name and the values agree; the sim clamps at the same horizon |
+| `hero_margin_local` | four ray scans over observed gas | recoverable **to the sim's horizon** |
 | `active` | has any gas been observed this match | truthful |
-| `safe_area_frac` | 1 - observed gas area / the sim's map area | the group's weak column, knowingly |
-| `next_shrink_in` | **pinned at 0.0** | a lie, measured at <=1 SE, recorded, reversible |
 
-`estimate` returns every one of them, and `assemble._put_zone` takes only what the loaded spec
-names: `agent_obs_deploy.yaml` wants the four `hero_margin` / `active` / `safe_area_frac` /
-`next_shrink_in`, and `agent_obs_deploy2.yaml` and `agent_obs_deploy3.yaml` want
-`hero_margin_local` and `active`. Supplying the union rather than asking which spec is loaded keeps
-the estimator from needing to know about specs at all; the spec-driven choice stays in one place.
+`estimate` returns exactly these two, and `assemble._put_zone` takes what the loaded spec names, so
+a spec that wants a zone field this file does not make fails closed on its first decision.
 
-**On `agent_obs_deploy.yaml` the column is `hero_margin` and the values are `hero_margin_local`.
-That is on purpose and it is priced.** The sim's `hero_margin` is unclamped -- a training episode
-could show 25 tiles -- while everything below saturates at the horizon, because a bounded sensor is
-what deployment has. §9.15's second ablation pass measured exactly this substitution at **-1.9 pp**
-("clamped at 10 tiles"), against a 1.5 pp standard error. `agent_obs_deploy2.yaml` fixes it properly
-by naming `zone.hero_margin_local`, which the sim emits, and `agent_obs_deploy3.yaml` inherits that
-group unchanged. So the mismatch is confined to runs on the first deploy spec, and it is the thing to
-look at first if one of those agents misjudges gas at long range.
-
-**Pinning `next_shrink_in` is a deliberate exception to "never feed a constant for a field you
-cannot supply", not an oversight of it.** The rule exists because a fabricated column is usually an
-*unpriced* lie. This one is priced: §9.14 measured zeroing it at 1.5 pp and feeding it a
-plausible-looking wrong number at 4.4 pp -- so inventing a countdown is worse than admitting there
-isn't one. It is structurally unobservable, and not for want of a better reader: an egocentric
-camera cannot tell the gas front advancing from the gas front being revealed as the camera pans
-(measured, 7 tiles in 3 s purely from reveal). `configs/agent_obs_deploy2.yaml` drops the column
-outright and is the honest spec; it has no run behind it, and the retrain is a lever, not a
-prerequisite.
+The first deploy spec (`archive/configs/agent_obs_deploy.yaml`) also read three columns this file
+supplied until that spec was archived on 2026-10-21: the unclamped `hero_margin`, fed these clamped
+values (-1.9 pp, §9.15's "clamped at 10 tiles"); `safe_area_frac`, estimated over the sim's map
+extent (-2.8 pp at +/-0.05); and `next_shrink_in`, pinned at 0.0 because zeroing it cost 1.5 pp and
+a plausible wrong countdown 4.4 pp (§9.14). The countdown is structurally unobservable: an
+egocentric camera cannot tell the gas front advancing from the gas front being revealed as the
+camera pans (measured, 7 tiles in 3 s purely from reveal).
 
 **The horizon is read from the run's config, never hardcoded.** `cfg.zone_margin_horizon_tiles`
 (10.0 tiles) is the same number `zone.hero_margin_local` clamps to on the sim side. Two copies in
@@ -45,33 +24,26 @@ two packages is exactly how the two halves drift apart, and the drift is silent:
 names the right column while the estimator saturates somewhere the training data never did.
 
 **The known bias is one-sided and optimistic.** `GasMap` is sticky -- a cell it has never seen
-stays clear forever -- so both the ray scans and the area estimate read *safer* than the truth, in
-exactly the places the hero walked away from. The clamp bounds that error at the horizon; it does
-not remove it. §9.16 records this as the residual and as a deployment-side problem: the fix is a
-better accumulation rule in `GasMap`, not a different observation.
+stays clear forever -- so the ray scans read *safer* than the truth, in exactly the places the
+hero walked away from. The clamp bounds that error at the horizon; it does not remove it. §9.16
+records this as the residual and as a deployment-side problem: the fix is a better accumulation
+rule in `GasMap`, not a different observation.
 """
 import numpy as np
 
-# `hero_margin`'s four components, in the sim's own order:
+# `hero_margin_local`'s four components, in the sim's own order (its `hero_margin`, clamped):
 # `(x - lo.x, hi.x - x, y - lo.y, hi.y - y)` -- see `core/obs_schema.py`. Each is a signed distance
 # in tiles to one edge of the safe rect, POSITIVE when the hero is inside on that side.
 _RAYS = ((-1, 0), (1, 0), (0, -1), (0, 1))
-
-# What a pinned `next_shrink_in` is set to. Zero, not a large number: the schema bounds the field
-# at >= 0 and the sim emits `clamp(zone_next_t - time, min=0)`, so 0 is what an overdue-or-disabled
-# schedule already looks like in training. A large constant would be a value the column's training
-# distribution does contain, which is worse -- it would read as "a shrink is far away" rather than
-# as the degenerate case the policy has seen.
-PINNED_NEXT_SHRINK_IN = 0.0
 
 
 class ZoneEstimator:
     """`GasMap` + hero position -> the `zone` group, in the sim's units.
 
-    One instance per loop, reset by the loop at every match start. The margins and the area are
-    stateless between calls: each is a function of the gas map handed in, which is where the
-    accumulation actually lives, so a `GasMap.reset` on a segment change needs no corresponding
-    reset here -- margins of its own would point at a world frame that moved.
+    One instance per loop, reset by the loop at every match start. The margins are stateless
+    between calls: they are a function of the gas map handed in, which is where the accumulation
+    actually lives, so a `GasMap.reset` on a segment change needs no corresponding reset here --
+    margins of its own would point at a world frame that moved.
 
     `active` is the one exception, and on purpose. It is a single bit with no position in it, so
     it has no world frame to go stale in, and it must NOT follow the gas map through a segment
@@ -82,7 +54,6 @@ class ZoneEstimator:
         self.cfg = cfg
         # Read, not stored as a literal. See the module docstring.
         self.horizon = float(cfg.zone_margin_horizon_tiles)
-        self.map_area = float(cfg.map_w) * float(cfg.map_h)
         self._seen = False          # `active`'s latch
 
     def reset(self) -> None:
@@ -98,20 +69,8 @@ class ZoneEstimator:
         `GasMap` deposits in. Passing camera-relative coordinates here would put the scan origin
         wherever the hero happened to start the match, which reads as a plausible margin and is
         wrong by however far they have walked.
-
-        `hero_margin` and `hero_margin_local` are one scan under two names, not two estimates: the
-        scan saturates at the horizon, which is what `hero_margin_local` means and what
-        `hero_margin` knowingly borrows (module docstring). Computing them separately would only
-        make room for them to disagree.
         """
-        margin = self.hero_margin(gas, hero_pos)
-        return {
-            "hero_margin": margin,
-            "hero_margin_local": margin,
-            "active": self.active(gas),
-            "safe_area_frac": self.safe_area_frac(gas),
-            "next_shrink_in": PINNED_NEXT_SHRINK_IN,
-        }
+        return {"hero_margin_local": self.hero_margin(gas, hero_pos), "active": self.active(gas)}
 
     # -- the fields -----------------------------------------------------------
 
@@ -159,22 +118,6 @@ class ZoneEstimator:
         self._seen = self._seen or bool(gas.gassed.any())
         return self._seen
 
-    def safe_area_frac(self, gas) -> float:
-        """Safe area / map area, over the sim's map extent.
-
-        **The group's weak column, and knowingly so.** The true value needs the map's total extent,
-        which an odometry-anchored 128x128 canvas never learns. What makes an estimate possible at
-        all is the assumption §9.17 already accepted for `hero.pos_norm`: the map is
-        `cfg.map_w x cfg.map_h` tiles centred on the odometry origin. That assumption buys the
-        *scale* exactly and quarantines the uncertainty in the origin -- one assumption, reused
-        here rather than a second one invented.
-
-        Optimistic, like everything else that reads `GasMap`: cells never seen count as safe.
-        Priced at -2.8 pp for a +/-0.05 error (§9.15), which is the cost being accepted.
-        """
-        gassed = float(np.count_nonzero(self._map_region(gas)))
-        return float(np.clip(1.0 - gassed / self.map_area, 0.0, 1.0))
-
     # -- geometry -------------------------------------------------------------
 
     def _cell(self, gas, hero_pos) -> tuple[int, int]:
@@ -202,17 +145,3 @@ class ZoneEstimator:
             if bool(gas.gassed[r, c]) == looking_for:
                 return min(float(step), self.horizon)
         return self.horizon
-
-    def _map_region(self, gas) -> np.ndarray:
-        """The `cfg.map_w x cfg.map_h` block of the gas canvas, centred on the world origin.
-
-        `GasMap.origin` is `(-(width // 2), -(height // 2))`, so the canvas is already centred on
-        world (0, 0) -- which is where `MapFrame` puts the map's centre. The two agree by
-        construction rather than by a coincidence worth asserting elsewhere.
-        """
-        ox, oy = gas.origin
-        c0 = max(0, int(-self.cfg.map_w / 2) - ox)
-        r0 = max(0, int(-self.cfg.map_h / 2) - oy)
-        c1 = min(gas.width, c0 + int(self.cfg.map_w))
-        r1 = min(gas.height, r0 + int(self.cfg.map_h))
-        return gas.gassed[r0:r1, c0:c1]

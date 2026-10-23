@@ -197,7 +197,7 @@ Changing either list does not break a checkpoint: no agent observation spec read
 which is why `scripts/watch.py` rebuilds the env from the run's own `train.yaml` and a saved match
 carries its map bank for the viewer's `--preset`. The observation spec is the real contract:
 changing the spec that `run.agent_obs` names in `configs/train.yaml` (currently
-`configs/agent_obs_deploy5.yaml`) mismatches every checkpoint trained on the old one.
+`configs/agent_obs_deploy6.yaml`) mismatches every checkpoint trained on the old one.
 
 ## Adding a map
 

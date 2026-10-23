@@ -1,4 +1,4 @@
-"""SIM_ISSUES_PLAN.md §5.2 (user decision, 2026-10-07): the `move_reversal` shaping term.
+"""archive/SIM_ISSUES_PLAN.md §5.2 (user decision, 2026-10-07): the `move_reversal` shaping term.
 
 One count per decision whose move bin swung at least 135 degrees from the previous decision's,
 both non-idle, paid by training/reward.py. The previous decision is read off the history ring

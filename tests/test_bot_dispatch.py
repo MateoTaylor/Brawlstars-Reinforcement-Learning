@@ -40,12 +40,12 @@ def _cfg_and_params(n_envs=1, n_enemies=4, map_h=20, map_w=20):
 
 
 def _fresh_state_one_of_each(cfg, params, n_envs=1):
-    """Entity 0 = hero, 1 = sniper, 2 = artillery, 3 = melee, 4 = rifle (requires n_enemies=4)."""
+    """Slot e holds Kind(e): entity 0 = hero, 1 = sniper, 2 = artillery, 3 = melee, 4 = rifle,
+    then Edgar, Spike and Bull, so n_enemies may be anything up to len(Kind) - 1."""
     state = allocate(cfg, n_envs=n_envs, device="cpu", verbose=False)
     state.ent_alive.fill_(True)
-    kinds = [Kind.HERO_MORTIS, Kind.BOT_SNIPER, Kind.BOT_ARTILLERY, Kind.BOT_MELEE, Kind.BOT_RIFLE]
-    for e, k in enumerate(kinds):
-        state.ent_kind[:, e] = int(k)
+    for e in range(cfg.n_entities):
+        state.ent_kind[:, e] = int(Kind(e))
     state.map_id.fill_(0)
     state.ent_target.fill_(-1)
     # RUSH for everyone: this file tests the KIND dispatch, so personality is held constant.
@@ -72,58 +72,70 @@ def _scatter_entities_around(state, center=(10.0, 10.0), spread=3.0):
 # ---- selection correctness -----------------------------------------------------------
 
 def test_fire_and_aim_match_the_combat_rule_for_every_kind():
-    """The dispatcher passes bots/combat_rules' output through unaltered except for the two
-    gates it owns (decision period on fire, hero/dead zeroing).
+    """The dispatcher passes bots/combat_rules' output through unaltered except for the three
+    gates it owns: the personality veto on fire (personality.fire_allowed, held open here since
+    every bot is a RUSH), the decision period on fire, and hero/dead zeroing.
 
-    step_count=0 means only entities whose slot index is itself a multiple of their
-    decision_period get to reconsider firing on this exact tick (staggering by design, see
-    policy.all_bot_intents' docstring) -- so `fire` is only directly comparable to the raw rule
-    for entities where that holds. aim_dir/aim_point never pass through decision-period gating or
-    reaction-delay smoothing at all, so those match unconditionally for every living non-hero
-    entity.
+    The decision period staggers by slot (policy.all_bot_intents' docstring): a bot reconsiders
+    firing only on ticks where step_count + its slot index is a multiple of its kind's period.
+    Every period divides 4, so four ticks give every slot its decision tick, and `fire` is
+    compared against the raw rule on each (on step_count 0 alone, only slot 4 ever compared a
+    True). aim_dir/aim_point never pass through decision-period gating or reaction-delay
+    smoothing at all, so those match unconditionally for every living non-hero entity.
 
     The per-kind DIFFERENCES are tested in tests/test_combat_rules.py."""
-    cfg, params, gen = _cfg_and_params(n_enemies=4)
+    cfg, params, gen = _cfg_and_params(n_enemies=len(Kind) - 1)   # one slot per kind
     state = _fresh_state_one_of_each(cfg, params)
     tiles = _grid(20, 20)
     bank = _FakeBank(tiles)
     _scatter_entities_around(state)
-
-    vis, tgt = build_targeting(state, bank, params, cfg)  # match all_bot_intents' own preamble
-    ref_fire, ref_dir, ref_point = combat_rules.combat(state, tgt, bank, params, cfg, gen)
-
-    # re-seed so the dispatcher's own aim noise draws line up with the reference call above
-    gen.manual_seed(0)
-    vis2 = perception.visibility(state, bank, params, cfg)
-    intent = policy.all_bot_intents(state, vis2, bank, params, cfg, gen)
 
     decision_period = torch.clamp(
         stats.gather_kind(params.decision_period, state.ent_kind), min=1,
     )
     entity_idx = torch.arange(cfg.n_entities, dtype=torch.int64).view(1, -1)
-    decision_tick = (entity_idx % decision_period) == 0  # step_count == 0
-    # Slots 1..4 are one of each bot kind (see _fresh_state_one_of_each).
-    for e in range(1, cfg.n_entities):
-        assert torch.allclose(intent.aim_dir[0, e], ref_dir[0, e]), f"aim_dir entity {e}"
-        assert torch.allclose(intent.aim_point[0, e], ref_point[0, e]), f"aim_point entity {e}"
-        expected_fire = ref_fire[0, e] & decision_tick[0, e]
-        assert bool(intent.fire[0, e]) == bool(expected_fire), f"fire entity {e}"
+    fired = set()
+    for step in range(4):
+        state.step_count.fill_(step)
+        _vis, tgt = build_targeting(state, bank, params, cfg)  # match all_bot_intents' own preamble
+        # the same seed before both calls: combat is the first thing all_bot_intents draws for, so
+        # the dispatcher's aim noise lines up with the reference's
+        gen.manual_seed(0)
+        ref_fire, ref_dir, ref_point = combat_rules.combat(state, tgt, bank, params, cfg, gen)
+        gen.manual_seed(0)
+        vis2 = perception.visibility(state, bank, params, cfg)
+        intent = policy.all_bot_intents(state, vis2, bank, params, cfg, gen)
 
-    # ...and the hero's row is zeroed on the way out no matter what the rule computed for it.
-    assert not bool(intent.fire[0, 0])
-    assert torch.all(intent.aim_dir[0, 0] == 0)
-    assert torch.all(intent.aim_point[0, 0] == 0)
+        decision_tick = ((step + entity_idx) % decision_period) == 0
+        for e in range(1, cfg.n_entities):
+            assert torch.allclose(intent.aim_dir[0, e], ref_dir[0, e]), f"aim_dir entity {e}, step {step}"
+            assert torch.allclose(intent.aim_point[0, e], ref_point[0, e]), f"aim_point entity {e}, step {step}"
+            expected_fire = bool(ref_fire[0, e] & decision_tick[0, e])
+            assert bool(intent.fire[0, e]) == expected_fire, f"fire entity {e}, step {step}"
+            if expected_fire:
+                fired.add(e)
+
+        # ...and the hero's row is zeroed on the way out no matter what the rule computed for it.
+        assert not bool(intent.fire[0, 0])
+        assert torch.all(intent.aim_dir[0, 0] == 0)
+        assert torch.all(intent.aim_point[0, 0] == 0)
+    # a fire comparison that only ever reads False == False cannot see a gate go wrong
+    assert len(fired) >= 4, fired
 
 
 def test_move_dir_on_first_tick_is_rate_scaled_raw_intent():
     # ent_move_smooth starts at exactly 0 (allocate()'s zero-init), so the very first EMA
-    # update is exactly rate * raw_move_dir -- an exact, not approximate, check. Movement comes
-    # from the personality layer now, so the reference is personality.movement, not an archetype.
+    # update is exactly rate * raw_move_dir -- an exact, not approximate, check, for every slot
+    # at its own kind's rate. Movement comes from the personality layer now, so the reference is
+    # personality.movement, not an archetype. Slot 4 stands out of everyone's sight, so its
+    # heading is a random draw, which only matches if the reference draws from `gen` where the
+    # dispatcher does: after combat's two draws.
     cfg, params, gen = _cfg_and_params(n_enemies=4)
     state = _fresh_state_one_of_each(cfg, params)
     tiles = _grid(20, 20)
     bank = _FakeBank(tiles)
-    _scatter_entities_around(state)
+    _scatter_entities_around(state, center=(4.0, 4.0))
+    state.ent_pos[0, 4] = torch.tensor([18.0, 18.0])   # > cfg.bots_sight_tiles (14) from all
     assert torch.allclose(state.ent_move_smooth, torch.zeros_like(state.ent_move_smooth))
 
     _vis, tgt = build_targeting(state, bank, params, cfg)
@@ -132,6 +144,7 @@ def test_move_dir_on_first_tick_is_rate_scaled_raw_intent():
     # then restore, letting the dispatcher below start from the same place.
     saved = {name: getattr(state, name).clone() for name in
              ("ent_wander_dir", "ent_wander_t", "ent_hunt_seen", "ent_hunt_t")}
+    combat_rules.combat(state, tgt, bank, params, cfg, gen)   # all_bot_intents draws for it first
     ref_move, _ref_mode = personality.movement(state, tgt, bank, params, cfg, gen)
     ref_move = ref_move.clone()
     for name, value in saved.items():
@@ -141,11 +154,11 @@ def test_move_dir_on_first_tick_is_rate_scaled_raw_intent():
     vis2 = perception.visibility(state, bank, params, cfg)
     intent = policy.all_bot_intents(state, vis2, bank, params, cfg, gen)
 
-    reaction_delay = params.reaction_delay[0, int(Kind.BOT_SNIPER)].item()
-    rate = min(1.0, cfg.dt / reaction_delay)
-    expected = rate * ref_move[0, 1]
-    assert torch.allclose(intent.move_dir[0, 1], expected, atol=1e-5)
-    assert torch.allclose(state.ent_move_smooth[0, 1], expected, atol=1e-5)
+    for e in range(1, cfg.n_entities):
+        rate = min(1.0, cfg.dt / params.reaction_delay[0, int(state.ent_kind[0, e])].item())
+        expected = rate * ref_move[0, e]
+        assert torch.allclose(intent.move_dir[0, e], expected, atol=1e-5), f"entity {e}"
+        assert torch.allclose(state.ent_move_smooth[0, e], expected, atol=1e-5), f"entity {e}"
 
 
 def test_move_smooth_converges_toward_raw_target_over_many_ticks():
@@ -172,13 +185,15 @@ def test_move_smooth_converges_toward_raw_target_over_many_ticks():
     state.ent_pos[0, 0] = torch.tensor([14.0, 10.0])
     state.ent_pos[0, 1] = torch.tensor([2.0, 10.0])
 
-    for _ in range(200):
+    for _ in range(20):
         vis = perception.visibility(state, bank, params, cfg)
         intent = policy.all_bot_intents(state, vis, bank, params, cfg, gen)
 
-    # CLOSE blends seek (1.0) with strafe (0.3), so the converged unit heading is
-    # 1/sqrt(1 + 0.3^2) ~= 0.958 along x, not exactly 1.
-    assert intent.move_dir[0, 1, 0].item() > 0.9  # converged close to the raw unit direction
+    # CLOSE blends the RAW seek offset (12, 0) at weight 1.0 with a unit strafe at 0.3 (slot 1's
+    # sign is -1), and combine normalizes the sum: (12, -0.3) / 12.0037. The EMA moves 0.05 / 0.15
+    # = 1/3 of the way each tick, so 20 ticks leave (2/3)^20 ~= 3e-4 of the gap.
+    assert torch.allclose(intent.move_dir[0, 1], torch.tensor([0.99969, -0.02499]), atol=1e-3), \
+        intent.move_dir[0, 1]
 
 
 # ---- decision period (fire) ---------------------------------------------------------

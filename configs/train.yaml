@@ -22,23 +22,23 @@ run:
   seed: 0
   device: cuda                  # cuda | cpu
   out_dir: runs                 # runs/<name>/{best,checkpoints,tb,train.yaml,curriculum.json}
-  total_timesteps: 600_000_000   # decisions (3.0B sim ticks); the user's budget, see curriculum
+  total_timesteps: 400_000_000   # decisions (2.0B sim ticks); the user's budget (2026-10-12,
+                                 # was 600M), see curriculum
   n_envs: 4096                   # SB3 boundary cost grows with this
   algo: maskable_ppo            # maskable_ppo (uses action_masks) | ppo
 
   env_config: configs/default.yaml
-  # The deployable spec, and the default: agent_obs_deploy5.yaml is deploy4 plus `hero.near_edge`
-  # and tracked-slot enemy rows, and brawl_deployment supplies every field of it. The older specs
-  # stay loadable, because every run's train.yaml names its spec by path:
+  # The deployable spec, and the default: agent_obs_deploy6.yaml is deploy5 with enemy MEMORY
+  # (each tracked enemy as last seen, plus how long ago) and a privileged CRITIC section, the
+  # value head's view of every bot's true state (archive/CRITIC_AND_MEMORY_PLAN.md).
+  # brawl_deployment supplies every actor field of it; live play never runs the critic. The two
+  # specs it narrows stay in configs/:
   #   --set run.agent_obs=configs/agent_obs.yaml           <- full information; cannot deploy
   #   --set run.agent_obs=configs/agent_obs_lowinfo.yaml   <- full, minus kind and weapon type
-  #   --set run.agent_obs=configs/agent_obs_deploy.yaml    <- the first deployable spec
-  #   --set run.agent_obs=configs/agent_obs_deploy2.yaml   <- deploy, zone group rebuilt
-  #   --set run.agent_obs=configs/agent_obs_deploy3.yaml   <- deploy2 plus crates and cubes
-  #   --set run.agent_obs=configs/agent_obs_deploy4.yaml   <- deploy3 plus gadget and history
-  # deploy and deploy2 cannot see cubes, so they also need `--set reward.cube_pickup=0` (below).
-  # Each is a different observation width, so none of them is a checkpoint swap.
-  agent_obs: configs/agent_obs_deploy5.yaml
+  # The five deploy specs before deploy6 went to archive/configs/ on 2026-10-21, so a run whose
+  # train.yaml names one by its old configs/ path no longer loads. Each spec is a different
+  # observation width, so none of them is a checkpoint swap.
+  agent_obs: configs/agent_obs_deploy6.yaml
   # Per-env jitter, redrawn at every reset and applied on top of (and independently of) the
   # curriculum below. The shipped file jitters only the gas schedule, +/-10 % around the values in
   # `env_overrides`, as part of the user's gas pace (see below). Evaluation never applies it:
@@ -67,6 +67,13 @@ run:
       # could read hundreds of seconds. On screen it now stays under the farthest visible
       # point over 2 tiles/s (9.2 s mid-map), as it does live.
       projectile_static_speed: 2.0
+    # USER SETTING, 2026-10-12 (archive/CRITIC_AND_MEMORY_PLAN.md decision 1): an enemy keeps its
+    # slot through 12 unseen decisions (3.0 s), and deploy6's `enemies` rows hold its last sighting,
+    # with its age, for that long. default.yaml's 3 is the tracker's old 0.75 s coast. The live
+    # tracker reads the run's value (loop.py), so the deployed coast follows it; the hero's own
+    # track and the auto-aim target keep 3 whatever this is.
+    slots:
+      max_misses: 12
     world:
       # THE TRAINING ROTATION: default.yaml's thirty-six maps minus the two in
       # `eval.holdout_maps` below. A list in an override REPLACES the base list, it is not merged
@@ -104,8 +111,8 @@ run:
     # run trained without it keeps default.yaml's `false` in its own frozen train.yaml.
     action:
       auto_aim: true
-    # USER SETTINGS, 2026-10-06 (SIM_ISSUES_PLAN.md, from the issues seen in watch.py). Every
-    # key below keeps the old sim at its default.yaml value, so earlier runs replay unchanged.
+    # USER SETTINGS, 2026-10-06 (archive/SIM_ISSUES_PLAN.md, from the issues seen in watch.py).
+    # Every key below keeps the old sim at its default.yaml value, so earlier runs replay unchanged.
     #
     # Crates: a dash hits each crate once, as it does each unit, and 8000 HP (the real game's
     # 4500-8500) takes Mortis 4 dashes at 0-3 cubes, 3 at 4-9 and 2 from 10. Before, a crate
@@ -118,13 +125,14 @@ run:
     # it could not take, with nothing in the observation to say why.
     cubes:
       max_cubes: 99
-    # Bots (the user's 2026-10-06 answers to SIM_ISSUES_PLAN.md §7):
+    # Bots (the user's 2026-10-06 answers to archive/SIM_ISSUES_PLAN.md §7):
     #   nav: "bots should get as real pathfinding as possible without compromising training time
     #     seriously". A shortest walkable path to the enemy, bush or waypoint, out of the gas and
     #     away when backing off; a kiter with no line of sight closes, and one whose strafe meets
     #     a wall turns round (2026-10-07). These keys together (boxes, cubes, bots, and the
     #     reward's move_reversal) cost +9.9 % per env step on CUDA at 4096 envs (311 -> 342 ms on
-    #     an idle machine), part of it the harder game's extra episode resets (SIM_ISSUES_PLAN.md §B).
+    #     an idle machine), part of it the harder game's extra episode resets
+    #     (archive/SIM_ISSUES_PLAN.md §B).
     #   endgame_players: "campers should switch to hunting in final 4" (the hero counts).
     #   tap_aim: the game's bots attack with a tap, whose auto-aim fires at the target's current
     #     position and never leads, so a LEAD/LOB bot aims there (the tier aim noise still applies).
@@ -174,12 +182,16 @@ clip_range:
   initial: 0.2
   final: 0.1
 
+# USER SETTING, 2026-10-12: the narrow widths, every keyed width at 2/3 of the 600M control's
+# (archive/MODEL_SIZE_STUDY.md section 8, runs/mortis_narrow-20261011-032708). Under deploy6 the
+# value head also reads the critic groups, appended to the extractor's output
+# (wrappers/sb3_policy.py).
 policy:
-  cnn_output_dim: 160           # BrawlFeaturesExtractor: conv stack over the uint8 grid group
-  mlp_hidden_dims: [256, 256]   # BrawlFeaturesExtractor: stacked MLP over every float32 group
+  cnn_output_dim: 104           # BrawlFeaturesExtractor: conv stack over the uint8 grid group
+  mlp_hidden_dims: [168, 168]   # BrawlFeaturesExtractor: stacked MLP over every actor float32 group
   net_arch:                     # policy/value heads on top of the extractor
-    pi: [384, 384]
-    vf: [384, 384]
+    pi: [256, 256]
+    vf: [256, 256]
 
 # VecNormalize. Observation normalization is OFF by default because every configs/agent_obs*.yaml
 # already sets `normalize: true` (obs_select scales fields into sane ranges on-device, before
@@ -212,8 +224,8 @@ reward:
   #
   # This is a SHARED file and the specs differ, so the pairing is enforced per RUN, where the two
   # meet: brawl_sim/training/builder.check_reward_is_observable refuses to build a run that pays
-  # this term under a spec that cannot see pickups. Retraining on agent_obs_deploy.yaml or
-  # agent_obs_deploy2.yaml therefore needs `--set reward.cube_pickup=0`, and the error says so.
+  # this term under a spec that cannot see pickups; its error names `--set reward.cube_pickup=0`.
+  # Every spec in configs/ sees them; the first two deploy specs did not (both in archive/configs/).
   # 0.7 because the early game is where cubes are built, and the hero's win rate climbs steeply
   # with the cubes it holds (BRAWL_SIM_DESIGN.md §10). Cubes are conserved, so the term is bounded
   # by what is on the map: one per crate (24 on average) plus what kills drop.
@@ -231,8 +243,8 @@ reward:
   # on crates or on nothing. Paid on top of damage_dealt (0.6 for a base 2000 hit). The 18 s
   # cooldown allows about ten throws a match, so about 3 at most, against 10 for a win.
   gadget_hit: 0.3
-  # USER DECISION 2026-10-07 (SIM_ISSUES_PLAN.md §5.2). x decisions whose move bin swung >= 135
-  # degrees from the last one's, both non-idle. The old policy reversed on 26 % of its decisions
+  # USER DECISION 2026-10-07 (archive/SIM_ISSUES_PLAN.md §5.2). x decisions whose move bin swung >=
+  # 135 degrees from the last one's, both non-idle. The old policy reversed on 26 % of its decisions
   # (measured), about 1.2 a 120 s match at this weight; a dodge that saves one 1300-HP hit is
   # worth 0.13 in damage_taken, so a real dodge still pays and jitter with nobody shooting stops
   # paying. Counts decisions, not ticks, so a different action_repeat changes its price; 0 is off.
@@ -259,7 +271,7 @@ reward:
 # periodic eval. At n=300/tier the win-rate standard error is at most ~2.9 pp.
 #
 # `every_timesteps` counts SB3 timesteps, which advance by n_envs (4096) per decision, so 20M of
-# them is ~4,900 decisions of each training env: ~31 evals over the 600M run, at_start included.
+# them is ~4,900 decisions of each training env: ~21 evals over the 400M run, at_start included.
 eval:
   enabled: true
   every_timesteps: 20_000_000      # decisions. An eval is TWO rollouts, training maps then
@@ -307,17 +319,18 @@ eval:
 # Only episodes whose bots were drawn from the CURRENT stage count. The episodes in flight when a
 # stage changes finish afterwards with the previous stage's bots, and are skipped.
 #
-# USER SETTINGS: gates 0.15 at every stage, window and minimum 2000/2000, demotion off, a 125M cap
-# per stage and a 600M run (run.total_timesteps). A stage that misses its gate is force-advanced
-# at the cap, so the run reaches elite by 500M at the latest (BRAWL_SIM_DESIGN.md §11).
+# USER SETTINGS: gates 0.15 at every stage, window and minimum 2000/2000, demotion off, an 83M cap
+# per stage and a 400M run (run.total_timesteps; 2026-10-12, the 600M run's 125M cap scaled by
+# 2/3). A stage that misses its gate is force-advanced at the cap, so the run reaches elite by
+# 332M at the latest (BRAWL_SIM_DESIGN.md §11).
 curriculum:
   enabled: true
   window_episodes: 2000         # rolling window the win rate is measured over (SE ~0.8 pp at 0.15)
   min_episodes_at_stage: 2000   # floor before a stage may advance; must not exceed the window
   demote_win_rate: null         # keep null: the first episodes to finish at a new stage are the
                                 # short ones, i.e. early deaths, so a fresh window starts low
-  max_timesteps_at_stage: 125_000_000   # force-advance a stalled stage, so the run always reaches
-                                       # elite: worst case it gets there at 500M of 600M
+  max_timesteps_at_stage: 83_000_000   # force-advance a stalled stage, so the run always reaches
+                                      # elite: worst case it gets there at 332M of 400M
 
   # Multipliers on the brawlers.yaml base value, applied to bot kinds only (never the hero).
   #   aim_noise       x aim_noise_std_rad and aim_noise_tiles  (HIGHER = worse aim)

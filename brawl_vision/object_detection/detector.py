@@ -221,9 +221,9 @@ def providers_for(device: str, key: str = "detector.device") -> list[str] | None
     """ONNX Runtime providers for a config `device` word, or None to let the runtime choose.
 
     `auto` returns None -- the caller's `providers=None` path already means "CUDA if the GPU build
-    is installed, else CPU", and duplicating that decision here would be a second place for the
-    two to drift apart. `cuda` INSISTS, and raises naming `key` so the message points at the
-    setting the reader actually has to change; `cpu` pins CPU.
+    is installed and a device can run it, else CPU", and duplicating that decision here would be a
+    second place for the two to drift apart. `cuda` INSISTS, and raises naming `key` so the
+    message points at the setting the reader actually has to change; `cpu` pins CPU.
 
     `key` is a parameter because two config sections spell this same setting -- `detector.device`
     for the third-party entity model and `projectile.device` for ours -- and an error naming the
@@ -288,6 +288,7 @@ class ObjectDetector:
         if not spin:
             so.add_session_config_entry("session.intra_op.allow_spinning", "0")
             so.add_session_config_entry("session.inter_op.allow_spinning", "0")
+        requested = providers
         if providers is None:
             # CUDA if the GPU build is installed, else CPU. Deliberately not DirectML or Azure,
             # both of which PylaAI accepts: untested here, and an untested provider that silently
@@ -300,7 +301,10 @@ class ObjectDetector:
         # A provider list is a REQUEST. ORT appends a CPU fallback, takes it silently when the
         # provider's DLLs will not load, and returns a perfectly working detector at 26 ms a
         # frame. Someone who wrote `device: cuda` in the config asked a question this answers.
-        if providers == ["CUDAExecutionProvider"] and self.provider != "CUDAExecutionProvider":
+        # The check reads `requested`, the caller's own list, not `providers`: the branch above
+        # writes the same CUDA list for `device: auto`, and an `auto` session that lands on the
+        # CPU is the fallback that word asks for (until 2026-10-21 it raised here too).
+        if requested == ["CUDAExecutionProvider"] and self.provider != "CUDAExecutionProvider":
             raise RuntimeError(
                 f"asked for CUDA and got {self.provider}: onnxruntime fell back silently. The "
                 f"usual cause is the CUDA libraries not being on the DLL path -- install them "

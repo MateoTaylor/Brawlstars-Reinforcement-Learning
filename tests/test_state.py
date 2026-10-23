@@ -80,10 +80,12 @@ def test_allocate_shapes_and_dtypes():
 
 
 def test_allocate_on_device():
+    """On `meta`, not `cpu`: torch's default device is the cpu, so an allocate that dropped its
+    `device=` would still have passed the cpu version of this test (until 2026-10-20)."""
     cfg = _small_cfg()
-    state = allocate(cfg, n_envs=4, device="cpu", verbose=False)
+    state = allocate(cfg, n_envs=4, device="meta", verbose=False)
     for name in SimState.__slots__:
-        assert getattr(state, name).device.type == "cpu"
+        assert getattr(state, name).device.type == "meta"
 
 
 def test_allocate_all_zero_initially():
@@ -202,7 +204,9 @@ def test_check_invariants_noop_when_debug_checks_false():
 def test_check_invariants_catches_nan():
     cfg, state, params = _valid_state_and_params()
     state.ent_hp[0, 0] = float("nan")
-    with pytest.raises(ValueError):
+    # The message, too: a NaN hp also fails the [0, max_hp] range check, which raises a
+    # ValueError of its own, so a bare raises() passed with the NaN/Inf scan deleted.
+    with pytest.raises(ValueError, match="NaN/Inf"):
         check_invariants(state, cfg, params)
 
 

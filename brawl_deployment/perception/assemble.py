@@ -24,25 +24,24 @@ Two consequences worth stating, because both look like bugs:
 * **The `view` grid is built with every sim channel, and only the spec's are filled.** The sim's
   view is the 12 base channels plus one `enemy_hist` plane per history slot, 15 at the default
   config, and `obs_select.channel_index(cfg)` names them all. `GridBuilder` produces the planes the
-  spec asks for, 8 on deploy; this scatters them into their canonical sim indices and leaves the
-  rest as zeros, on deploy `enemy_any`, `enemy_hidden`, `box`, `pickup` and the three history
-  planes. `_build_grid_group` does an `index_select` over exactly the configured channels, so the
-  zeros are **provably unread** rather than fed to anything -- which is the distinction that makes
-  this legal under the never-feed-a-constant rule. Building an 8-channel array and splicing it in
-  as the finished group would work too, and would quietly stop working the day a spec reorders its
-  channels.
-* **The entities axis carries a hero slot.** `obs_select` drops index 0 (`_HERO_AXIS_PREFIX`), so
-  slot k of `EntityTracker` lands at `entities[:, k + 1]`. Writing enemies at index 0 would shift
-  every enemy one slot and silently delete the last one.
+  spec asks for, 13 on deploy6; this scatters them into their canonical sim indices and leaves the
+  rest as zeros, on deploy6 `enemy_any` and `enemy_hidden`. `_build_grid_group` does an
+  `index_select` over exactly the configured channels, so the zeros are **provably unread** rather
+  than fed to anything -- which is the distinction that makes this legal under the
+  never-feed-a-constant rule. Building a 13-channel array and splicing it in as the finished group
+  would work too, and would quietly stop working the day a spec reorders its channels.
+* **The entities axis carries a hero slot.** `obs_select` drops index 0 (`_HERO_AXIS_PREFIXES`),
+  so slot k of `EntityTracker` lands at `entities[:, k + 1]`, and the same for `memory`. Writing
+  enemies at index 0 would shift every enemy one slot and silently delete the last one.
 
-#### The `entities.hp` promotion rule
+#### The enemy HP promotion rule
 
 Measured in 6.5: 84% of enemy boxes yield an HP, and every enemy track that NEVER produced one
 lived four frames or fewer -- glancing detections, not enemies. Tracks that persist read within 1
 frame at p50 and 3 at p90, inside one 250 ms decision.
 
 So a track is promoted to an enemy slot **only once it has a committed HP**, and until then the
-slot reads `entities.alive = 0` with its other columns zeroed. That is the state the sim itself
+slot reads `memory.tracked = 0` with its other columns zeroed. That is the state the sim itself
 produces for an empty slot, so it is in-distribution rather than invented; the alternative is a
 made-up HP in a column the policy was trained to trust. It costs at most one decision of latency.
 
@@ -179,10 +178,10 @@ class DecisionSnapshot:
 def _require(value, name: str):
     """A supplier that was not passed is an error, never a zero.
 
-    This is the whole discipline of `configs/agent_obs_deploy.yaml` expressed as a function: a
-    field the loop cannot fill is dropped from the spec, and a field that IS in the spec must be
-    filled by something real. A `None` reaching a column here means a supplier failed upstream,
-    and the loop's answer to that is to fail closed, not to substitute.
+    This is the whole discipline of a deploy spec (`configs/agent_obs_deploy6.yaml`) expressed as
+    a function: a field the loop cannot fill is dropped from the spec, and a field that IS in the
+    spec must be filled by something real. A `None` reaching a column here means a supplier
+    failed upstream, and the loop's answer to that is to fail closed, not to substitute.
     """
     if value is None:
         raise ValueError(
@@ -225,8 +224,8 @@ class ObservationAssembler:
         self._view = np.zeros((len(self._channel_index), self.cfg.view_h, self.cfg.view_w),
                               np.uint8)
         self._grid_channels = self._channel_indices()
-        # `hero.near_edge` needs the tracker's `hero_offset`; a spec that
-        # does not read it (deploy4 and earlier) must not have to supply one.
+        # `hero.near_edge` needs the tracker's `hero_offset`, and only a spec that reads the field
+        # (deploy6 does) has to supply one.
         self._wants_near_edge = any("hero.near_edge" in g.fields for g in self.spec.groups)
 
     @classmethod
@@ -289,7 +288,9 @@ class ObservationAssembler:
         self._put_zone(full, zone)
         self._put_view(full, grid)
 
-        out = obs_select.build_agent_obs(full, self.spec, self.cfg, self.buffers)
+        # critic=False: a privileged critic's inputs are the sim's true state, which nothing live
+        # has. Those buffers stay at zero, and only the value head, which never runs here, reads them.
+        out = obs_select.build_agent_obs(full, self.spec, self.cfg, self.buffers, critic=False)
         # `.numpy()` on a buffer tensor SHARES its memory, so without the copy every tick's
         # observation silently rewrites the previous one -- anything that holds a reference (a
         # telemetry ring, a frame stack, a debug dump) reads the wrong frame with no error. The
@@ -392,11 +393,15 @@ class ObservationAssembler:
         }
 
     def _put_entities(self, full, hero_pos, hero_vel, enemies, enemy_hp, enemy_in_bush) -> None:
-        """The `entities` axis, hero at index 0 and enemy slot k at index k + 1.
+        """The `entities` and `memory` axes, hero at index 0 and enemy slot k at index k + 1.
 
-        `obs_select` slices index 0 off (`_HERO_AXIS_PREFIX`), so the hero row here is never read
+        `obs_select` slices index 0 off (`_HERO_AXIS_PREFIXES`), so the hero row here is never read
         and is left zero -- the one place in this module where zeros are correct, because they are
         discarded before the policy sees anything.
+
+        `memory` is the same rows as the sim's obs["memory"] reads them: a coasting track's `pos`
+        is already its last detection and its HP the last committed read, so only `tracked`,
+        `seen` and `age_s` are new, and `age_s` is the track's unseen decisions x agent_dt.
         """
         e = self.cfg.n_entities
         alive = torch.zeros((1, e), dtype=torch.bool, device=self.device)
@@ -406,6 +411,7 @@ class ObservationAssembler:
         rel_vel = torch.zeros((1, e, 2), dtype=torch.float32, device=self.device)
         dist = torch.zeros((1, e), dtype=torch.float32, device=self.device)
         hp = torch.zeros((1, e), dtype=torch.float32, device=self.device)
+        age_s = torch.zeros((1, e), dtype=torch.float32, device=self.device)
 
         hx, hy = _require(hero_pos, "hero_pos")
         hvx, hvy = _require(hero_vel, "hero_vel")
@@ -427,9 +433,12 @@ class ObservationAssembler:
                                          device=self.device)
             hp[0, i] = float(value)
             in_bush[0, i] = bool(enemy_in_bush.get(slot, False))
+            age_s[0, i] = track.misses * self.cfg.agent_dt
 
         full["entities"] = {"alive": alive, "revealed_to_hero": revealed, "rel_pos": rel_pos,
                             "dist": dist, "rel_vel": rel_vel, "hp": hp, "in_bush": in_bush}
+        full["memory"] = {"tracked": alive, "seen": revealed, "rel_pos": rel_pos, "dist": dist,
+                          "rel_vel": rel_vel, "hp": hp, "in_bush": in_bush, "age_s": age_s}
         # The identity permutation for `slots: tracked`: track k sits at
         # entities index k + 1 and `slots.entity` stores entity + 1, so obs_select's gather maps
         # slot k back to row k. The tracker already IS the slot rule the sim reproduces
@@ -475,10 +484,10 @@ class ObservationAssembler:
     def _put_zone(self, full, zone) -> None:
         """Whatever zone fields the loaded spec names, and nothing else.
 
-        Driven by the spec rather than by a fixed list because there are two live spec versions:
-        `agent_obs_deploy.yaml` wants four fields and `agent_obs_deploy2.yaml` wants
-        `hero_margin_local` and `active` (9.16). A hardcoded list here would silently supply the
-        wrong one after a retrain.
+        Driven by the spec rather than by a fixed list because the group has changed under a
+        retrain before: the first deploy spec wanted four fields, the second `hero_margin_local`
+        and `active`, which deploy6 keeps (9.16). A hardcoded list here would silently supply the
+        wrong ones after the next such change.
         """
         zone = _require(zone, "zone")
         wanted = [f.split(".", 1)[1] for g in self.spec.groups if g.name == "zone"

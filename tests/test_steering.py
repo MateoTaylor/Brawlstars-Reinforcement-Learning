@@ -28,6 +28,9 @@ def test_strafe_is_perpendicular_to_seek():
     to_target = target - pos
     dot = (d * to_target).sum(dim=-1)
     assert torch.allclose(dot, torch.zeros_like(dot), atol=1e-5)
+    # a UNIT vector turned counter-clockwise: the target is due +x, so +1 strafes toward +y (a
+    # zero vector, or an unnormalized one, is perpendicular too)
+    assert torch.allclose(d, torch.tensor([[[0.0, 1.0]]]))
 
 
 def test_strafe_sign_flips_direction():
@@ -36,6 +39,7 @@ def test_strafe_sign_flips_direction():
     plus = steering.strafe(pos, target, sign=1.0)
     minus = steering.strafe(pos, target, sign=-1.0)
     assert torch.allclose(plus, -minus)
+    assert torch.allclose(plus, torch.tensor([[[0.0, 1.0]]]))
 
 
 def test_strafe_per_entity_sign_tensor():
@@ -43,7 +47,7 @@ def test_strafe_per_entity_sign_tensor():
     target = torch.tensor([[[5.0, 0.0], [5.0, 0.0]]])
     sign = torch.tensor([[1.0, -1.0]])
     d = steering.strafe(pos, target, sign)
-    assert torch.allclose(d[0, 0], -d[0, 1])
+    assert torch.allclose(d, torch.tensor([[[0.0, 1.0], [0.0, -1.0]]]))
 
 
 # ---- maintain_range (acceptance) --------------------------------------------------
@@ -75,15 +79,16 @@ def test_maintain_range_multi_entity_per_row_tensor_desired():
     # broadcast against (N,E) as if E were a second entity axis -- silently comparing entity
     # 0's distance against entity 1's desired range whenever E happened to equal 2 (the
     # vector's own last-dim size), instead of raising a shape error. Two entities, two
-    # different (desired, deadband) pairs, each picking out a DIFFERENT one of the too-far /
-    # too-close / dead-band branches, is exactly the shape combination that hid it.
+    # different (desired, deadband) pairs, each in a DIFFERENT branch under its own band, is
+    # exactly the shape combination that hid it: with equal pairs (as this test had until
+    # 2026-10-20) every cross-comparison gives the same answer and the bug passes.
     pos = torch.tensor([[[0.0, 0.0], [0.0, 0.0]]])
     target = torch.tensor([[[12.0, 0.0], [3.0, 0.0]]])  # dist 12, dist 3
-    desired = torch.tensor([[8.0, 8.0]])
-    deadband = torch.tensor([[1.5, 1.5]])
+    desired = torch.tensor([[12.0, 1.0]])
+    deadband = torch.tensor([[1.5, 0.5]])
     d = steering.maintain_range(pos, target, desired, deadband)
-    assert d[0, 0, 0].item() > 0   # entity 0: too far -> seeks
-    assert d[0, 1, 0].item() < 0   # entity 1: too close -> flees
+    assert torch.equal(d[0, 0], torch.zeros(2))   # entity 0: inside its own band -> holds
+    assert d[0, 1, 0].item() > 0                  # entity 1: past its 1.5 seek edge -> seeks
 
 
 def test_maintain_range_max_dist_caps_only_the_seek_edge():

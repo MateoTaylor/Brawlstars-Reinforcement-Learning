@@ -10,9 +10,10 @@ against the wrong observation is silent at inference.
 `from_run(run_dir)` reads that run's own `train.yaml` and takes the observation spec, the env
 config and the env overrides *from it*. Nothing here accepts a spec path, because the one thing
 that must never happen is a checkpoint being fed an observation built to a different spec than it
-was trained on. `configs/agent_obs_deploy.yaml` and `configs/agent_obs_deploy2.yaml` differ by two
-columns in one group; a policy handed the wrong one gets a shape error if it is lucky and a
-silently shifted `zone` group if it is not. The run knows which it was, so the run decides.
+was trained on. The first two deploy specs (`archive/configs/agent_obs_deploy.yaml` and
+`_deploy2.yaml`) differed by two columns in one group; a policy handed the wrong one gets a shape
+error if it is lucky and a silently shifted `zone` group if it is not. The run knows which it was,
+so the run decides.
 
 The same reasoning is why `make_assembler()` lives here: the assembler and the network are handed
 the *same* loaded spec object, so they cannot disagree about anything.
@@ -80,8 +81,8 @@ def check_spaces(model, spec, cfg, *, label: str, spec_path="the spec", cfg_path
     `train.yaml`.
 
     A mismatch here has exactly one cause worth naming: a spec or env config edited after the run
-    finished. That is why `configs/agent_obs_deploy2.yaml` is a new file rather than an edit of
-    `agent_obs_deploy.yaml`, and why `tests/test_configs_files.py` pins both.
+    finished. That is why every deploy spec change was a new file, deploy2 through deploy6 (the
+    older five are in `archive/configs/`), and why `tests/test_configs_files.py` pins deploy6.
     """
     want = obs_select.agent_space(spec, cfg)
     if model.observation_space != want:
@@ -199,6 +200,18 @@ class DeployedPolicy:
 
         check_spaces(model, spec, cfg, label=f"{run_dir.name}/{checkpoint}",
                      spec_path=tcfg.run.agent_obs, cfg_path=tcfg.run.env_config)
+        # A spec's critic groups are zero here (`build_agent_obs(critic=False)`), which is only
+        # safe while the policy head cannot read them: the extractor must set them aside and the
+        # policy must be the one that slices them off (wrappers/sb3_policy.py).
+        from brawl_sim.wrappers.sb3_policy import SplitMlpExtractor
+        critic_keys = tuple(g.name for g in spec.critic_groups)
+        policy = model.policy
+        if (getattr(policy.features_extractor, "critic_keys", ()) != critic_keys
+                or (critic_keys and not isinstance(policy.mlp_extractor, SplitMlpExtractor))):
+            raise ValueError(
+                f"{run_dir.name}/{checkpoint}: {tcfg.run.agent_obs} has critic groups "
+                f"{critic_keys}, but the checkpoint's policy does not keep them from its actor "
+                f"head. Live play zero-fills them, so the policy would act on zeros.")
         return cls(model, spec, cfg, deterministic=deterministic)
 
     def make_assembler(self, *, map_frame: MapFrame | None = None) -> ObservationAssembler:

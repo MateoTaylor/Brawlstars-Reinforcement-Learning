@@ -1,3 +1,4 @@
+import copy
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -10,17 +11,18 @@ from brawl_sim.constants import Kind, N_KINDS
 from brawl_sim.core import stats
 
 CONFIGS = Path(__file__).resolve().parent.parent / "configs"
+#: default.yaml + brawlers.yaml, parsed once; every `_real_params` call gets its own deep copy.
+_BASE_SPEC = {
+    **yaml.safe_load((CONFIGS / "default.yaml").read_text()),
+    **yaml.safe_load((CONFIGS / "brawlers.yaml").read_text()),
+}
 
 
 def _real_params(n_envs=4):
     cfg = load_config(CONFIGS / "default.yaml")
-    spec = {
-        **yaml.safe_load((CONFIGS / "default.yaml").read_text()),
-        **yaml.safe_load((CONFIGS / "brawlers.yaml").read_text()),
-    }
     gen = torch.Generator(device="cpu")
     gen.manual_seed(0)
-    return cfg, build_params(cfg, n_envs=n_envs, device="cpu", gen=gen, spec=spec)
+    return cfg, build_params(cfg, n_envs=n_envs, device="cpu", gen=gen, spec=copy.deepcopy(_BASE_SPEC))
 
 
 def _synthetic_params(n_envs=3, n_kinds=N_KINDS):

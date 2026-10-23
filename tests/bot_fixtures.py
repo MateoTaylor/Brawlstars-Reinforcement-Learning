@@ -4,11 +4,13 @@ Not a conftest.py: these are plain helper FUNCTIONS that tests import by name, n
 fixtures, and `from bot_fixtures import ...` is unambiguous where a magically-injected fixture
 would not be.
 """
+import copy
+
 import yaml
 import torch
 
 from brawl_sim.bots import perception, policy
-from brawl_sim.config import body_radius_tiles, build_params, load_config
+from brawl_sim.config import _deep_merge, body_radius_tiles, build_params, load_config
 from brawl_sim.constants import (
     TILE_BLOCKS_PROJ,
     TILE_BLOCKS_UNIT,
@@ -23,6 +25,12 @@ from brawl_sim.maps import nav
 from brawl_sim.maps.loader import bush_waypoints
 
 CONFIGS_DEFAULT = "configs/default.yaml"
+#: default.yaml + brawlers.yaml, parsed once (both files cost ~17 ms per call to re-read); every
+#: `cfg_and_params` call gets its own deep copy.
+_BASE_SPEC = {
+    **yaml.safe_load(open(CONFIGS_DEFAULT).read()),
+    **yaml.safe_load(open("configs/brawlers.yaml").read()),
+}
 
 
 class FakeBank:
@@ -44,10 +52,9 @@ class FakeBank:
         self.bush_wp = torch.as_tensor(pts, dtype=torch.float32).reshape(1, -1, 2)
         self.n_bush_wp = torch.tensor([len(pts)], dtype=torch.int64)
         if nav_cfg is not None:
-            spec = yaml.safe_load(open(CONFIGS_DEFAULT).read())
             (self.nav_next, self.nav_anchor_of, self.nav_anchor_tile, self.nav_offsets,
              self.nav_centre_box) = nav.build_tables(self.blocks_unit, nav_cfg, "cpu",
-                                                     body_radius_tiles(spec))
+                                                     body_radius_tiles(_BASE_SPEC))
 
 
 def grid(h, w, fill=Tile.FLOOR):
@@ -68,10 +75,9 @@ def cfg_and_params(n_envs=1, n_enemies=1, map_h=20, map_w=20, overrides=None):
     for section, values in (overrides or {}).items():
         merged[section] = {**merged.get(section, {}), **values}
     cfg = load_config(CONFIGS_DEFAULT, overrides=merged)
-    spec = {
-        **yaml.safe_load(open(CONFIGS_DEFAULT).read()),
-        **yaml.safe_load(open("configs/brawlers.yaml").read()),
-    }
+    # The overrides reach the spec too: build_params reads its SimParams-only fields (unit radius,
+    # regen, perception, ...) from the spec, never from cfg -- the trap env.BrawlVecEnv documents.
+    spec = _deep_merge(copy.deepcopy(_BASE_SPEC), merged)
     gen = torch.Generator(device="cpu")
     gen.manual_seed(0)
     params = build_params(cfg, n_envs=n_envs, device="cpu", gen=gen, spec=spec)

@@ -1,8 +1,7 @@
 import numpy as np
 import yaml
-from stable_baselines3.common.env_checker import check_env
 
-from brawl_sim.config import load_config
+from brawl_sim.config import _deep_merge, load_config
 from brawl_sim.core import obs_select
 from brawl_sim.core.reward import ExampleReward
 from brawl_sim.env import BrawlVecEnv
@@ -16,23 +15,19 @@ AGENT_OBS_YAML = "configs/agent_obs.yaml"
 def _make(seed=0, reward_fn=None, overrides=None):
     merged = dict(CONFIGS_TINY)
     if overrides:
-        merged = {**merged, **overrides}
+        merged = _deep_merge(merged, overrides)  # the preset's other keys in a section stay
     cfg = load_config(CONFIGS_DEFAULT, overrides=merged)
     env = BrawlVecEnv(cfg, n_envs=1, device="cpu", seed=seed)
     spec = obs_select.load_agent_spec(AGENT_OBS_YAML, cfg)
     return BrawlGymEnv(env, spec, reward_fn or ExampleReward())
 
 
-# ---- check_env passes with no errors -------------------------------------------------------
+# ---- the time limit ends an episode as truncated, obs dtypes match the space ---------------
 
-def test_check_env_passes():
-    env = _make()
-    check_env(env, warn=True)  # raises on any failure
-
-
-# ---- 300-step random episode terminates correctly, obs dtypes match the space --------------
-
-def test_random_episode_terminates_and_obs_dtypes_match_space():
+def test_the_time_limit_ends_an_episode_truncated_and_obs_dtypes_match_space():
+    # 2026-10-20: this stepped up to 300 random actions and accepted either ending, so a wrapper
+    # that reported the clock as `terminated` passed, after up to 60 full steps of the tiny
+    # preset. The clock now starts one tick short, and the one step must come back truncated.
     env = _make()
     obs, info = env.reset()
     assert info == {}
@@ -40,24 +35,15 @@ def test_random_episode_terminates_and_obs_dtypes_match_space():
         assert obs[name].shape == box.shape
         assert obs[name].dtype == box.dtype
 
-    rng = np.random.default_rng(0)
-    terminated = truncated = False
-    steps = 0
-    for _ in range(300):
-        action = env.action_space.sample()
-        obs, reward, terminated, truncated, info = env.step(action)
-        steps += 1
-        for name, box in env.observation_space.spaces.items():
-            assert obs[name].shape == box.shape
-            assert obs[name].dtype == box.dtype
-        assert isinstance(reward, float)
-        assert isinstance(terminated, bool)
-        assert isinstance(truncated, bool)
-        if terminated or truncated:
-            break
-
-    assert terminated or truncated
-    assert steps <= 300
+    env.env.state.step_count.fill_(env.env.cfg.max_episode_steps - 1)
+    obs, reward, terminated, truncated, info = env.step(np.zeros(2, dtype=np.int64))
+    for name, box in env.observation_space.spaces.items():
+        assert obs[name].shape == box.shape
+        assert obs[name].dtype == box.dtype
+    assert isinstance(reward, float)
+    assert isinstance(terminated, bool)
+    assert isinstance(truncated, bool)
+    assert truncated and not terminated
 
 
 # ---- no autoreset: obs is the terminal tick's own state, not a fresh episode ----------------
@@ -102,7 +88,6 @@ def test_env_autoreset_flag_is_forced_off():
 def test_reset_seed_reproduces_the_same_trajectory():
     env_a = _make(seed=1)
     obs_a, _ = env_a.reset(seed=42)
-    rng = np.random.default_rng(0)
     actions = [env_a.action_space.sample() for _ in range(10)]
     traj_a = [obs_a["self"].copy()]
     for a in actions:

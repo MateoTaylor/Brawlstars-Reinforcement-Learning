@@ -7,6 +7,7 @@ import yaml
 
 from brawl_sim.config import EnvConfig, load_config
 from brawl_sim.constants import Tile
+from brawl_sim.core import spawn
 from brawl_sim.env import BrawlVecEnv
 from brawl_sim.maps.generate import generate, to_csv
 from brawl_sim.maps.loader import (
@@ -74,48 +75,27 @@ def test_validate_map_passes_on_real_maps():
     validate_map(tiles, cfg20)
 
 
-def test_validate_map_rejects_broken_border():
-    h = w = 10
-    tiles = np.full((h, w), Tile.FLOOR, dtype=np.int64)
-    tiles[0, :] = Tile.WALL
-    tiles[-1, :] = Tile.WALL
-    tiles[:, 0] = Tile.WALL
-    tiles[:, -1] = Tile.WALL
-    tiles[0, 5] = Tile.FLOOR  # break the border
-    tiles[1:3, 1] = Tile.SPAWN
-    cfg = EnvConfig(map_h=h, map_w=w)
-    with pytest.raises(ValueError):
-        validate_map(tiles, cfg)
-
-
-def test_validate_map_rejects_too_few_markers():
-    h = w = 10
-    tiles = np.full((h, w), Tile.FLOOR, dtype=np.int64)
-    tiles[0, :] = Tile.WALL
-    tiles[-1, :] = Tile.WALL
-    tiles[:, 0] = Tile.WALL
-    tiles[:, -1] = Tile.WALL
-    tiles[1, 1] = Tile.SPAWN  # only 1, need >= 8
-    tiles[1, 2] = Tile.BOX
-    cfg = EnvConfig(map_h=h, map_w=w)
-    with pytest.raises(ValueError):
-        validate_map(tiles, cfg)
-
-
-def test_validate_map_rejects_disconnected_region():
-    h = w = 10
-    tiles = np.full((h, w), Tile.FLOOR, dtype=np.int64)
-    tiles[0, :] = Tile.WALL
-    tiles[-1, :] = Tile.WALL
-    tiles[:, 0] = Tile.WALL
-    tiles[:, -1] = Tile.WALL
-    tiles[:, 5] = Tile.WALL  # split the interior into two sealed halves
-    for i in range(8):
-        tiles[1 + (i % 4), 1 if i < 4 else 6] = Tile.SPAWN
-    for i in range(8):
-        tiles[6 - (i % 3), 2 if i < 4 else 7] = Tile.BOX
-    cfg = EnvConfig(map_h=h, map_w=w)
-    with pytest.raises(ValueError):
+@pytest.mark.parametrize("index, tile, match", [
+    ((0, 5), Tile.FLOOR, "top/bottom border"),
+    ((5, 0), Tile.FLOOR, "left/right border"),
+    ((1, 8), Tile.FLOOR, "7 SPAWN markers, need >= 8"),
+    ((2, 8), Tile.FLOOR, "7 BOX markers, need >= 8"),
+    ((slice(3, 7), slice(1, 11)), Tile.SPAWN, "48 SPAWN markers, exceeds MAX_SPAWNS"),
+    ((slice(3, 11), slice(1, 11)), Tile.BOX, "88 BOX markers, exceeds MAX_BOX_SPOTS"),
+    ((6, slice(1, 11)), Tile.WALL, "single connected component"),
+])
+def test_validate_map_names_each_rejection(index, tile, match):
+    """A valid map with ONE rule broken per case, matched by its own message: the three tests this
+    replaced (2026-10-20) each broke a rule an earlier check also caught, so connectivity, the
+    left/right border and both MAX limits never ran."""
+    cfg = EnvConfig(map_h=12, map_w=12)
+    tiles = np.full((12, 12), Tile.FLOOR, dtype=np.int64)
+    tiles[0, :] = tiles[-1, :] = tiles[:, 0] = tiles[:, -1] = Tile.WALL
+    tiles[1, 1:9] = Tile.SPAWN
+    tiles[2, 1:9] = Tile.BOX
+    validate_map(tiles, cfg)  # the base map is valid
+    tiles[index] = tile
+    with pytest.raises(ValueError, match=match):
         validate_map(tiles, cfg)
 
 
@@ -164,9 +144,15 @@ def _debug_tiny_cfg():
     return load_config(CONFIGS / "default.yaml", overrides=overrides)
 
 
-def test_build_map_bank_leading_dim_matches_map_names():
+@pytest.fixture(scope="module")
+def default_bank():
+    """The default rotation's bank, built once for the module: the tests below only read it."""
     cfg = _default_cfg()
-    bank = build_map_bank(cfg, device="cpu")
+    return cfg, build_map_bank(cfg, device="cpu")
+
+
+def test_build_map_bank_leading_dim_matches_map_names(default_bank):
+    cfg, bank = default_bank
     m = len(cfg.map_names)
     assert bank.tiles.shape == (m, cfg.map_h, cfg.map_w)
     assert bank.blocks_unit.shape == (m, cfg.map_h, cfg.map_w)
@@ -179,9 +165,8 @@ def test_build_map_bank_leading_dim_matches_map_names():
     assert bank.n_box_spots.shape == (m,)
 
 
-def test_build_map_bank_dtypes():
-    cfg = _default_cfg()
-    bank = build_map_bank(cfg, device="cpu")
+def test_build_map_bank_dtypes(default_bank):
+    _cfg, bank = default_bank
     assert bank.tiles.dtype == torch.int64
     assert bank.blocks_unit.dtype == torch.bool
     assert bank.blocks_proj.dtype == torch.bool
@@ -191,9 +176,8 @@ def test_build_map_bank_dtypes():
     assert bank.n_spawns.dtype == torch.int64
 
 
-def test_build_map_bank_padded_shape_and_blocking():
-    cfg = _default_cfg()
-    bank = build_map_bank(cfg, device="cpu")
+def test_build_map_bank_padded_shape_and_blocking(default_bank):
+    cfg, bank = default_bank
     m = len(cfg.map_names)
     # `map + 2 * (view // 2)`, NOT `map + view`. The loader pads by `view // 2` on each side, so
     # the two agree only for EVEN view dimensions -- which every config had until the view was
@@ -222,9 +206,8 @@ def test_build_map_bank_padded_shape_and_blocking():
     assert torch.equal(bank.pad_tiles[:, pad_h:-pad_h, pad_w:-pad_w], bank.tiles)
 
 
-def test_build_map_bank_n_spawns_and_n_box_spots_match_counts():
-    cfg = _default_cfg()
-    bank = build_map_bank(cfg, device="cpu")
+def test_build_map_bank_n_spawns_and_n_box_spots_match_counts(default_bank):
+    cfg, bank = default_bank
     for i, name in enumerate(cfg.map_names):
         tiles = load_map_csv(CSV_DIR / f"{name}.csv", cfg)
         assert int(bank.n_spawns[i]) == int(np.sum(tiles == Tile.SPAWN))
@@ -240,18 +223,6 @@ def test_build_map_bank_debug_tiny_single_blank_map():
     assert bank.tiles.shape == (1, 20, 20)
     assert int(bank.n_spawns[0]) == 8
     assert int(bank.n_box_spots[0]) == 8
-
-
-def test_gather_indexing_never_materializes_per_env_slice():
-    # the whole point of MapBank: point queries gather-index the (M,H,W) bank directly
-    cfg = _default_cfg()
-    bank = build_map_bank(cfg, device="cpu")
-    n = 5
-    map_id = torch.tensor([0, 1, 2, 0, 1], dtype=torch.int64)
-    iy = torch.tensor([10, 20, 30, 5, 6], dtype=torch.int64)
-    ix = torch.tensor([10, 20, 30, 5, 6], dtype=torch.int64)
-    blocked = bank.blocks_unit[map_id, iy, ix]
-    assert blocked.shape == (n,)
 
 
 # ---- the generated maps (the first ten, plus fifteen on 2026-09-27) ------------------------
@@ -326,49 +297,74 @@ def test_generated_map_is_reproduced_by_its_seed_at_the_first_attempt(name):
     assert to_csv(grid) == (CSV_DIR / f"{name}.csv").read_text()
 
 
-def test_default_rotation_is_the_sixteen_plus_the_twenty():
-    cfg = _default_cfg()
+def test_default_rotation_is_the_sixteen_plus_the_twenty(default_bank):
+    cfg, bank = default_bank
     assert len(cfg.map_names) == 36
     assert cfg.map_names == THIRTY_SIX_MAP_ROTATION
-    bank = build_map_bank(cfg, device="cpu")
     assert bank.tiles.shape == (36, 60, 60)
 
 
-@pytest.mark.parametrize("name", list(GENERATED_MAPS))
-def test_smoke_episode_on_generated_map_holds_the_invariants(name):
-    """One 1000-tick episode per generated map with `engine.debug_checks` on, so
-    `check_invariants` runs after the reset and after every decision: a map whose spawn ring,
-    crate spots or water layout breaks the sim (a NaN, a unit outside the map, a dead entity
-    with hp) fails here by name.
-
-    "1000-step" is read in the config's own unit, SIM TICKS (`sim.max_episode_steps`): 200
-    decisions at the shipped `action_repeat: 5`. Measured 2026-09-18 on CPU the sim costs
-    ~14 ms per tick whatever `n_envs` or `n_enemies` is (kernel-launch bound), so this is
-    ~15 s per map and ~6 min for the twenty-five; 1000 DECISIONS per map would be ~12 min. Random
-    move/attack/super actions rather than idling so the hero walks into walls, water and
-    crates and the super's projectiles cross them; the attack column is drawn over the action
-    spec's full width so a super (value 2) fires on every map, not only ordinary attacks."""
+def _smoke_rollout(names, monkeypatch, envs_per_map=2):
+    """200 decisions of random play on `names` side by side in ONE env, `envs_per_map` envs
+    each; returns the episodes each map's envs ended. Env i plays map `i // envs_per_map` at
+    every reset, autoresets included: the map sampler is the one thing replaced, by an
+    assignment its own contract allows ((N,) map indices into `cfg.map_names`)."""
     cfg = load_config(CONFIGS / "default.yaml", overrides={
-        "world": {"maps": [name], "map_selection": "fixed", "fixed_map": name},
+        "world": {"maps": list(names)},
         "sim": {"max_episode_steps": 1000},
         "engine": {"debug_checks": True},
     })
     assert cfg.debug_checks is True  # the override key spelled wrong would make this test vacuous
     assert cfg.max_episode_steps == 1000 and cfg.action_repeat == 5
-    env = BrawlVecEnv(cfg, n_envs=2, device="cpu", seed=0, verbose=False)
+    n_envs = envs_per_map * len(names)
+    pinned = torch.arange(n_envs) // envs_per_map
+    monkeypatch.setattr(spawn, "sample_map_ids", lambda reset_mask, bank, cfg, gen: pinned.clone())
+    env = BrawlVecEnv(cfg, n_envs=n_envs, device="cpu", seed=0, verbose=False)
     env.reset()
-    assert env.state.map_id.tolist() == [0, 0]
+    assert env.state.map_id.tolist() == pinned.tolist()
     n_move, n_attack = cfg.action_nvec
     assert n_move == 17
     assert n_attack >= 3  # 0 nothing / 1 attack / 2 super: the super must be drawable below
     gen = torch.Generator().manual_seed(0)
-    n_done = 0
+    n_done = torch.zeros(n_envs, dtype=torch.int64)
     for _ in range(200):
-        action = torch.stack([torch.randint(0, n_move, (2,), generator=gen),
-                              torch.randint(0, n_attack, (2,), generator=gen)], dim=1)
+        action = torch.stack([torch.randint(0, n_move, (n_envs,), generator=gen),
+                              torch.randint(0, n_attack, (n_envs,), generator=gen)], dim=1)
         obs, reward, terminated, truncated, info = env.step(action)
-        n_done += int((terminated | truncated).sum())
+        n_done += (terminated | truncated).to(torch.int64)
         assert torch.isfinite(reward).all()
+    assert env.state.map_id.tolist() == pinned.tolist()
+    return n_done.view(len(names), envs_per_map).sum(dim=1).tolist()
+
+
+def test_smoke_episode_on_every_generated_map_holds_the_invariants(monkeypatch):
+    """A 1000-tick episode on every generated map with `engine.debug_checks` on, so
+    `check_invariants` runs after the reset and after every decision: a map whose spawn ring,
+    crate spots or water layout breaks the sim (a NaN, a unit outside the map, a dead entity
+    with hp) fails here by name.
+
+    "1000-tick" is read in the config's own unit, SIM TICKS (`sim.max_episode_steps`): 200
+    decisions at the shipped `action_repeat: 5`. The sim is kernel-launch bound on CPU (a
+    decision costs about the same at 2 envs as at 52), so all the maps play at once, two envs
+    each: ~30 s where one env per map took ~15 s per map. `check_invariants` names the field,
+    not the env, so a failing batch is replayed map by map to name the map. Random
+    move/attack actions rather than idling so the hero walks into walls, water and crates; the
+    attack column is drawn over the action spec's full width, so the gadget (value 3) is thrown
+    on every map (7-10 throws each, measured 2026-10-20). The SUPER is drawn too but rarely
+    fires: it needs a charge random play seldom earns (2 of the 25 maps fire one on this seed).
+    Charging it by hand would put a bolt across every map, but a bolt fired near the border flies
+    off the map and fails `check_invariants`. The user accepted that bolt, unfixed (2026-10-21,
+    BRAWL_SIM_DESIGN.md §2's accepted divergences), so the super is left to random play."""
+    names = list(GENERATED_MAPS)
+    try:
+        done = _smoke_rollout(names, monkeypatch)
+    except ValueError:
+        for name in names:
+            try:
+                _smoke_rollout([name], monkeypatch)
+            except ValueError as err:
+                raise AssertionError(f"generated map {name!r} breaks an invariant: {err}") from err
+        raise  # no map fails alone, so the batch's own draw found it: the traceback is the lead
     # 1000 ticks with max_episode_steps 1000: every env ended at least once (by death or by
-    # the clock), so the autoreset path ran on this map too.
-    assert n_done >= 2
+    # the clock), so the autoreset path ran on every map too.
+    assert all(n >= 2 for n in done), dict(zip(names, done))

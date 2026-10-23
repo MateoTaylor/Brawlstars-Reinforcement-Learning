@@ -7,7 +7,7 @@ import torch
 import yaml
 from matplotlib.colors import to_rgba
 
-from brawl_sim.config import load_config
+from brawl_sim.config import _deep_merge, load_config
 from brawl_sim.core import geometry as geo
 from brawl_sim.env import BrawlVecEnv
 from brawl_sim.maps.loader import build_map_bank
@@ -30,7 +30,7 @@ class _FakeButtonEvent:
 def _session(overrides=None, seed=0):
     merged = dict(CONFIGS_TINY)
     if overrides:
-        merged = {**merged, **overrides}
+        merged = _deep_merge(merged, overrides)  # the preset's other keys in a section stay
     cfg = load_config(CONFIGS_DEFAULT, overrides=merged)
     env = BrawlVecEnv(cfg, n_envs=1, device="cpu", seed=seed)
     bank = build_map_bank(cfg, device="cpu")

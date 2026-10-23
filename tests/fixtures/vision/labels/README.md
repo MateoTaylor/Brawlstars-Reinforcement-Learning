@@ -35,7 +35,7 @@ copy under the other name would leak the held-out map into training.
 
 ## The current round: `2maps_dataset`
 
-`TERRAIN_RELABEL_2MAPS.md` at the repo root holds a picked, reviewed list of 100 frames from
+The repo's `archive/TERRAIN_RELABEL_2MAPS.md` holds a picked, reviewed list of 100 frames from
 `2maps_dataset.mp4` — one BlueStacks session, 13 back-to-back matches on 13 distinct maps, six
 graveyard and seven desert. It is meant to be the whole training set on its own, with four matches
 held out for test; the older labels here are not mixed in. That file also carries the map table,

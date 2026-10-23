@@ -19,10 +19,11 @@ This document replaces the sim's plan documents: the build plan, the bot overhau
 - A camera-window reveal with tracked enemy slots, `hero.near_edge`, a latched `zone.active` and three decisions of local history.
 - Gas timed from the real game.
 - 38 map CSVs and holdout evaluation.
-- Since 2026-10-07, behind keys only `configs/train.yaml` turns on (SIM_ISSUES_PLAN.md): bot pathfinding, the final-4 endgame switch, 8000-HP crates hit once per dash, the game's 99-cube cap and tap-aimed bots; then gas rules measured along the way out, a retreat goal, a strafe that turns round at a wall and a `move_reversal` reward term; and a projectile under 2.0 tiles/s reading as still in the agent's view, as live reports it. `runs/mortis_ppo-20261007-161117` is the first run trained on them.
+- Since 2026-10-07, behind keys only `configs/train.yaml` turns on (archive/SIM_ISSUES_PLAN.md): bot pathfinding, the final-4 endgame switch, 8000-HP crates hit once per dash, the game's 99-cube cap and tap-aimed bots; then gas rules measured along the way out, a retreat goal, a strafe that turns round at a wall and a `move_reversal` reward term; and a projectile under 2.0 tiles/s reading as still in the agent's view, as live reports it. `runs/mortis_ppo-20261007-161117` is the first run trained on them.
+- Since 2026-10-12 (archive/CRITIC_AND_MEMORY_PLAN.md), in `configs/agent_obs_deploy6.yaml`: enemy memory, `memory.*` rows that keep a lost enemy's last sighting and its age while its slot coasts, and a privileged critic, a spec's `critic:` groups, which only the value head reads. The same day `slots.update` stopped running twice per step (§9, tracked enemy slots).
 
 **In use.**
-- `configs/train.yaml` trains `configs/agent_obs_deploy5.yaml` for 600M decisions on 4096 envs and 34 maps.
+- `configs/train.yaml` trains `configs/agent_obs_deploy6.yaml` for 400M decisions on 4096 envs and 34 maps, at the narrow widths (archive/MODEL_SIZE_STUDY.md), with a 3 s enemy memory (`slots.max_misses` 12). No run has trained on it yet.
 - `configs/deployment.yaml` serves `runs/mortis_ppo-20261007-161117` (best_model.zip, the 580M eval), since 2026-10-08.
 
 **Open.** Each item waits on its owner.
@@ -31,7 +32,6 @@ This document replaces the sim's plan documents: the build plan, the bot overhau
 
 | # | Item | Owner |
 |---|---|---|
-| 2 | **The piercing super leaves the map** for a tick before its range runs out. With `debug_checks` off this is harmless, because terrain lookups clamp. With `debug_checks` on, `state.check_invariants` raises. Either kill the bolt at the border or relax the invariant. | user |
 | 3 | **The super ignores cubes.** `super_damage` and `super_heal` are flat, while attacks and the gadget get +10 % per cube. No decision is on record either way. | user |
 | 4 | **Same-tick pickup revive.** Pickups (phase 12) run before deaths (phase 13) and check `ent_alive`, not HP > 0. A unit at 0 HP can therefore take a cube, gain 400 HP and survive. | user |
 | 5 | **Same-tick double death.** `compute_rank` ties same-tick deaths. A hero who dies on the same tick as the last bot ranks first and is paid `win_bonus` and `death_penalty` together. | user |
@@ -83,7 +83,7 @@ These are settled. Do not re-open one without new evidence. "User" marks the use
 | No synthetic speed benchmarks. Read speed off a real run's `time/fps`, and hunt unbounded memory or storage growth instead. | Past synthetic numbers ignored 4000+ envs and training time. | user, 2026-08; reaffirmed 2026-09-30 |
 | **Game fidelity** | | |
 | Real game statistics, never rebalanced. | An uneven roster is something to learn, not a bug. Tiers (§11) are a separate difficulty layer. | user, 2026-08-19 |
-| Power cubes give +400 max HP flat and +10 % damage each. `default.yaml` caps them at 16; `train.yaml` uses the game's own cap, 99 (Brawl Stars, 2019), which no match reaches. | This is the real mechanic. A fractional HP bonus made the tankiest brawlers tankier. A hero at 16 circled cubes he could not take, with nothing in the obs to say why. | user, 2026-08; cap 2026-10-06 (SIM_ISSUES_PLAN.md §3) |
+| Power cubes give +400 max HP flat and +10 % damage each. `default.yaml` caps them at 16; `train.yaml` uses the game's own cap, 99 (Brawl Stars, 2019), which no match reaches. | This is the real mechanic. A fractional HP bonus made the tankiest brawlers tankier. A hero at 16 circled cubes he could not take, with nothing in the obs to say why. | user, 2026-08; cap 2026-10-06 (archive/SIM_ISSUES_PLAN.md §3) |
 | Regen follows the official rule: 13 % of max HP per second after 3 s without attacking or being hit. | Disengaging to heal is intended; the gas punishes it. | 2026-08-18 |
 | Gas damage is a fraction of each unit's own max HP: 0.20/s, +0.04 per shrink. | Nobody should survive ~5 s in the gas whatever their HP; a flat rate let cube-stacked tanks ignore it. | 2026-08-18 |
 | No attack animations. `attack_cooldown` is a window with no attack and no reload; the floor is 0.25 s (one decision), Mortis has 0.35 and Buzz 1.00. | This removed an animation subsystem. | 2026-08-18 |
@@ -154,6 +154,7 @@ These are settled. Do not re-open one without new evidence. "User" marks the use
 - Bots are heuristic, so their parameters are randomized.
 - Crates have a flat HP (3000 in `default.yaml`, 8000 in `train.yaml`), where the real game's 4500–8500 scales with lobby power.
 - A bot that dies mid-dash still finishes it: the rest of the dash (at most 0.3 s) can hit a crate, though never a unit. "#31 isn't an issue, no fix needed" (user, 2026-10-07).
+- The piercing super can fly past the map border for a tick before its range runs out. With `debug_checks` off this is harmless, because terrain lookups clamp. With them on, `state.check_invariants` raises, so the debug-checked test rollouts leave the super out of their draws. "Not an issue I am concerned with", no fix (user, 2026-10-21; was §1 #2).
 
 ## 3. Architecture
 
@@ -197,7 +198,7 @@ These are settled. Do not re-open one without new evidence. "User" marks the use
 3. `_observe` computes done and info, and calls `reward_fn` once.
 4. Finished envs' final obs and info are cloned, then `_autoreset` resets those envs in place and rebuilds their obs.
 
-**Obs build**, once per decision (twice for an env that resets): visibility, then `camera.hero_view`, then `slots.update`, then `zone.mark_seen`, then `raw_los` (if read), then `build_obs`. `step` hands that `hero_view` to the next `history.push`.
+**Obs build**, once per decision (twice for an env that resets): visibility, then `camera.hero_view`, then `slots.update`, then `zone.mark_seen`, then `raw_los` (if read), then `build_obs`. `step` hands that `hero_view` to the next `history.push`. The second build, in `_autoreset`, runs for every env (sync-free), but its `slots.update` moves only the envs it reset (`envs=done`): each call counts a sighting or a miss.
 
 **Step contract.**
 - For a finished env, `obs` is the new episode's first observation, and the old episode's last one is in `info["final_observation"]` / `info["final_info"]`.
@@ -441,7 +442,7 @@ Stat conversions from the game's data: Power 11 = 2 × Power 1; `Speed`/300 = ti
 - A crate within 20 tiles pulls at weight 3.0, and a cube within 12 tiles at weight 4.0. Each is a unit direction that replaces the personality's steering while active; only the gas terms compete.
 - Both need no enemy target within 8 tiles (a cube within 2 tiles is exempt, since kill drops land mid-fight), a clear straight walk (`_walk_clear`: the centre line, or the body's under `bots.nav`), and a spot at least 1 tile inside the safe area.
 - A cube pull cancels the crate pull, both are off in RETREAT, and CAMPERs never get the crate pull.
-- These radii and weights make live-like farming: the richest elite bot holds 7+ cubes at 60 s in more than half the matches. The measurements are in BRAWL_DEPLOYMENT_DESIGN.md §9 entries 21–22, and the probes are `scripts/probes/cube_economy_measure.py` and `bot_pull_measure.py`. Re-measured 2026-10-07 with configs/train.yaml's new keys on (SIM_ISSUES_PLAN.md: 8000-HP crates hit once per dash, pathfinding, tap-aimed bots), on the 2026-09-30 checkpoint, elite tier, 64 matches. The target still holds, and earlier: a bot held 7+ at 60 s in 5 of the 6 matches still running (12 of 23 before), and at 45 s in 10 of 11. Paths get bots to their crates: pulled decisions stalled more than 1.5 tiles out fell from 32 % to 6 %. The sample is small because that checkpoint now dies by a median 18 s.
+- These radii and weights make live-like farming: the richest elite bot holds 7+ cubes at 60 s in more than half the matches. The measurements are in BRAWL_DEPLOYMENT_DESIGN.md §9 entries 21–22, and the probes are `scripts/probes/cube_economy_measure.py` and `bot_pull_measure.py`. Re-measured 2026-10-07 with configs/train.yaml's new keys on (archive/SIM_ISSUES_PLAN.md: 8000-HP crates hit once per dash, pathfinding, tap-aimed bots), on the 2026-09-30 checkpoint, elite tier, 64 matches. The target still holds, and earlier: a bot held 7+ at 60 s in 5 of the 6 matches still running (12 of 23 before), and at 45 s in 10 of 11. Paths get bots to their crates: pulled decisions stalled more than 1.5 tiles out fell from 32 % to 6 %. The sample is small because that checkpoint now dies by a median 18 s.
 
 **Toggles:** `bots.break_boxes` (the crate pull), `attack_boxes` (the crate target), `collect_cubes`, `avoid_zone`, `personalities`, `nav`, `tap_aim`, and the numbers `endgame_players` and `lead_velocity_tau` (0 is off). Every lobby is free-for-all.
 
@@ -511,18 +512,21 @@ Every reset leaves the gadget charged and the history empty, so an episode's fir
 - **The grid:** the 13×21 crop stays hero-centred; only its enemy planes are windowed.
 
 **`obs_select`** (`AgentObsSpec`) is the only fairness point.
-- **Gating:** entities drop the hero row and are gated by `revealed_to_hero`. Projectiles are gated by `in_view`. Boxes and pickups pass ungated.
+- **Gating:** entities drop the hero row and are gated by `revealed_to_hero`. `memory.*` drops it too and is gated by `memory.tracked`, so a coasting row survives. Projectiles are gated by `in_view`. Boxes and pickups pass ungated.
 - **Projectile ranking:** projectiles are ranked by `time_to_closest` over all live projectiles, on screen or not, with ties nearest-first (`_nearest_first`: sort by distance, then stably by `time_to_closest`). An off-screen projectile keeps its slot, blanked. Ties are common, since anything moving away reads 0. Under `observation.projectile_static_speed` (train.yaml), anything slower than 2.0 tiles/s reads 0 too, with `vel` 0, before the ranking, as the live tracker reports it.
-- **Refusals:** under `fair`, `enemy_any` and `enemy_hidden` are refused. So are `entities.privileged.*` and raw `slots.*`, always.
+- **Refusals:** under `fair`, `enemy_any` and `enemy_hidden` are refused. So are `entities.privileged.*` and raw `slots.*` in actor groups, always, and a `memory.*` group without `slots: tracked`.
+- **Critic groups:** a spec's `critic:` section, at most 2 float32 groups named `critic_*`, feeds the value head only (`wrappers/sb3_policy.PrivilegedCriticPolicy`, §11). No fair gate, `entities.privileged.*` allowed, and a per-entity row is masked by `entities.alive`. `build_agent_obs(critic=False)`, the live assembler's call, leaves them zero.
 - **Groups:** at most 6 (`_MAX_GROUPS`), one host copy each. `BrawlFeaturesExtractor` takes at most one uint8 group, so a new field joins an existing group.
 - **Normalizers:** tiles ÷ the larger map dimension, speed ÷ 20, HP ÷ 20000, counts ÷ 20.
 
 **Tracked enemy slots** mirror the live `EntityTracker`, counted in decisions.
 - An enemy takes the lowest free slot on its second consecutive sighting (`slots.promote_hits` 2).
-- It keeps the slot through 3 unseen decisions (`slots.max_misses` 3), with its row zeroed by the fairness mask, and frees it on the fourth.
+- It keeps the slot through `slots.max_misses` unseen decisions (3 by default, 12 in train.yaml) and frees it on the next. An `entities.*` group zeroes the coasting row through the fairness mask; a `memory.*` group keeps it.
+- **Memory:** each sighting snapshots the enemy's position, velocity and HP (`ent_seen_pos/vel/hp`). `obs["memory"]` reads them: `tracked` (`ent_slot > 0`), `seen` (no misses), the last-seen values relative to the hero now, `in_bush` at the last-seen position, and `age_s` = misses × `agent_dt`.
 - Retirement runs before promotion, and `slots.update` runs before `build_obs`, so a sighting counts on its own decision.
+- **Once per decision.** Until 2026-10-12, `_autoreset`'s build moved every env's slots a second time each step, so a slot was promoted after one sighting and held for half its coast (one unseen decision at 3, against the tracker's three). `runs/mortis_ppo-20261007-161117` and every earlier run trained that way. `test_one_env_step_is_one_decision_of_the_slot_table` now steps the env.
 - Not modelled: the tracker's HP-commit delay, its promotion tie order (moot with 9 slots for 9 enemies), and its promotion-tick `rel_vel`.
-- Live, `DeployLoop` builds its `EntityTracker` from the run's `slots.*`, so an override reaches both sides. The tracker's `max_misses` also bounds its hero track's coast, which has no sim counterpart.
+- Live, `DeployLoop` builds its `EntityTracker` from the run's `slots.*`, so an override reaches both sides. The hero track keeps its own 3-decision coast (`EntityTracker.hero_max_misses`), which has no sim counterpart. Auto-aim and `enemy_in_reach` count a track through `AIM_MAX_MISSES` (3) misses only. Gates are per track, `GATE_NOISE_TILES + MAX_WALK_TILES_S × gap`, so a long coast cannot widen a fresh track's gate, and a coast's prediction stops at `MAX_PREDICT_S` (1.0 s).
 
 **History.**
 - **`hist` group:** K = 3 decisions, newest first. Each slot has `valid`, `move_onehot` (17), `attack_onehot` (4, or 5 under auto-aim), `hp`, `ammo_frac` and `displacement` (position then minus position now): 78 floats, or 81. Every field is 0 when `valid` is False, since an empty slot's action (0, 0) would otherwise read as "idle, no attack".
@@ -546,18 +550,20 @@ Its live counterpart is `TrackerResult.hero_offset`: the player box's tile minus
 
 **Deploy parity rule.** A field enters a deployable spec only if `brawl_deployment` can supply it, either from `brawl_vision` or from the shadow's proprioception. `agent_obs_lowinfo.yaml` is stricter: a field must be recoverable by CV.
 
-**The training spec, `agent_obs_deploy5.yaml`,** has six groups and 266 extractor floats (263 without auto-aim), all pinned in `test_configs_files.py`:
+**The training spec, `agent_obs_deploy6.yaml`,** has six actor groups and 275 actor floats (272 without auto-aim), plus two critic groups of 231 floats, all pinned in `test_configs_files.py`. It is deploy5 with the enemies read from memory, plus the critic:
 
 | Group | Contents |
 |---|---|
 | self | 27 floats; the gadget pair (`gadget_ready`, `gadget_charge_frac`) at columns 23–24, then `near_edge` after `in_zone` |
-| enemies | 9×9, in tracked-slot order |
+| enemies | 9×10, in tracked-slot order, from `memory.*`: deploy5's nine columns plus `memory.age_s` |
 | projectiles | 12×6 |
 | zone | 5 |
 | history | `hist`, 81 floats under the run's auto-aim |
 | grid | 13 channels, 13×21, uint8 |
+| critic_enemies | 9×25, critic only: every bot's true state in entity order, `privileged.targets_hero` and `react_t` included |
+| critic_world | 6, critic only: `hero.cubes`, `zone.hero_margin`, `zone.safe_area_frac` |
 
-`projectiles.class_onehot` exists in the schema but deploy5 omits it. `train.yaml` turns off the world grid and `raw_los` (the (N,E,E) LOS used only by `entities.los_from_hero` and `visibility.los`); turn either back on only if a spec reads it. The camera and slot dataclass defaults equal the shipped yaml, so older frozen configs get the same camera.
+`projectiles.class_onehot` exists in the schema but deploy5 and deploy6 omit it. `train.yaml` turns off the world grid and `raw_los` (the (N,E,E) LOS used only by `entities.los_from_hero` and `visibility.los`); turn either back on only if a spec reads it. The camera and slot dataclass defaults equal the shipped yaml, so older frozen configs get the same camera.
 
 ## 10. Reward
 
@@ -597,7 +603,7 @@ Its live counterpart is `TrackerResult.hero_offset`: the player box's tile minus
 **`move_reversal`** counts decisions whose move bin swung 135° or more from the previous decision's (6 or more of 16 bins), both non-idle (user, 2026-10-07).
 - `core/events.move_reversals` reads the previous decision off history slot 0 in `env.step`, before `history.push` overwrites it. So an episode's first decision never counts: the reset empties the ring.
 - The 2026-09-30 policy reversed on 26 % of its decisions (measured 2026-10-07), about 1.2 a 120 s match at −0.01. A dodge that saves one 1300-HP hit is worth 0.13 in `damage_taken` alone, so a real dodge still pays and jitter with nobody shooting stops paying.
-- The first run trained with it, `runs/mortis_ppo-20261007-161117`, reverses on 11 % (watch) to 16 % (train) of its decisions, on the probe's count (pairs of non-idle moves). The 2026-09-30 policy reverses on 28 % on the same count and seeds (measured 2026-10-10). The rate was already that low at 200M (MODEL_SIZE_STUDY.md).
+- The first run trained with it, `runs/mortis_ppo-20261007-161117`, reverses on 11 % (watch) to 16 % (train) of its decisions, on the probe's count (pairs of non-idle moves). The 2026-09-30 policy reverses on 28 % on the same count and seeds (measured 2026-10-10). The rate was already that low at 200M (archive/MODEL_SIZE_STUDY.md).
 - The policy sees its last three moves (`hist.move_onehot`), so the cost is a function of what it observes.
 
 **Invariants and guards.**
@@ -614,11 +620,13 @@ Its live counterpart is `TrackerResult.hero_offset`: the player box's tile minus
 1. `BrawlVecEnv` with the merged spec. `CurriculumManager` is its `params_hook` and shares `sim.gen`, so one seed also reproduces the tier draws.
 2. `VecMonitor(BrawlSB3VecEnv)`.
 3. `VecNormalize`, on the reward only.
-4. MaskablePPO `MultiInputPolicy` through `VecTransposeImage(skip=True)`. SB3 guesses an image's channel axis from its smallest dimension; without the skip, `--smoke` once trained on transposed grids.
+4. MaskablePPO `MultiInputPolicy` through `VecTransposeImage(skip=True)`, or `PrivilegedCriticPolicy` when the spec has critic groups (refused under `run.algo: ppo`). SB3 guesses an image's channel axis from its smallest dimension; without the skip, `--smoke` once trained on transposed grids.
 
 `Distribution` argument validation is off process-wide.
 
 **Features extractor.** A padded 3×3 CNN (strides 1, 2, 2; SiLU) plus a SiLU MLP over the float groups. `n_flatten` is measured, never hard-coded, and `normalize_images=False` is required.
+
+**Privileged critic.** With `critic_keys`, the extractor keeps the critic groups out of the MLP and appends them, flattened, after the actor features (`actor_dim` wide). `PrivilegedCriticPolicy` overrides only `_build_mlp_extractor`, with a `SplitMlpExtractor` whose pi net reads the first `actor_dim` columns and whose vf net reads them all, so the trunk stays shared. `MaskablePPO.save` pickles the class by import path, which makes `brawl_sim.wrappers.sb3_policy` a contract. `DeployedPolicy.from_run` refuses a critic spec whose checkpoint lacks the split. `tests/test_privileged_critic.py` checks that critic noise moves the value and no actor output.
 
 **Units.** One SB3 timestep is one decision (0.25 s): `n_steps`, `total_timesteps` and `eval.every_timesteps` all count decisions. A bare `python scripts/train.py` trains the deployable spec.
 
@@ -660,7 +668,7 @@ The PPO buffer lives in host RAM, proportional to `n_steps` × `n_envs` × agent
 | elite | hard .1, veteran .15, expert .25, elite .5 (no gate) |
 
 - **Transitions:** the window clears at each transition, and each env's first finish afterwards is skipped, because its bots came from the previous stage.
-- **Forced advance:** `max_timesteps_at_stage` (125M of 600M) force-advances a stage. Elite needs `total_timesteps` above 4 × the cap.
+- **Forced advance:** `max_timesteps_at_stage` (83M of 400M) force-advances a stage. Elite needs `total_timesteps` above 4 × the cap.
 - **Resume:** the state JSON is rewritten at each transition.
 
 **Eval** runs every 20M decisions and at the start.

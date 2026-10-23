@@ -115,7 +115,7 @@ def move_reversals(state, action: torch.Tensor, cfg) -> torch.Tensor:
 
     Reads ring slot 0, so env.step calls it BEFORE `history.push` writes this action there.
     Per DECISION, like the ring: training/reward.py's `move_reversal` term reads it
-    (SIM_ISSUES_PLAN.md §5.2; user decision, 2026-10-07)."""
+    (archive/SIM_ISSUES_PLAN.md §5.2; user decision, 2026-10-07)."""
     n = cfg.n_move_bins
     prev = state.hist_action[:, 0, 0]
     cur = action[:, 0]

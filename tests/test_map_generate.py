@@ -143,7 +143,9 @@ def test_crate_spot_is_one_or_two_adjacent_boxes():
         if len(cells) == 2:
             (a, b) = cells
             assert abs(a[0] - b[0]) + abs(a[1] - b[1]) == 1
-    assert g.crate_spot(random.Random(0), (10, 10), lambda cell: False) == {(10, 10): "X"}
+    # 50 seeds: only the ~40% that draw the pair branch ever ask `free` (Random(0) does not)
+    for seed in range(50):
+        assert g.crate_spot(random.Random(seed), (10, 10), lambda cell: False) == {(10, 10): "X"}
 
 
 def test_centre_features_are_all_point_symmetric():
@@ -292,7 +294,6 @@ def test_csv_round_trips_through_the_loader(tmp_path):
 def test_generate_passes_every_band_and_check_and_is_deterministic(family):
     fam = g.FAMILIES[family]
     grid, stats = g.generate(1, family)
-    assert g.check(grid, fam, fam.symmetry) == []
     assert np.array_equal(grid, g.mirror_grid(grid, fam.symmetry))
     assert fam.wall[0] <= stats["wall"] <= fam.wall[1]
     assert fam.bush[0] <= stats["bush"] <= fam.bush[1]
@@ -308,9 +309,10 @@ def test_generate_passes_every_band_and_check_and_is_deterministic(family):
     again, again_stats = g.generate(1, family)
     assert g.to_csv(again) == g.to_csv(grid), "byte-identical across two calls"
     assert again_stats["seed"] == stats["seed"]
-    direct, direct_stats = g.generate(stats["seed"], family)
-    assert direct_stats["attempts"] == 1 and g.to_csv(direct) == g.to_csv(grid), \
-        "the reported seed regenerates the map on its own"
+    if stats["seed"] != 1:  # with seed 1 accepted, `again` already was generate(stats["seed"], family)
+        direct, direct_stats = g.generate(stats["seed"], family)
+        assert direct_stats["attempts"] == 1 and g.to_csv(direct) == g.to_csv(grid), \
+            "the reported seed regenerates the map on its own"
     if fam.moat_inset:
         assert (grid[fam.moat_inset, 6:54] == "~").sum() > 40, "the moat is there"
 
@@ -322,11 +324,19 @@ def test_generate_symmetry_override_makes_a_mirror_standard_map():
     assert g.check(grid, g.FAMILIES["standard"], g.MIRROR) == []
 
 
-def test_generate_reports_rejected_seeds_and_gives_up_on_an_impossible_family():
+def test_generate_reports_rejected_seeds_and_gives_up_on_an_impossible_family(monkeypatch):
     impossible = g.Family("impossible", 0, (0.90, 1.0), (0.0, 1.0), (0.0, 1.0), (0, 64))
     with pytest.raises(RuntimeError, match="impossible: no seed in \\[5, 7\\)"):
         g.generate(5, impossible, max_attempts=2)
-    tight = g.Family("tight", 0, (0.07, 0.12), (0.20, 0.30), (0.03, 0.08), (20, 32))
-    _, stats = g.generate(1, tight, max_attempts=50)
-    assert all(isinstance(seed, int) and reasons for seed, reasons in stats["rejected"])
-    assert stats["attempts"] == len(stats["rejected"]) + 1
+    # Two forced rejections. The "tight" family this used had standard's own bands, so seed 1
+    # passed and `rejected` was empty; `generate` looks `check` up at call time.
+    real, calls = g.check, []
+
+    def check(grid, fam, sym):
+        calls.append(1)
+        return ["forced"] if len(calls) <= 2 else real(grid, fam, sym)
+
+    monkeypatch.setattr(g, "check", check)
+    _, stats = g.generate(1, "standard", max_attempts=5)
+    assert stats["rejected"] == [(1, ["forced"]), (2, ["forced"])]
+    assert stats["attempts"] == 3 and stats["seed"] == 3

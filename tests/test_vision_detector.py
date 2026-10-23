@@ -43,6 +43,8 @@ needs_weights = pytest.mark.skipif(
 
 @pytest.fixture(scope="module")
 def detector():
+    """The shipped `device: auto`: CUDA with the GPU visible, the CPU with it hidden
+    (`CUDA_VISIBLE_DEVICES=-1`, how the suite runs while training holds it)."""
     pytest.importorskip("onnxruntime")
     from brawl_vision.object_detection import ObjectDetector
     return ObjectDetector.from_config(load_vision_config(), ignore=())
@@ -608,6 +610,32 @@ def test_a_box_projecting_past_the_horizon_is_skipped_not_drawn_enormous(plan):
 
 
 # ---------------------------------------------------------------------------
+# the device words, when CUDA is listed but cannot run
+# ---------------------------------------------------------------------------
+
+@needs_weights
+def test_auto_takes_the_cpu_when_cuda_cannot_run_and_cuda_refuses_it(monkeypatch):
+    """onnxruntime-gpu lists its CUDA provider for the BUILD, not for what can run (no visible
+    device, DLLs that will not load), and a session asked for CUDA then lands on the CPU without
+    a word. `device: cuda` must refuse that and `device: auto` must take it. Until 2026-10-21 the
+    guard read the list `__init__` had resolved, which `auto` fills with the same CUDA list, so
+    `auto` raised too, telling you to set `auto`. The fallback is forced here, so this runs the
+    same with the GPU visible or hidden."""
+    ort = pytest.importorskip("onnxruntime")
+    from brawl_vision.object_detection import ObjectDetector
+
+    session = ort.InferenceSession
+    monkeypatch.setattr(ort, "get_available_providers",
+                        lambda: ["CUDAExecutionProvider", "CPUExecutionProvider"])
+    monkeypatch.setattr(ort, "InferenceSession", lambda path, sess_options=None, providers=None:
+                        session(path, sess_options=sess_options, providers=["CPUExecutionProvider"]))
+    cfg = load_vision_config()
+    assert ObjectDetector.from_config(cfg, device="auto").provider == "CPUExecutionProvider"
+    with pytest.raises(RuntimeError, match="asked for CUDA and got CPUExecutionProvider"):
+        ObjectDetector.from_config(cfg, device="cuda")
+
+
+# ---------------------------------------------------------------------------
 # the GPU path, which fails at predict rather than at construction
 # ---------------------------------------------------------------------------
 
@@ -633,7 +661,9 @@ def test_both_detectors_run_a_real_inference_on_cuda_with_torch_loaded():
     preload_cuda_dlls()
     if "CUDAExecutionProvider" not in ort.get_available_providers():
         pytest.skip("this onnxruntime build has no CUDA provider")
-    pytest.importorskip("torch")
+    torch = pytest.importorskip("torch")
+    if not torch.cuda.is_available():               # the provider is listed with no device behind it
+        pytest.skip("no CUDA device is visible (CUDA_VISIBLE_DEVICES hides it)")
 
     from brawl_vision.object_detection import ObjectDetector
     from brawl_vision.object_detection.projectile_detection.detect import ProjectileDetector

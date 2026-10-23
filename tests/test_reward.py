@@ -1,6 +1,6 @@
 import torch
 
-from brawl_sim.core.reward import ExampleReward, RewardFn, ZeroReward
+from brawl_sim.core.reward import ExampleReward, ZeroReward
 
 
 def _fake_obs_info(n_envs=4, device="cpu", terminated=None, hero_alive=None):
@@ -72,39 +72,9 @@ def test_example_reward_truncated_without_termination_is_zero():
     assert torch.all(reward == 0)
 
 
-# ---- RewardFn Protocol: structural typing, no inheritance required -----------------------
-
-def test_plain_function_satisfies_reward_fn_protocol():
-    def my_reward(obs, info, cfg):
-        return torch.ones(info["time"].shape[0], dtype=torch.float32)
-
-    assert isinstance(my_reward, RewardFn)
-    assert isinstance(ZeroReward(), RewardFn)
-    assert isinstance(ExampleReward(), RewardFn)
-
-
-def test_custom_reward_fn_needs_no_special_registration():
-    class DistanceBasedReward:
-        """A custom reward reading obs directly -- proof a RewardFn never needs to touch the
-        simulator or subclass anything from core/reward.py."""
-
-        def __call__(self, obs, info, cfg):
-            return -obs["hero"]["dummy_dist"].to(torch.float32)
-
-    obs, info = _fake_obs_info(n_envs=3)
-    obs["hero"]["dummy_dist"] = torch.tensor([1.0, 2.0, 3.0])
-
-    fn = DistanceBasedReward()
-    reward = fn(obs, info, cfg=None)
-    assert reward.tolist() == [-1.0, -2.0, -3.0]
-
-
-# ---- batched / device-agnostic smoke -------------------------------------------------------
-
-def test_batched_smoke_large_n():
-    fn = ZeroReward()
-    n_envs = 4096
-    obs, info = _fake_obs_info(n_envs=n_envs)
-    reward = fn(obs, info, cfg=None)
-    assert reward.shape == (n_envs,)
-    assert not torch.any(torch.isnan(reward))
+# The RewardFn Protocol has no tests of its own: it is `runtime_checkable` with `__call__` alone,
+# so `isinstance(f, RewardFn)` holds for every callable, and nothing in brawl_sim asks it. That a
+# plain callable works as an env's reward_fn is shown where an env really calls one
+# (tests/test_autoreset.py, test_move_reversal.py, test_attack_in_reach.py). Three tests here
+# checked only the Protocol, a class this file defined itself, or ZeroReward's zeros for NaN, and
+# were removed on 2026-10-20.

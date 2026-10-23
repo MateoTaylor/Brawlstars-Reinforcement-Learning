@@ -2,7 +2,7 @@ import torch
 import yaml
 
 from brawl_sim.bots import perception
-from brawl_sim.config import load_config
+from brawl_sim.config import _deep_merge, load_config
 from brawl_sim.core import stats
 from brawl_sim.core.state import snapshot as state_snapshot
 from brawl_sim.env import BrawlVecEnv
@@ -16,7 +16,7 @@ CONFIGS_TINY = yaml.safe_load(open("configs/presets/debug_tiny.yaml").read())
 def _env_bank_snap(overrides=None, seed=0):
     merged = dict(CONFIGS_TINY)
     if overrides:
-        merged = {**merged, **overrides}
+        merged = _deep_merge(merged, overrides)  # the preset's other keys in a section stay
     cfg = load_config(CONFIGS_DEFAULT, overrides=merged)
     env = BrawlVecEnv(cfg, n_envs=1, device="cpu", seed=seed)
     env.reset()
@@ -101,15 +101,25 @@ def test_agent_mode_never_shows_a_bush_hidden_bot():
     snap = state_snapshot(env.state, 0)
     snap["revealed_to_hero"] = vis[0, 0].numpy()
     snap["max_ammo"] = stats.gather_kind(env.params.max_ammo, env.state.ent_kind)[0].numpy()
+    ch = _BOT_CHAR.get(int(snap["ent_kind"][1]), "?")
 
     world_out = render_ascii(snap, bank, cfg, mode="world")
     world_map = world_out.split("\n\n")[0]
-    assert "s" in world_map or "a" in world_map or "m" in world_map or "r" in world_map  # lowercase, shown
+    assert ch.lower() in world_map  # lowercase, shown
 
-    agent_out = render_ascii(snap, bank, cfg, mode="agent")
-    agent_map = agent_out.split("\n\n")[0]
-    assert "S" not in agent_map and "A" not in agent_map and "M" not in agent_map and "R" not in agent_map
-    assert "s" not in agent_map and "a" not in agent_map and "m" not in agent_map and "r" not in agent_map
+    # 2026-10-20: the hero stood 20 tiles from the bot, outside the agent crop, so the bot was
+    # absent whether or not the renderer gates it on the reveal. The rendered hero now stands
+    # 3 tiles from it (inside the crop; the visibility above still comes from 20 tiles), and the
+    # same snapshot with the bot marked revealed must show it, so its absence is the gate's.
+    snap["ent_pos"] = snap["ent_pos"].copy()
+    step = 3.0 if snap["ent_pos"][1, 0] + 3.0 < cfg.map_w else -3.0
+    snap["ent_pos"][0] = snap["ent_pos"][1] + (step, 0.0)
+    agent_map = render_ascii(snap, bank, cfg, mode="agent").split("\n\n")[0]
+    assert ch.upper() not in agent_map and ch.lower() not in agent_map
+
+    shown = dict(snap, revealed_to_hero=snap["revealed_to_hero"].copy())
+    shown["revealed_to_hero"][1] = True
+    assert ch.upper() in render_ascii(shown, bank, cfg, mode="agent").split("\n\n")[0]
 
 
 def test_agent_mode_shows_a_revealed_bot():
@@ -125,7 +135,7 @@ def test_agent_mode_shows_a_revealed_bot():
     assert bool(snap["revealed_to_hero"][1])
     out = render_ascii(snap, bank, cfg, mode="agent")
     map_part = out.split("\n\n")[0]
-    assert any(c in map_part for c in "SAMR")
+    assert _BOT_CHAR.get(int(snap["ent_kind"][1]), "?").upper() in map_part
 
 
 # ---- mode='agent' requires revealed_to_hero ---------------------------------------------------

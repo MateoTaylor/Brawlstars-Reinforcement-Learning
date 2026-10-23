@@ -2,7 +2,7 @@
 
     python scripts/train.py                                  # configs/train.yaml as-is
     python scripts/train.py --set run.n_envs=1024 --set ppo.n_steps=256
-    python scripts/train.py --smoke                          # 30-second wiring check on CPU
+    python scripts/train.py --smoke                          # ~50-second wiring check on CPU
     python scripts/train.py --resume runs/mortis_ppo-.../checkpoints/model_4000000_steps.zip
     python scripts/train.py --resume <zip> --restart-schedules --set run.total_timesteps=100000000 \
         --set learning_rate.initial=5e-5 --set clip_range.initial=0.1   # fine-tune at the floors
@@ -72,8 +72,12 @@ DEFAULT_TRAIN_CONFIG = REPO_ROOT / "configs" / "train.yaml"
 # smoke budget and the curriculum half would never be exercised at all. The stage budget is what
 # makes the transitions happen: an untrained policy wins nothing against the first stage's bots
 # (since 2026-09-13 medium and hard), so the win-rate gate alone never opens.
+# 64 envs, not the 8 it had until 2026-10-21: on CPU the sim is dispatch-bound, a decision costing
+# about the same at 64 envs as at 8, so the 8192 timesteps are 128 decisions instead of 1024 and
+# the run takes 52 s instead of 133 s (measured 2026-10-21). PPO does the same work either way: 2
+# updates of 32 minibatches instead of 16 of 4, 128 gradient steps.
 _SMOKE = {
-    "run": {"device": "cpu", "n_envs": 8, "total_timesteps": 8192, "name": "smoke",
+    "run": {"device": "cpu", "n_envs": 64, "total_timesteps": 8192, "name": "smoke",
             "checkpoint_every_steps": 4096, "tensorboard": False},
     "ppo": {"n_steps": 64, "batch_size": 128, "n_epochs": 2},
     "curriculum": {"window_episodes": 8, "min_episodes_at_stage": 8,

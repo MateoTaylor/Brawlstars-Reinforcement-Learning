@@ -133,8 +133,8 @@ class EnvConfig:
     bots_hunt_cell_tiles: int = 10
     bots_hunt_arrive_tiles: float = 2.0
     bots_hunt_timeout_seconds: float = 12.0
-    # --- bot behaviour from SIM_ISSUES_PLAN.md (user decisions, 2026-10-06). Every default is the
-    # old sim; configs/train.yaml turns them on.
+    # --- bot behaviour from archive/SIM_ISSUES_PLAN.md (user decisions, 2026-10-06). Every default
+    # is the old sim; configs/train.yaml turns them on.
     # Pathfinding (maps/nav.py): bots follow shortest walkable paths instead of steering straight
     # at a goal behind a wall, and a KITE with no line of sight closes instead of holding range.
     bots_nav: bool = False

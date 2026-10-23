@@ -9,11 +9,14 @@ from types import SimpleNamespace
 
 import torch
 
+import yaml
+
 from brawl_sim.config import load_config
 from brawl_sim.core import slots
 from brawl_sim.core.state import allocate, zero_
 
 CONFIGS_DEFAULT = "configs/default.yaml"
+TINY = yaml.safe_load(open("configs/presets/debug_tiny.yaml").read())
 
 
 def _cfg(n_enemies=3, **slot_overrides):
@@ -93,6 +96,22 @@ def test_max_misses_one_frees_on_the_second_unseen_decision():
     assert tables[2] == [1, -1, -1] and tables[3] == [-1, -1, -1]
 
 
+def test_twelve_misses_hold_the_slot_for_three_seconds():
+    """train.yaml's `slots.max_misses: 12` (archive/CRITIC_AND_MEMORY_PLAN.md decision 1): at
+    agent_dt 0.25 an unseen enemy keeps its slot, and with it its memory row, for 3.0 s, counting
+    misses 1 to 12, and loses both on the 13th unseen decision."""
+    cfg = _cfg(max_misses=12)
+    state = _state(cfg)
+    _run(state, cfg, ["x..", "x.."])
+    coast = []
+    for _ in range(13):
+        _run(state, cfg, ["..."])
+        coast.append((int(state.ent_misses[0, 1]), _table(state)[0]))
+    assert coast[:12] == [(k, 1) for k in range(1, 13)]
+    assert coast[12] == (0, -1)
+    assert 12 * cfg.agent_dt == 3.0
+
+
 def test_a_return_takes_the_lowest_free_slot_not_the_old_one():
     """Entity 1 held slot 0, was freed, and entity 2 took slot 0 meanwhile: entity 1 comes back
     into slot 1."""
@@ -112,12 +131,52 @@ def test_a_dead_entity_coasts_out_on_the_same_schedule():
     assert tables[:3] == [[1, -1, -1]] * 3 and tables[3] == [-1, -1, -1]
 
 
-def test_zero_clears_every_slot_field():
+# ---- the last-sighting snapshots ----------------------------------------------------------------
+
+def test_the_snapshot_follows_a_seen_enemy_and_holds_through_the_coast():
+    """`ent_seen_*` copy an enemy's position, velocity and HP on every decision it is seen, pending
+    or slotted, and keep them while it is not: the last sighting obs["memory"] shows. A death is
+    not a sighting, so a dead enemy keeps its last living one. Every value is exact in float32."""
     cfg = _cfg()
     state = _state(cfg)
+
+    def place(x, hp):
+        state.ent_pos[0, 1] = torch.tensor([x, 2.0])
+        state.ent_vel[0, 1] = torch.tensor([x / 4, -1.0])
+        state.ent_hp[0, 1] = hp
+
+    def seen():
+        return (state.ent_seen_pos[0, 1].tolist(), state.ent_seen_vel[0, 1].tolist(),
+                float(state.ent_seen_hp[0, 1]))
+
+    place(5.0, 3000.0)
+    assert _run(state, cfg, ["x.."]) == [[-1, -1, -1]]
+    assert seen() == ([5.0, 2.0], [1.25, -1.0], 3000.0), "pending, and already snapshotted"
+    place(6.0, 2500.0)
+    _run(state, cfg, ["x.."])
+    assert seen() == ([6.0, 2.0], [1.5, -1.0], 2500.0)
+    place(9.0, 1000.0)                                  # moves on and takes damage unseen
+    _run(state, cfg, ["...", "..."])
+    assert seen() == ([6.0, 2.0], [1.5, -1.0], 2500.0) and int(state.ent_misses[0, 1]) == 2
+    place(10.0, 0.0)
+    state.ent_alive[0, 1] = False
+    _run(state, cfg, ["x.."])                           # in view, but dead
+    assert seen() == ([6.0, 2.0], [1.5, -1.0], 2500.0) and int(state.ent_misses[0, 1]) == 3
+
+
+def test_zero_clears_every_slot_field():
+    """Every field nonzero first, so a field `zero_` skipped would fail here."""
+    cfg = _cfg()
+    state = _state(cfg)
+    state.ent_pos.fill_(4.0)
+    state.ent_vel.fill_(1.0)
+    state.ent_hp.fill_(3000.0)
     _run(state, cfg, ["xx.", "xx.", "..x"])
+    names = ("slot_ent", "ent_slot", "ent_hits", "ent_misses",
+             "ent_seen_pos", "ent_seen_vel", "ent_seen_hp")
+    assert all(getattr(state, name).any() for name in names)
     zero_(state, torch.ones(1, dtype=torch.bool))
-    for name in ("slot_ent", "ent_slot", "ent_hits", "ent_misses"):
+    for name in names:
         assert not getattr(state, name).any(), name
 
 
@@ -131,7 +190,10 @@ def test_more_candidates_than_free_slots_leave_the_highest_index_pending():
     state = SimpleNamespace(
         slot_ent=torch.zeros(1, K, dtype=torch.int64), ent_slot=torch.zeros(1, E, dtype=torch.int64),
         ent_hits=torch.zeros(1, E, dtype=torch.int32), ent_misses=torch.zeros(1, E, dtype=torch.int32),
-        ent_alive=torch.ones(1, E, dtype=torch.bool))
+        ent_alive=torch.ones(1, E, dtype=torch.bool),
+        ent_pos=torch.zeros(1, E, 2), ent_vel=torch.zeros(1, E, 2), ent_hp=torch.zeros(1, E),
+        ent_seen_pos=torch.zeros(1, E, 2), ent_seen_vel=torch.zeros(1, E, 2),
+        ent_seen_hp=torch.zeros(1, E))
     all_seen = torch.tensor([[False] + [True] * 10])
     slots.update(state, all_seen, cfg)
     slots.update(state, all_seen, cfg)
@@ -142,6 +204,35 @@ def test_more_candidates_than_free_slots_leave_the_highest_index_pending():
     for _ in range(4):
         slots.update(state, first_unseen, cfg)
     assert _table(state)[0] == 10, "entity 1 retired on its 4th miss and entity 10 took slot 0"
+
+
+def test_an_envs_mask_moves_only_the_named_envs_on():
+    cfg = _cfg()
+    state = _state(cfg, n_envs=2)
+    hv = torch.stack([_view("x..", cfg.n_entities)[0]] * 2)
+    slots.update(state, hv, cfg)
+    slots.update(state, hv, cfg, envs=torch.tensor([True, False]))
+    assert _table(state, 0) == [1, -1, -1] and _table(state, 1) == [-1, -1, -1]
+    assert int(state.ent_hits[1, 1]) == 1
+
+
+def test_one_env_step_is_one_decision_of_the_slot_table():
+    """With autoreset on, `env.step` builds the observation twice: in `_observe`, and again for
+    the whole batch in `_autoreset`, where only the reset envs start a decision. Until 2026-10-12
+    both builds ran `slots.update`, so a coast counted two misses per step. A dead enemy is
+    unseen, so its slot must count exactly one miss per step."""
+    from brawl_sim.env import BrawlVecEnv
+
+    cfg = load_config(CONFIGS_DEFAULT, overrides={**TINY, "slots": {"max_misses": 12}})
+    env = BrawlVecEnv(cfg, n_envs=1, device="cpu", seed=0)
+    env.reset()
+    idle = torch.zeros((1, 2), dtype=torch.int64)
+    env.step(idle)
+    assert int(env.state.ent_slot[0, 1]) > 0, "entity 1 holds a slot"
+    env.state.ent_alive[0, 1] = False
+    for k in range(1, 5):
+        env.step(idle)
+        assert int(env.state.ent_misses[0, 1]) == k
 
 
 def test_envs_are_independent():

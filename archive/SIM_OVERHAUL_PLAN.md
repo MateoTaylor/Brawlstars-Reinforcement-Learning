@@ -91,11 +91,11 @@ The facts each phase is built on. Verified in the tree on 2026-09-17.
 ## 1.1 Decision timing, and the cadence cap
 
 `dt = 0.05`, `action_repeat = 5`: a decision is 5 sub-ticks, 0.25 s. `env._run_decision`
-([env.py:336](brawl_sim/env.py#L336)) runs sub-tick 1 with the action and sub-ticks 2..5 with `_held`
-([env.py:384](brawl_sim/env.py#L384)), which zeroes the attack column -- **one decision is at most one
+([env.py:336](../brawl_sim/env.py#L336)) runs sub-tick 1 with the action and sub-ticks 2..5 with `_held`
+([env.py:384](../brawl_sim/env.py#L384)), which zeroes the attack column -- **one decision is at most one
 attack attempt**, and the attempt is on sub-tick 1 only.
 
-`hero.action_mask` ([hero.py:35](brawl_sim/core/hero.py#L35)) is evaluated at phase 3 of sub-tick 1:
+`hero.action_mask` ([hero.py:35](../brawl_sim/core/hero.py#L35)) is evaluated at phase 3 of sub-tick 1:
 `ready = alive & attack_cd <= 0 & dash_t <= 0`; `fire_ok = ready & ammo >= 1`; `super_ok = ready &
 super_ready`. Mortis: `attack_cooldown 0.35`, `dash_duration 0.30`.
 
@@ -123,7 +123,7 @@ it with an enemy in reach).
 
 ## 1.2 Bots: what scales today, and what does not exist
 
-- **Targeting** ([bots/perception.py `select_target`](brawl_sim/bots/perception.py)): sticky nearest
+- **Targeting** ([bots/perception.py `select_target`](../brawl_sim/bots/perception.py)): sticky nearest
   visible other entity, hero and bots alike, within `bots.sight_tiles: 14`. **No notion of the hero.**
   A bot that has a valid sticky target keeps it until it dies or leaves sight.
 - **Fire** (`bots/combat_rules.combat` + `policy.fire_gate`): data-driven from per-kind `SimParams`
@@ -133,7 +133,7 @@ it with an enemy in reach).
 - **Movement** (`personality._select_mode` -> `_MODE_WEIGHTS`): per-`Person` mode machine; the only
   HP-dependent behaviour is `RETREAT_HP_FRACTION = 0.35` (HUNTER and KITE retreat below it). KITE
   holds `desired_range_fraction * attack_range`.
-- **Tiers** ([training/config.py `TIER_FIELDS`](brawl_sim/training/config.py)): `aim_noise,
+- **Tiers** ([training/config.py `TIER_FIELDS`](../brawl_sim/training/config.py)): `aim_noise,
   reaction_delay, lead_target, decision_period, move_speed, hp, damage`, applied per (env, bot kind)
   by `curriculum.TierApplier` via `_FLOAT_TARGETS` (multipliers) plus the `lead_target` clamp and
   `decision_period` rounding. **Shipped elite: hp 2.0, damage 1.75, aim_noise 0.25, reaction 0.35,
@@ -144,7 +144,7 @@ it with an enemy in reach).
 
 ## 1.3 The observation pipeline
 
-- `core/observation.build_obs` builds the full dict; `_build_grid` ([observation.py:133](brawl_sim/core/observation.py#L133))
+- `core/observation.build_obs` builds the full dict; `_build_grid` ([observation.py:133](../brawl_sim/core/observation.py#L133))
   rasterizes 12 channels into a window given an `origin`; entity channels are `_scatter_count`s of
   world positions into that window. **Any world-position list can be scattered into the current
   view the same way** -- that is what makes S13(b) cheap.
@@ -161,7 +161,7 @@ it with an enemy in reach).
   `scripts/dump_obs_schema.py` regenerates `docs/OBSERVATION.md` and `docs/AGENT_OBS.md`.
 - Deployment: `perception/assemble.ObservationAssembler` fills each group from an explicit
   supplier and **raises on a missing one** (`_require`); `_put_self`
-  ([assemble.py:252](brawl_deployment/perception/assemble.py#L252)) is a literal table of `hero.*`
+  ([assemble.py:252](../brawl_deployment/perception/assemble.py#L252)) is a literal table of `hero.*`
   names read off `ShadowHero.observe()`. `perception/grid.GridBuilder.build` takes the tracked
   enemies/projectiles/crates/cubes and scatters them.
 

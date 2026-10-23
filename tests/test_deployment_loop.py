@@ -52,6 +52,10 @@ VIEWPORT = (2002, 1126)
 # not pinned anywhere); only the set matters to the loop.
 PROJECTILE_NAMES = {0: CUBE_BOX, 1: CUBE_DROPPED, 2: PROJECTILE}
 
+# The deploy spec in use, and every `_Policy`'s unless a test names a variant of it. The five
+# before it are in archive/configs/.
+DEPLOY6 = "configs/agent_obs_deploy6.yaml"
+
 
 # -- fakes -------------------------------------------------------------------------------------
 
@@ -339,16 +343,15 @@ class _Assembler:
 
 
 class _Policy:
-    """Real config and a real agent-obs spec -- the loop derives its rates, slot counts and grid
-    channels from them -- and a scripted act.
+    """Real config and a real agent-obs spec, deploy6's by default -- the loop derives its rates,
+    slot counts and grid channels from them -- and a scripted act.
 
     `real_assembler=True` swaps the recording `_Assembler` for the real `ObservationAssembler`,
     which is what `DeployedPolicy.make_assembler` returns. The recorder accepts any keyword at all,
     so it cannot see a field the spec needs and the loop never supplies; the real one raises.
     """
 
-    def __init__(self, decision=None, spec_path="configs/agent_obs_deploy.yaml",
-                 real_assembler=False, cfg=None):
+    def __init__(self, decision=None, spec_path=DEPLOY6, real_assembler=False, cfg=None):
         self.cfg = CFG if cfg is None else cfg
         self.spec = load_agent_spec(spec_path, self.cfg)
         self.assembler = (ObservationAssembler(self.spec, self.cfg) if real_assembler
@@ -938,7 +941,7 @@ def test_a_missing_hero_box_skips_the_decision_instead_of_filling_it(loop):
     _play(loop, loop.decision_every)
     assert loop.policy.calls == 1
     loop.vision.entities.detections = []     # the detector stops seeing the hero
-    loop.tracker.max_misses = -1             # and the track is dropped rather than coasting
+    loop.tracker.hero_max_misses = -1        # and the track is dropped rather than coasting
     for _ in range(loop.decision_every):
         loop.tick()
     assert loop.policy.calls == 1
@@ -950,7 +953,7 @@ def test_a_skipped_decision_holds_the_previous_action(loop):
     decision put it."""
     _play(loop, loop.decision_every)
     loop.vision.entities.detections = []
-    loop.tracker.max_misses = -1
+    loop.tracker.hero_max_misses = -1
     before = list(loop.backend.events)
     for _ in range(loop.decision_every):
         loop.tick()
@@ -1051,20 +1054,16 @@ def test_zone_active_outlives_a_new_segment_and_a_new_match_clears_it(loop, monk
 
 # -- the real assembler ------------------------------------------------------------------------
 
-# Globbed, so a new deploy spec is exercised here the day it is added.
-DEPLOY_SPECS = sorted(str(p).replace("\\", "/") for p in Path("configs").glob("agent_obs_deploy*.yaml"))
-
-
-@pytest.mark.parametrize("spec_path", DEPLOY_SPECS)
-def test_a_decision_reaches_the_policy_through_the_real_assembler(loop, spec_path):
+def test_a_decision_reaches_the_policy_through_the_real_assembler(loop):
     """Every supplier the loop wires up, fed through the assembler the checkpoint would get.
 
     Every other test in this file hands the loop `_Assembler`, which accepts any keyword and any
     value, so none of them can see a field the spec names and the loop never supplies. That is how
-    the first live decision on an agent_obs_deploy3.yaml run raised "no value supplied for
+    the first live decision on a deploy3 run raised "no value supplied for
     'zone.hero_margin_local'": the zone estimator only answered to the first spec's field names.
+    deploy6 reads `hero.near_edge`, so the tracker's `hero_offset` is one of the suppliers here.
     """
-    policy = _Policy(spec_path=spec_path, real_assembler=True)
+    policy = _Policy(real_assembler=True)
     lp = DeployLoop(capture=_Capture(), guard=_Guard(), match=_Match(), vision=loop.vision,
                     policy=policy, controls=loop.controls, cfg=DeploymentConfig())
     _play(lp, 1)
@@ -1079,20 +1078,6 @@ def test_a_decision_reaches_the_policy_through_the_real_assembler(loop, spec_pat
 
 
 # -- hero_offset and hero.near_edge -----------------------------------------------------------
-
-def _near_edge_spec() -> str:
-    """deploy4 with `hero.near_edge` after `hero.in_zone`, the shape deploy5 takes."""
-    import tempfile
-    import yaml
-    doc = yaml.safe_load(open("configs/agent_obs_deploy4.yaml").read())
-    for g in doc["groups"]:
-        if "hero.in_zone" in g.get("fields", ()):
-            g["fields"].insert(g["fields"].index("hero.in_zone") + 1, "hero.near_edge")
-    path = tempfile.mktemp(suffix=".yaml")
-    with open(path, "w") as f:
-        yaml.dump(doc, f)
-    return path
-
 
 _OLD_RECORD = {"index": "7", "t": "0.35", "grab_ms": "1.5", "phase": "playing", "tick_ms": "40.0",
                "odometry": "ok", "warmup": "False", "decision": "True", "move_bin": "3",
@@ -1115,23 +1100,14 @@ def test_the_trackers_hero_offset_reaches_the_assembler_and_the_telemetry(loop):
     assert (old.hero_offset_x, old.hero_offset_y, old.near_edge) == (0.0, 0.0, -1), "older CSVs"
 
 
-def test_a_spec_that_names_near_edge_decides_through_the_real_assembler(loop):
-    policy = _Policy(spec_path=_near_edge_spec(), real_assembler=True)
-    lp = DeployLoop(capture=_Capture(), guard=_Guard(), match=_Match(), vision=loop.vision,
-                    policy=policy, controls=loop.controls, cfg=DeploymentConfig())
-    _play(lp, 1)
-    assert policy.calls == 1, _last_attempt(lp).note
-
-
 # -- the history -------------------------------------------------------------------------------
 
-def _deploy4_loop(loop, decision=None, real_assembler=True):
-    """The fixture's loop with a deploy4 policy, the first spec that reads the history. The real
-    assembler by default, so the `hist` group is the one the checkpoint would read; the recorder
-    when a test wants the snapshots and the grid exactly as the loop handed them over."""
+def _loop_with(loop, decision=None, real_assembler=True):
+    """The fixture's loop rebuilt around a policy that answers `decision`. The real assembler by
+    default, so the `hist` group is the one the checkpoint would read; the recorder when a test
+    wants the snapshots and the grid exactly as the loop handed them over."""
     lp = DeployLoop(capture=_Capture(), guard=_Guard(), match=_Match(), vision=loop.vision,
-                    policy=_Policy(decision=decision, spec_path="configs/agent_obs_deploy4.yaml",
-                                   real_assembler=real_assembler),
+                    policy=_Policy(decision=decision, real_assembler=real_assembler),
                     controls=loop.controls, cfg=DeploymentConfig())
     lp.backend = loop.backend
     return lp
@@ -1146,7 +1122,7 @@ def test_the_first_decisions_after_the_gate_fill_the_history_one_slot_at_a_time(
     """Through the real assembler: [0,0,0], [1,0,0],
     [1,1,0], and then the ring is full. A different HP read each decision shows the order:
     newest first, as the sim's ring keeps it."""
-    lp = _deploy4_loop(loop)
+    lp = _loop_with(loop)
     for i, hp in enumerate((8000, 7000, 6000, 5000)):
         lp.vision.health.readings = [_Reading("player", hp)]
         _play(lp, lp.decision_every if i else 1)
@@ -1159,8 +1135,8 @@ def test_a_snapshot_holds_the_modelled_attack_and_what_its_observation_was_built
     and the next observation's history says nothing was: `hist.attack_onehot` is what the device
     did. The rest is what the first observation was handed: move bin 3, the 8000 read, the full
     clip a match starts with, and the hero's world position."""
-    lp = _deploy4_loop(loop, Decision(move_bin=3, attack=ATTACK_SUPER,
-                                      legal=(True, True, False, True)))
+    lp = _loop_with(loop, Decision(move_bin=3, attack=ATTACK_SUPER,
+                                   legal=(True, True, False, True)))
     _play(lp, lp.decision_every + 1)
     assert lp.policy.calls == 2, _last_attempt(lp).note
     first = lp._history[1]
@@ -1176,8 +1152,8 @@ def test_the_history_holds_the_ammo_an_observation_saw_not_what_its_shot_left(lo
     """The sim pushes `hist_ammo` at the top of `env.step`, before the action lands, so slot 0
     is the clip the previous observation was built from. Here that observation's answer is a
     shot, the shadow spends it before the next decision, and the history still says full."""
-    lp = _deploy4_loop(loop, Decision(move_bin=3, attack=ATTACK_FIRE,
-                                      legal=(True, True, False, True)))
+    lp = _loop_with(loop, Decision(move_bin=3, attack=ATTACK_FIRE,
+                                   legal=(True, True, False, True)))
     _play(lp, 1)
     lp.shadow.advance(0.05)    # one sub-tick; the fixture ticks back to back, in no real time
     assert lp.shadow.observe()["ammo_frac"] < 1.0, "the shot was not modelled"
@@ -1191,7 +1167,7 @@ def test_the_history_holds_the_ammo_an_observation_saw_not_what_its_shot_left(lo
 def test_a_snapshot_holds_the_heros_world_position_x_then_y(loop):
     """World (3, 1), where the two axes differ, so a transposed snapshot shows. The hero never
     moves, so the next decision's displacement for slot 0 must read zero."""
-    lp = _deploy4_loop(loop)
+    lp = _loop_with(loop)
     lp.vision.odometry.position = (3.0, 1.0)
     _play(lp, lp.decision_every + 1)
     assert lp.policy.calls == 2, _last_attempt(lp).note
@@ -1200,7 +1176,7 @@ def test_a_snapshot_holds_the_heros_world_position_x_then_y(loop):
 
 
 def test_a_new_match_starts_with_no_history(loop):
-    lp = _deploy4_loop(loop)
+    lp = _loop_with(loop)
     _play(lp, 2 * lp.decision_every + 1)
     assert _valid(lp)[-1] == [1.0, 1.0, 0.0]
     lp.match.gate = False
@@ -1214,7 +1190,7 @@ def test_a_new_segment_drops_the_history(loop):
     """A snapshot's positions are world-frame, and a new segment has no defined offset to the old
     one, so the ring empties the way every tracker does. The first decision in the new segment is
     the tracker's reset tick and is skipped; the one after reads an empty history."""
-    lp = _deploy4_loop(loop)
+    lp = _loop_with(loop)
     _play(lp, 2 * lp.decision_every + 1)
     assert _valid(lp)[-1] == [1.0, 1.0, 0.0]
     lp.vision.odometry.segment += 1
@@ -1228,7 +1204,7 @@ def test_a_skipped_decision_takes_no_snapshot(loop):
     """No hero HP read, no decision, and no snapshot. The next decision's first slot is the last
     decision that reached the policy, two windows back, and `valid` stays a prefix: the sim never
     produces an invalid slot in front of a valid one."""
-    lp = _deploy4_loop(loop)
+    lp = _loop_with(loop)
     _play(lp, 1)
     lp.vision.health.readings = []
     _play(lp, lp.decision_every)
@@ -1245,7 +1221,7 @@ def test_a_snapshot_keeps_only_the_enemies_seen_that_decision(loop):
     on this side that set is `seen_now`. A coasted track is the tracker's prediction, not a
     sighting, so the snapshot of a decision it coasted through leaves it out while the track
     itself lives on. The planes follow the snapshots, oldest last."""
-    lp = _deploy4_loop(loop, real_assembler=False)
+    lp = _loop_with(loop, real_assembler=False)
     enemy = _Detection("enemy", (HERO_PX[0] + 2 * 48, HERO_PX[1]))     # world (2, 0)
     lp.vision.entities.detections.append(enemy)
     _play(lp, lp.decision_every + 1)      # two decisions: pending, then promoted and seen
@@ -1273,26 +1249,40 @@ def test_a_snapshot_keeps_only_the_enemies_seen_that_decision(loop):
 CRATE = Detection(CUBE_BOX, 0.9, (580.0, 290.0, 620.0, 390.0))
 
 
-def _deploy3_loop(loop, detections=(), names=PROJECTILE_NAMES):
-    """The fixture's loop again with a deploy3 policy. Rebuilt rather than patched, because the
-    grid's channels and the class check are both settled at construction."""
+def _loot_loop(loop, detections=(), names=PROJECTILE_NAMES, spec_path=DEPLOY6):
+    """The fixture's loop rebuilt with a projectile model that returns `detections` and knows the
+    classes `names`. Rebuilt rather than patched, because the grid's channels and the class check
+    are both settled at construction."""
     loop.vision.projectiles = _Detector(detections, names=names)
     lp = DeployLoop(capture=_Capture(), guard=_Guard(), match=_Match(), vision=loop.vision,
-                    policy=_Policy(spec_path="configs/agent_obs_deploy3.yaml"),
+                    policy=_Policy(spec_path=spec_path),
                     controls=loop.controls, cfg=DeploymentConfig())
     lp.backend = loop.backend
     return lp
 
 
-def test_the_grid_is_built_for_the_policys_spec_not_a_default_one(loop):
-    """`GridSpec.load()` with no arguments is deploy's eight planes. A deploy3 policy built with
-    that would fail its first `assemble` on the shape, mid-match."""
-    assert loop.grid.spec.shape == (8, 13, 21)
-    assert _deploy3_loop(loop).grid.spec.shape == (10, 13, 21)
+def _deploy6_without(tmp_path, *channels) -> str:
+    """deploy6 with `channels` taken off its grid, written under `tmp_path`: the spec of a policy
+    that does not read those planes."""
+    import yaml
+    doc = yaml.safe_load(Path(DEPLOY6).read_text(encoding="utf-8"))
+    grid = next(g for g in doc["groups"] if g["name"] == "grid")
+    grid["view_channels"] = [c for c in grid["view_channels"] if c not in channels]
+    path = tmp_path / "agent_obs_variant.yaml"
+    path.write_text(yaml.safe_dump(doc), encoding="utf-8")
+    return str(path)
 
 
-def test_a_deploy3_policy_sees_a_crate_in_its_box_plane_once_it_is_confirmed(loop):
-    lp = _deploy3_loop(loop, [CRATE])
+def test_the_grid_is_built_for_the_policys_spec_not_a_default_one(loop, tmp_path):
+    """`GridSpec.load()` with no arguments is deploy6's thirteen planes. A policy whose spec has
+    fewer, built with that, would fail its first `assemble` on the shape, mid-match."""
+    assert loop.grid.spec.shape == (13, 13, 21)
+    single = _deploy6_without(tmp_path, "enemy_hist1", "enemy_hist2", "enemy_hist3")
+    assert _loot_loop(loop, spec_path=single).grid.spec.shape == (10, 13, 21)
+
+
+def test_the_policy_sees_a_crate_in_its_box_plane_once_it_is_confirmed(loop):
+    lp = _loot_loop(loop, [CRATE])
     _play(lp, lp.decision_every + 1)
     channels = lp.grid.spec.channels
     grids = [call["grid"] for call in lp.policy.assembler.calls]
@@ -1308,7 +1298,7 @@ def test_each_class_goes_to_its_own_consumer(loop):
     """One model, one call, three classes. A crate in the projectile tracker would be a still
     projectile for its whole life; a shot in the loot map would be a crate."""
     shot = Detection(PROJECTILE, 0.9, (700.0, 300.0, 720.0, 320.0))
-    lp = _deploy3_loop(loop, [CRATE, shot])
+    lp = _loot_loop(loop, [CRATE, shot])
     _play(lp, 4)
     assert lp.vision.projectiles.calls == 4
     assert lp.loot.crates() == [(2.5, 1.5)] and lp.loot.cubes() == []
@@ -1316,8 +1306,8 @@ def test_each_class_goes_to_its_own_consumer(loop):
 
 
 def test_a_crate_box_keeps_the_terrain_map_off_the_floor_under_it(loop):
-    """The occupancy map's fifth gate, and independent of the spec: a deploy policy never reads a
-    crate, but its terrain map still must not lock the crate as a wall."""
+    """The occupancy map's fifth gate, and independent of the spec: whatever planes the policy
+    reads, its terrain map must not lock a crate as a wall."""
     loop.vision.entities.detections = []         # the crate alone; brawlers are the next test
     _play(loop, 1)
     assert loop.vision.occupancy.occluded.shape == (13, 21)
@@ -1327,6 +1317,22 @@ def test_a_crate_box_keeps_the_terrain_map_off_the_floor_under_it(loop):
     occluded = loop.vision.occupancy.occluded
     assert occluded[7, 12]
     assert occluded[:, 12].sum() == occluded.sum() <= 3     # the box is 40 px wide, inside col 12
+
+
+def test_an_enemy_box_on_a_confirmed_crate_never_becomes_a_track(loop):
+    """The entity detector boxes crates as `enemy` (`tracker.CRATE_VETO_TILES`). The loop hands
+    the tracker the loot map's crates, so once the crate is confirmed (third sighting) a box on it
+    is dropped before association, while a brawler elsewhere is tracked as before."""
+    loop.vision.projectiles.detections = [CRATE]                      # confirms at (2.5, 1.5)
+    loop.vision.entities.detections = [_Detection("player", HERO_PX),
+                                       _Detection("enemy", (12.5 * 48, 7.5 * 48)),  # (2.5, 1.5)
+                                       _Detection("enemy", (15 * 48, 3 * 48))]      # (5, -3)
+    _play(loop, 3 * loop.decision_every)
+    assert loop.loot.crates() == [(2.5, 1.5)]
+    # The first decision is the first tick, before the crate is confirmed.
+    assert [r.n_crate_vetoed for r in _decisions(loop)] == [0, 1, 1]
+    tracks = [t for t in loop.tracker.slots() if t is not None]
+    assert [t.pos for t in tracks] == [pytest.approx((5.0, -3.0))]
 
 
 def test_a_brawler_box_keeps_the_terrain_map_off_the_floor_under_it_on_every_tick(loop):
@@ -1384,7 +1390,7 @@ def test_every_consumer_moves_onto_the_game_lattice_the_crates_give(loop):
     odometry frame. On the third sighting the world frame moves by exactly that. The deposit is
     registered at the moved position, every tracker starts over in the new frame, and the crate the
     loot map confirms sits on a tile centre: the cell the sim keeps a crate in."""
-    lp = _deploy3_loop(loop, [_lattice_crate((2.8, 1.25))])
+    lp = _loot_loop(loop, [_lattice_crate((2.8, 1.25))])
     _play(lp, 7)
     rows = list(lp.telemetry)
     assert [r.lattice for r in rows[:4]] == ["unlocked", "unlocked", "rebased", "locked"]
@@ -1409,7 +1415,7 @@ def test_a_new_match_is_a_new_lattice_and_its_first_decision_still_goes_through(
     """The match start hands every tracker the NEW epoch. Handed the odometry segment instead,
     each would see the lattice's epoch as a change on its first update, reset, and skip the
     match's first decision, every match."""
-    lp = _deploy3_loop(loop, [_lattice_crate((2.8, 1.25))])
+    lp = _loot_loop(loop, [_lattice_crate((2.8, 1.25))])
     _play(lp, 4)
     assert lp.lattice.phase != (0.0, 0.0)
     lp.match.gate = False
@@ -1421,19 +1427,17 @@ def test_a_new_match_is_a_new_lattice_and_its_first_decision_still_goes_through(
     assert lp.policy.calls == calls + 1, _last_attempt(lp).note
 
 
-def test_a_deploy3_policy_refuses_a_projectile_model_that_cannot_see_crates(loop):
+def test_a_policy_with_a_box_plane_refuses_a_projectile_model_that_cannot_see_crates(loop):
     with pytest.raises(ValueError, match="Power Cube Box"):
-        _deploy3_loop(loop, names={0: PROJECTILE})
+        _loot_loop(loop, names={0: PROJECTILE})
 
 
-def test_a_policy_that_reads_no_crates_does_not_need_the_crate_class(loop):
-    loop.vision.projectiles = _Detector(names={0: PROJECTILE})
-    DeployLoop(capture=_Capture(), guard=_Guard(), match=_Match(), vision=loop.vision,
-               policy=_Policy(), controls=loop.controls, cfg=DeploymentConfig())
+def test_a_policy_that_reads_no_crates_does_not_need_the_crate_class(loop, tmp_path):
+    _loot_loop(loop, names={0: PROJECTILE}, spec_path=_deploy6_without(tmp_path, "box", "pickup"))
 
 
 def test_a_new_match_starts_with_no_crates(loop):
-    lp = _deploy3_loop(loop, [CRATE])
+    lp = _loot_loop(loop, [CRATE])
     _play(lp, 4)
     assert lp.loot.crates()
     lp.match.gate = False
@@ -1443,7 +1447,7 @@ def test_a_new_match_starts_with_no_crates(loop):
     assert lp.phase is Phase.PLAYING and lp.loot.crates() == []
 
 
-# -- a known map (KNOWN_MAP_LOCALIZATION_PLAN.md step K3) --------------------------------------
+# -- a known map (archive/KNOWN_MAP_LOCALIZATION_PLAN.md step K3) ----------------------------------
 
 # Where the fakes put the camera on Dark Passage: map world = odometry + TRUE_OFFSET. With odometry
 # at (0.5, 0.5) the hero, camera-relative (-4, 0), stands on the centre of the spawn at col 6,
@@ -1485,7 +1489,7 @@ class _MapClassifier:
         return self.classes[r:r + rows, c:c + cols].copy(), np.ones((rows, cols), np.float32)
 
 
-def _map_loop(loop, spec_path="configs/agent_obs_deploy.yaml", real_assembler=True):
+def _map_loop(loop, real_assembler=True):
     """The fixture's loop again with `map.name: dark_passage`, the camera as above, and its log
     kept on `lp.messages`. The commit margin is pinned to the provisional 60, which the clean view
     clears on its first tick, so tuning the default in step K4 cannot move the commit."""
@@ -1498,7 +1502,7 @@ def _map_loop(loop, spec_path="configs/agent_obs_deploy.yaml", real_assembler=Tr
     messages = []
     cfg = DeploymentConfig(map_name="dark_passage", map_commit_margin=60.0)
     lp = DeployLoop(capture=_Capture(), guard=_Guard(), match=_Match(), vision=vision,
-                    policy=_Policy(spec_path=spec_path, real_assembler=real_assembler),
+                    policy=_Policy(real_assembler=real_assembler),
                     controls=loop.controls, cfg=cfg, log=messages.append)
     lp.backend, lp.messages = loop.backend, messages
     return lp
@@ -1591,7 +1595,7 @@ def test_a_crate_seen_before_a_confirmed_cut_is_still_in_the_box_plane_after_it(
     """A cut the localizer confirms keeps its epoch, so the loot map, the tracks and the history
     keep their state across it. The crate leaves the screen before the cut, so only the loot map's
     memory can put it in the box plane afterwards."""
-    lp = _map_loop(loop, "configs/agent_obs_deploy3.yaml", real_assembler=False)
+    lp = _map_loop(loop, real_assembler=False)
     _until(lp, lambda: lp.localizer.state == "fixed")
     # Camera-relative (-2, 1), a true tile centre: map world (-21.5, -4.5), two columns right of
     # the hero and one row down. Crate check 3 finds the fix on the game's lattice and leaves it.
@@ -1688,10 +1692,15 @@ def test_pin_thread_pools_caps_torch_and_cv2_from_the_config():
     from brawl_deployment.loop import pin_thread_pools
 
     torch_before, cv2_before = torch.get_num_threads(), cv2.getNumThreads()
+    # Caps unlike the starting pools, or a cap that never reached its pool would still read
+    # right: under pytest-xdist every worker starts torch at one thread (tests/conftest.py).
+    torch_cap = 2 if torch_before == 1 else 1
+    cv2_cap = 2 if cv2_before == 3 else 3
     try:
-        pin_thread_pools(DeploymentConfig(compute_torch_threads=1, compute_cv2_threads=3))
-        assert torch.get_num_threads() == 1
-        assert cv2.getNumThreads() == 3
+        caps = DeploymentConfig(compute_torch_threads=torch_cap, compute_cv2_threads=cv2_cap)
+        pin_thread_pools(caps)
+        assert torch.get_num_threads() == torch_cap
+        assert cv2.getNumThreads() == cv2_cap
     finally:
         torch.set_num_threads(torch_before)
         cv2.setNumThreads(cv2_before)
@@ -1937,7 +1946,7 @@ def test_a_wall_beside_the_hero_masks_the_bin_into_it(loop):
     from brawl_sim.constants import Tile
     from brawl_vision.terrain.labeling import CLASS_INDEX
 
-    lp = _deploy4_loop(loop, real_assembler=False)
+    lp = _loop_with(loop, real_assembler=False)
     lp.vision.entities.detections = [_Detection("player", (HERO_PX[0] + 24, HERO_PX[1] + 24))]
     _play(lp, 1)
     assert lp.policy.calls == 1, _last_attempt(lp).note
@@ -1965,7 +1974,7 @@ def test_the_dead_bin_mask_is_off_by_config_and_the_row_says_so(loop):
     from brawl_deployment.loop import TickRow
 
     lp = DeployLoop(capture=_Capture(), guard=_Guard(), match=_Match(), vision=loop.vision,
-                    policy=_Policy(spec_path="configs/agent_obs_deploy4.yaml"),
+                    policy=_Policy(),
                     controls=loop.controls, cfg=DeploymentConfig(policy_dead_bin_mask=False))
     lp.backend = loop.backend
     assert lp.move_mask is None
@@ -2075,3 +2084,34 @@ def test_a_run_trained_without_the_flag_never_taps_an_auto_aimed_attack(loop):
     _play(loop, loop.decision_every)
     assert ("down", SLOT_TAP) not in loop.backend.events
     assert _decisions(loop)[0].attack == ATTACK_NONE
+
+
+# ---- the memory coast (archive/CRITIC_AND_MEMORY_PLAN.md A8) -------------------------------------
+
+def test_the_tracker_coasts_enemies_for_the_runs_slots_and_the_hero_for_its_own_three(monkeypatch):
+    """The enemy coast is the run's `slots.max_misses` (12 in train.yaml), because deploy6's
+    memory rows were trained on it; the hero track keeps the 3 it always had."""
+    _patch_vision(monkeypatch)
+    cfg = load_config("configs/default.yaml", overrides={"slots": {"max_misses": 12}})
+    lp = _build_loop(_Policy(cfg=cfg))
+    assert lp.tracker.max_misses == 12 and lp.tracker.hero_max_misses == 3
+
+
+def test_aim_and_reach_count_a_lost_track_for_aim_max_misses_decisions_only(monkeypatch):
+    """A 12-miss coast holds an enemy's track for 3 s after the detector last saw it. The
+    auto-aim estimate and the reach telemetry count it while it has been lost for at most
+    AIM_MAX_MISSES (3) decisions, the coast both always had, and not after: a 3 s old position
+    is a memory for the policy, not a target for the game's auto-aim."""
+    from brawl_deployment.loop import AIM_MAX_MISSES
+    from brawl_deployment.perception.tracker import Track
+
+    _patch_vision(monkeypatch)
+    lp = _build_loop(_Policy(cfg=AUTO_CFG))
+    hero = (10.0, 10.0)
+    tr = Track(id=1, slot=0, label="enemy", pos=(11.5, 10.0), misses=AIM_MAX_MISSES,
+               seen_now=False)
+    assert lp._auto_aim(hero, [tr]) == pytest.approx((1.0, 0.0))
+    assert lp._enemy_in_reach(hero, [tr]) is True
+    tr.misses = AIM_MAX_MISSES + 1
+    assert lp._auto_aim(hero, [tr]) is None
+    assert lp._enemy_in_reach(hero, [tr]) is False

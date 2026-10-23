@@ -1,3 +1,5 @@
+import itertools
+
 import matplotlib
 matplotlib.use("Agg")  # headless: never open a GUI window/event loop during tests
 
@@ -8,7 +10,7 @@ import yaml
 from matplotlib.colors import to_rgba
 
 from brawl_sim.bots import perception
-from brawl_sim.config import load_config
+from brawl_sim.config import _deep_merge, load_config
 from brawl_sim.constants import Proj
 from brawl_sim.core import stats
 from brawl_sim.env import BrawlVecEnv
@@ -24,14 +26,26 @@ CONFIGS_TINY = yaml.safe_load(open("configs/presets/debug_tiny.yaml").read())
 def _cfg(overrides=None):
     merged = dict(CONFIGS_TINY)
     if overrides:
-        merged = {**merged, **overrides}
+        merged = _deep_merge(merged, overrides)  # the preset's other keys in a section stay
     return load_config(CONFIGS_DEFAULT, overrides=merged)
 
 
+_ROLLOUTS = {}
+
+
 def _viewer_from_rollout(cfg=None, steps=5, seed=0, n_enemies=2):
-    cfg = cfg or _cfg(overrides={"entities": {"n_enemies": n_enemies}})
-    frames = record_rollout.record_rollout(cfg, steps=steps, seed=seed)
-    bank = build_map_bank(cfg, device="cpu")
+    # A default-config rollout is recorded once per (n_enemies, steps, seed) and shared; every
+    # call still builds its own ReplayViewer, and no test writes to the frames, bank or cfg.
+    if cfg is None:
+        key = (n_enemies, steps, seed)
+        if key not in _ROLLOUTS:
+            cfg = _cfg(overrides={"entities": {"n_enemies": n_enemies}})
+            _ROLLOUTS[key] = (record_rollout.record_rollout(cfg, steps=steps, seed=seed),
+                              build_map_bank(cfg, device="cpu"), cfg)
+        frames, bank, cfg = _ROLLOUTS[key]
+    else:
+        frames = record_rollout.record_rollout(cfg, steps=steps, seed=seed)
+        bank = build_map_bank(cfg, device="cpu")
     return viewer_mod.ReplayViewer(frames, bank, cfg), frames, cfg, bank
 
 
@@ -293,7 +307,7 @@ def test_c_key_toggles_view_rect_visibility():
 
 # ---- zone bands partition the map correctly (no double coverage, no gaps) -----------------------
 
-def test_zone_bands_never_cover_the_safe_rect():
+def test_zone_bands_partition_the_map_around_the_safe_rect():
     viewer, frames, cfg, bank = _viewer_from_rollout(steps=1)
     frame0 = {k: v[0].copy() for k, v in frames.items()}
     cx, cy = cfg.map_w / 2.0, cfg.map_h / 2.0
@@ -309,6 +323,18 @@ def test_zone_bands_never_cover_the_safe_rect():
         # every band must not overlap the safe rect's interior
         overlaps = rx0 < cx + 5 and rx1 > cx - 5 and ry0 < cy + 5 and ry1 > cy - 5
         assert not overlaps, f"zone band ({rx0},{ry0},{rx1},{ry1}) overlaps the safe rect"
+
+    # 2026-10-20: the loop above only showed that no band overlaps the safe rect, which four
+    # empty bands pass. Together they must tile the map minus the safe rect: each inside the
+    # map, no two overlapping, and their areas summing to the rest of the map.
+    rects = [(r.get_x(), r.get_y(), r.get_x() + r.get_width(), r.get_y() + r.get_height())
+             for r in (top, bottom, left, right)]
+    for x0, y0, x1, y1 in rects:
+        assert 0.0 <= x0 <= x1 <= viewer.W and 0.0 <= y0 <= y1 <= viewer.H, (x0, y0, x1, y1)
+    for a, b in itertools.combinations(rects, 2):
+        assert not (a[0] < b[2] and b[0] < a[2] and a[1] < b[3] and b[1] < a[3]), (a, b)
+    area = sum((x1 - x0) * (y1 - y0) for x0, y0, x1, y1 in rects)
+    assert area == pytest.approx(viewer.W * viewer.H - 10.0 * 10.0)
 
 
 # ---- projectile scatter routes each kind to its own collection ---------------------------------

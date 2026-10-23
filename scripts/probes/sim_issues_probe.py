@@ -1,5 +1,5 @@
 """The five sim issues seen in scripts/watch.py on 2026-10-06, measured in the sim itself
-(SIM_ISSUES_PLAN.md).
+(archive/SIM_ISSUES_PLAN.md).
 
 watch.py builds the training env from the run's own train.yaml and changes three things: one
 pinned tier, no zone jitter, argmax actions. This probe runs a checkpoint both ways, so a finding

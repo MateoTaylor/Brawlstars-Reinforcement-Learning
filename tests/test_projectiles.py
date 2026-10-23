@@ -14,6 +14,13 @@ from brawl_sim.core import terrain
 from brawl_sim.core.state import allocate
 
 CONFIGS = Path(__file__).resolve().parent.parent / "configs"
+# The brawler spec, parsed once per module: until 2026-10-20 every `_cfg_and_params` call re-read
+# both YAML files (~16 ms a call). Each call gets its own deep copy, so nothing one test does to
+# the spec it was handed can reach the next.
+_SPEC = {
+    **yaml.safe_load((CONFIGS / "default.yaml").read_text()),
+    **yaml.safe_load((CONFIGS / "brawlers.yaml").read_text()),
+}
 
 
 class _FakeBank:
@@ -39,10 +46,7 @@ def _cfg_and_params(n_envs=1, map_h=20, map_w=20, max_projectiles=16, max_boxes=
         "world": {"map_h": map_h, "map_w": map_w},
         "limits": {"max_projectiles": max_projectiles, "max_boxes": max_boxes, "max_pickups": 8},
     })
-    spec = {
-        **yaml.safe_load((CONFIGS / "default.yaml").read_text()),
-        **yaml.safe_load((CONFIGS / "brawlers.yaml").read_text()),
-    }
+    spec = copy.deepcopy(_SPEC)
     gen = torch.Generator(device="cpu")
     gen.manual_seed(0)
     params = build_params(cfg, n_envs=n_envs, device="cpu", gen=gen, spec=spec)
@@ -277,11 +281,17 @@ def test_volley_width_constant_covers_every_kinds_proj_count():
 
 
 def test_firing_into_full_buffer_changes_nothing():
+    """A volley into a full buffer is dropped, never written over a live slot. The live slots are
+    zero-init, so for an overwrite to show the shot must not look like them: the shooter fires
+    from (5, 5), not the origin, and every field a shot carries is compared. Until 2026-10-20 it
+    fired from the all-zero `ent_pos` and only alive/pos were compared, so an overwrite wrote
+    back exactly the alive and pos it found, and passed."""
     cfg, params = _cfg_and_params(max_projectiles=2)
     state = _fresh_state(cfg)
     state.prj_alive[0, :2] = True
-    before_pos = state.prj_pos.clone()
-    before_alive = state.prj_alive.clone()
+    state.ent_pos[0, 1] = torch.tensor([5.0, 5.0])
+    fields = ("prj_alive", "prj_pos", "prj_vel", "prj_owner", "prj_damage", "prj_dist_left", "prj_kind")
+    before = {name: getattr(state, name).clone() for name in fields}
 
     fire_mask = torch.zeros(1, cfg.n_entities, dtype=torch.bool)
     fire_mask[0, 1] = True
@@ -294,8 +304,8 @@ def test_firing_into_full_buffer_changes_nothing():
 
     proj.spawn_volley(state, fire_mask, origin, aim_dir, aim_point, kind, damage, params, cfg)
 
-    assert torch.equal(state.prj_alive, before_alive)
-    assert torch.equal(state.prj_pos, before_pos)
+    for name in fields:
+        assert torch.equal(getattr(state, name), before[name]), f"a volley into a full buffer rewrote {name}"
 
 
 # ---- step_projectiles ---------------------------------------------------------
@@ -420,29 +430,36 @@ def test_projectile_never_hits_its_own_owner():
 
 
 def test_earliest_t_wins_hits_closer_target_not_farther():
+    """A shot whose path crosses two bodies IN ONE TICK hits the one it reaches first
+    (`_earliest_only`). Both bodies sit inside the first tick's segment, and the farther one has
+    the lower entity index, so neither "hit everything on the segment" nor "lowest index wins"
+    passes. Until 2026-10-20 the targets were 7 tiles apart: no one tick's segment reached both,
+    so `_earliest_only` never had a choice to make. One tick only, because the rocket is Brock's
+    and the sphere it leaves behind would catch both bodies on later ticks."""
     cfg, params = _cfg_and_params(map_h=30, map_w=30)
     state = _fresh_state(cfg)
     tiles = _grid(30, 30)
     bank = _bank_from_grid(tiles)
 
-    state.ent_pos[0, 0] = torch.tensor([8.0, 5.0])   # closer
-    state.ent_pos[0, 2] = torch.tensor([15.0, 5.0])  # farther, same line
-    state.ent_kind[0, 2] = int(Kind.BOT_SNIPER)
+    near_x, far_x = 5.72, 5.85
+    state.ent_pos[0, 2] = torch.tensor([near_x, 5.0])  # closer, higher index
+    state.ent_pos[0, 0] = torch.tensor([far_x, 5.0])   # farther, same line
     for e in (0, 2):
         state.ent_hp[0, e] = 999999.0
         state.ent_max_hp[0, e] = 999999.0
 
+    # Preconditions, from the shooter's own stats: the bolt starts outside both bodies (a start
+    # inside one reads t = 0 for it), and its first tick's segment enters both.
+    hit_r = params.unit_radius[0].item() + params.proj_radius[0, int(Kind.BOT_SNIPER)].item()
+    step = params.proj_speed[0, int(Kind.BOT_SNIPER)].item() * cfg.dt
+    assert near_x - hit_r > 5.0, "the bolt would start inside the near body"
+    assert far_x - hit_r < 5.0 + step, "one tick's segment no longer reaches the far body"
+
     _spawn_single_bolt(state, cfg, params, [5.0, 5.0], [1.0, 0.0], owner=1)
+    dmg_ent, _, _, _, _ = proj.step_projectiles(state, bank, params, cfg)
 
-    total_dmg = torch.zeros(1, cfg.n_entities)
-    for _ in range(50):
-        if not torch.any(state.prj_alive):
-            break
-        dmg_ent, dmg_by, dmg_box, _heal, _charge = proj.step_projectiles(state, bank, params, cfg)
-        total_dmg += dmg_ent
-
-    assert total_dmg[0, 0].item() > 0.0
-    assert total_dmg[0, 2].item() == 0.0
+    assert dmg_ent[0, 2].item() > 0.0
+    assert dmg_ent[0, 0].item() == 0.0
 
 
 def test_box_collision_deals_damage_and_kills_projectile():
@@ -587,7 +604,12 @@ def test_lob_detonates_on_its_landing_point_not_past_it():
 
 
 def test_detonation_splits_into_four_axis_aligned_half_damage_shards():
+    """Half damage by construction: Grom's shipped split_damage_fraction is 1.0 (his shards deal
+    the shell's full damage), and a multiply by 1.0 is invisible. It is forced to 0.5 here and
+    checked against the literal half. Until 2026-10-20 the expectation was `full_damage *
+    fraction` with the fraction read back from params, so a dropped multiply passed."""
     cfg, params = _cfg_and_params(map_h=20, map_w=20)
+    params.split_damage_fraction[:, int(Kind.BOT_ARTILLERY)] = 0.5
     state = _fresh_state(cfg)
     bank = _bank_from_grid(_grid(20, 20))
 
@@ -601,8 +623,7 @@ def test_detonation_splits_into_four_axis_aligned_half_damage_shards():
     assert bool((state.prj_aoe[0][alive] == 0).all())      # ... with no blast of their own
     assert bool((state.prj_owner[0][alive] == 1).all())    # ... still owned by the shooter
 
-    fraction = params.split_damage_fraction[0, int(Kind.BOT_ARTILLERY)].item()
-    assert torch.allclose(state.prj_damage[0][alive], torch.full((4,), full_damage * fraction))
+    assert torch.allclose(state.prj_damage[0][alive], torch.full((4,), 0.5 * full_damage))
 
     # One shard per world axis, each carrying split_distance tiles of travel.
     #
@@ -640,7 +661,11 @@ def test_shards_finish_their_path_in_split_seconds():
 
 
 def test_shard_deals_half_damage_two_tiles_off_the_landing_point():
+    """split_damage_fraction forced to 0.5 and the literal half asserted, as in the split test
+    above: at the shipped 1.0 a shard that skipped the multiply would read the same (the
+    expectation was derived from that 1.0 until 2026-10-20)."""
     cfg, params = _cfg_and_params(map_h=20, map_w=20)
+    params.split_damage_fraction[:, int(Kind.BOT_ARTILLERY)] = 0.5
     state = _fresh_state(cfg)
     bank = _bank_from_grid(_grid(20, 20))
 
@@ -655,8 +680,7 @@ def test_shard_deals_half_damage_two_tiles_off_the_landing_point():
         dmg_ent, _, _, _, _ = proj.step_projectiles(state, bank, params, cfg)
         total += dmg_ent[0, 0].item()
 
-    fraction = params.split_damage_fraction[0, int(Kind.BOT_ARTILLERY)].item()
-    assert abs(total - full_damage * fraction) < 1e-3
+    assert abs(total - 0.5 * full_damage) < 1e-3
 
 
 def test_direct_hit_is_not_also_hit_by_its_own_shards():
@@ -680,23 +704,30 @@ def test_direct_hit_is_not_also_hit_by_its_own_shards():
 
 
 def test_shards_are_stopped_by_walls():
-    cfg, params = _cfg_and_params(map_h=20, map_w=20)
-    state = _fresh_state(cfg)
-    tiles = _grid(20, 20)
-    tiles[:, 14] = Tile.WALL  # 2 tiles east of the landing point
-    bank = _bank_from_grid(tiles)
+    """Measured against open ground: the east arm only just reaches the target (0.2 tiles of
+    slack at the shipped stats), so a shorter arm would read as "stopped by the wall" too. Until
+    2026-10-20 there was no open-ground run (tests/test_spike.py's wall test has always had one)."""
+    def damage_to_target(wall):
+        cfg, params = _cfg_and_params(map_h=20, map_w=20)
+        state = _fresh_state(cfg)
+        tiles = _grid(20, 20)
+        if wall:
+            tiles[:, 14] = Tile.WALL  # 2 tiles east of the landing point
+        bank = _bank_from_grid(tiles)
 
-    state.ent_pos[0, 0] = torch.tensor([15.0, 10.0])  # behind that wall, inside the arm's reach
-    _spawn_shell(state, cfg, params, [5.0, 10.0], [12.0, 10.0])
+        state.ent_pos[0, 0] = torch.tensor([15.0, 10.0])  # behind that wall, inside the arm's reach
+        _spawn_shell(state, cfg, params, [5.0, 10.0], [12.0, 10.0])
 
-    total = 0.0
-    for _ in range(100):
-        if not torch.any(state.prj_alive):
-            break
-        dmg_ent, _, _, _, _ = proj.step_projectiles(state, bank, params, cfg)
-        total += dmg_ent[0, 0].item()
+        total = 0.0
+        for _ in range(100):
+            if not torch.any(state.prj_alive):
+                break
+            dmg_ent, _, _, _, _ = proj.step_projectiles(state, bank, params, cfg)
+            total += dmg_ent[0, 0].item()
+        return total
 
-    assert total == 0.0  # the shell arcs over walls; its shards do not
+    assert damage_to_target(wall=False) > 0.0, "the arm no longer reaches the target on open ground"
+    assert damage_to_target(wall=True) == 0.0  # the shell arcs over walls; its shards do not
 
 
 def test_non_lobbed_expiry_never_splits():

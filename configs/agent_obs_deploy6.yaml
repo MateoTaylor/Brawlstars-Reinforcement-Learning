@@ -1,0 +1,95 @@
+# DEPLOYABLE agent view, sixth of the deploy line and configs/train.yaml's default:
+# archive/configs/agent_obs_deploy5.yaml with enemy MEMORY in `enemies` and a privileged CRITIC
+# section. `self`, `projectiles`, `zone`, `history` and `grid` are byte-identical to deploy5's.
+# The five deploy specs before this one are in archive/configs/, so tests/test_configs_files.py
+# pins this file against configs/agent_obs_lowinfo.yaml instead: every field it drops, swaps and
+# adds, and each group's column order. Plan and decisions: archive/CRITIC_AND_MEMORY_PLAN.md.
+#
+#   python scripts/train.py --set run.agent_obs=configs/agent_obs_deploy6.yaml
+#
+# WHAT THIS CHANGES
+# -----------------
+#   enemies   Reads `memory.*` instead of `entities.*`: each slotted enemy as the hero LAST SAW it
+#             (core/slots.py snapshots, core/observation.py obs["memory"]). Under deploy5, `fair`
+#             multiplied a row by `entities.revealed_to_hero`, so a slot coasting through its
+#             unseen decisions read like an empty one. Here the gate is `memory.tracked`, so the
+#             row keeps the last-seen position, velocity, HP and bush flag for as long as the
+#             enemy holds its slot, and `memory.age_s` says how old they are (0 while seen, then
+#             +0.25 s per unseen decision). How long a slot coasts is `slots.max_misses`, 12
+#             decisions (3.0 s) in configs/train.yaml. Column for column against deploy5:
+#             alive -> tracked, revealed_to_hero -> seen, the five value columns read the
+#             snapshot, and age_s is new. (n_enemies, 10) against deploy5's 9.
+#   critic    NEW section: the value head's inputs, never the policy's (obs_select's module
+#             docstring, wrappers/sb3_policy.py). critic_enemies is every bot's TRUE state,
+#             seen or not, in entity order, a dead bot's row 0; critic_world adds what the
+#             actor groups leave out. The policy head reads only the actor features, and live
+#             play leaves these buffers at zero (`build_agent_obs(critic=False)`).
+#
+# Normalization: memory.* keep the divisors of the entities.* fields they replace (tiles,
+# tiles/s, hp); age_s is seconds, 0 to 3.0, and passes through. Every critic field is a bool, a
+# one-hot, a fraction, or a unit with a divisor, except react_t (seconds, under a second).
+#
+# WIDTHS: enemies 9 x 10, so the extractor takes 13 grid channels and 272 floats (deploy5: 263).
+# Six actor groups is obs_select._MAX_GROUPS. The critic adds 9 x 25 + 6 = 231 floats on the
+# value side only; two critic groups is _MAX_CRITIC_GROUPS.
+#
+# WHAT SUPPLIES THE NEW FIELDS LIVE (no new detector)
+# ---------------------------------------------------
+#   enemies (memory)   assemble._put_entities writes full["memory"] from the tracks it already
+#                      holds: a coasting track's `pos` is its last detection, its HP is the last
+#                      committed read, its bush flag is looked up at `pos`, `seen` is `seen_now`
+#                      and `age_s` is `misses` x agent_dt.
+#   critic             Nothing: live play never runs the value head.
+fair: true
+normalize: true
+groups:
+  - name: self                          # deploy5's, unchanged
+    per_entity: false
+    dtype: float32
+    fields: [hero.pos_norm, hero.vel, hero.facing_vec, hero.hp, hero.ammo_frac,
+             hero.ammo_whole, hero.attack_cd, hero.can_attack, hero.dashing,
+             hero.dash_t, hero.dash_dir, hero.invuln, hero.in_bush, hero.in_zone,
+             hero.near_edge,
+             hero.long_dash_ready, hero.long_dash_frac,
+             hero.super_ready, hero.super_charge_frac,
+             hero.gadget_ready, hero.gadget_charge_frac,
+             meta.time_frac, meta.n_enemies_alive]
+  - name: enemies                       # NEW: tracked slots read from MEMORY, see the header
+    per_entity: true
+    slots: tracked
+    dtype: float32
+    fields: [memory.tracked, memory.seen, memory.rel_pos, memory.dist, memory.rel_vel,
+             memory.hp, memory.in_bush, memory.age_s]
+  - name: projectiles                   # nearest K by time_to_closest, K = 12 -- NOT index-stable
+    per_entity: true
+    max_slots: 12
+    dtype: float32
+    fields: [projectiles.alive, projectiles.rel_pos, projectiles.vel,
+             projectiles.time_to_closest]
+  - name: zone                          # deploy5's, unchanged
+    per_entity: false
+    dtype: float32
+    fields: [zone.hero_margin_local, zone.active]
+  - name: history                       # deploy5's, unchanged
+    per_entity: false
+    dtype: float32
+    fields: [hist.valid, hist.move_onehot, hist.attack_onehot, hist.hp, hist.ammo_frac,
+             hist.displacement]
+  - name: grid                          # deploy5's, unchanged
+    dtype: uint8
+    view_channels: [blocks_unit, blocks_projectile, is_bush, is_water, in_zone,
+                    enemy_revealed, hero, box, pickup, projectile,
+                    enemy_hist1, enemy_hist2, enemy_hist3]
+critic:   # value head only: the policy never reads these, and live play zero-fills them
+  - name: critic_enemies                # all 9 bots, true values, entity order, dead rows 0
+    per_entity: true
+    dtype: float32
+    fields: [entities.alive, entities.kind_onehot, entities.rel_pos, entities.dist,
+             entities.rel_vel, entities.hp, entities.max_hp, entities.cubes,
+             entities.ammo_frac, entities.can_attack, entities.dashing, entities.in_bush,
+             entities.revealed_to_hero, entities.hero_revealed_to,
+             entities.privileged.targets_hero, entities.privileged.react_t]
+  - name: critic_world                  # the unclamped zone margin, and the hero's own cubes
+    per_entity: false
+    dtype: float32
+    fields: [hero.cubes, zone.hero_margin, zone.safe_area_frac]

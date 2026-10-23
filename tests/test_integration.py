@@ -194,12 +194,9 @@ def test_every_privileged_field_is_individually_rejected_by_load_agent_spec(tmp_
             obs_select.load_agent_spec(path, _cfg())
 
 
-def test_real_agent_obs_yaml_never_produces_a_privileged_field_in_its_output():
-    env, cfg, obs = _bush_hidden_env()
-    spec = obs_select.load_agent_spec(AGENT_OBS_YAML, cfg)
-    for group in spec.groups:
-        for field in group.fields:
-            assert not field.startswith("entities.privileged."), f"group {group.name!r} exposes {field!r}"
+# (A test that scanned configs/agent_obs.yaml's loaded groups for a privileged field was removed
+# on 2026-10-20: `load_agent_spec` raises on any such field in an actor group -- the test above
+# pins that for every one -- so a spec that loads cannot hold one.)
 
 
 # ---- combined config overrides: every knob the plan names, changed together, still runs -------
@@ -229,32 +226,93 @@ def test_every_named_config_override_can_be_combined_and_the_env_still_runs():
     obs_select.build_agent_obs(obs, unfair_spec, cfg, buffers)
 
     gen = torch.Generator().manual_seed(0)
-    for _ in range(30):
+    for _ in range(30):   # 30 decisions = 150 ticks, past the 100-tick cap: every env autoresets
         env.step(_random_action(4, gen))
-    assert True  # ran 30 ticks with every named knob touched at once without raising
 
 
 # ---- sync-free native stepping (CUDA only -- set_sync_debug_mode is a CUDA concept) ------------
 
+@pytest.mark.gpu
 def test_native_step_is_sync_free_on_cuda():
+    """A 25-tick clock (5 decisions) puts truncation and autoreset inside a 15-decision window
+    three times; until 2026-10-20 debug_tiny's 300-tick clock needed 100 decisions to reach
+    either once. The actions are drawn on the cpu from a seeded generator before the window and
+    differ per decision (they were one unseeded draw, replayed 100 times)."""
     if not torch.cuda.is_available():
         pytest.skip("CUDA not available")
-    cfg = _cfg(overrides={"entities": {"n_enemies": 3}})
+    cfg = _cfg(overrides={"entities": {"n_enemies": 3},
+                          "sim": {**CONFIGS_TINY["sim"], "max_episode_steps": 25}})
     env = BrawlVecEnv(cfg, n_envs=64, device="cuda", seed=0, verbose=False)
     env.reset()
-    gen = torch.Generator(device="cuda").manual_seed(0)
-    action = _random_action(64, None).to("cuda")
+    gen = torch.Generator().manual_seed(0)
+    actions = torch.stack([_random_action(64, gen) for _ in range(18)]).to("cuda")
 
     # a couple of untimed warmup steps first -- lazy first-call allocations are expected to
     # sync, that's not what this test is checking.
-    for _ in range(3):
-        env.step(action)
+    for i in range(3):
+        env.step(actions[i])
     torch.cuda.synchronize()
 
     torch.cuda.set_sync_debug_mode("error")
     try:
-        for _ in range(100):
-            env.step(action)
+        for i in range(3, 18):
+            env.step(actions[i])
     finally:
         torch.cuda.synchronize()
         torch.cuda.set_sync_debug_mode("default")
+
+
+@pytest.mark.gpu
+def test_the_training_configuration_steps_sync_free_on_cuda():
+    """The sync tests above and in test_gadget.py / test_attack_in_reach.py build debug_tiny over
+    default.yaml, where every switch train.yaml's `run.env_overrides` turns on is off: bot nav,
+    tap aim, the endgame hunt, auto-aim, crates hit once per dash, the static-projectile read.
+    This one builds the env the way training does (`builder.build_env`: the shaped reward, the
+    curriculum's params hook, the randomization), draws the attack column over its whole width
+    with the super charged and the gadget armed every decision, and kills eight heroes
+    mid-window so an autoreset -- and the curriculum's tier draw -- runs under the check too.
+    Added 2026-10-20; ~115 supers fire in the window."""
+    if not torch.cuda.is_available():
+        pytest.skip("CUDA not available")
+    from brawl_sim.training import builder
+    from brawl_sim.training.config import load_train_config
+
+    tcfg = load_train_config("configs/train.yaml", overrides={"run": {"device": "cuda"}})
+    _venv, parts = builder.build_env(tcfg, n_envs=64, verbose=False)
+    env = parts["sim"]
+    st = env.state
+    assert env.cfg.auto_aim and env.cfg.bots_nav and parts["curriculum"] is not None
+    env.reset()
+    gen = torch.Generator().manual_seed(0)
+    n_move, n_attack = env.cfg.action_nvec
+    actions = torch.stack([torch.stack([torch.randint(0, n_move, (64,), generator=gen),
+                                        torch.randint(0, n_attack, (64,), generator=gen)], dim=1)
+                           for _ in range(16)]).to("cuda")
+    charged = env.params.super_charge_hits[:, 0].to(st.ent_super_charge.dtype)
+    supers = torch.zeros((), dtype=torch.int64, device="cuda")
+    ended = torch.zeros((), dtype=torch.int64, device="cuda")
+
+    def _arm():
+        st.ent_super_charge[:, 0] = charged
+        st.ent_gadget_cd[:, 0] = 0.0
+
+    for i in range(3):                           # warm-up: lazy first-call allocations may sync
+        _arm()
+        env.step(actions[i])
+    torch.cuda.synchronize()
+
+    torch.cuda.set_sync_debug_mode("error")
+    try:
+        for i in range(3, 16):
+            _arm()
+            if i == 8:
+                st.ent_hp[:8, 0] = 0.0
+            _obs, _reward, terminated, truncated, _info = env.step(actions[i])
+            supers.add_((st.ent_super_charge[:, 0] < charged).sum())
+            ended.add_((terminated | truncated).sum())
+    finally:
+        torch.cuda.synchronize()
+        torch.cuda.set_sync_debug_mode("default")
+
+    assert int(supers) > 8                       # spent charges (the eight reset envs read 0 too)
+    assert int(ended) >= 8

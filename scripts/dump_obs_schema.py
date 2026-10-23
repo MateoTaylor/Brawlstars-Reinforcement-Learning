@@ -7,13 +7,14 @@ hand-edit docs/OBSERVATION.md or docs/AGENT_OBS.md; edit OBS_SCHEMA / agent_obs.
 this instead.
 
     python scripts/dump_obs_schema.py                                    # the full spec
-    python scripts/dump_obs_schema.py --spec configs/agent_obs_deploy4.yaml   # what trains
+    python scripts/dump_obs_schema.py --spec configs/agent_obs_deploy6.yaml   # what trains
 
 `--spec` renders any sibling spec to its own file, named after the spec:
-configs/agent_obs_deploy4.yaml renders docs/AGENT_OBS_DEPLOY4.md. One doc per spec, because each
+configs/agent_obs_deploy6.yaml renders docs/AGENT_OBS_DEPLOY6.md. One doc per spec, because each
 narrowing is a different observation WIDTH and a different from-scratch run; a single merged doc
 would have to say which of five layouts a column index belongs to. OBS_SCHEMA is spec-independent,
-so docs/OBSERVATION.md is rewritten either way and its content does not depend on --spec.
+so docs/OBSERVATION.md is rewritten either way and its content does not depend on --spec. Only the
+specs in use keep a doc in docs/: deploy4's and deploy5's went to archive/ on 2026-10-21, frozen.
 """
 import argparse
 import sys
@@ -31,8 +32,8 @@ DEFAULT_YAML = REPO_ROOT / "configs" / "default.yaml"
 
 # Top-level group order -- matches core/observation.py's own dict-construction order.
 _GROUP_ORDER = (
-    "hero", "hist", "entities", "projectiles", "boxes", "pickups", "zone", "slots", "visibility",
-    "view", "world", "action_mask", "meta",
+    "hero", "hist", "entities", "projectiles", "boxes", "pickups", "zone", "slots", "memory",
+    "visibility", "view", "world", "action_mask", "meta",
 )
 
 
@@ -99,7 +100,7 @@ def _rel(path) -> str:
 
 def agent_docs_path(spec_path) -> Path:
     """docs/<SPEC STEM>.md: configs/agent_obs.yaml -> docs/AGENT_OBS.md, and
-    configs/agent_obs_deploy4.yaml -> docs/AGENT_OBS_DEPLOY4.md. Derived rather than mapped, so a
+    configs/agent_obs_deploy6.yaml -> docs/AGENT_OBS_DEPLOY6.md. Derived rather than mapped, so a
     seventh spec file needs no edit here."""
     return REPO_ROOT / "docs" / f"{Path(spec_path).stem.upper()}.md"
 
@@ -123,11 +124,19 @@ def render_agent_obs(spec_path=AGENT_OBS_YAML, config_path=DEFAULT_YAML) -> str:
         "",
     ]
 
-    for g in spec.groups:
+    for g in spec.all_groups:
         lines.append(f"## `{g.name}`")
         lines.append("")
         lines.append(f"shape: `{g.shape}`, dtype: `{g.dtype}`" + (", per_entity" if g.per_entity else ""))
-        if g.max_slots is not None:
+        if g.critic:
+            lines.append(
+                "\n**Critic only** (the spec's `critic:` section) -- the value head reads it and the "
+                "policy never does (`wrappers/sb3_policy.PrivilegedCriticPolicy`). True sim state "
+                "with no fair gate" + (": each row is masked by `entities.alive` instead, so a "
+                "dead bot's row is zero" if g.per_entity else "") + ". Live play never writes it, "
+                "so it stays zero there."
+            )
+        elif g.max_slots is not None:
             lines.append(
                 f"\n**Not index-stable** -- the {g.max_slots} nearest (by "
                 f"`{g.entity_prefix}.time_to_closest`, ties nearest the hero first) live slots, "
@@ -141,6 +150,12 @@ def render_agent_obs(spec_path=AGENT_OBS_YAML, config_path=DEFAULT_YAML) -> str:
                 "sighting, kept through `slots.max_misses` unseen decisions, re-used lowest-free-"
                 "first; an empty slot is all zeros. Same shape as entity order, not the same rows."
             )
+            if g.entity_prefix == "memory":
+                lines.append(
+                    "A `memory.*` row is masked by `memory.tracked`, not by the reveal, so it "
+                    "outlives the sighting: while its enemy is unseen it holds the last sighting, "
+                    "with `memory.seen` 0 and `memory.age_s` the time since."
+                )
         lines.append("")
         if g.view_channels is not None:
             lines.append("| channel index | source `view` channel |")

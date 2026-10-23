@@ -1,3 +1,4 @@
+import pytest
 import yaml
 
 from brawl_sim.config import load_config
@@ -17,12 +18,31 @@ def _cfg_and_spec():
 
 # ---- the script runs start to finish, learn completes without shape/dtype/space errors ------
 
-def test_run_smoke_completes_all_8_steps_on_cpu(tmp_path):
-    cfg, spec = _cfg_and_spec()
-    results = sb3_smoke.run_smoke(
-        cfg, spec, device="cpu", n_envs=4, n_steps=32, batch_size=32,
-        total_timesteps=128, verbose=0, save_dir=tmp_path, log=lambda *a: None,
-    )
+def test_main_cli_runs_all_8_steps_end_to_end(tmp_path, capsys, monkeypatch):
+    """The CLI (`main()`) and `run_smoke()` in one run: `main` hands its arguments to the real
+    `run_smoke`, whose results are kept and checked here, and then prints the banner. Until
+    2026-10-20 two tests ran this smoke once each, at 128 timesteps; it is now one 16-step
+    rollout (2 envs x 8 steps) and one update, which reaches every step. The pass-through also
+    points the save/load round trip at `tmp_path`: the CLI passes no `save_dir`, so
+    `run_smoke` would leave a model zip in a fresh system temp dir on every run."""
+    real_run_smoke = sb3_smoke.run_smoke
+    kept = {}
+
+    def keep(*args, **kwargs):
+        kwargs.setdefault("save_dir", tmp_path)
+        kept["results"] = real_run_smoke(*args, **kwargs)
+        return kept["results"]
+
+    monkeypatch.setattr(sb3_smoke, "run_smoke", keep)
+    argv = [
+        "--preset", "configs/presets/debug_tiny.yaml",
+        "--n-envs", "2", "--n-steps", "8", "--batch-size", "16",
+        "--total-timesteps", "16", "--verbose", "0",
+    ]
+    assert sb3_smoke.main(argv) == 0
+    assert "ALL 8 STEPS PASSED" in capsys.readouterr().out
+    assert (tmp_path / "sb3_smoke_maskable_ppo.zip").exists()
+    results = kept["results"]
     for key in (
         "check_env", "maskable_ppo_steps_per_sec", "predict_masked",
         "save_load_roundtrip", "plain_ppo_steps_per_sec", "predict_unmasked",
@@ -38,28 +58,14 @@ def test_run_smoke_completes_all_8_steps_on_cpu(tmp_path):
 
 # ---- CUDA variant (skipped if unavailable) ---------------------------------------------------
 
+@pytest.mark.gpu
 def test_run_smoke_completes_all_8_steps_on_cuda(tmp_path):
     import torch
     if not torch.cuda.is_available():
-        import pytest
         pytest.skip("CUDA not available")
     cfg, spec = _cfg_and_spec()
     results = sb3_smoke.run_smoke(
-        cfg, spec, device="cuda", n_envs=4, n_steps=32, batch_size=32,
-        total_timesteps=128, verbose=0, save_dir=tmp_path, log=lambda *a: None,
+        cfg, spec, device="cuda", n_envs=2, n_steps=8, batch_size=16,
+        total_timesteps=16, verbose=0, save_dir=tmp_path, log=lambda *a: None,
     )
     assert results["save_load_roundtrip"] == "OK"
-
-
-# ---- CLI entry point (main()) works too, not just run_smoke() directly -----------------------
-
-def test_main_cli_runs_end_to_end(capsys):
-    argv = [
-        "--preset", "configs/presets/debug_tiny.yaml",
-        "--n-envs", "4", "--n-steps", "32", "--batch-size", "32",
-        "--total-timesteps", "128", "--verbose", "0",
-    ]
-    exit_code = sb3_smoke.main(argv)
-    assert exit_code == 0
-    out = capsys.readouterr().out
-    assert "ALL 8 STEPS PASSED" in out

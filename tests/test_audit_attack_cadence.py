@@ -42,7 +42,7 @@ def _pin_world(env) -> None:
     st.ent_ammo[:, 0] = 3.0
 
 
-def _scripted_rollout(n_decisions=40):
+def _scripted_rollout(n_decisions=12):
     env = _env()
     env.reset()
     bots_idle = torch.zeros(1, env.cfg.n_entities, 2, dtype=torch.int64)
@@ -73,16 +73,17 @@ def test_recorder_holds_one_row_per_decision_and_env_with_every_field():
 
 
 def test_scripted_policy_attacks_at_exactly_the_structural_cap():
-    env, recorder = _scripted_rollout(n_decisions=40)
+    # 12 decisions: the legal/illegal alternation repeats from the first one (it was 40)
+    env, recorder = _scripted_rollout(n_decisions=12)
     rows = recorder.rows()
     assert all(row["enemy_in_reach"] for row in rows), "the pinned enemy must be in reach throughout"
 
     summary = summarize(rows)
     assert summary["utilization"]["value"] == 1.0
-    assert summary["utilization"]["n_opportunities"] == 20  # every other decision is legal
+    assert summary["utilization"]["n_opportunities"] == 6  # every other decision is legal
     # The cap: one dash per 10 ticks (0.50 s), never 5, even though the cooldown is 7 ticks.
     assert set(summary["interval_hist"]) == {10}
-    assert summary["interval_hist"][10] == 19
+    assert summary["interval_hist"][10] == 5
     # ...and its footprint: the decision after every dash has 0.15 s of cooldown left.
     assert summary["phasing_loss"]["value"] == pytest.approx(0.5)
     assert summary["long_dash_waiting"]["value"] == 0.0
@@ -113,7 +114,9 @@ def test_summarize_segments_fights_by_reach_and_episode():
     assert s["long_dash_waiting"]["n_waiting"] == 1
     assert s["ammo_at_first_attack"]["hist"] == {2: 1, 3: 1}
     text = render_report(s, {"run": "hand-built"})
-    assert "| 1 | utilization" in text and "10 ticks" in text
+    # whole rows: the row label and the footer's "10 ticks" print whatever the numbers are
+    assert "| 1 | utilization P(attack \\| legal & enemy in reach) | 0.750 | 3 / 4 |" in text
+    assert "| 2 | inter-attack interval, ticks (mode) | 10 | 1 intervals |" in text
 
 
 def test_a_gadget_decision_is_not_counted_as_an_attack():

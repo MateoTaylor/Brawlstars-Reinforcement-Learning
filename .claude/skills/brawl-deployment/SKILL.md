@@ -219,6 +219,11 @@ per-enemy slots the policy was trained on both need identity across frames.
   life and only a retired track's slot is reused.
 - `hp_detection/smooth.py` says in its own docstring that it is not a tracker and that `associate`
   is the function to replace. This is that replacement -- do not add a second one.
+- **The entity detector calls power-cube crates `enemy`** (same red HP bar). `EntityTracker.update`
+  takes the loot map's crates and drops `enemy` boxes within `CRATE_VETO_TILES` (0.7) of one
+  (2026-10-20). Without it a crate flickers in and out as an enemy beside the hero, which the policy
+  reads as a kill, and it stops hitting the crate. Don't remove it as "losing real enemies": it
+  costs 2.2% of brawler sightings, measured.
 
 ## Centres transfer across frame sources; radii do not
 
@@ -241,7 +246,7 @@ those constants; it misses them by the scale ratio. Check frame height before tr
 calibrated stage, and reject rather than upscale — the function already raises for exactly this
 reason.
 
-## The observation spec the live loop targets is `configs/agent_obs_deploy.yaml`
+## The observation spec the live loop targets is `configs/agent_obs_deploy6.yaml`
 
 Three sibling specs, each a narrowing of the last, for three different reasons:
 
@@ -249,7 +254,11 @@ Three sibling specs, each a narrowing of the last, for three different reasons:
 |---|---|---|
 | `agent_obs.yaml` | — | full information |
 | `agent_obs_lowinfo.yaml` | enemy archetype, projectile type | a **type leak** — CV cannot name a silhouette |
-| `agent_obs_deploy.yaml` | `entities.cubes`, `entities.can_attack`, `entities.dashing`, `hero.cubes` | nothing will **supply** them |
+| `agent_obs_deploy6.yaml` | `entities.cubes`, `entities.can_attack`, `entities.dashing`, `hero.cubes`, `zone.safe_area_frac`, `zone.next_shrink_in` | nothing will **supply** them |
+
+deploy6 is the sixth file of the deploy line: the first deploy spec dropped the four, deploy2 the
+two zone columns (`BRAWL_DEPLOYMENT_DESIGN.md` §9.16), and the five files before deploy6 are in
+`archive/configs/`.
 
 **Recoverability is not the criterion; intent to supply is.** `hero.cubes` is in that list even
 though the pip row sits in the hero's own box stack next to the HP bar — the operator decided no
@@ -279,7 +288,8 @@ the schema, so a new raw field fails rather than trains.
 observation width and with it `BrawlFeaturesExtractor`'s first linear layer. And when a spec must
 change, **add a file — never edit one in place**: finished runs name their spec by path in their
 own `train.yaml`, so an in-place edit silently makes an existing checkpoint unreproducible.
-`tests/test_configs_files.py` pins each file's relationship to its parent in both directions.
+`tests/test_configs_files.py` pins deploy6 against `agent_obs_lowinfo.yaml` in both directions:
+each field it drops, swaps and adds, and each group's column order.
 
 ## `meta.time_frac` is wall-clock ÷ 150 s, clamped to [0, 1]
 
@@ -332,12 +342,10 @@ failure is silent and looks like "the policy is bad at real Brawl Stars."
 
 ## The history: one snapshot per decision, newest first
 
-`configs/agent_obs_deploy4.yaml` reads the last three decisions: the `history` group and the
-`enemy_hist1..3` grid planes (2026-09-21); `configs/agent_obs_deploy5.yaml`
-(2026-09-24) is deploy4 plus `hero.near_edge` after `hero.in_zone` and
-`slots: tracked` on `enemies`, with the history rules below unchanged, and `configs/deployment.yaml`
-stays on the deploy4 run until a deploy5 checkpoint exists. The loop keeps a deque of
-`DecisionSnapshot`s sized from `history_frames`. The load-bearing rules:
+`configs/agent_obs_deploy6.yaml` reads the last three decisions: the `history` group and the
+`enemy_hist1..3` grid planes, unchanged since deploy4 introduced them on 2026-09-21 (deploy4 and
+deploy5 are in `archive/configs/`). The loop keeps a deque of `DecisionSnapshot`s sized from
+`history_frames`. The load-bearing rules:
 
 - **Snapshot after `shadow.act`, holding the MODELLED attack**: what was pressed, not the
   policy's pick. Everything else is what that decision's observation was built from, read once:

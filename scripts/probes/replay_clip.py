@@ -21,11 +21,17 @@ Usage (repo root, the venv's python; `--device cpu` keeps every model off the GP
         --window 22 32 --mask both --device cpu
     .venv/Scripts/python.exe scripts/probes/replay_clip.py <clip> --run runs/<deploy5 run> --mask on
     .venv/Scripts/python.exe scripts/probes/replay_clip.py <clip> --map dark_passage --mask on \
-        --device cpu --csv <out.csv>       # KNOWN_MAP_LOCALIZATION_PLAN.md step K4
+        --device cpu --csv <out.csv>       # archive/KNOWN_MAP_LOCALIZATION_PLAN.md step K4
 
 `--start` skips the clip's head (the gate still has to open, so leave a few seconds before the
 window); `--window` is the stretch reported in detail. Writes nothing; `--csv` dumps every tick's
 `TickRow` for the last run, as `deploy_run.py` would.
+
+Every run also prints the enemy memory's coasts (archive/CRITIC_AND_MEMORY_PLAN.md C3): each slotted
+track's stretch unseen, and whether it was reacquired (and how far it had jumped), coasted out, or
+was cleared by a reset, with the tracks promoted meanwhile. `--max-misses 12` coasts as a deploy6
+run does on any checkpoint: on a fixed clip the frames do not depend on the decisions, so neither
+does the tracker.
 
 With a map, each run also prints K4's label check (`LabelCheck`): what the classifier saw at every
 map tile while the loop was in the map frame, scored against the label. Its best offset must be
@@ -34,6 +40,7 @@ map tile while the loop was in the map frame, scored against the label. Its best
 """
 import argparse
 import dataclasses
+import math
 import sys
 import time
 from collections import Counter
@@ -86,9 +93,10 @@ class NoGuard:
 
 
 class LabelCheck:
-    """K4's label check (KNOWN_MAP_LOCALIZATION_PLAN.md). A second occupancy map takes every deposit
-    the loop's own map takes while the frame handed out is the map's, and never resets, so after a
-    match it holds what the classifier saw on each map tile. `report` scores it against the label."""
+    """K4's label check (archive/KNOWN_MAP_LOCALIZATION_PLAN.md). A second occupancy map takes every
+    deposit the loop's own map takes while the frame handed out is the map's, and never resets, so
+    after a match it holds what the classifier saw on each map tile. `report` scores it against the
+    label."""
 
     SURE = 0.9        # a disputed cell is listed only when this share of its views agreed
     LISTED = 40
@@ -161,13 +169,15 @@ def build_loop(dcfg, *, vision, policy, log):
 
 
 def replay(clip, dcfg, *, vision, policy, start: float, stop: float | None, quiet: bool,
-           check: LabelCheck | None = None):
+           check: LabelCheck | None = None, max_misses: int | None = None):
     """Feed the clip at the loop's tick rate; return (decision rows, stops, ticks fed)."""
     stops = []
     logs = []
     loop, capture = build_loop(dcfg, vision=vision, policy=policy,
                                log=lambda m: logs.append((capture.pending.t if capture.pending
                                                           else -1.0, m)))
+    if max_misses is not None:
+        loop.tracker.max_misses = max_misses
     if check is not None:
         check.attach(loop)
     # Record a stop and keep going: on a clip the point is to see every decision, and the reason
@@ -208,7 +218,10 @@ def replay(clip, dcfg, *, vision, policy, start: float, stop: float | None, quie
                                  hero_offset=(float(row.hero_offset_x), float(row.hero_offset_y)),
                                  near_edge=int(row.near_edge),
                                  odo_pos=(float(odo.position[0]), float(odo.position[1])),
-                                 odo_seg=int(odo.segment), odo_status=str(row.odometry)))
+                                 odo_seg=int(odo.segment), odo_status=str(row.odometry),
+                                 n_ghosts=int(row.n_ghosts),
+                                 tracks=[(tr.id, int(tr.misses), bool(tr.seen_now), tuple(tr.pos))
+                                         for tr in loop.tracker.enemies.values()]))
             if not quiet and fed % 120 == 0:
                 print(f"    t={frame.t:6.1f}s  ticks {fed}  decisions {len(rows)}  phase {loop.phase.value}"
                       f"  {time.perf_counter() - t0:4.0f} s", flush=True)
@@ -223,6 +236,52 @@ def _bits(mask: int, n: int = 17) -> str:
     if mask < 0:
         return "-" * (n - 1)
     return "".join("." if mask >> b & 1 else "x" for b in range(1, n))
+
+
+def _coasts(rows, max_misses: int) -> list[dict]:
+    """Every stretch a slotted enemy track spent unseen, from the decision rows' track snapshots:
+    its id, the clip second it began, its unseen decisions, where it was last seen, how it ended
+    -- "reacquired" (with `jump`, the tiles to the detection that took it), "coasted out" (past
+    `max_misses`), "cleared" (dropped sooner: a segment reset or the match's end) or "open" (the
+    clip ended) -- and `born`, the distance from it to each track promoted while it coasted. A
+    ghost that coasts out with a track born a few tiles away is the plan's case 1, an enemy back
+    outside its ghost's gate (or another enemy: this cannot tell)."""
+    out, coasting, known = [], {}, set()
+    for r in rows:
+        now = {tid: (misses, seen, pos) for tid, misses, seen, pos in r["tracks"]}
+        newborn = [pos for tid, (_, _, pos) in now.items() if tid not in known]
+        known |= now.keys()
+        for tid, c in list(coasting.items()):
+            if tid not in now:
+                c["end"] = "coasted out" if c["gap"] >= max_misses else "cleared"
+            elif now[tid][1]:
+                c["end"], c["jump"] = "reacquired", math.dist(c["pos"], now[tid][2])
+            else:
+                c["gap"] = now[tid][0]
+                c["born"] += [math.dist(c["pos"], p) for p in newborn]
+                continue
+            out.append(coasting.pop(tid))
+        for tid, (misses, seen, pos) in now.items():
+            if not seen and tid not in coasting:
+                coasting[tid] = dict(id=tid, t=r["t"], gap=misses, pos=pos, end="open",
+                                     born=[math.dist(pos, p) for p in newborn])
+    return sorted(out + list(coasting.values()), key=lambda c: c["t"])
+
+
+def _memory_report(rows, max_misses: int) -> None:
+    if not rows:
+        return
+    ghosts = [r["n_ghosts"] for r in rows]
+    coasts = _coasts(rows, max_misses)
+    ends = Counter(c["end"] for c in coasts)
+    print(f"    memory (coast {max_misses}): ghosts on {sum(g > 0 for g in ghosts)}/{len(rows)} "
+          f"decisions, at most {max(ghosts)}; {len(coasts)} coasts: "
+          + ", ".join(f"{k} {n}" for k, n in ends.most_common()))
+    for c in coasts:
+        jump = f", {c['jump']:.2f} tiles off" if c["end"] == "reacquired" else ""
+        born = (f"; promoted meanwhile at {', '.join(f'{d:.1f}' for d in c['born'])} tiles"
+                if c["born"] else "")
+        print(f"      track {c['id']:3d}  t={c['t']:6.2f}s  unseen {c['gap']:2d}  {c['end']}{jump}{born}")
 
 
 def _hist(rows, window):
@@ -247,6 +306,9 @@ def main(argv=None) -> int:
     ap.add_argument("--window", type=float, nargs=2, default=(22.0, 32.0),
                     help="clip seconds reported in detail (the stuck stretch)")
     ap.add_argument("--csv", default=None, help="write the last run's telemetry here")
+    ap.add_argument("--max-misses", type=int, default=None,
+                    help="the enemy tracks' coast in decisions, in place of the run's "
+                         "slots.max_misses (12 replays a deploy6 run's memory)")
     ap.add_argument("--quiet", action="store_true")
     args = ap.parse_args(argv)
 
@@ -279,7 +341,7 @@ def main(argv=None) -> int:
         check = LabelCheck(vision) if base.map_name else None
         rows, stops, logs, fed, loop = replay(args.clip, dcfg, vision=vision, policy=policy,
                                               start=args.start, stop=args.stop, quiet=args.quiet,
-                                              check=check)
+                                              check=check, max_misses=args.max_misses)
         runs[label] = rows
         notes = Counter(r["note"] or "decided" for r in rows)
         print(f"    {fed} ticks, {len(rows)} decision ticks in {time.perf_counter() - t0:.0f} s; "
@@ -291,6 +353,7 @@ def main(argv=None) -> int:
             print(f"    would have STOPPED at t={t:.1f}s: {reason}")
         if check is not None:
             check.report(KnownMap.load(base.map_name))
+        _memory_report(rows, loop.tracker.max_misses)
         inside, hist = _hist(rows, args.window)
         top = ", ".join(f"{_BIN_NAMES.get(b, b)} x{n}" for b, n in hist.most_common(5))
         east = hist.get(_EAST, 0)

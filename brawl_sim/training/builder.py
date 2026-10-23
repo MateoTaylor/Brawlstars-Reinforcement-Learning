@@ -78,8 +78,8 @@ def check_reward_is_observable(reward, spec: obs_select.AgentObsSpec, spec_path)
         raise ValueError(
             f"reward.cube_pickup is {reward.cube_pickup}, but {spec_path} has no grid `pickup` "
             "channel and no `pickups.*` field, so the agent would be paid for collecting something "
-            "it cannot see. Pass `--set reward.cube_pickup=0` for this spec (the deploy and deploy2 "
-            "specs need it), or train on one that sees cubes (agent_obs_deploy3.yaml)."
+            "it cannot see. Pass `--set reward.cube_pickup=0` for this spec, or train on one that "
+            "sees cubes (configs/agent_obs_deploy6.yaml)."
         )
 
 
@@ -147,10 +147,10 @@ def build_policy_kwargs(tcfg: TrainConfig, agent_spec, env_cfg) -> dict:
     """`default_policy_kwargs` (features extractor + the required `normalize_images=False`) plus
     this config's extractor widths and head architecture."""
     kwargs = default_policy_kwargs(agent_spec, env_cfg)
-    kwargs["features_extractor_kwargs"] = {
+    kwargs["features_extractor_kwargs"].update({
         "cnn_output_dim": tcfg.policy.cnn_output_dim,
         "mlp_hidden_dims": tuple(tcfg.policy.mlp_hidden_dims),
-    }
+    })
     if tcfg.policy.net_arch:
         kwargs["net_arch"] = dict(tcfg.policy.net_arch)
     return kwargs
@@ -197,11 +197,21 @@ def build_model(tcfg: TrainConfig, venv, agent_spec, env_cfg):
     `MaskablePPO` is the default because `core/hero.action_mask` already knows when firing is
     illegal (dead / out of ammo / on cooldown / mid-dash) and `BrawlSB3VecEnv` exposes it, so
     masking is free and the policy doesn't spend early training learning that "fire" is often a
-    no-op."""
+    no-op.
+
+    A spec with `critic:` groups gets `PrivilegedCriticPolicy` (wrappers/sb3_policy.py), the
+    maskable policy whose actor head reads only the actor features."""
     algo_cls = PPO
     if tcfg.run.algo == "maskable_ppo":
         from sb3_contrib import MaskablePPO
         algo_cls = MaskablePPO
+    policy = "MultiInputPolicy"
+    if agent_spec.critic_groups:
+        if tcfg.run.algo != "maskable_ppo":
+            raise ValueError(f"{tcfg.run.agent_obs} has critic groups, and the privileged-critic "
+                             f"policy is built on MaskablePPO's: set run.algo: maskable_ppo")
+        from ..wrappers.sb3_policy import PrivilegedCriticPolicy
+        policy = PrivilegedCriticPolicy
 
     # PPO builds a fresh Categorical every action-selection call, and each one re-validates
     # logits the policy already guarantees valid: a measurable share of wall-clock for nothing.
@@ -209,7 +219,7 @@ def build_model(tcfg: TrainConfig, venv, agent_spec, env_cfg):
     torch.distributions.Distribution.set_default_validate_args(False)
 
     return algo_cls(
-        "MultiInputPolicy", no_image_transpose(venv),
+        policy, no_image_transpose(venv),
         policy_kwargs=build_policy_kwargs(tcfg, agent_spec, env_cfg),
         learning_rate=make_schedule(tcfg.learning_rate),
         clip_range=make_schedule(tcfg.clip_range),

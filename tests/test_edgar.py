@@ -4,6 +4,8 @@ Edgar is the first brawler whose sub-swings all fire at ONE angle (`hitscan_swee
 the first with `melee_lifesteal_fraction`, so these tests pin the two things that are genuinely
 new rather than re-testing core/melee_sweep's schedule (tests/test_melee_sweep.py owns that).
 """
+import copy
+
 import torch
 import yaml
 
@@ -16,15 +18,24 @@ CONFIGS_DEFAULT = "configs/default.yaml"
 EDGAR = int(Kind.BOT_EDGAR)
 
 
+def _load_spec():
+    spec = {}
+    for path in (CONFIGS_DEFAULT, "configs/brawlers.yaml"):
+        with open(path) as f:
+            spec.update(yaml.safe_load(f))
+    return spec
+
+
+# Parsed once at import rather than on every _params call; build_params gets a deep copy, so
+# nothing it does to the spec can leak from one test into the next.
+_SPEC = _load_spec()
+
+
 def _params(n_envs=1):
     cfg = load_config(CONFIGS_DEFAULT, overrides={"world": {"map_h": 20, "map_w": 20}})
-    spec = {
-        **yaml.safe_load(open(CONFIGS_DEFAULT).read()),
-        **yaml.safe_load(open("configs/brawlers.yaml").read()),
-    }
     gen = torch.Generator(device="cpu")
     gen.manual_seed(0)
-    return cfg, build_params(cfg, n_envs=n_envs, device="cpu", gen=gen, spec=spec)
+    return cfg, build_params(cfg, n_envs=n_envs, device="cpu", gen=gen, spec=copy.deepcopy(_SPEC))
 
 
 def _env_with_edgars(n_enemies=2):
@@ -73,8 +84,12 @@ def _overrides(env):
     return fire, hold
 
 
-def _run_combo(env, ticks=40, victim_dist=1.2, edgar_hp=3000.0):
-    """Fires one combo and returns the per-tick (damage to hero, HP gained by Edgar) events."""
+def _run_combo(env, ticks=16, victim_dist=1.2, edgar_hp=3000.0):
+    """Fires one combo and returns the per-tick (damage to hero, HP gained by Edgar) events.
+
+    16 ticks: the 0.5 s combo is 10 ticks at action_repeat 1 (hits on ticks 0 and 5), and the
+    6 spare ones would catch a third or a late hit. Nothing fires after it: `hold` keeps every
+    bot's trigger up."""
     st = _stage_a_swing(env, victim_dist)
     st.ent_hp[0, 1] = edgar_hp
     fire, hold = _overrides(env)
@@ -109,17 +124,22 @@ def test_edgar_lands_exactly_two_hits_a_quarter_second_apart():
 
 def test_the_whole_combo_costs_one_ammo():
     """Two hits, one ammo -- the same rule Buzz's five-hitscan sweep follows. If this ever became
-    one ammo per hit Edgar's sustained output would halve."""
+    one ammo per hit Edgar's sustained output would halve.
+
+    EXACTLY one: Edgar starts at max ammo, and the combo's own 0.5 s cooldown pauses the reload for
+    the 10 ticks read here, so nothing refills while it runs. Until 2026-10-20 this ran 12 ticks,
+    long enough for the reload to resume, and so could only check `<= 1` -- which a combo that cost
+    no ammo at all passed too."""
     env = _env_with_edgars()
     st = _stage_a_swing(env)
     fire, hold = _overrides(env)
     idle = torch.zeros(1, 2, dtype=torch.int64)
 
     before = float(st.ent_ammo[0, 1])
-    for t in range(12):  # through both hits, but not far enough to reload a whole point
+    for t in range(10):  # both hits, and the whole cooldown that pauses the reload
         env.step(idle, override=fire if t == 0 else hold)
     spent = before - float(st.ent_ammo[0, 1])
-    assert spent <= 1.0 + 1e-3, f"the combo spent {spent:.3f} ammo, expected at most 1"
+    assert abs(spent - 1.0) < 1e-4, f"the combo spent {spent:.4f} ammo, expected exactly 1"
 
 
 def test_both_hits_fire_down_the_trigger_facing():
@@ -201,8 +221,11 @@ def test_a_half_connected_combo_heals_half_as_much():
 
 def test_lifesteal_ignores_damage_an_invulnerable_victim_never_took():
     """`combat.melee_lifesteal` re-applies the i-frame mask `apply_damage` uses, because `dmg_by`
-    is raw cone output. Without it Edgar would heal off swinging into a dashing Mortis -- damage
-    that was never dealt."""
+    is raw cone output: if a victim is i-framed, the heal must follow the damage it actually took.
+
+    This pins a DORMANT mask. Nothing in the sim seeds `ent_invuln_t` (the dash has no i-frames),
+    so the i-frame is set by hand; the test keeps the heal consistent with `apply_damage` if
+    anything ever grants one again."""
     cfg, params = _params()
     from brawl_sim.core.state import allocate
     st = allocate(cfg, n_envs=1, device="cpu", verbose=False)
@@ -215,7 +238,7 @@ def test_lifesteal_ignores_damage_an_invulnerable_victim_never_took():
     vulnerable = combat.melee_lifesteal(st, dmg_by, params)
     assert abs(float(vulnerable[0, 1]) - 378.0) < 1e-3
 
-    st.ent_invuln_t[0, 0] = 0.2  # entity 0 is now dashing / i-framed
+    st.ent_invuln_t[0, 0] = 0.2  # entity 0 i-framed, by hand: nothing in the sim seeds this
     blocked = combat.melee_lifesteal(st, dmg_by, params)
     assert float(blocked[0, 1]) == 0.0, "healed off damage an invulnerable victim never took"
 
@@ -241,13 +264,27 @@ def test_no_other_kind_lifesteals():
 
 
 def test_boxes_do_not_feed_lifesteal():
-    """`melee_lifesteal` reads only the entity matrix. Healing off loot boxes would hand Edgar a
-    free top-up on every map, from a target that cannot fight back."""
-    cfg, params = _params()
-    from brawl_sim.core.state import allocate
-    st = allocate(cfg, n_envs=1, device="cpu", verbose=False)
-    st.ent_alive.fill_(True)
-    st.ent_kind[0, 1] = EDGAR
+    """Edgar's combo into a loot box damages the box and heals him nothing. Healing off boxes
+    would hand Edgar a free top-up on every map, from a target that cannot fight back.
 
-    no_entity_damage = torch.zeros(1, cfg.n_entities, cfg.n_entities)
-    assert float(combat.melee_lifesteal(st, no_entity_damage, params)[0, 1]) == 0.0
+    Driven through the real env tick, where the box damage and the lifesteal meet (the hero stands
+    out of reach, so the box is the only thing hit). Until 2026-10-20 this called
+    `melee_lifesteal` on an all-zero damage matrix, which returns zero whatever the env does with
+    box damage."""
+    env = _env_with_edgars()
+    st = _stage_a_swing(env)
+    anchor = st.ent_pos[0, 1].clone()
+    st.ent_pos[0, 0] = anchor + torch.tensor([0.0, 12.0])
+    st.box_alive[0, 0] = True
+    st.box_pos[0, 0] = anchor + torch.tensor([1.2, 0.0])  # where the hero would stand: down the facing
+    st.box_hp[0, 0] = 1e6
+    st.box_max_hp[0, 0] = 1e6
+    st.ent_hp[0, 1] = 3000.0  # well under max, so any heal would show
+    fire, hold = _overrides(env)
+    idle = torch.zeros(1, 2, dtype=torch.int64)
+
+    for t in range(10):  # the whole combo: both hits
+        env.step(idle, override=fire if t == 0 else hold)
+
+    assert float(st.box_hp[0, 0]) < 1e6, "the combo never reached the box"
+    assert float(st.ent_hp[0, 1]) == 3000.0, f"Edgar healed to {float(st.ent_hp[0, 1])} off a loot box"

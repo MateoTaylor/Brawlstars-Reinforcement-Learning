@@ -137,7 +137,7 @@ class ShapedReward:
             # the shipped 0.3 a match of landed spinners is worth about 3, against 10 for a win.
             self._add(reward, "gadget_hit", info["gadget_hit_tick"], w.gadget_hit)
 
-        # ---- movement shaping (user decision, 2026-10-07; SIM_ISSUES_PLAN.md §5.2) ----
+        # ---- movement shaping (user decision, 2026-10-07; archive/SIM_ISSUES_PLAN.md §5.2) ----
         if w.move_reversal != 0.0:
             # A count, 0 or 1 per decision: the move bin swung >= 135 degrees from the last
             # decision's, both non-idle (core/events.move_reversals). A cost, so a reversal must

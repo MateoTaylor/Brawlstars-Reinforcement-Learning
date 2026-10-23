@@ -46,9 +46,10 @@ _ARTILLERY = int(ProjClass.ARTILLERY)
 _N_BASE_CHANNELS = 12
 
 
-def _in_bush(state, bank) -> torch.Tensor:
-    """(N,E) bool -- see module docstring on why this duplicates perception.in_bush."""
-    ix, iy = terrain.to_tile(state.ent_pos)
+def _in_bush(state, bank, pos: torch.Tensor | None = None) -> torch.Tensor:
+    """(N,E) bool -- see module docstring on why this duplicates perception.in_bush. `pos`:
+    (N,E,2), default `state.ent_pos`; obs["memory"] passes the last-seen positions."""
+    ix, iy = terrain.to_tile(state.ent_pos if pos is None else pos)
     map_id = terrain._broadcast_map_id(state.map_id, ix.shape)
     h, w = bank.is_bush.shape[1:]
     ix = torch.clamp(ix, 0, w - 1)
@@ -370,6 +371,9 @@ def build_obs(state, bank, vis: torch.Tensor, raw_los: torch.Tensor | None, para
             "reveal_t": state.ent_reveal_t,
             "decision_phase": decision_phase,
             "move_intent": state.ent_move_smooth,
+            # The bot is hunting the hero: `target_id == 0` as a bool, the only part of the raw
+            # index a value head can use (a privileged critic group reads it, never an actor).
+            "targets_hero": state.ent_target == _HERO,
         }
     obs["entities"] = entities_obs
 
@@ -469,6 +473,26 @@ def build_obs(state, bank, vis: torch.Tensor, raw_los: torch.Tensor | None, para
     # Bookkeeping for obs_select's `slots: tracked`, not an observation: `load_agent_spec`
     # refuses `slots.*` in a spec's fields. Slot k holds entity `entity[k] - 1`; 0 is empty.
     obs["slots"] = {"entity": state.slot_ent, "valid": state.slot_ent > 0}
+
+    # ---- memory: each enemy as the hero last saw it (core/slots.py) ----
+    # Every value comes from the ent_seen_* snapshots, so a coasting slot keeps its last sighting
+    # and a seen one reads now (slots.update runs just before this, in the same decision). Rows
+    # are NOT masked here: obs_select's fair gate multiplies a memory group by `tracked`, as it
+    # multiplies an entities group by `revealed_to_hero`. `age_s` is 0 while seen and grows by
+    # agent_dt per unseen decision until the slot retires after `slots.max_misses` of them.
+    # brawl_deployment/perception/assemble.py writes the same fields from its tracks.
+    mem_rel = state.ent_seen_pos - hero_pos.unsqueeze(1)
+    tracked = state.ent_slot > 0
+    obs["memory"] = {
+        "tracked": tracked,
+        "seen": tracked & (state.ent_misses == 0),
+        "rel_pos": mem_rel,
+        "dist": geo.safe_norm(mem_rel, dim=-1),
+        "rel_vel": state.ent_seen_vel - hero_vel.unsqueeze(1),
+        "hp": state.ent_seen_hp,
+        "in_bush": _in_bush(state, bank, state.ent_seen_pos),
+        "age_s": state.ent_misses.to(state.ent_pos.dtype) * cfg.agent_dt,
+    }
 
     # ---- visibility ----
     obs["visibility"] = {

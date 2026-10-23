@@ -3,7 +3,7 @@ import torch
 import yaml
 from stable_baselines3.common.vec_env import VecEnv
 
-from brawl_sim.config import load_config
+from brawl_sim.config import _deep_merge, load_config
 from brawl_sim.core import obs_select
 from brawl_sim.core.reward import ExampleReward, ZeroReward
 from brawl_sim.env import BrawlVecEnv
@@ -17,7 +17,7 @@ AGENT_OBS_YAML = "configs/agent_obs.yaml"
 def _make(n_envs=6, seed=0, reward_fn=None, info_mode="minimal", info_every=1, overrides=None):
     merged = dict(CONFIGS_TINY)
     if overrides:
-        merged = {**merged, **overrides}
+        merged = _deep_merge(merged, overrides)  # the preset's other keys in a section stay
     cfg = load_config(CONFIGS_DEFAULT, overrides=merged)
     env = BrawlVecEnv(cfg, n_envs=n_envs, device="cpu", seed=seed)
     spec = obs_select.load_agent_spec(AGENT_OBS_YAML, cfg)
@@ -67,30 +67,43 @@ def test_reset_returns_observations_only():
 
 # ---- terminal_observation / TimeLimit.truncated / episode ------------------------------------
 
-def test_terminal_observation_present_on_done_absent_otherwise_and_matches_final_obs():
+def test_terminal_observation_is_each_done_envs_own_final_observation(monkeypatch):
+    # 2026-10-20: this compared env 0's terminal obs with the NEW episode's reset obs and only
+    # asserted they differ, which any finished episode's row satisfies: a wrapper that handed
+    # env 0 another env's row passed. Two envs now finish on one step, and each one's
+    # terminal_observation must equal, group for group, its own row of the final_observation
+    # the underlying env returned on that step (captured by a spy on the wrapped step).
     venv = _make(n_envs=4)
     venv.reset()
-    venv.env.env.state.ent_hp[0, 0] = 0.0
-    venv.env.env.state.ent_last_hit_by[0, 0] = -1
+    venv.env.env.state.ent_hp[[0, 2], 0] = 0.0
+    venv.env.env.state.ent_last_hit_by[[0, 2], 0] = -1
 
+    captured = {}
+    real_step = venv.env.step
+
+    def spy(actions):
+        captured["out"] = real_step(actions)
+        return captured["out"]
+
+    monkeypatch.setattr(venv.env, "step", spy)
     venv.step_async(np.zeros((4, 2), dtype=np.int64))
     obs, reward, dones, infos = venv.step_wait()
 
-    assert bool(dones[0]) and not any(dones[1:])
-    assert "terminal_observation" in infos[0]
-    for i in (1, 2, 3):
+    assert dones.tolist() == [True, False, True, False]
+    for i in (1, 3):
         assert "terminal_observation" not in infos[i]
 
-    # matches building the agent obs directly from the underlying env's own final_observation
-    # (accessed via a second BrawlSB3VecEnv step is not possible after the fact, so instead
-    # recompute independently from the same info the wrapper itself used).
-    expected = obs_select.build_agent_obs(
-        venv._last_full_obs, venv.agent_spec, venv.cfg,
+    want = obs_select.build_agent_obs(
+        captured["out"][4]["final_observation"], venv.agent_spec, venv.cfg,
         obs_select.make_agent_obs_buffers(venv.agent_spec, venv.cfg, 4, "cpu"),
     )
-    # env 0 was reset -> _last_full_obs is the NEW episode; terminal_observation must differ
-    # from it (it's the OLD, finished episode) for the field that changed (hero just died there).
-    assert not np.allclose(infos[0]["terminal_observation"]["self"], expected["self"][0].numpy())
+    for i in (0, 2):
+        term = infos[i]["terminal_observation"]
+        assert set(term) == set(want)
+        for name in want:
+            assert np.array_equal(term[name], want[name][i].numpy()), (i, name)
+        # the finished episode's hero is dead; the obs SB3 carries on from is the fresh episode
+        assert term["self"][6] == 0.0 and obs["self"][i, 6] > 0.0
 
 
 def test_time_limit_truncated_true_exactly_on_timeout_without_death():
@@ -201,8 +214,8 @@ def test_maskable_ppo_builds_a_21_logit_head_and_its_gadget_pick_reaches_the_sim
     Then the column is driven end to end through SB3: a mask that leaves only the gadget legal
     makes the policy pick attack value 3, the wrapper hands it to the sim and the 18 s cooldown
     starts (17.8 after the throw's own 5-tick decision); with the wrapper's real mask, which now
-    refuses the gadget, 50 stochastic picks never return a 3; and a rollout + update at this
-    width runs (the maskable buffer stores 21-wide masks)."""
+    refuses the gadget, 50 stochastic picks never return a 3. (A rollout + update through the
+    maskable buffer is the auto-aim test's below.)"""
     from sb3_contrib import MaskablePPO
     from brawl_sim.wrappers.sb3_features import default_policy_kwargs
 
@@ -232,8 +245,6 @@ def test_maskable_ppo_builds_a_21_logit_head_and_its_gadget_pick_reaches_the_sim
         picks.update(action[:, 1].tolist())
     assert 3 not in picks and picks <= {0, 1}
 
-    model.learn(total_timesteps=32)
-
 
 # ---- bounded, counted device->host transfers per step (minimal mode) -------------------------
 
@@ -242,43 +253,49 @@ def test_minimal_mode_host_transfers_are_bounded_and_independent_of_n_envs():
     # +5 more (a second, same-size group pass) only on ticks where >= 1 episode just finished
     # (building terminal_observation) -- so the FLOOR is identical across n_envs (nothing here
     # scales with batch size, only with "did an episode end this particular tick", which is
-    # deliberately checked separately from n_envs).
+    # deliberately checked separately from n_envs). Checked EXACTLY, step by step, against
+    # whether that step ended an episode; a 2-decision clock (10 ticks) makes every size see
+    # both kinds of step within 3 decisions, where 50 decisions of 60-decision episodes saw an
+    # end at 4 envs only if a hero happened to die.
     rng = np.random.default_rng(0)
-    baseline_by_n_envs = {}
-    max_by_n_envs = {}
+    clock = {"sim": {**CONFIGS_TINY["sim"], "max_episode_steps": 10}}
     for n_envs in (4, 64):
-        venv = _make(n_envs=n_envs, info_mode="minimal")
+        venv = _make(n_envs=n_envs, info_mode="minimal", overrides=clock)
+        assert len(venv.observation_space.spaces) == 5  # the "5 obs groups" the counts are made of
         venv.reset()
-        seen = []
-        for _ in range(50):
+        seen = set()
+        for _ in range(3):
             venv.step_async(_random_actions(n_envs, rng))
-            venv.step_wait()
-            seen.append(venv.last_step_host_transfers)
-        baseline_by_n_envs[n_envs] = min(seen)
-        max_by_n_envs[n_envs] = max(seen)
-
-    assert baseline_by_n_envs[4] == baseline_by_n_envs[64] == 8
-    assert max_by_n_envs[4] <= 13 and max_by_n_envs[64] <= 13  # bounded even when episodes end
+            _obs, _reward, dones, _infos = venv.step_wait()
+            assert venv.last_step_host_transfers == (13 if dones.any() else 8), n_envs
+            seen.add(venv.last_step_host_transfers)
+        assert seen == {8, 13}, (n_envs, seen)
 
 
 # ---- switching info_mode does not change trajectories -----------------------------------------
 
 def test_switching_info_mode_does_not_change_trajectories():
+    # 2026-10-20: 20 steps of a 60-decision episode never finished one, and info_mode is read
+    # only on a done step (plus full mode's diagnostics), so the modes never took different
+    # paths. Env 0's hero now dies before step 3, so every mode builds its done infos.
     n_envs = 4
-    action_seq = [np.random.default_rng(7).integers(0, 2, size=(n_envs, 2)).astype(np.int64) for _ in range(20)]
-    # deterministic action sequence, precomputed once, replayed identically against both envs
+    # deterministic action sequence, precomputed once, replayed identically against every mode
     rng = np.random.default_rng(7)
-    action_seq = [_random_actions(n_envs, rng) for _ in range(20)]
+    action_seq = [_random_actions(n_envs, rng) for _ in range(6)]
 
     results = {}
     for mode in ("minimal", "episode", "full"):
         venv = _make(n_envs=n_envs, seed=3, reward_fn=ZeroReward(), info_mode=mode)
         obs0 = venv.reset()
         traj = [{k: v.copy() for k, v in obs0.items()}]
-        for a in action_seq:
+        for t, a in enumerate(action_seq):
+            if t == 2:
+                venv.env.env.state.ent_hp[0, 0] = 0.0
+                venv.env.env.state.ent_last_hit_by[0, 0] = -1
             venv.step_async(a)
             obs, reward, dones, infos = venv.step_wait()
             traj.append((reward.copy(), dones.copy(), {k: v.copy() for k, v in obs.items()}))
+        assert bool(traj[3][1][0]), mode  # the done branch really ran in this mode
         results[mode] = traj
 
     for mode in ("episode", "full"):
@@ -364,4 +381,4 @@ def test_the_auto_aim_flag_widens_the_flat_mask_to_22_and_the_head_with_it():
     ammo = venv.env.env.state.ent_ammo[:, 0].tolist()
     assert all(abs(a - 2.0) < 1e-4 for a in ammo), ammo
     assert venv.action_masks()[:, 21].tolist() == [False, False]   # the cooldown, like column 18
-    model.learn(total_timesteps=32)
+    model.learn(total_timesteps=16)  # one rollout (2 envs x 8 steps) and one update

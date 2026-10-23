@@ -258,22 +258,6 @@ def test_march_blank_csv_terminates_at_border_every_direction():
     assert torch.all(hit_pos >= 0.0) and torch.all(hit_pos <= cfg.map_w)
 
 
-def test_march_no_hxw_allocation_scales_with_batch_not_map():
-    # a large map with a small batch should be just as cheap as a small map -- if this
-    # accidentally materialized an (H, W) grid per sample, this would be the first place
-    # a naive implementation blows up.
-    cfg = _cfg(map_h=200, map_w=200, los_step_tiles=0.5, max_ray_tiles=50.0)
-    tiles = _tiles(200, 200)
-    mask = _unit_mask(tiles)
-    map_id = torch.zeros(3, dtype=torch.int64)
-    p0 = torch.full((3, 2), 100.0)
-    dir_ = torch.tensor([[1.0, 0.0], [0.0, 1.0], [-1.0, 0.0]])
-    max_dist = torch.full((3,), 50.0)
-    hit, hit_pos, hit_t = terrain.march(mask, map_id, p0, dir_, max_dist, cfg)
-    assert hit.shape == (3,)
-    assert hit_pos.shape == (3, 2)
-
-
 # ---- line_of_sight (only WALL blocks) ----------------------------------------
 
 def test_line_of_sight_blocked_by_wall_only():

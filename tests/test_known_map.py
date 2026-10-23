@@ -1,5 +1,5 @@
 """Known-map labels: the loader's checks, the labeling tool's first pass, and the Dark Passage label.
-KNOWN_MAP_LOCALIZATION_PLAN.md step K1.
+archive/KNOWN_MAP_LOCALIZATION_PLAN.md step K1.
 
 The spawn cells below were measured from the image by eye before `scripts/map_label.py` existed,
 and the user confirmed them when signing the label off (2026-09-28), so the finder test can fail.

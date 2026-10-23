@@ -65,6 +65,11 @@ def test_camera_constants_keep_the_hero_tensors_dtype_and_are_cached():
     camera.camera_centre(torch.zeros(4, 2, dtype=torch.float32), cfg)
     camera.in_camera(torch.zeros(4, 3, 2, dtype=torch.float32), cfg)
     assert len(camera._cache) == before + 1
+    # float64 heroes get float64 constants of their own. camera_centre's output can't show it
+    # (float32 constants promote to float64 there), so the cache entry itself is checked.
+    camera.camera_centre(torch.zeros(2, 2, dtype=torch.float64), cfg)
+    assert len(camera._cache) == before + 2
+    assert camera._constants(cfg, torch.device("cpu"), torch.float64)[0].dtype == torch.float64
 
 
 # ---- quad membership ---------------------------------------------------------------------

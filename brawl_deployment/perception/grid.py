@@ -1,10 +1,11 @@
 """The egocentric view grid, from the terrain map and the trackers. BRAWL_DEPLOYMENT_DESIGN.md 6.2.
 
-`configs/agent_obs_deploy.yaml`'s `grid` group is eight `(13, 21)` uint8 planes centred on the
-hero. Nothing here is new perception: the static planes are a crop of `terrain.OccupancyMap`, the
-dynamic ones are a scatter of the tracks `tracker.py` and `projectiles.py` already produce, and
-this module's whole job is to place them where `brawl_sim/core/observation.py:_build_grid` places
-them. Every choice below is therefore a claim about matching that function.
+`configs/agent_obs_deploy6.yaml`'s `grid` group is thirteen `(13, 21)` uint8 planes centred on the
+hero, ten of this decision and three of past sightings. Nothing here is new perception: the static
+planes are a crop of `terrain.OccupancyMap`, the dynamic ones are a scatter of the tracks
+`tracker.py` and `projectiles.py` already produce, and this module's whole job is to place them
+where `brawl_sim/core/observation.py:_build_grid` places them. Every choice below is therefore a
+claim about matching that function.
 
 #### The crop, and the one thing it makes free
 
@@ -45,23 +46,23 @@ planes are 0/1 because they come from a per-tile lookup, but `enemy_revealed`, `
 | `pickup` | `LootMap.cubes()` | sticky, one fixed cell per cube on screen |
 | `enemy_hist1..K` | `DeployLoop`'s decision snapshots | past `seen_now` tracks, cut to the sim's block |
 
-`box` and `pickup` are what `configs/agent_obs_deploy3.yaml` added back after 9.11 dropped them for
-want of a detector. They are sticky where every other dynamic plane here is "seen this tick", and
-that is the sim's rule rather than a choice: `_build_grid` scatters every live crate and pickup in
-the crop, visible or not, and `fair` gates neither. `loot.py` says what that costs and where the
-two lists differ from the sim's. `enemy_any` and `enemy_hidden` are refused: they leak the position
-of an enemy the hero cannot see, and `obs_select` already rejects them at spec-load time under
-`fair: true`.
+`box` and `pickup` are what the third deploy spec (`archive/configs/agent_obs_deploy3.yaml`) added
+back after 9.11 dropped them for want of a detector. They are sticky where every other dynamic
+plane here is "seen this tick", and that is the sim's rule rather than a choice: `_build_grid`
+scatters every live crate and pickup in the crop, visible or not, and `fair` gates neither.
+`loot.py` says what that costs and where the two lists differ from the sim's. `enemy_any` and
+`enemy_hidden` are refused: they leak the position of an enemy the hero cannot see, and
+`obs_select` already rejects them at spec-load time under `fair: true`.
 
 **`enemy_revealed` takes `Track.seen_now`, not "the track exists".** Under `fair: true` an
 unrevealed enemy appears in NO grid channel at all, so a coasted track -- one carried forward on a
 constant-velocity prediction because the detector missed it -- must not be deposited. It is also
-exactly the rule `entities.revealed_to_hero` uses in the `enemies` group, so the two halves of the
-observation cannot disagree about who is visible.
+exactly the rule `memory.seen` uses in the `enemies` group, so the two halves of the observation
+cannot disagree about who is visible now.
 
 #### The history planes are past sightings, cut to the sim's block
 
-`configs/agent_obs_deploy4.yaml` adds `enemy_hist1..3`. Plane k marks
+The last three planes are `enemy_hist1..3`, in the deploy line since its fourth spec. Plane k marks
 the enemies that were `seen_now` k decisions ago, which `DeployLoop` keeps in its decision
 snapshots and hands over as `enemy_history`, newest first. Each is drawn at the world cell it stood
 on then, in the CURRENT window, with no re-centring, which is `observation._build_grid`'s rule. And
@@ -94,11 +95,11 @@ region at once and is worth watching for rather than defending against here.
 
 The occupancy map's own docstring instructs its consumers to treat UNKNOWN as its own state
 ("a policy that believes unexplored ground is walkable will walk into walls"). This observation
-has no state to treat it as: the policy was trained on eight planes with fixed meanings, and there
-is no ninth channel to add without another from-scratch run -- and no way to train one, since the
-sim is fully observed and the channel would be constant `1` in every training sample, which is the
-exact lie `agent_obs_deploy.yaml` exists to prevent. So UNKNOWN must map onto a real tile, and the
-only question is which.
+has no state to treat it as: the policy was trained on planes with fixed meanings, and there is no
+extra channel to add without another from-scratch run -- and no way to train one, since the sim is
+fully observed and the channel would be constant `1` in every training sample, which is the exact
+lie a deploy spec exists to prevent. So UNKNOWN must map onto a real tile, and the only question
+is which.
 
 Measured over two clips at the 4 Hz decision rate, hero-centred crop, occupancy accumulating
 normally (`scratchpad/crop_coverage.py`; the hero is approximated by the fixed screen-centre
@@ -167,7 +168,7 @@ from brawl_vision.terrain.labeling import CLASSES
 from brawl_vision.terrain.occupancy import UNKNOWN
 
 _CONFIGS_DIR = Path(__file__).resolve().parents[2] / "configs"
-_DEPLOY_SPEC = _CONFIGS_DIR / "agent_obs_deploy.yaml"
+_DEPLOY_SPEC = _CONFIGS_DIR / "agent_obs_deploy6.yaml"
 _DEFAULT_CFG = _CONFIGS_DIR / "default.yaml"
 
 # Which of `_build_grid`'s twelve base channels this module can fill, and how. The static four are
@@ -242,7 +243,7 @@ class GridSpec:
         """Channels from the agent-obs spec; the view dimensions and the history pair from the
         sim config.
 
-        Reading both rather than hardcoding `(8, 13, 21)` is the same discipline
+        Reading both rather than hardcoding `(13, 13, 21)` is the same discipline
         `ShadowParams.load` applies to `configs/brawlers.yaml`: the deployed grid has to be the
         grid the checkpoint was trained on, and the run directory's archived `train.yaml` names
         the spec by path. A constant here would go stale silently the first time either moved.
@@ -267,8 +268,8 @@ class GridSpec:
     def from_agent_spec(cls, agent_spec, cfg) -> "GridSpec":
         """From an already-loaded `obs_select.AgentObsSpec` and `EnvConfig`: the pair the policy
         was built from, so the grid cannot be built for a different spec than the one assembling
-        it. `load` with no arguments reads `agent_obs_deploy.yaml`, which a deploy3 checkpoint
-        would get wrong by two channels. The grid group is found the way `assemble.py` finds it,
+        it. `load` with no arguments reads `agent_obs_deploy6.yaml`, which a checkpoint trained on
+        any other spec would get wrong. The grid group is found the way `assemble.py` finds it,
         as the one with `view_channels`."""
         g = next((g for g in agent_spec.groups if g.view_channels is not None), None)
         if g is None:

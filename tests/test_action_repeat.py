@@ -235,9 +235,9 @@ def test_one_fire_decision_produces_exactly_one_shot():
     """The guard itself, exercised through the override channel.
 
     The cooldown is forced to 0.05s HERE rather than relying on the shipped value: every
-    attack_cooldown in configs/brawlers.yaml is now 0.30-0.50s, comfortably longer than a 0.25s
-    decision, so with shipped numbers no brawler can physically fire twice in one window and this
-    test would pass whether or not the guard existed. Pinning a fast weapon locally is what keeps
+    attack_cooldown in configs/brawlers.yaml is 0.25-1.00s, none shorter than a 0.25s decision
+    (five kinds sit exactly on that floor), so with shipped numbers no brawler can physically fire
+    twice in one window and this test would pass whether or not the guard existed. Pinning a fast weapon locally is what keeps
     it a test of `_held` instead of a test of the current balance -- and a fast weapon is exactly
     the case the guard is retained for."""
     from brawl_sim.constants import Kind
@@ -260,9 +260,10 @@ def test_one_fire_decision_produces_exactly_one_shot():
     env.step(_idle(1), override=override)
 
     assert int(env.state.ent_shots_fired[0, 1]) - shots_before == 1
-    # Exactly one round left the clip. Not `== 2.0`: ammo also RELOADS continuously
-    # (reload_seconds=1.8, so ~0.11 ammo trickles back over the window's remaining 4 ticks).
-    # Two shots would land near 1.1 and three near 0.1, so `> 2.0` separates the cases cleanly.
+    # Exactly one round left the clip. Not `== 2.0`: ammo also RELOADS continuously (the
+    # sniper's reload_seconds is 2.1 and the 1-tick cooldown pauses one tick, so ~0.07 ammo
+    # trickles back over the window). Two shots would land near 1.07 and three near 0.07, so
+    # `> 2.0` separates the cases cleanly.
     assert 2.0 < float(env.state.ent_ammo[0, 1]) < 3.0
 
 

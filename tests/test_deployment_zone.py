@@ -11,7 +11,7 @@ import numpy as np
 import pytest
 
 from brawl_deployment.perception.grid import GasMap
-from brawl_deployment.perception.zone import PINNED_NEXT_SHRINK_IN, ZoneEstimator
+from brawl_deployment.perception.zone import ZoneEstimator
 from brawl_sim.config import load_config
 from brawl_vision.terrain.odometry import OdometryResult
 from brawl_vision.terrain.zone import ZoneMask
@@ -103,28 +103,13 @@ def test_the_clamp_is_symmetric_because_the_blindness_is():
 
 
 def test_gas_beyond_the_horizon_is_not_reported():
-    """The saturation the deployed spec's `hero_margin_local` sibling was created to match. Gas
-    at 15 tiles is outside what the camera reaches, so reporting 15 would be training the policy
-    on a sensor range the live loop does not have."""
+    """The saturation the sim's `hero_margin_local` column clamps at too, which is why deploy6
+    reads that column rather than the unclamped `hero_margin`. Gas at 15 tiles is outside what the
+    camera reaches, so reporting 15 would be training the policy on a sensor range the live loop
+    does not have."""
     gas = _gas()
     _mark(gas, -40, -15, -40, 40)
     assert _est().hero_margin(gas, (0.0, 0.0))[0] == HORIZON
-
-
-def test_the_values_are_hero_margin_local_even_though_the_column_is_hero_margin():
-    """The deployed spec names `zone.hero_margin`, which the sim emits UNCLAMPED. This supplies the
-    clamped shape, because a bounded sensor is what deployment has. Priced at -1.9 pp (9.15's
-    "clamped at 10 tiles" row) and fixed properly by `agent_obs_deploy2.yaml`, which names
-    `hero_margin_local`. Pinned so the substitution stays visible rather than looking like a bug."""
-    import yaml
-    spec = yaml.safe_load(open("configs/agent_obs_deploy.yaml").read())
-    group = next(g for g in spec["groups"] if g["name"] == "zone")
-    assert "zone.hero_margin" in group["fields"]              # the unclamped column...
-    assert "zone.hero_margin_local" not in group["fields"]
-
-    gas = _gas()
-    _mark(gas, -40, -25, -40, 40)                             # gas at 25 tiles: a real distance
-    assert _est().hero_margin(gas, (0.0, 0.0))[0] == HORIZON  # ...fed a clamped value
 
 
 def test_the_horizon_comes_from_the_config_not_from_this_module():
@@ -166,7 +151,7 @@ def test_unseen_cells_read_as_safe_which_is_the_documented_bias():
 
 
 # ---------------------------------------------------------------------------------------------
-# The other three fields.
+# `active`.
 # ---------------------------------------------------------------------------------------------
 
 def test_active_is_false_until_gas_is_seen_and_then_latches():
@@ -195,37 +180,6 @@ def test_active_survives_a_new_segment_and_only_a_new_match_clears_it():
     assert est.active(gas) is True, "and that match's first gas latches it again"
 
 
-def test_safe_area_frac_is_one_on_a_clean_map_and_falls_with_observed_gas():
-    gas = _gas()
-    est = _est()
-    assert est.safe_area_frac(gas) == pytest.approx(1.0)
-    _mark(gas, -30, -1, -30, 29)                              # exactly half the 60x60 map
-    assert est.safe_area_frac(gas) == pytest.approx(0.5, abs=0.02)
-
-
-def test_safe_area_frac_only_counts_gas_inside_the_map_extent():
-    """The canvas is 128x128 and the map is 60x60. Gas deposited in the margin is real gas the
-    hero walked past, but it is not map area, and counting it would drive the fraction negative."""
-    gas = _gas()
-    _mark(gas, -60, -31, -60, 60)                             # entirely west of the map
-    assert _est().safe_area_frac(gas) == pytest.approx(1.0)
-
-
-def test_safe_area_frac_stays_in_range_when_the_whole_canvas_is_gassed():
-    gas = _gas()
-    gas.gassed[:] = True
-    assert _est().safe_area_frac(gas) == 0.0
-
-
-def test_next_shrink_in_is_pinned_at_zero_and_says_so():
-    """A deliberate exception to "never feed a constant", because it is a PRICED one: zeroing cost
-    1.5 pp and feeding a plausible wrong countdown cost 4.4 pp (9.14). Zero is also what an
-    overdue or disabled schedule already looks like in training -- `clamp(zone_next_t - time,
-    min=0)` -- so it is a value the column's distribution contains for the right reason."""
-    assert PINNED_NEXT_SHRINK_IN == 0.0
-    assert _est().estimate(_gas(), (0.0, 0.0))["next_shrink_in"] == 0.0
-
-
 # ---------------------------------------------------------------------------------------------
 # The whole group.
 # ---------------------------------------------------------------------------------------------
@@ -240,11 +194,12 @@ def _zone_fields(spec_path) -> set[str]:
 # Globbed rather than listed, so the next deploy spec is covered the day it is added. A listed tuple
 # is how agent_obs_deploy2/3 went unchecked here: the first live run on deploy3 raised
 # "no value supplied for 'zone.hero_margin_local'" on its first decision.
-DEPLOY_SPECS = sorted(str(p).replace("\\", "/") for p in Path("configs").glob("agent_obs_deploy*.yaml"))
+DEPLOY_SPECS = sorted(str(p).replace("\\", "/")
+                      for p in Path("configs").glob("agent_obs_deploy*.yaml"))
 
 
 def test_every_deploy_spec_is_covered_here():
-    assert len(DEPLOY_SPECS) >= 3, DEPLOY_SPECS
+    assert "configs/agent_obs_deploy6.yaml" in DEPLOY_SPECS, DEPLOY_SPECS
 
 
 @pytest.mark.parametrize("spec_path", DEPLOY_SPECS)
@@ -261,16 +216,6 @@ def test_estimate_supplies_nothing_no_deploy_spec_reads():
     has since dropped would keep being computed -- and, for a pinned one, keep looking supplied."""
     wanted = set().union(*(_zone_fields(p) for p in DEPLOY_SPECS))
     assert set(_est().estimate(_gas(), (0.0, 0.0))) == wanted
-
-
-def test_both_margin_names_are_one_scan():
-    """`hero_margin` borrows `hero_margin_local`'s values on the first deploy spec; the two keys
-    must never be able to disagree about the same gas."""
-    gas = _gas()
-    _mark(gas, -40, -5, -40, 40)
-    zone = _est().estimate(gas, (0.0, 0.0))
-    assert zone["hero_margin_local"] == zone["hero_margin"]
-    assert zone["hero_margin_local"][0] == pytest.approx(5.0)
 
 
 def test_the_margins_hold_no_state_between_calls():
@@ -306,8 +251,7 @@ def test_the_group_round_trips_through_the_assembler(spec_path):
     margin = next(k for k in full["zone"] if k.startswith("hero_margin"))
     assert tuple(full["zone"][margin].shape) == (1, 4)
     assert full["zone"][margin][0, 0].item() == pytest.approx(5.0)
-    if "safe_area_frac" in full["zone"]:
-        assert tuple(full["zone"]["safe_area_frac"].shape) == (1,)
+    assert full["zone"]["active"].tolist() == [True]
 
 
 def test_the_assembler_refuses_a_group_this_estimator_would_never_produce():
@@ -316,9 +260,9 @@ def test_the_assembler_refuses_a_group_this_estimator_would_never_produce():
     from brawl_deployment.perception.assemble import ObservationAssembler
     from brawl_sim.core import obs_select
 
-    asm = ObservationAssembler(obs_select.load_agent_spec("configs/agent_obs_deploy.yaml", CFG),
+    asm = ObservationAssembler(obs_select.load_agent_spec("configs/agent_obs_deploy6.yaml", CFG),
                                CFG)
     zone = _est().estimate(_gas(), (0.0, 0.0))
-    del zone["safe_area_frac"]
-    with pytest.raises(ValueError, match="zone.safe_area_frac"):
+    del zone["active"]
+    with pytest.raises(ValueError, match="zone.active"):
         asm._put_zone({}, zone)

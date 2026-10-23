@@ -184,7 +184,7 @@ class DeploymentConfig:
     # that should survive into an unattended run.
     telemetry_frame_dump: int = 0
 
-    # --- a known map (KNOWN_MAP_LOCALIZATION_PLAN.md) ----------------------------------------
+    # --- a known map (archive/KNOWN_MAP_LOCALIZATION_PLAN.md) -------------------------------------
     # The hand-labelled map the match is played on, `brawl_deployment/data/maps/<name>.csv`, or
     # None for the map-agnostic terrain. Named, `MapLocalizer` finds the camera on the label and
     # the grid reads the label instead of the occupancy map. The rest are `MapLocalizer`'s keyword

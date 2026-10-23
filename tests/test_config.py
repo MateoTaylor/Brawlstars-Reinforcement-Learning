@@ -11,7 +11,6 @@ from brawl_sim.config import (
     _dset,
     apply_randomization,
     build_params,
-    check_removed_keys,
     load_config,
     load_randomization,
     resample_params,
@@ -44,8 +43,8 @@ observation:
 entities:
   n_enemies: 6
   randomize_enemy_types: true
-  enemy_type_weights: {sniper: 0.2, artillery: 0.2, melee: 0.2, rifle: 0.2, edgar: 0.2, spike: 0.2,
-                       bull: 0.2}
+  # reverse roster order, distinct values: a read by position instead of by name gets 7, 6, ...
+  enemy_type_weights: {bull: 7, spike: 6, edgar: 5, rifle: 4, melee: 3, artillery: 2, sniper: 1}
   fixed_enemy_types: [sniper, artillery, melee, rifle, sniper, rifle]
   enemy_hp_mult: 1.0
   enemy_damage_mult: 1.0
@@ -245,9 +244,9 @@ def test_load_config_maps_fields(config_dir):
     assert cfg.view_h == 20 and cfg.view_w == 40
     assert cfg.n_enemies == 6
     # One entry per ARCHETYPE_SHORT_NAMES, in that order -- the point of this assertion is the
-    # mapping from named keys to a positional tuple, so it is written against the roster's own
-    # length rather than a literal that has to be edited for every new brawler.
-    assert cfg.enemy_type_weights == (0.2,) * len(ARCHETYPE_SHORT_NAMES)
+    # mapping from named keys to a positional tuple. DEFAULT_YAML writes them in reverse with
+    # distinct values, so only a lookup by name lands sniper=1 first.
+    assert cfg.enemy_type_weights == tuple(float(i + 1) for i in range(len(ARCHETYPE_SHORT_NAMES)))
     assert cfg.fixed_enemy_types == ("sniper", "artillery", "melee", "rifle", "sniper", "rifle")
     assert cfg.dt == 0.05 and cfg.max_episode_steps == 3000
     assert cfg.action_latency_seconds == 0.001
@@ -284,7 +283,9 @@ def test_load_config_overrides_deep_merge(config_dir):
     assert cfg.n_entities == 3
     assert cfg.max_episode_steps == 300
     assert cfg.zone_enabled is False
-    assert cfg.dt == 0.05  # untouched field keeps its default.yaml value
+    # the untouched sibling of the overridden entities.n_enemies keeps its default.yaml value
+    # (the dataclass default is ()), so the overrides merge into the section, not over it
+    assert cfg.fixed_enemy_types == ("sniper", "artillery", "melee", "rifle", "sniper", "rifle")
 
 
 def test_derived_properties():
@@ -330,8 +331,11 @@ def test_apply_randomization_additive_and_multiplicative(config_dir):
 
 
 def test_apply_randomization_multiplicative_needs_scalar_base():
-    with pytest.raises(ValueError):
-        apply_randomization({}, {"bot_melee.move_speed": {"low": 0.9, "high": 1.1, "mode": "multiplicative"}})
+    entry = {"bot_melee.move_speed": {"low": 0.9, "high": 1.1, "mode": "multiplicative"}}
+    with pytest.raises(ValueError, match="needs an existing scalar base"):
+        apply_randomization({}, entry)
+    with pytest.raises(ValueError, match="needs an existing scalar base"):   # a range is no base
+        apply_randomization({"bot_melee": {"move_speed": {"low": 1.0, "high": 2.0}}}, entry)
 
 
 # ---- SimParams / build_params / resample_params ------------------------------
@@ -434,8 +438,10 @@ def test_resample_params_only_touches_masked_rows(config_dir):
 
 
 def test_resample_params_no_sync_ops(config_dir, monkeypatch):
+    """Under the fixture's randomization, so resample_params has ranges to redraw rather than the
+    fixed values a bare spec gives it."""
     cfg = load_config(config_dir / "default.yaml")
-    spec = merged_spec()
+    spec = apply_randomization(merged_spec(), load_randomization(config_dir / "randomization.yaml"))
     gen = torch.Generator(device="cpu")
     gen.manual_seed(6)
     params = build_params(cfg, n_envs=8, device="cpu", gen=gen, spec=spec)
@@ -445,9 +451,10 @@ def test_resample_params_no_sync_ops(config_dir, monkeypatch):
     def _boom(*a, **k):
         raise AssertionError("host sync op called from resample_params")
 
-    monkeypatch.setattr(torch.Tensor, "item", _boom)
-    monkeypatch.setattr(torch.Tensor, "numpy", _boom)
-    monkeypatch.setattr(torch.Tensor, "tolist", _boom)
+    for op in ("item", "numpy", "tolist", "__bool__", "__float__", "__int__"):
+        monkeypatch.setattr(torch.Tensor, op, _boom)
+    with pytest.raises(AssertionError):
+        bool(torch.ones(1))  # the patch is live: an implicit sync through `if tensor:` trips it
     resample_params(params, mask, cfg, gen, spec)
 
 
@@ -457,7 +464,7 @@ def test_range_with_low_greater_than_high_raises(config_dir):
     spec["entities"]["unit_radius"] = {"low": 1.0, "high": 0.5}
     gen = torch.Generator(device="cpu")
     gen.manual_seed(8)
-    with pytest.raises(ValueError):
+    with pytest.raises(ValueError, match="range has low > high"):
         build_params(cfg, n_envs=4, device="cpu", gen=gen, spec=spec)
 
 
@@ -546,7 +553,7 @@ def test_build_params_loads_the_gadget_for_a_kind_that_authors_it_and_zero_for_t
     for field, value in _GADGET.items():
         column = getattr(params, field)
         assert torch.all(column[:, 0] == value), field                  # hero_mortis
-        assert torch.all(column[:, 1:5] == 0), f"{field} leaked into a bot column"
+        assert torch.all(column[:, 1:] == 0), f"{field} leaked into a bot column"
 
 
 def test_validate_rejects_a_gadget_cooldown_with_no_geometry(config_dir):
@@ -571,26 +578,30 @@ def test_validate_allows_a_gadget_with_zero_damage_but_not_a_negative_cooldown(c
 
 def test_validate_view_larger_than_map():
     cfg = EnvConfig(map_h=10, map_w=10, view_h=20, view_w=40)
-    with pytest.raises(ValueError):
-        validate(cfg, _dummy_params(cfg))
+    params = _dummy_params(cfg)
+    with pytest.raises(ValueError, match="larger than the map"):
+        validate(cfg, params)
 
 
 def test_validate_n_enemies_too_low():
     cfg = EnvConfig(n_enemies=0)
-    with pytest.raises(ValueError):
-        validate(cfg, _dummy_params(cfg))
+    params = _dummy_params(cfg)
+    with pytest.raises(ValueError, match="n_enemies must be >= 1"):
+        validate(cfg, params)
 
 
 def test_validate_unknown_map_name():
     cfg = EnvConfig(map_names=("open", "not_a_map"))
-    with pytest.raises(ValueError):
-        validate(cfg, _dummy_params(cfg))
+    params = _dummy_params(cfg)
+    with pytest.raises(ValueError, match="unknown map name 'not_a_map'"):
+        validate(cfg, params)
 
 
 def test_validate_action_latency_negative():
     cfg = EnvConfig(action_latency_seconds=-0.1)
-    with pytest.raises(ValueError):
-        validate(cfg, _dummy_params(cfg))
+    params = _dummy_params(cfg)
+    with pytest.raises(ValueError, match="action_latency_seconds must be >= 0"):
+        validate(cfg, params)
 
 
 _SHIPPED = Path(__file__).resolve().parents[1] / "configs"
@@ -725,20 +736,11 @@ def test_build_params_rejects_a_config_using_a_renamed_key(config_dir):
         assert expected in str(exc.value), stale
 
 
-def test_shipped_configs_use_no_renamed_keys():
-    """The shipped files are the ones that would actually cost a training run."""
-    spec = {
-        **yaml.safe_load(Path("configs/default.yaml").read_text()),
-        **yaml.safe_load(Path("configs/brawlers.yaml").read_text()),
-    }
-    check_removed_keys(spec)  # must not raise
-
-
 def test_validate_zone_start_time_too_late():
     cfg = EnvConfig(max_episode_steps=100, dt=0.05)  # episode length 5.0s
     params = _dummy_params(cfg)
     params.zone_start_time = torch.full((4,), 10.0)  # >= 5.0s: invalid
-    with pytest.raises(ValueError):
+    with pytest.raises(ValueError, match="zone_start_time >= max_episode_steps"):
         validate(cfg, params)
 
 
@@ -781,26 +783,21 @@ def test_validate_dt_vs_zone_step_seconds():
     cfg = EnvConfig(dt=1.0)
     params = _dummy_params(cfg)
     params.zone_step_seconds = torch.full((4,), 0.5)  # dt >= zone_step_seconds: invalid
-    with pytest.raises(ValueError):
+    with pytest.raises(ValueError, match=">= zone_step_seconds for at least one env"):
         validate(cfg, params)
 
 
 def test_validate_max_projectiles_too_small():
     cfg = EnvConfig(n_enemies=6, max_projectiles=1)
     params = _dummy_params(cfg)
-    with pytest.raises(ValueError):
+    with pytest.raises(ValueError, match="below the worst-case concurrent demand"):
         validate(cfg, params)
 
 
-def test_auto_aim_widens_the_attack_column_and_reads_from_the_yaml():
+def test_auto_aim_widens_the_attack_column():
     """`action.auto_aim` (the lead, 2026-09-26): a fifth attack value, the auto-aimed dash. Off
     by default, so every config and run from before it keeps (17, 4); on, the column is 5 wide.
     Structural (the one-hot and the mask widen with it), hence a per-run override in train.yaml
-    rather than a default.yaml edit."""
+    rather than a default.yaml edit; the shipped files' side is test_configs_files'."""
     assert EnvConfig().action_nvec == (17, 4)
     assert EnvConfig(auto_aim=True).action_nvec == (17, 5)
-    shipped = load_config(_SHIPPED / "default.yaml")
-    assert shipped.auto_aim is False
-    flagged = load_config(_SHIPPED / "default.yaml", overrides={"action": {"auto_aim": True}})
-    assert flagged.auto_aim is True and flagged.action_nvec == (17, 5)
-    assert flagged.n_move_bins == shipped.n_move_bins == 16     # the deep merge keeps the rest

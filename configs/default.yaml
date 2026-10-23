@@ -238,9 +238,9 @@ bots:
   camper_zone_flee_tiles: 2.0   # a camper abandons its bush once clearance drops to this
   wander_seconds: 2.5           # explore-heading re-roll period when nothing is visible
 
-  # The five keys below are SIM_ISSUES_PLAN.md's bot changes (2026-10-06). Each value here keeps
-  # the old sim exactly, so every run trained before them replays unchanged; configs/train.yaml
-  # turns them on for the next run.
+  # The five keys below are archive/SIM_ISSUES_PLAN.md's bot changes (2026-10-06). Each value here
+  # keeps the old sim exactly, so every run trained before them replays unchanged;
+  # configs/train.yaml turns them on for the next run.
   #
   # Pathfinding (brawl_sim/maps/nav.py): a bot walks a shortest walkable path to its target, bush
   # or waypoint, and out of the gas, instead of steering straight at it and pinning on any wall

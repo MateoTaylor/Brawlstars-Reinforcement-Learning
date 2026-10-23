@@ -148,6 +148,11 @@ _SLOT_FIELDS = (
     ("ent_slot", lambda N, E, P, B, U, L, K: (N, E), I64),       # slot + 1 of entity e; 0 = none
     ("ent_hits", lambda N, E, P, B, U, L, K: (N, E), I32),       # consecutive sightings, unslotted
     ("ent_misses", lambda N, E, P, B, U, L, K: (N, E), I32),     # consecutive misses while slotted
+    # The entity as the hero last SAW it: copied from ent_pos/ent_vel/ent_hp on every decision
+    # `slots.update` counts it seen, held while it is unseen. Read only by obs["memory"].
+    ("ent_seen_pos", lambda N, E, P, B, U, L, K: (N, E, 2), F32),
+    ("ent_seen_vel", lambda N, E, P, B, U, L, K: (N, E, 2), F32),
+    ("ent_seen_hp", lambda N, E, P, B, U, L, K: (N, E), F32),
 )
 
 # Cached, not part of "state" in the resettable sense -- excluded from zero_ (see below).

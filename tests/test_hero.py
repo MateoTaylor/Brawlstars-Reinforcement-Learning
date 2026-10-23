@@ -306,13 +306,18 @@ def test_reload_is_not_paused_when_no_cooldown_is_running():
     assert abs(state.ent_ammo[0, 0].item() - cfg.dt / reload_seconds) < 1e-6
 
 
-def test_ammo_never_exceeds_max():
+def test_ammo_refills_to_max_and_never_past_it():
+    """From empty, for 15% more ticks than a full refill takes: the clip reads exactly max_ammo,
+    so the reload both ran and was clamped (unclamped it would read ~3.45). Until 2026-10-20 this
+    ran 10,000 ticks against `<= max_ammo`, which an ammo that never accrued passes too."""
     cfg, params = _cfg_and_params()
     state = _fresh_state(cfg)
     state.ent_ammo.fill_(0.0)
     max_ammo = params.max_ammo[0, int(Kind.HERO_MORTIS)].item()
-    for _ in range(10000):
+    reload_seconds = params.reload_seconds[0, int(Kind.HERO_MORTIS)].item()
+    for _ in range(math.ceil(1.15 * max_ammo * reload_seconds / cfg.dt)):
         hero.tick_timers(state, params, cfg)
+    assert state.ent_ammo[0, 0].item() == pytest.approx(max_ammo)
     assert torch.all(state.ent_ammo[:, 0] <= max_ammo + 1e-5)
 
 
@@ -600,6 +605,10 @@ def test_advance_dash_hits_stationary_enemy_exactly_once():
     # effective_damage(HERO kind, cubes=0, params), i.e. base_damage unscaled.
     hits = (total_dmg[0, 1] / max(expected_hit_dmg, 1e-6)).round().item()
     assert hits == 1, f"expected exactly one hit, got {total_dmg[0, 1]} (~{hits}x base damage)"
+    # ...and the body it hit did not stop the dash: halting at first contact would leave the
+    # hero at 4.5 - 2 * unit_radius = 3.7; it carries on past the enemy's centre (4.67).
+    # (tests/test_movement.py's dashers-pass-through-bodies test never ran advance_dash.)
+    assert state.ent_pos[0, 0, 0].item() > 4.5
 
 
 def test_advance_dash_does_not_hit_dead_or_self():
@@ -728,7 +737,7 @@ def test_a_kind_without_the_ability_never_charges_it():
     cfg, params = _cfg_and_params()
     state = _mortis_state(cfg, params)
     state.ent_attack_idle_t.fill_(1e6)
-    for kind in (Kind.BOT_SNIPER, Kind.BOT_ARTILLERY, Kind.BOT_MELEE, Kind.BOT_RIFLE):
+    for kind in list(Kind)[1:]:   # every bot kind (the four-kind tuple here predated Edgar, Spike, Bull)
         state.ent_kind[0, 0] = int(kind)
         assert not bool(hero.long_dash_ready(state, params)[0, 0]), f"{kind!r} charged a long dash"
         assert float(hero.long_dash_charge_frac(state, params)[0, 0]) == 0.0
@@ -1006,7 +1015,10 @@ def test_the_auto_aim_flag_adds_a_fifth_attack_value_that_decodes_as_a_dash():
     assert hero.action_mask(state, plain_params, plain)["attack"].shape == (1, 4)
     _mv, fire, _sup, _gadget, auto = hero.decode_action(torch.tensor([[3, 4]]), state, plain_params, plain)
     assert not bool(fire) and not bool(auto)
-    assert hero.ATTACK_AUTO == 4 and hero._BOX_RADIUS == 0.5   # projectiles.BOX_RADIUS restated
+    # hero.py restates projectiles.BOX_RADIUS: auto-aim's crate reach and the projectile box hit
+    # must use one radius, so the copy is pinned to the original, not to a literal alone.
+    from brawl_sim.core import projectiles
+    assert hero.ATTACK_AUTO == 4 and hero._BOX_RADIUS == projectiles.BOX_RADIUS == 0.5
 
 
 def test_auto_aim_target_is_the_nearest_enemy_or_crate_in_reach_and_ignores_visibility():

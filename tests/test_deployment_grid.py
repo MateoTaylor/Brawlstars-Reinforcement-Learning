@@ -2,13 +2,13 @@
 
 The load-bearing test is `test_the_grid_matches_the_sim_channel_for_channel`: it runs a real
 `BrawlVecEnv`, hands `GridBuilder` a perfect-perception view of that env's own world, and asserts
-the deployed planes (eight for deploy, ten for deploy3, thirteen for deploy4) equal
-`observation._build_grid`'s corresponding channels, cell for cell, every decision. Everything the
-module claims -- the crop origin, the channel order, counts rather than booleans, the hero
-constant, the terrain lookup, the history planes' block -- is a claim about matching that
-function. deploy4's three history planes are fed the test's own record of who was revealed each
-decision, the way `DeployLoop` keeps one, while the sim fills its ring inside `env.step`: two
-records of one run, compared.
+deploy6's thirteen planes equal `observation._build_grid`'s corresponding channels, cell for cell,
+every decision. Everything the module claims -- the crop origin, the channel order, counts rather
+than booleans, the hero constant, the terrain lookup, the history planes' block -- is a claim
+about matching that function. The three history planes are fed the test's own record of who was
+revealed each decision, the way `DeployLoop` keeps one, while the sim fills its ring inside
+`env.step`: two records of one run, compared. The tests about a single frame build
+`SINGLE_FRAME`, deploy6's planes without the history ones.
 
 **"Perfect perception" is the input, not the thing under test.** The occupancy map is seeded from
 the sim's own padded tile bank and the gas map from the sim's own zone rectangle, because the
@@ -53,6 +53,14 @@ SIM_CHANNEL = {"blocks_unit": 0, "blocks_projectile": 1, "is_bush": 2, "is_water
                "pickup": 10, "projectile": 11,
                "enemy_hist1": 12, "enemy_hist2": 13, "enemy_hist3": 14}
 
+# The grid the deployed checkpoint reads: ten planes of this decision, then enemy_hist1..3.
+DEPLOY6 = GridSpec.load(CONFIGS / "agent_obs_deploy6.yaml")
+# The same planes without the history ones. A grid with history planes refuses a build that hands
+# it no `enemy_history` (test_a_history_grid_is_never_handed_empty_planes_by_default), so the
+# tests about one frame's planes build this one instead.
+SINGLE_FRAME = replace(DEPLOY6, channels=tuple(c for c in DEPLOY6.channels
+                                               if c not in DEPLOY6.history_slots))
+
 
 # ---------------------------------------------------------------------------
 # helpers
@@ -63,11 +71,13 @@ def _occupancy(height: int = 128, width: int = 128) -> OccupancyMap:
 
 
 def _spec(**kw) -> GridSpec:
-    """deploy's spec with `kw` swapped in, unchecked, so a test can hand `check` a bad one."""
+    """deploy6's spec with `kw` swapped in, unchecked, so a test can hand `check` a bad one."""
     return replace(GridSpec.load(), **kw)
 
 
 def _builder(occupancy=None, **kw) -> GridBuilder:
+    """`SINGLE_FRAME` unless a test names a spec."""
+    kw.setdefault("spec", SINGLE_FRAME)
     return GridBuilder(occupancy if occupancy is not None else _occupancy(), **kw)
 
 
@@ -211,13 +221,13 @@ def _break_the_crates_beside_the_hero(env) -> None:
 
 def test_the_spec_is_read_from_the_yaml_rather_than_restated():
     spec = GridSpec.load()
-    raw = yaml.safe_load((CONFIGS / "agent_obs_deploy.yaml").read_text())
+    raw = yaml.safe_load((CONFIGS / "agent_obs_deploy6.yaml").read_text())
     grid = next(g for g in raw["groups"] if g["name"] == "grid")
     sim_cfg = yaml.safe_load((CONFIGS / "default.yaml").read_text())
     view, observation = sim_cfg["view"], sim_cfg["observation"]
     assert spec.channels == tuple(grid["view_channels"])
     assert spec.shape == (len(grid["view_channels"]), view["height"], view["width"])
-    assert spec.shape == (8, 13, 21)          # the shape the deploy run actually trained on
+    assert spec.shape == (13, 13, 21)         # the shape the deploy6 run actually trained on
     assert (spec.history_frames, spec.history_radius_tiles) == (
         observation["history_frames"], observation["history_radius_tiles"]) == (3, 4)
 
@@ -232,42 +242,35 @@ def test_the_hero_sits_at_the_exact_centre_of_an_odd_view():
     ("enemy_hidden", "hidden"),
 ])
 def test_a_channel_with_no_supplier_is_refused_by_name(channel, fragment):
-    """Feeding zeros into a channel the policy was trained to read is the silent failure the whole
-    agent_obs_deploy line of configs exists to prevent, so asking for one raises."""
+    """Feeding zeros into a channel the policy was trained to read is the silent failure a deploy
+    spec exists to prevent, so asking for one raises."""
     with pytest.raises(ValueError, match=fragment):
         _spec(channels=(channel,)).check()
 
 
-def test_a_deploy3_spec_loads_now_that_crates_and_cubes_have_a_supplier():
-    """`configs/agent_obs_deploy3.yaml` trained on `box` and `pickup` ahead of their detector, and
-    this used to be the test that refused it. `loot.LootMap` is the supplier now."""
-    spec = GridSpec.load(CONFIGS / "agent_obs_deploy3.yaml")
-    assert spec.shape == (10, 13, 21)
+def test_deploy6_is_ten_planes_of_this_decision_then_one_history_plane_per_frame():
+    """`box` and `pickup` sit right after `hero`, the sim's order. The third deploy spec trained on
+    them ahead of their detector, and this used to be the test that refused them; `loot.LootMap`
+    is the supplier now."""
+    spec = GridSpec.load()
+    assert spec.shape == (13, 13, 21)
     assert spec.channels.index("box") == spec.channels.index("hero") + 1
     assert spec.channels.index("pickup") == spec.channels.index("box") + 1
+    assert spec.channels[10:] == ("enemy_hist1", "enemy_hist2", "enemy_hist3")
 
 
-@pytest.mark.parametrize("spec_name", ["agent_obs_deploy.yaml", "agent_obs_deploy2.yaml",
-                                       "agent_obs_deploy3.yaml", "agent_obs_deploy4.yaml",
-                                       "agent_obs_deploy5.yaml"])
-def test_the_spec_the_policy_was_built_with_gives_the_same_grid_as_the_yaml(spec_name):
-    """The loop builds its grid from the policy's own `AgentObsSpec`, not from a path, so a deploy3
-    checkpoint cannot be handed deploy's eight planes. Both routes have to agree."""
+def test_the_spec_the_policy_was_built_with_gives_the_same_grid_as_the_yaml():
+    """The loop builds its grid from the policy's own `AgentObsSpec`, not from a path, so a
+    checkpoint cannot be handed another spec's planes. Both routes have to agree, and with the
+    file the no-argument `load` reads."""
     cfg = load_config(CONFIGS / "default.yaml")
-    agent_spec = load_agent_spec(CONFIGS / spec_name, cfg)
-    assert GridSpec.from_agent_spec(agent_spec, cfg) == GridSpec.load(CONFIGS / spec_name)
+    agent_spec = load_agent_spec(CONFIGS / "agent_obs_deploy6.yaml", cfg)
+    assert GridSpec.from_agent_spec(agent_spec, cfg) == DEPLOY6 == GridSpec.load()
 
 
 def test_a_typo_lists_what_this_builder_can_actually_fill():
     with pytest.raises(ValueError, match="unknown grid channel"):
         _spec(channels=("blocks_units",)).check()
-
-
-def test_a_deploy4_spec_is_deploy3_then_one_history_plane_per_frame():
-    spec = GridSpec.load(CONFIGS / "agent_obs_deploy4.yaml")
-    assert spec.shape == (13, 13, 21)
-    assert spec.channels[:10] == GridSpec.load(CONFIGS / "agent_obs_deploy3.yaml").channels
-    assert spec.channels[10:] == ("enemy_hist1", "enemy_hist2", "enemy_hist3")
 
 
 @pytest.mark.parametrize("channel", ["enemy_hist4", "enemy_hist0", "enemy_hist01", "enemy_hist"])
@@ -296,9 +299,7 @@ def test_how_many_history_planes_exist_is_the_configs_history_frames():
 PARITY_SEED = 10
 
 
-@pytest.mark.parametrize("spec_name", ["agent_obs_deploy.yaml", "agent_obs_deploy3.yaml",
-                                       "agent_obs_deploy4.yaml"])
-def test_the_grid_matches_the_sim_channel_for_channel(spec_name):
+def test_the_grid_matches_the_sim_channel_for_channel():
     env = _sim_env(seed=PARITY_SEED)
     env.reset()
     # The bots still aim and fire, but their hits deal nothing, so the hero lives through all forty
@@ -311,7 +312,7 @@ def test_the_grid_matches_the_sim_channel_for_channel(spec_name):
     _break_the_crates_beside_the_hero(env)
     occ = _occupancy()
     _seed_from_bank(occ, env)
-    builder = _builder(occ, spec=GridSpec.load(CONFIGS / spec_name))
+    builder = _builder(occ, spec=DEPLOY6)
     spec = builder.spec
 
     rng = Random(0)
@@ -319,7 +320,7 @@ def test_the_grid_matches_the_sim_channel_for_channel(spec_name):
     # The loop's snapshots, kept the way `DeployLoop` keeps them: each decision's revealed enemies,
     # newest first, three deep (the config's `history_frames`, pinned above). The sim fills its own
     # ring inside `env.step` from the visibility pass `_sim_view` just ran, so this is a second,
-    # independent record of the same sightings. Specs without history planes ignore it.
+    # independent record of the same sightings.
     past = deque(maxlen=3)
     for decision in range(40):
         view = _sim_view(env)
@@ -348,7 +349,7 @@ def test_the_grid_matches_the_sim_channel_for_channel(spec_name):
     # Anti-vacuity: agreeing on planes of zeros would prove nothing, and one lucky cell is barely
     # better, so this counts DECISIONS on which each plane was non-empty. Measured on this seed
     # with the bots harmless (2026-09-25): terrain, hero, enemy_revealed, in_zone and box 40/40,
-    # pickup 39, projectile 28, and for deploy4 enemy_hist1 39, enemy_hist2 38, enemy_hist3 37.
+    # pickup 39, projectile 28, enemy_hist1 39, enemy_hist2 38, enemy_hist3 37.
     thin = {ch: n for ch, n in seen.items() if n < 5}
     assert not thin, f"barely exercised: {thin} of 40 decisions (all: {seen})"
 
@@ -530,12 +531,8 @@ def test_projectiles_land_in_their_own_plane():
     assert grid[b.spec.channels.index("enemy_revealed")].sum() == 0
 
 
-def _deploy3_builder() -> GridBuilder:
-    return _builder(spec=GridSpec.load(CONFIGS / "agent_obs_deploy3.yaml"))
-
-
 def test_crates_and_cubes_land_in_their_own_planes():
-    b = _deploy3_builder()
+    b = _builder()
     grid = b.build((10.5, 6.5), crates=[(12.5, 5.5)], cubes=[(8.5, 9.5)])
     box = grid[b.spec.channels.index("box")]
     pickup = grid[b.spec.channels.index("pickup")]
@@ -545,13 +542,13 @@ def test_crates_and_cubes_land_in_their_own_planes():
 
 def test_two_cubes_in_one_cell_count_two():
     """A death pile on screen is several cube boxes; each is one object, like the sim's pickups."""
-    b = _deploy3_builder()
+    b = _builder()
     grid = b.build((10.5, 6.5), cubes=[(8.2, 9.1), (8.8, 9.9)])
     assert grid[b.spec.channels.index("pickup")][9, 8] == 2
 
 
 def test_a_crate_outside_the_crop_is_dropped():
-    b = _deploy3_builder()
+    b = _builder()
     grid = b.build((10.5, 6.5), crates=[(40.5, 6.5)], cubes=[(10.5, -40.5)])
     assert grid[b.spec.channels.index("box")].sum() == 0
     assert grid[b.spec.channels.index("pickup")].sum() == 0
@@ -570,8 +567,8 @@ def test_the_output_is_uint8_at_the_declared_shape_and_a_reused_buffer_is_cleare
 # the history planes
 # ---------------------------------------------------------------------------
 
-def _deploy4_builder() -> GridBuilder:
-    return _builder(spec=GridSpec.load(CONFIGS / "agent_obs_deploy4.yaml"))
+def _deploy6_builder() -> GridBuilder:
+    return _builder(spec=DEPLOY6)
 
 
 def _plane(b: GridBuilder, grid: np.ndarray, channel: str) -> np.ndarray:
@@ -601,7 +598,7 @@ def test_a_past_enemy_lands_in_the_cell_the_sims_scatter_puts_it():
     view = _sim_view(env)
 
     dx, dy = _frame_offset(env)
-    b = _deploy4_builder()
+    b = _deploy6_builder()
     grid = b.build((30.3 + dx, 29.8 + dy),
                    enemy_history=tuple(tuple((x + dx, y + dy) for x, y in slot) for slot in past))
     for ch in ("enemy_hist1", "enemy_hist2", "enemy_hist3"):
@@ -615,7 +612,7 @@ def test_a_past_enemy_lands_in_the_cell_the_sims_scatter_puts_it():
 
 def test_plane_k_draws_the_enemies_seen_k_decisions_ago():
     """`enemy_history` is newest first, like the sim's ring: entry 0 feeds enemy_hist1."""
-    b = _deploy4_builder()
+    b = _deploy6_builder()
     grid = b.build((10.5, 6.5), enemy_history=(((11.5, 6.5),), ((12.5, 7.5),),
                                                ((9.5, 5.5), (8.5, 4.5))))
     assert np.argwhere(_plane(b, grid, "enemy_hist1")).tolist() == [[6, 11]]
@@ -628,7 +625,7 @@ def test_the_block_is_whole_cells_by_chebyshev_distance_from_the_heros_tile():
     """Radius 4 around hero tile (10, 6) keeps columns 6..14 and rows 2..10, wherever inside its
     tile each point stood. (14.9, 6.5) is 4.4 tiles from the hero and kept; (15.0, 6.5) is 4.5
     and dropped. Every dropped point is inside the window, so the block did the cutting."""
-    b = _deploy4_builder()
+    b = _deploy6_builder()
     kept = [(14.9, 6.5), (6.1, 2.2), (6.0, 10.99)]
     dropped = [(15.0, 6.5), (10.5, 11.5), (5.99, 6.5), (10.5, 1.9)]
     grid = b.build((10.5, 6.5), enemy_history=(tuple(kept + dropped),))
@@ -639,7 +636,7 @@ def test_the_block_follows_the_hero_now_and_the_sighting_stays_where_it_was():
     """The radius is from the hero's tile NOW, and the sighting is drawn at its world cell THEN
     in the current window: no re-centring. One step east brings world column 15 into the block,
     at window column 14 of a window that now starts at column 1."""
-    b = _deploy4_builder()
+    b = _deploy6_builder()
     past = (((15.5, 6.5),),)
     assert _plane(b, b.build((10.5, 6.5), enemy_history=past), "enemy_hist1").sum() == 0
     moved = _plane(b, b.build((11.2, 6.5), enemy_history=past), "enemy_hist1")
@@ -647,7 +644,7 @@ def test_the_block_follows_the_hero_now_and_the_sighting_stays_where_it_was():
 
 
 def test_two_past_enemies_in_one_cell_count_two():
-    b = _deploy4_builder()
+    b = _deploy6_builder()
     grid = b.build((10.5, 6.5), enemy_history=(((12.2, 6.4), (12.8, 6.9)),))
     assert _plane(b, grid, "enemy_hist1")[6, 12] == 2
 
@@ -655,7 +652,7 @@ def test_two_past_enemies_in_one_cell_count_two():
 def test_a_history_grid_is_never_handed_empty_planes_by_default():
     """An empty plane claims nobody was seen, so `None` is refused. An empty tuple, a match's first
     decision, is the explicit form of the same zeros. More than the config keeps is refused too."""
-    b = _deploy4_builder()
+    b = _deploy6_builder()
     with pytest.raises(ValueError, match="no enemy_history was supplied"):
         b.build((10.5, 6.5))
     grid = b.build((10.5, 6.5), enemy_history=())
@@ -665,8 +662,9 @@ def test_a_history_grid_is_never_handed_empty_planes_by_default():
 
 
 def test_a_grid_without_history_planes_ignores_the_history():
-    """The loop hands every spec its history; deploy and deploy3 checkpoints never read it."""
-    b = _deploy3_builder()
+    """The loop hands every spec its history, and a grid with no history planes (no deploy spec
+    before the fourth had any) never reads it, not even past the config's three."""
+    b = _builder()
     fed = b.build((10.5, 6.5), enemy_history=(((11.5, 6.5),),) * 5)
     assert np.array_equal(fed, b.build((10.5, 6.5)))
 

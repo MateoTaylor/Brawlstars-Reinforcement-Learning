@@ -88,26 +88,32 @@ def test_distance_fields_match_dijkstra_on_a_walled_map(pool):
 def _walk(codes: torch.Tensor, free: torch.Tensor):
     """Walks every (source, start tile) pair along `codes` (S, H, W) at once. Asserts every step
     lands on a walkable tile and every diagonal clears its 2x2 block. Returns the end tiles and
-    each walk's summed step cost."""
+    each walk's summed step cost.
+
+    By pointer doubling: every tile's own step is checked once (each tile starts a walk, so that
+    is every step any walk takes), then each walk jumps 1, 2, 4, ... steps per gather, summing the
+    costs it jumps over. A finished walk points at itself at cost 0, since `nav.OFFSETS[0]` is
+    (0, 0). One step per loop iteration took ~0.7 s a map; this takes ~20 ms."""
+    assert nav.OFFSETS[0] == (0, 0)
     s_count, h, w = codes.shape
     off = torch.tensor(nav.OFFSETS)
-    src = torch.arange(s_count).view(-1, 1, 1).expand(s_count, h, w)
-    y = torch.arange(h).view(1, -1, 1).expand(s_count, h, w).clone()
-    x = torch.arange(w).view(1, 1, -1).expand(s_count, h, w).clone()
-    cost = torch.zeros((s_count, h, w), dtype=torch.float64)
-    for _ in range(h * w):
-        code = codes[src, y, x].long()
-        moving = code > 0
-        if not moving.any():
-            return y, x, cost
-        dx, dy = off[code, 0], off[code, 1]
-        ny, nx_ = y + dy, x + dx
-        assert free[ny, nx_][moving].all(), "a step into a wall"
-        diag = moving & (dx != 0) & (dy != 0)
-        assert (free[y, nx_] & free[ny, x])[diag].all(), "a diagonal cut a wall corner"
-        cost += torch.where(diag, math.sqrt(2.0), moving.double())
-        y, x = ny, nx_
-    raise AssertionError("a walk never ended: the field has a loop")
+    code = codes.long()
+    moving = code > 0
+    dx, dy = off[code, 0], off[code, 1]
+    y = torch.arange(h).view(1, -1, 1).expand(s_count, h, w)
+    x = torch.arange(w).view(1, 1, -1).expand(s_count, h, w)
+    ny, nx_ = y + dy, x + dx
+    assert free[ny, nx_][moving].all(), "a step into a wall"
+    diag = moving & (dx != 0) & (dy != 0)
+    assert (free[y, nx_] & free[ny, x])[diag].all(), "a diagonal cut a wall corner"
+    nxt = (ny * w + nx_).reshape(s_count, h * w)
+    cost = torch.where(diag, math.sqrt(2.0), moving.double()).reshape(s_count, h * w)
+    for _ in range(math.ceil(math.log2(h * w)) + 1):   # 2**k jumps outrun any walk of <= h*w steps
+        cost = cost + torch.gather(cost, 1, nxt)
+        nxt = torch.gather(nxt, 1, nxt)
+    assert (torch.gather(code.reshape(s_count, h * w), 1, nxt) == 0).all(), \
+        "a walk never ended: the field has a loop"
+    return (nxt // w).view(s_count, h, w), (nxt % w).view(s_count, h, w), cost.view(s_count, h, w)
 
 
 @pytest.mark.parametrize("name", WALK_MAPS)
@@ -486,12 +492,14 @@ def test_a_body_pushed_sideways_past_a_blocked_corner_is_pinned_only_without_the
         assert (float(pos[0]) < 9.0) is passes, radius
 
 
-def test_tables_are_absent_without_the_flag_and_rebuild_identically():
+def test_tables_are_absent_without_the_flag_and_rebuild_identically(monkeypatch):
     cfg = load_config(CONFIGS_DEFAULT, overrides={"world": {"maps": ["open"]}})
     assert not hasattr(loader.build_map_bank(cfg, "cpu"), "nav_next")
     on = load_config(CONFIGS_DEFAULT, overrides={"world": {"maps": ["open"]}, "bots": {"nav": True}})
     first = loader.build_map_bank(on, "cpu")
-    nav._CACHE.clear()
+    # an empty cache for the rebuild only: clearing the real one would make every later nav-on
+    # bank build in this process (the module's `pool` included) rebuild its tables
+    monkeypatch.setattr(nav, "_CACHE", {})
     again = loader.build_map_bank(on, "cpu")
     assert torch.equal(first.nav_next, again.nav_next)
     assert torch.equal(first.nav_anchor_of, again.nav_anchor_of)

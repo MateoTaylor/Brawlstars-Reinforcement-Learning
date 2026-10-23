@@ -15,6 +15,11 @@ docs/AGENT_OBS.md
 runs/
 eval_videos/
 
+# Diagrams drawn for videos about the project (video_graphics/<topic>/{dark,light}/*.png) and the
+# make_graphics.py beside them that draws them. Not training or deployment code: the whole folder,
+# script included, stays local.
+video_graphics/
+
 # Sprite PNGs are extracted game assets (Supercell IP) -- keep the folder structure and README
 # tracked, not the images themselves. See brawl_sim/render/assets/README.md.
 brawl_sim/render/assets/**/*.png

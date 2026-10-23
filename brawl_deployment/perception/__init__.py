@@ -17,7 +17,7 @@ the game's tiles, and a re-lock resets them all as a new odometry segment would.
 
 `localize` replaces it when the deployment names a map (`known_map`, a hand-labelled layout):
 `MapLocalizer` finds the camera on the label and hands out the MAP frame, and `KnownTerrain` gives
-the grid the label in place of the occupancy map (KNOWN_MAP_LOCALIZATION_PLAN.md).
+the grid the label in place of the occupancy map (archive/KNOWN_MAP_LOCALIZATION_PLAN.md).
 
 `grid` is the last stage before assembly: it crops the accumulated terrain map and scatters the
 tracks into the hero-centred planes the observation's `grid` group wants (6.2). Everything

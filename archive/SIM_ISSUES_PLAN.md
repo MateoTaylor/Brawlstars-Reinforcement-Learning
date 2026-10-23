@@ -2,7 +2,7 @@
 
 **Status:** BUILT 2026-10-07 and verified, with second and third rounds the same day (BRAWL_SIM_DESIGN.md #27–#30) and a pathfinding fix from the pre-training check (end of §B), then #32 as option C (end of §B). Trained by you, fresh, 2026-10-07 to 10-08: `runs/mortis_ppo-20261007-161117` (600M decisions, ended in the elite stage), which `configs/deployment.yaml` serves since 2026-10-08 (best_model.zip, the 580M eval: 0.333 across the six tiers). §B, just below, has your answers, what was built from them and what it measured. §0–§7 are the plan as written on 2026-10-06.
 **Run measured:** `runs/mortis_ppo-20260930-182748/best_model.zip`, expert tier.
-**Probe:** [scripts/probes/sim_issues_probe.py](scripts/probes/sim_issues_probe.py). It writes nothing. It runs the checkpoint two ways:
+**Probe:** [scripts/probes/sim_issues_probe.py](../scripts/probes/sim_issues_probe.py). It writes nothing. It runs the checkpoint two ways:
 
 | Mode | What it is |
 |---|---|
@@ -19,7 +19,7 @@ Every change sits behind a key whose default.yaml value is the old sim. Finished
 
 | Your answer (§7) | Built | Key: default.yaml → train.yaml |
 |---|---|---|
-| 1. "as real pathfinding as possible without compromising training time seriously" | 1.1–1.4 as planned. Flow fields per 3-tile cell ([maps/nav.py](brawl_sim/maps/nav.py)), built at load and cached per map. `policy.path_toward` steers CLOSE, HOLD_RANGE, TO_BUSH and HUNT_BUSH, and the centre field steers both gas terms. A KITE without line of sight closes. | `bots.nav` false → true, with `bots.nav_anchor_tiles` 3 |
+| 1. "as real pathfinding as possible without compromising training time seriously" | 1.1–1.4 as planned. Flow fields per 3-tile cell ([maps/nav.py](../brawl_sim/maps/nav.py)), built at load and cached per map. `policy.path_toward` steers CLOSE, HOLD_RANGE, TO_BUSH and HUNT_BUSH, and the centre field steers both gas terms. A KITE without line of sight closes. | `bots.nav` false → true, with `bots.nav_anchor_tiles` 3 |
 | 2. "campers should switch to hunting in final 4" | 2.2: `policy.effective_person` reads CAMPER and TRAPPER as HUNTER once 4 players are left (the hero counts). The camper fire veto lifts with it. | `bots.endgame_players` 0 → 4 |
 | 3. "what is the cap?" | 99, the game's own cap ([Brawl Stars on X, 2019-09-20](https://x.com/BrawlStars/status/1174928524039245824)). Neither 3.A nor 3.B is needed at 99: the supply is one cube per crate plus one per death, and no probe match came near it. | `cubes.max_cubes` 16 → 99 |
 | 4. "a maximum of 1 hit per target per dash" | 4.1–4.2: `ent_dash_box_hits`, so a dash hits each crate once, as it already hit each unit once. | `boxes.dash_hits_once` false → true; `boxes.hp` 3000 → 8000 |
@@ -241,10 +241,10 @@ Before the next run, the sim was checked with every train.yaml key on:
   | Longest unbroken stretch | 17 s | 98 s |
 
 ### Cause
-- **Straight-line seeks.** [bots/personality.py](brawl_sim/bots/personality.py) `movement` steers with `steering.seek(pos, goal)`. The goal is the enemy, the nearest bush tile (`perception.bush_scan`, by straight-line distance) or the next bush waypoint.
+- **Straight-line seeks.** [bots/personality.py](../brawl_sim/bots/personality.py) `movement` steers with `steering.seek(pos, goal)`. The goal is the enemy, the nearest bush tile (`perception.bush_scan`, by straight-line distance) or the next bush waypoint.
   - `terrain.resolve_move` slides along a wall one axis at a time, so a line aimed through a wall pins the bot against it.
   - `advance_hunt`'s docstring already describes this ("the hunter grinds against that wall") and patches it with a timeout.
-- **The gas pull.** [bots/policy.py](brawl_sim/bots/policy.py) `zone_avoid_contribution` aims at the safe rect's centre. Its vector is a raw offset (length = distance) with weight up to 2.0.
+- **The gas pull.** [bots/policy.py](../brawl_sim/bots/policy.py) `zone_avoid_contribution` aims at the safe rect's centre. Its vector is a raw offset (length = distance) with weight up to 2.0.
   - Near the gas it outweighs every other term. A wall between a bot and the centre pins it there until the gas arrives.
   - `zone_contribution`, for a bot already in the gas, aims at the nearest safe point. That point can be behind a wall too.
 - **KITE.** `_select_mode` puts a KITE in HOLD_RANGE whenever it has an enemy target. Walls never block sight (§2), so a target behind a wall stays its target, and nothing checks line of sight.
@@ -398,7 +398,7 @@ Seed 0, the match watch.py shows first, spent 83 of its 128 s in this phase.
 - **Rollouts.** A full crate broke in a single dash 25 of 30 times (watch) and 49 of 73 (train).
 
 ### Cause
-- [core/hero.py](brawl_sim/core/hero.py) `advance_dash` (L450–451) remembers which units a dash has hit (`ent_dash_hits`) but not which crates. A crate inside the dash capsule takes damage on every tick, as §4 says ("crates are hit on every tick").
+- [core/hero.py](../brawl_sim/core/hero.py) `advance_dash` (L450–451) remembers which units a dash has hit (`ent_dash_hits`) but not which crates. A crate inside the dash capsule takes damage on every tick, as §4 says ("crates are hit on every tick").
 - With a flat 3000 HP (§2's divergence list), any dash that passes through a crate breaks it.
 - Raising HP to 8000 alone would not fix it: 4 ticks still deal 8000.
 

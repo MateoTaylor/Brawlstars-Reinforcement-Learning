@@ -6,6 +6,7 @@ it never deals to anyone. These tests pin those three things plus the damage-vs-
 they combine into. Grom's own cross is owned by tests/test_projectiles.py and is only
 cross-checked here where Spike could have broken it.
 """
+import copy
 import math
 from dataclasses import dataclass
 
@@ -28,20 +29,31 @@ class _FakeBank:
     blocks_proj: torch.Tensor
 
 
-def _setup(map_h=40, map_w=40, wall_cols=()):
+def _load_spec():
+    spec = {}
+    for path in (CONFIGS_DEFAULT, "configs/brawlers.yaml"):
+        with open(path) as f:
+            spec.update(yaml.safe_load(f))
+    return spec
+
+
+# Parsed once at import rather than on every _setup call; build_params gets a deep copy, so
+# nothing it does to the spec can leak from one test into the next.
+_SPEC = _load_spec()
+
+
+def _setup(map_h=40, map_w=40, wall_cols=(), n_envs=1):
+    """`n_envs` > 1 builds identical, independent envs (every env plays map 0, and no param here is
+    randomised per env), so a batch of victims can share one simulation -- see _damage_at_many."""
     cfg = load_config(CONFIGS_DEFAULT, overrides={
         "world": {"map_h": map_h, "map_w": map_w},
         "observation": {"include_world_grid": False},
     })
-    spec = {
-        **yaml.safe_load(open(CONFIGS_DEFAULT).read()),
-        **yaml.safe_load(open("configs/brawlers.yaml").read()),
-    }
     gen = torch.Generator(device="cpu")
     gen.manual_seed(0)
-    params = build_params(cfg, n_envs=1, device="cpu", gen=gen, spec=spec)
+    params = build_params(cfg, n_envs=n_envs, device="cpu", gen=gen, spec=copy.deepcopy(_SPEC))
 
-    state = allocate(cfg, n_envs=1, device="cpu", verbose=False)
+    state = allocate(cfg, n_envs=n_envs, device="cpu", verbose=False)
     state.ent_alive.fill_(True)
     # Everyone is parked in a corner unless a test places them: an entity left at the origin would
     # sit inside the star of every shell these tests fire.
@@ -56,17 +68,19 @@ def _setup(map_h=40, map_w=40, wall_cols=()):
 
 
 def _throw(state, cfg, params, kind, origin, landing):
-    """Fires one shell from entity 1 and returns the damage it carries."""
+    """Fires one shell from entity 1 in every env (the same throw in each) and returns the damage
+    it carries."""
     k = int(kind)
-    state.ent_kind[0, 1] = k
-    fire = torch.zeros(1, cfg.n_entities, dtype=torch.bool)
-    fire[0, 1] = True
-    org = torch.zeros(1, cfg.n_entities, 2)
-    org[0, 1] = torch.tensor(origin)
-    aim = torch.zeros(1, cfg.n_entities, 2)
-    aim[0, 1] = torch.tensor(landing)
-    damage = params.base_damage[:, k].unsqueeze(-1).expand(1, cfg.n_entities).clone()
-    kinds = torch.full((1, cfg.n_entities), k, dtype=torch.int64)
+    n = state.ent_kind.shape[0]
+    state.ent_kind[:, 1] = k
+    fire = torch.zeros(n, cfg.n_entities, dtype=torch.bool)
+    fire[:, 1] = True
+    org = torch.zeros(n, cfg.n_entities, 2)
+    org[:, 1] = torch.tensor(origin)
+    aim = torch.zeros(n, cfg.n_entities, 2)
+    aim[:, 1] = torch.tensor(landing)
+    damage = params.base_damage[:, k].unsqueeze(-1).expand(n, cfg.n_entities).clone()
+    kinds = torch.full((n, cfg.n_entities), k, dtype=torch.int64)
     proj.spawn_volley(state, fire, org, aim - org, aim, kinds, damage, params, cfg)
     return float(params.base_damage[0, k])
 
@@ -96,12 +110,27 @@ def _detonate(state, bank, params, cfg, limit=200):
     raise AssertionError("the shell never detonated")
 
 
+def _damage_at_many(offsets, landing=(20.0, 20.0), origin=(13.0, 20.0), ticks=200, **kw):
+    """For each offset, the total damage a lone victim standing at `landing + offset` takes from
+    one Spike shell. One env per offset, all stepped together: the envs share nothing, so env i's
+    total is what a separate simulation of offsets[i] gives (summed in float64 tick by tick, the
+    same as `_run`). The sweeps below need ~35 victims each: batched, that is ~0.4 s a sweep
+    instead of ~3.5 s one victim at a time."""
+    cfg, params, state, bank = _setup(n_envs=len(offsets), **kw)
+    state.ent_pos[:, 0] = torch.tensor([[landing[0] + dx, landing[1] + dy] for dx, dy in offsets])
+    _throw(state, cfg, params, Kind.BOT_SPIKE, origin, landing)
+    total = torch.zeros(len(offsets), dtype=torch.float64)
+    for _ in range(ticks):
+        if not bool(state.prj_alive.any()):
+            break
+        dmg_ent, _, _, _, _ = proj.step_projectiles(state, bank, params, cfg)
+        total += dmg_ent[:, 0].double()
+    return total.tolist()
+
+
 def _damage_at(offset, landing=(20.0, 20.0), origin=(13.0, 20.0), **kw):
     """Total damage a lone victim standing at `landing + offset` takes from one Spike shell."""
-    cfg, params, state, bank = _setup(**kw)
-    state.ent_pos[0, 0] = torch.tensor([landing[0] + offset[0], landing[1] + offset[1]])
-    _throw(state, cfg, params, Kind.BOT_SPIKE, origin, landing)
-    return _run(state, bank, params, cfg)[0]
+    return _damage_at_many([offset], landing=landing, origin=origin, **kw)[0]
 
 
 def _polar(dist, degrees):
@@ -238,15 +267,15 @@ def test_a_near_miss_lands_two_or_three_spikes():
     """The behaviour the spec describes: "when his attack hits an enemy, it hurts by detonating
     right next to them (so they take around 2-4 of the mini-projectiles)". All the damage comes
     from how many arms sweep the victim, so it is asserted as a shard COUNT."""
-    for dist in (0.1, 0.3, 0.5):
-        for bearing in range(0, 360, 30):
-            damage = _damage_at(_polar(dist, bearing))
-            spikes = damage / SHARD_DAMAGE
-            assert spikes == int(spikes), f"partial shard damage {damage} at {dist}/{bearing} deg"
-            assert 2 <= spikes <= 3, (
-                f"a shell landing {dist} tiles from a victim (bearing {bearing} deg) landed "
-                f"{spikes:.0f} spikes; expected 2-3"
-            )
+    points = [(dist, bearing) for dist in (0.1, 0.3, 0.5) for bearing in range(0, 360, 30)]
+    damages = _damage_at_many([_polar(dist, bearing) for dist, bearing in points])
+    for (dist, bearing), damage in zip(points, damages):
+        spikes = damage / SHARD_DAMAGE
+        assert spikes == int(spikes), f"partial shard damage {damage} at {dist}/{bearing} deg"
+        assert 2 <= spikes <= 3, (
+            f"a shell landing {dist} tiles from a victim (bearing {bearing} deg) landed "
+            f"{spikes:.0f} spikes; expected 2-3"
+        )
 
 
 def test_the_star_thins_out_with_distance_instead_of_stopping():
@@ -267,11 +296,11 @@ def test_one_shell_cannot_land_more_than_three_spikes():
     proj_radius` from the landing point -- exactly their own hit radius -- so no victim is ever
     inside more than three arms at once. Spawning them at the centre instead would put all SIX on
     a victim standing there: 6480 damage, enough to delete a 6000 HP brawler with one shell."""
-    worst = max(
-        _damage_at(_polar(dist, bearing))
+    worst = max(_damage_at_many([
+        _polar(dist, bearing)
         for dist in (0.2, 0.5, 0.8, 1.1, 1.4)
         for bearing in range(0, 61, 10)  # one sixth of the ring covers every distinct geometry
-    )
+    ]))
     assert worst <= 3 * SHARD_DAMAGE, f"a single shell landed {worst / SHARD_DAMAGE:.0f} spikes"
 
 

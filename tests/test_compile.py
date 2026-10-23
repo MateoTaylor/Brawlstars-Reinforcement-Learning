@@ -36,20 +36,13 @@ def _assert_obs_close(a, b):
 # ---- compile: false is completely unaffected --------------------------------------------
 
 def test_compile_false_uses_the_raw_uncompiled_tick():
+    """No wrapping at all, so a compile: false env steps the very tick every other test in the
+    suite steps -- why there is no compile: false rollout here (a 50-decision one, until
+    2026-10-20, re-ran what tests/test_env.py covers)."""
     env = _tiny_env(compile=False)
     # bound methods aren't `is`-identical across separate attribute accesses even when they
     # wrap the same function+instance -- `==` is the correct identity check here.
     assert env._tick_fn == env._run_tick  # no wrapping at all -- zero overhead, zero behavior change
-
-
-def test_compile_false_rollout_behaves_normally():
-    from brawl_sim.core import obs_schema
-    env = _tiny_env(n_envs=8, compile=False)
-    env.reset()
-    gen = torch.Generator().manual_seed(0)
-    for _ in range(50):
-        obs, reward, terminated, truncated, info = env.step(_random_action(8, "cpu", gen))
-    obs_schema.validate_obs(obs, env.cfg)
 
 
 # ---- compile: true either matches eager, or fails with a clear, documented error ---------

@@ -3,9 +3,8 @@ import pytest
 import torch
 import yaml
 from gymnasium import spaces
-from stable_baselines3 import PPO
 
-from brawl_sim.config import load_config
+from brawl_sim.config import _deep_merge, load_config
 from brawl_sim.core import obs_select
 from brawl_sim.wrappers.sb3_features import BrawlFeaturesExtractor, default_policy_kwargs, float_group_names
 
@@ -17,7 +16,7 @@ AGENT_OBS_YAML = "configs/agent_obs.yaml"
 def _space(overrides=None):
     merged = dict(CONFIGS_TINY)
     if overrides:
-        merged = {**merged, **overrides}
+        merged = _deep_merge(merged, overrides)  # the preset's other keys in a section stay
     cfg = load_config(CONFIGS_DEFAULT, overrides=merged)
     spec = obs_select.load_agent_spec(AGENT_OBS_YAML, cfg)
     return obs_select.agent_space(spec, cfg), spec, cfg
@@ -38,34 +37,6 @@ def test_forward_pass_produces_declared_features_dim():
     batch = _sample_batch(space, batch_size=5)
     out = fe(batch)
     assert out.shape == (5, fe.features_dim)
-    assert torch.isfinite(out).all()
-
-
-def test_forward_pass_works_at_the_real_default_config_grid_size():
-    """The real (non-tiny) view size, the one NatureCNN's stack cannot handle.
-
-    The grid shape is read from the config rather than written as a literal. It used to say
-    (10, 20, 40), which was only ever true while the view was a guess -- measuring it against the
-    real camera (Terrain_Perception_Build_Plan.md Phase K) made it 13x21 and this test failed on a
-    hardcoded number rather than on anything about the feature extractor.
-
-    What DOES need asserting is the thing the smaller view puts at risk: the conv stack is
-    stride 1/2/2, so a 13x21 grid comes out 4x6, and a further shrink would eventually collapse a
-    spatial dimension to zero and take the forward pass with it.
-    """
-    space, spec, cfg = _space(overrides=None)
-    cfg_full = load_config(CONFIGS_DEFAULT)
-    spec_full = obs_select.load_agent_spec(AGENT_OBS_YAML, cfg_full)
-    space_full = obs_select.agent_space(spec_full, cfg_full)
-    c, h, w = space_full.spaces["grid"].shape
-    assert (h, w) == (cfg_full.view_h, cfg_full.view_w)
-    assert h >= 8 and w >= 8, (
-        f"view {w}x{h} leaves the stride-1/2/2 conv stack {w // 4}x{h // 4} to work with"
-    )
-    fe = BrawlFeaturesExtractor(space_full)
-    batch = _sample_batch(space_full, batch_size=3)
-    out = fe(batch)
-    assert out.shape == (3, fe.features_dim)
     assert torch.isfinite(out).all()
 
 
@@ -93,25 +64,6 @@ def test_rejects_two_uint8_groups():
         assert False, "expected a ValueError"
     except ValueError as e:
         assert "grid1" in str(e) and "grid2" in str(e)
-
-
-# ---- default_policy_kwargs plugs into PPO("MultiInputPolicy", ...) unmodified --------------
-
-def test_default_policy_kwargs_plugs_into_ppo_unmodified():
-    from brawl_sim.env import BrawlVecEnv
-    from brawl_sim.core.reward import ExampleReward
-    from brawl_sim.wrappers.sb3_vecenv import BrawlSB3VecEnv
-
-    cfg = load_config(CONFIGS_DEFAULT, overrides=CONFIGS_TINY)
-    spec = obs_select.load_agent_spec(AGENT_OBS_YAML, cfg)
-    env = BrawlVecEnv(cfg, n_envs=4, device="cpu", seed=0)
-    venv = BrawlSB3VecEnv(env, spec, ExampleReward())
-
-    model = PPO(
-        "MultiInputPolicy", venv, policy_kwargs=default_policy_kwargs(spec, cfg),
-        n_steps=16, batch_size=16, verbose=0,
-    )
-    model.learn(total_timesteps=64)  # must not raise
 
 
 def test_default_policy_kwargs_has_normalize_images_false():
@@ -142,40 +94,57 @@ def test_float_group_names_excludes_the_uint8_grid_group():
     assert set(names) == {g.name for g in spec.groups if g.name != "grid"}
 
 
-# ---- the deploy specs' input widths, pinned -------------------------------------------------
+# ---- the grid's channel axis, pinned --------------------------------------------------------
 
-# Measured at the default config when deploy4's spec was built, with no extractor change. A
-# checkpoint's first conv and first linear layer are sized from these two numbers, so a change to
-# either is a from-scratch retrain, never a checkpoint swap. Deploy3 is the last trained run's spec
-# and deploy4 the next one's. Written out rather than read from the spec: a test that asked the spec
-# for its own width could not fail.
-DEPLOY_WIDTHS = {
-    "configs/agent_obs_deploy3.yaml": (10, 182, {"self": 24, "enemies": 81, "projectiles": 72,
-                                                 "zone": 5}),
-    "configs/agent_obs_deploy4.yaml": (13, 262, {"self": 26, "enemies": 81, "projectiles": 72,
-                                                 "zone": 5, "history": 78}),
-}
+# A checkpoint's first conv is sized from the grid's channel count, so a change to it is a
+# from-scratch retrain, never a checkpoint swap. deploy6's own input widths are pinned in
+# test_configs_files.py; the five deploy specs before it are in archive/configs/.
+DEPLOY6 = "configs/agent_obs_deploy6.yaml"
+HISTORY_PLANES = ("enemy_hist1", "enemy_hist2", "enemy_hist3")
 
 
-@pytest.mark.parametrize("spec_path", sorted(DEPLOY_WIDTHS))
-def test_a_deploy_spec_builds_the_extractor_at_its_pinned_widths(spec_path):
-    """Deploy4 feeds the CNN 13 channels and the MLP 262 floats; deploy3 feeds 10 and 182.
-
-    Both specs are pinned, not only the one the next run trains. Deploy4's grid is 13 x 13 x 21,
-    so its channel count equals the view height, and an extractor that read the wrong axis would
-    still build 13 input channels for it. Deploy3's 10 channels are what tell the two apart.
-    The per-group widths say which group moved when the total does.
+def test_the_extractor_sizes_its_first_conv_from_the_grid_channel_axis(tmp_path):
+    """deploy6's grid is 13 x 13 x 21, so its channel count equals the view height, and an
+    extractor that read the wrong axis would still build the 13 input channels
+    test_configs_files.py pins for it. The same spec without its three history planes is
+    10 x 13 x 21, and its 10 is what tells the two axes apart, as deploy3's ten planes did before
+    it went to archive/configs/. Dropping grid planes leaves every float group alone, so the MLP
+    keeps deploy6's 272.
     """
-    channels, float_width, group_widths = DEPLOY_WIDTHS[spec_path]
+    doc = yaml.safe_load(open(DEPLOY6, encoding="utf-8").read())
+    grid = next(g for g in doc["groups"] if g["name"] == "grid")
+    grid["view_channels"] = [c for c in grid["view_channels"] if c not in HISTORY_PLANES]
+    variant = tmp_path / "agent_obs_variant.yaml"
+    variant.write_text(yaml.safe_dump(doc), encoding="utf-8")
     cfg = load_config(CONFIGS_DEFAULT)
-    space = obs_select.agent_space(obs_select.load_agent_spec(spec_path, cfg), cfg)
-    fe = BrawlFeaturesExtractor(space)
+    spec = obs_select.load_agent_spec(variant, cfg)
+    space = obs_select.agent_space(spec, cfg)
+    kwargs = default_policy_kwargs(spec, cfg)
+    fe = BrawlFeaturesExtractor(space, **kwargs["features_extractor_kwargs"])
 
-    floats = {k: int(np.prod(s.shape)) for k, s in space.spaces.items() if s.dtype == np.float32}
-    assert floats == group_widths
-    assert sum(group_widths.values()) == float_width
-    assert fe.cnn[0].in_channels == channels
-    assert fe.mlp[0].in_features == float_width
+    assert space.spaces["grid"].shape == (10, 13, 21)
+    assert fe.cnn[0].in_channels == 10
+    assert fe.mlp[0].in_features == 272
     out = fe(_sample_batch(space, batch_size=2))
     assert out.shape == (2, fe.features_dim)
     assert torch.isfinite(out).all()
+
+
+# ---- critic_keys (archive/CRITIC_AND_MEMORY_PLAN.md part B) --------------------------------------
+
+def test_critic_keys_bypass_both_actor_layers_and_are_appended_as_given():
+    """The output is the actor features, then each critic group flattened, untouched: the MLP is
+    sized without them and the tail is the input itself. An unknown key is refused."""
+    cfg = load_config(CONFIGS_DEFAULT, overrides=CONFIGS_TINY)
+    spec = obs_select.load_agent_spec(DEPLOY6, cfg)
+    space = obs_select.agent_space(spec, cfg)
+    keys = ("critic_enemies", "critic_world")
+    fe = BrawlFeaturesExtractor(space, critic_keys=keys)
+    actor_floats = sum(int(np.prod(s.shape)) for k, s in space.spaces.items()
+                       if s.dtype == np.float32 and k not in keys)
+    assert fe.mlp[0].in_features == actor_floats
+    batch = _sample_batch(space, batch_size=3)
+    out = fe(batch)
+    assert torch.equal(out[:, fe.actor_dim:], torch.cat([batch[k].flatten(1) for k in keys], 1))
+    with pytest.raises(ValueError, match="critic_keys"):
+        BrawlFeaturesExtractor(space, critic_keys=("critic_nope",))

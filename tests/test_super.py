@@ -92,8 +92,10 @@ def test_charge_fraction_ramps_then_saturates():
 
 def test_a_kind_without_a_super_never_charges_or_becomes_ready():
     """Every bot resolves super_charge_hits to 0. The gate is on that field, not on entity index,
-    which is what will let a future bot super be a config block rather than a rewrite."""
+    which is what will let a future bot super be a config block rather than a rewrite. `_state`
+    makes every bot a sniper, so the other bot kinds are checked on the params themselves."""
     cfg, params = _cfg_and_params()
+    assert float(params.super_charge_hits[:, 1:].max()) == 0, "a bot kind resolves a super"
     state = _state(cfg, params)
     hero.add_super_charge(state, torch.full((1, cfg.n_entities), 50, dtype=torch.int32), params)
     for e in range(1, cfg.n_entities):
@@ -447,16 +449,22 @@ def test_an_idle_super_through_env_flies_and_expires_at_its_range():
 def test_super_charge_comes_from_player_hits_not_box_hits():
     """Charge is derived from the attacker x victim matrix, which box damage never enters -- so a
     hero cannot farm his super off crates. Asserted directly because the alternative implementation
-    ('did I deal damage this tick') would look identical in every other test."""
+    ('did I deal damage this tick') would look identical in every other test.
+
+    `autoreset=False`, and the dash re-armed from the same spot every decision: with both bots
+    dead the first decision ends the episode as a win, and until 2026-10-20 autoreset then
+    respawned a normal match, so the 19 decisions after it never saw this box (it read 3000 hp,
+    a spawned crate's). The box's hp is asserted too, so the dashes are shown to connect."""
     cfg = load_config(f"{CONFIGS}/default.yaml", overrides={
         "entities": {"n_enemies": 2}, "zone": {"enabled": False},
         "observation": {"include_world_grid": False}})
-    env = BrawlVecEnv(cfg, n_envs=1, device="cpu", seed=0, verbose=False)
+    env = BrawlVecEnv(cfg, n_envs=1, device="cpu", seed=0, verbose=False, autoreset=False)
     env.reset()
     st = env.state
     st.ent_super_charge.fill_(0)
+    hero_at = st.ent_pos[0, 0].clone()
 
-    # Park a box right on top of the hero and dash into it repeatedly; no enemy is in reach.
+    # Park a box right beside the hero and dash into it repeatedly; no enemy is alive.
     st.ent_pos[0, 1] = torch.tensor([1.5, 1.5])
     st.ent_pos[0, 2] = torch.tensor([1.5, 1.5])
     st.ent_alive[0, 1] = False
@@ -465,13 +473,19 @@ def test_super_charge_comes_from_player_hits_not_box_hits():
     st.box_alive[0, 0] = True
     st.box_hp[0, 0] = 1e9
     st.box_max_hp[0, 0] = 1e9
-    st.box_pos[0, 0] = st.ent_pos[0, 0] + torch.tensor([1.0, 0.0])
+    st.box_pos[0, 0] = hero_at + torch.tensor([1.0, 0.0])
 
+    hits = 0
     for _ in range(20):
+        st.ent_pos[0, 0] = hero_at   # each dash carries the hero past the box
         st.ent_ammo[0, 0] = 3.0
         st.ent_attack_cd[0, 0] = 0.0
+        st.ent_dash_t[0, 0] = 0.0
+        box_hp = float(st.box_hp[0, 0])
         env.step(torch.tensor([[1, 1]], dtype=torch.int64))
+        hits += float(st.box_hp[0, 0]) < box_hp
 
+    assert hits == 20, f"only {hits} of the 20 dashes hit the box"
     assert int(st.ent_super_charge[0, 0]) == 0, (
         "box damage charged the super -- charge must come from hits on living players only"
     )

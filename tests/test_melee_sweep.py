@@ -3,6 +3,7 @@
 One test file per module, matching the repo's convention. The bot-side fire gate that decides
 WHEN Buzz starts a sweep lives in tests/test_melee.py with the rest of the archetype's logic.
 """
+import copy
 import math
 
 import torch
@@ -15,6 +16,19 @@ from brawl_sim.core.state import allocate
 
 CONFIGS = "configs"
 _MELEE = int(Kind.BOT_MELEE)
+
+
+def _load_spec():
+    spec = {}
+    for name in ("default.yaml", "brawlers.yaml"):
+        with open(f"{CONFIGS}/{name}") as f:
+            spec.update(yaml.safe_load(f))
+    return spec
+
+
+# Parsed once at import rather than on every _cfg_and_params call; build_params gets a deep copy,
+# so nothing it does to the spec can leak from one test into the next.
+_SPEC = _load_spec()
 
 
 class _FakeBank:
@@ -30,11 +44,9 @@ def _cfg_and_params(n_enemies=1, map_h=20, map_w=20):
         overrides={"world": {"map_h": map_h, "map_w": map_w},
                    "entities": {"n_enemies": n_enemies}, "zone": {"enabled": False}},
     )
-    spec = {**yaml.safe_load(open(f"{CONFIGS}/default.yaml")),
-            **yaml.safe_load(open(f"{CONFIGS}/brawlers.yaml"))}
     gen = torch.Generator(device="cpu")
     gen.manual_seed(0)
-    return cfg, build_params(cfg, n_envs=1, device="cpu", gen=gen, spec=spec)
+    return cfg, build_params(cfg, n_envs=1, device="cpu", gen=gen, spec=copy.deepcopy(_SPEC))
 
 
 def _armed_buzz(cfg, params, facing=0.0):
@@ -94,13 +106,23 @@ def test_sub_swings_are_evenly_spaced_across_the_cooldown():
 def test_schedule_never_drops_or_doubles_a_swing_when_dt_does_not_divide_the_interval():
     """The floor()-crossing schedule exists to be robust to a ragged interval. 5 swings across a
     0.30s cooldown gives 0.06s intervals against a 0.05s tick -- deliberately not a whole number
-    of ticks. A counter-based schedule would drift here; this must still fire exactly 5 times."""
+    of ticks. A counter-based schedule would drift here; this must still fire exactly 5 times,
+    and those 5 must be sub-swings 0..4 once each, read off each fire's cone direction.
+
+    Until 2026-10-20 the second check was a set of fire TIMES, which cannot repeat (`_run_sweep`
+    reports each tick once), so a schedule that fired sub-swing 3 twice and never fired 4 passed."""
     cfg, params = _cfg_and_params()
     params.attack_cooldown[0, _MELEE] = 0.30
     state = _armed_buzz(cfg, params)
     fired = _run_sweep(state, cfg, params)
-    assert len(fired) == int(params.hitscan_count[0, _MELEE])
-    assert len({round(t, 6) for t, _, _ in fired}) == len(fired), "a tick fired twice"
+    count = int(params.hitscan_count[0, _MELEE])
+    assert len(fired) == count
+
+    sweep = params.hitscan_sweep_rad[0, _MELEE].item()
+    step = sweep / (count - 1)
+    ks = [(d + sweep / 2.0) / step for _t, d, _dmg in fired]  # facing 0: cone k is -sweep/2 + k*step
+    assert all(abs(k - round(k)) < 1e-4 for k in ks), f"a cone fell between sub-swings: {ks}"
+    assert [round(k) for k in ks] == list(range(count)), f"sub-swings fired as {ks}: one dropped or doubled"
 
 
 # ---- geometry ---------------------------------------------------------------------------
@@ -164,8 +186,9 @@ def test_a_target_dead_centre_takes_the_full_three_hits():
 # ---- the not-swept path is untouched ----------------------------------------------------
 
 def test_hitscan_count_of_one_never_sweeps():
-    """Every non-Buzz kind resolves `hitscan_count` to 0 or 1, and must keep the single
-    instantaneous cone melee always had -- the sweep path must not fire for them at all."""
+    """A `hitscan_count` of 1 is the single instantaneous cone melee always had, so the sweep path
+    must not fire for it at all. (Every ranged kind resolves the count to 0; Edgar's 2 IS a sweep,
+    see the next test.)"""
     cfg, params = _cfg_and_params()
     params.hitscan_count[0, _MELEE] = 1
     state = _armed_buzz(cfg, params)
@@ -173,12 +196,20 @@ def test_hitscan_count_of_one_never_sweeps():
     assert _run_sweep(state, cfg, params) == []
 
 
-def test_is_swept_is_false_for_every_ranged_kind():
+def test_is_swept_holds_for_exactly_the_multi_hit_melee_kinds():
+    """Buzz (five sub-swings) and Edgar (two hits) sweep; every other kind, the hero included, must
+    not, or movement would freeze its facing whenever its cooldown runs. Every Kind is visited, so a
+    new brawler gets classified here instead of skipped.
+
+    Until 2026-10-20 this visited only the hero and the first three ranged bots, so the later kinds
+    (Bull among them) could report as swept and it still passed."""
     cfg, params = _cfg_and_params()
     state = _armed_buzz(cfg, params)
-    for kind in (Kind.HERO_MORTIS, Kind.BOT_SNIPER, Kind.BOT_ARTILLERY, Kind.BOT_RIFLE):
+    swept = {Kind.BOT_MELEE, Kind.BOT_EDGAR}
+    for kind in Kind:
         state.ent_kind[0, 1] = int(kind)
-        assert not bool(melee_sweep.is_swept(state, params)[0, 1]), f"{kind!r} reports as swept"
+        got = bool(melee_sweep.is_swept(state, params)[0, 1])
+        assert got == (kind in swept), f"{kind!r}: is_swept is {got}, expected {kind in swept}"
 
 
 # ---- integration through the real env ---------------------------------------------------
@@ -200,7 +231,11 @@ def _env_with_a_buzz():
 def test_a_whole_sweep_costs_exactly_one_ammo():
     """BRAWL_SIM_DESIGN.md §5, user-confirmed: Buzz spends 1 ammo to fire all five
     hitscans, not 1 per hitscan. If this ever became 5 his sustained DPS would collapse from
-    ~1260 to ~250 and he would stop being a threat, so it is worth pinning explicitly."""
+    ~1260 to ~250 and he would stop being a threat, so it is worth pinning explicitly.
+
+    The trigger pull costs EXACTLY one: Buzz starts at max ammo (the reload has nothing to add before
+    the attack books its ammo), and the cooldown pauses the reload for the rest of the step. Until
+    2026-10-20 the check was one-sided (`<= 1`), so a sweep that cost no ammo at all passed."""
     env = _env_with_a_buzz()
     override = torch.full((1, env.cfg.n_entities, 2), -1, dtype=torch.int64)
     override[0, 1] = torch.tensor([0, 1])  # entity 1: idle move, FIRE
@@ -211,7 +246,8 @@ def test_a_whole_sweep_costs_exactly_one_ammo():
     env.step(torch.zeros(1, 2, dtype=torch.int64), override=override)
     after_trigger = float(env.state.ent_ammo[0, 1])
 
-    assert before - after_trigger <= 1.0 + 1e-4, "the trigger pull cost more than one ammo"
+    spent = before - after_trigger
+    assert abs(spent - 1.0) < 1e-4, f"the trigger pull cost {spent} ammo, not one"
 
     # Drive the REST of the sweep with the fire bit DOWN. Ammo must not drop further (no sub-swing
     # charges ammo) and must not rise either (the cooldown pauses the reload).
@@ -266,7 +302,12 @@ def test_facing_is_frozen_during_a_sweep_but_the_body_still_moves():
 def test_a_ranged_kind_still_turns_freely_while_on_cooldown():
     """The facing freeze is gated on the KIND being swept, not on `ent_attack_cd > 0` -- every
     brawler has a cooldown running after every shot, so the looser gate would pin
-    every brawler's facing for 0.25s after every attack."""
+    every brawler's facing for 0.25s after every attack.
+
+    The shooter's cooldown is stretched to 1.0s so it is still running through the whole walk step
+    (asserted after it). Until 2026-10-20 it was the shipped 0.25s, exactly one decision, so it
+    ran out on the walk step's first tick and the looser gate turned the facing too: this could not
+    tell the two gates apart."""
     from brawl_sim.env import BrawlVecEnv
     cfg = load_config(
         f"{CONFIGS}/default.yaml",
@@ -276,6 +317,7 @@ def test_a_ranged_kind_still_turns_freely_while_on_cooldown():
     )
     env = BrawlVecEnv(cfg, n_envs=1, device="cpu", seed=0, verbose=False)
     env.reset()
+    env.params.attack_cooldown[:, int(Kind.BOT_RIFLE)] = 1.0
     env.state.ent_ammo[0, 1] = 3.0
     env.state.ent_attack_cd[0, 1] = 0.0
 
@@ -288,6 +330,7 @@ def test_a_ranged_kind_still_turns_freely_while_on_cooldown():
     walk = torch.full((1, cfg.n_entities, 2), -1, dtype=torch.int64)
     walk[0, 1] = torch.tensor([11, 0])
     env.step(torch.zeros(1, 2, dtype=torch.int64), override=walk)
+    assert bool(env.state.ent_attack_cd[0, 1] > 0), "the cooldown ran out during the walk step"
     assert abs(float(env.state.ent_facing[0, 1]) - facing_before) > 1e-3, (
         "a ranged kind's facing was frozen by its cooldown -- the freeze leaked past swept kinds"
     )

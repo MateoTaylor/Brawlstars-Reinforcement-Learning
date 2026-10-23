@@ -4,8 +4,8 @@ it is gated under entities.privileged or a cfg toggle. scripts/dump_obs_schema.p
 into docs/OBSERVATION.md.
 
 One declarative row per leaf field (`_ROWS`), in build_obs's dict order (hero, hist, entities
-[+ privileged], projectiles, boxes, pickups, zone, slots, visibility, view, world, action_mask,
-meta). dump_obs_schema.py orders the groups by its own `_GROUP_ORDER` and keeps this table's
+[+ privileged], projectiles, boxes, pickups, zone, slots, memory, visibility, view, world,
+action_mask, meta). dump_obs_schema.py orders the groups by its own `_GROUP_ORDER` and keeps this table's
 order within each.
 
 Shape dims are "N" (batch size, left unresolved even by obs_spec: n_envs is not part of
@@ -158,6 +158,7 @@ _ROWS: tuple[tuple, ...] = (
     ("entities.privileged.reveal_t", ("N", "E"), "float32", "seconds", (0.0, None), "Seconds left forced-revealed after this entity last attacked.", True, "obs_include_privileged"),
     ("entities.privileged.decision_phase", ("N", "E"), "int64", "ticks", (0, None), "(step_count + slot) % decision_period; 0 = this is a fire-reconsideration tick.", True, "obs_include_privileged"),
     ("entities.privileged.move_intent", ("N", "E", 2), "float32", "unitless", None, "Bot's smoothed (post-reaction-delay) movement intent.", True, "obs_include_privileged"),
+    ("entities.privileged.targets_hero", ("N", "E"), "bool", "bool", None, "target_id == 0: this bot is hunting the hero. For a privileged critic group.", True, "obs_include_privileged"),
 
     # ---- projectiles: all P slots ---------------------------------------------------
     ("projectiles.alive", ("N", "P"), "bool", "bool", None, "Whether this slot holds a live projectile.", False, None),
@@ -222,6 +223,16 @@ _ROWS: tuple[tuple, ...] = (
     # ---- tracker-style slots (core/slots.py) ------------------------------------------------
     ("slots.entity", ("N", "S"), "int64", "index", (0, None), "Entity index + 1 held by tracked slot k; 0 = empty (core/slots.py). Bookkeeping for obs_select's `slots: tracked`, refused in a spec's fields.", False, None),
     ("slots.valid", ("N", "S"), "bool", "bool", None, "Tracked slot k holds an entity.", False, None),
+
+    # ---- memory: each enemy as the hero last saw it (core/slots.py ent_seen_* snapshots) -------
+    ("memory.tracked", ("N", "E"), "bool", "bool", None, "Holds a tracked slot (seen now, or coasting). obs_select's fair gate for memory.* groups; an untracked row reads 0.", False, None),
+    ("memory.seen", ("N", "E"), "bool", "bool", None, "Tracked and seen this decision (age_s == 0). Live: the track's seen_now.", False, None),
+    ("memory.rel_pos", ("N", "E", 2), "float32", "tiles", None, "Last-seen position minus the hero's position now.", False, None),
+    ("memory.dist", ("N", "E"), "float32", "tiles", (0.0, None), "norm(memory.rel_pos).", False, None),
+    ("memory.rel_vel", ("N", "E", 2), "float32", "tiles/s", None, "Last-seen velocity minus the hero's velocity now.", False, None),
+    ("memory.hp", ("N", "E"), "float32", "hp", (0.0, None), "HP when last seen.", False, None),
+    ("memory.in_bush", ("N", "E"), "bool", "bool", None, "The last-seen position is on a BUSH tile.", False, None),
+    ("memory.age_s", ("N", "E"), "float32", "seconds", (0.0, None), "Seconds since last seen: unseen decisions x agent_dt, 0 while seen, at most slots.max_misses x agent_dt.", False, None),
 
     # ---- visibility ----------------------------------------------------------------------
     ("visibility.vis", ("N", "E", "E"), "bool", "bool", None, "vis[i,j]: i sees j (bush-aware targeting visibility).", False, None),

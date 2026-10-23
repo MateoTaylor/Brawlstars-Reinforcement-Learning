@@ -127,7 +127,7 @@ def test_shipped_tier_table_is_the_plan_table(tcfg):
 
 def test_shipped_stage_walk_is_the_plan_walk(tcfg):
     """The shipped walk as literals: stage names, every mixture, the 0.15 gates, the 2000-episode
-    window and the 125M cap.
+    window and the 83M cap (2026-10-12: the 600M run's 125M, scaled to the 400M run).
 
     The two structural tests around this one (thresholds non-decreasing, shares never falling)
     read every expectation off the loaded config, so a bumped gate or weight that keeps the walk
@@ -144,7 +144,7 @@ def test_shipped_stage_walk_is_the_plan_walk(tcfg):
     ]
     assert curriculum.enabled is True
     assert (curriculum.window_episodes, curriculum.min_episodes_at_stage) == (2000, 2000)
-    assert curriculum.max_timesteps_at_stage == 125_000_000
+    assert curriculum.max_timesteps_at_stage == 83_000_000
     assert curriculum.demote_win_rate is None
 
 
@@ -483,8 +483,8 @@ def test_reward_runs_inside_a_real_env():
     action = torch.zeros((8, 2), dtype=torch.int64)
     for _ in range(20):
         _, reward, _, _, _ = env.step(action)
-    assert reward.shape == (8,) and reward.dtype == torch.float32
-    assert torch.isfinite(reward).all()
+        assert reward.shape == (8,) and reward.dtype == torch.float32
+        assert torch.isfinite(reward).all()
 
 
 # ---------------------------------------------------------------------------
@@ -604,12 +604,11 @@ def test_every_tier_field_reaches_the_applier():
     assert set(TIER_FIELDS) == set(mgr._tables)
     assert set(TIER_FIELDS) == set(DifficultyTier.__dataclass_fields__) - {"name"}
     assert {"aggression", "hero_focus"} <= set(TIER_FIELDS)
-    assert TIER_FIELDS["aggression"] == 1.0 and TIER_FIELDS["hero_focus"] == 1.0
 
 
 def test_a_tier_that_names_no_knob_is_the_bots_as_authored(tmp_path):
     """B4.1's "default 1.0", pinned where it is LIVE. Nothing reads TIER_FIELDS' values (only its
-    keys), so the assertion above cannot see the real default: the dataclass's own. A default of
+    keys), so the real default is the dataclass's own. A default of
     0.5 there would halve the aggression and hero focus of every tier that omits the two keys --
     `hard: {}`, which DifficultyTier's docstring advertises, and every tier in a pre-B4 config."""
     tier = DifficultyTier("x")
@@ -805,10 +804,11 @@ def test_training_monitor_computes_win_rate_and_episode_stats():
     assert recorded["train/shots_fired_mean"] == pytest.approx(3.5)
 
 
-def test_training_monitor_never_resets_unlike_the_curriculum_window():
-    """The whole reason this is a SEPARATE callback: CurriculumCallback's own win_rate is
-    deliberately cleared on every stage transition (see its module docstring), but the
-    training-visibility signal must survive that -- it answers a different question."""
+def test_training_monitor_keeps_its_window_across_rollouts():
+    """A rollout end reports the window and the total but clears neither. This callback has no
+    reset at all -- why it is separate from CurriculumCallback, whose own win_rate is cleared on
+    every stage transition on purpose -- so what this pins is that `_on_rollout_end` leaves the
+    window alone; no curriculum is involved."""
     cb, recorded = _monitor(window_episodes=100)
     for _ in range(5):
         cb.locals = {"infos": [_outcome_info(True, 0)]}
@@ -817,8 +817,6 @@ def test_training_monitor_never_resets_unlike_the_curriculum_window():
     assert recorded["train/episodes_total"] == 5
     assert recorded["train/episodes_window"] == 5
 
-    # Simulate what a curriculum stage transition does to ITS OWN window -- nothing here should
-    # touch this callback's state, since nothing ever calls a reset on it.
     for _ in range(3):
         cb.locals = {"infos": [_outcome_info(False, 2)]}
         cb._on_step()
@@ -1005,7 +1003,7 @@ def test_sb3_vecenv_emits_the_outcome_the_curriculum_needs():
     venv.reset()
 
     seen, seen_stats = [], []
-    for _ in range(cfg.max_episode_steps + 1):
+    for _ in range(cfg.max_agent_steps + 1):   # decisions: the clock truncates by the last one
         _, _, dones, infos = venv.step(np.zeros((8, 2), dtype=np.int64))
         seen += [infos[i]["outcome"] for i in range(8) if dones[i]]
         seen_stats += [infos[i]["episode_stats"] for i in range(8) if dones[i]]
@@ -1074,16 +1072,21 @@ def test_fixed_tier_hook_block_assignment_scores_several_tiers_at_once():
 
 
 def test_fixed_tier_hook_is_deterministic_across_resets():
-    """No RNG at all -- two identically seeded envs must produce identical bot stats, which is
-    what makes an eval number comparable between two checkpoints."""
-    tiers = {"hard": DifficultyTier("hard", aim_noise=0.5)}
+    """No RNG at all, which is what makes an eval number comparable between two checkpoints. The
+    hook holds no generator, so the global one is its only possible source: reseeding that one
+    differently between two calls on identical params must change nothing. Until 2026-10-20 this
+    built two identically seeded envs, which agree whatever the hook draws from the env's own
+    generator."""
+    tiers = {"easy": DifficultyTier("easy", aim_noise=3.0), "hard": DifficultyTier("hard", aim_noise=0.5)}
+    hook = FixedTierHook(tiers, "cpu", torch.arange(16) % 2)   # even envs easy, odd hard
     out = []
-    for _ in range(2):
-        cfg, env = _tiny_env(n_envs=16, seed=3)
-        env.params_hook = FixedTierHook.uniform(tiers, "cpu", 16, "hard")
-        env.reset()
-        out.append(env.params.aim_noise_std_rad.clone())
+    for global_seed in (3, 4):
+        params = _flat_params(16)
+        torch.manual_seed(global_seed)
+        hook(params, torch.ones(16, dtype=torch.bool))
+        out.append(params.aim_noise_std_rad)
     assert torch.equal(out[0], out[1])
+    assert not torch.equal(out[0][0::2, 1:], out[0][1::2, 1:]), "the two tiers wrote the same noise"
 
 
 def test_fixed_tier_hook_rejects_unknown_tier():
@@ -1142,13 +1145,25 @@ def test_eval_requires_tiers_to_exist(tmp_path):
         load_train_config(path)
 
 
-def _eval_tcfg(episodes_per_tier=2, tiers=("easy", "hard")):
+def _eval_tcfg(episodes_per_tier=2, tiers=("easy", "hard"), ticks=None):
+    """`ticks` shortens debug_tiny's 300-tick clock (`sim.max_episode_steps`) for the tests of
+    the evaluator's PLUMBING -- counts, columns, gadget accounting -- which an episode of any
+    length exercises: an `evaluate()` of idle stubs runs every slot to its clock, ~5 s at 300.
+    The reproducibility and curriculum-isolation tests keep the full clock: measured
+    2026-10-20, at 50 ticks an idle hero takes no damage before its episode ends, so neither a
+    changed scenario draw nor a leaked training tier moved a single number."""
     # No holdout eval here: debug_tiny's world is 20x20 and `blank` is the only map that size, so
     # the shipped 60x60 holdout maps could not load. `_holdout_tcfg` below is the 60x60 twin.
+    env_overrides = yaml.safe_load(DEBUG_TINY.read_text())
+    if ticks is not None:
+        env_overrides = deep_merge(env_overrides, {"sim": {"max_episode_steps": ticks}})
     return load_train_config(TRAIN_CONFIG, overrides={
-        "run": {"device": "cpu", "env_overrides": yaml.safe_load(DEBUG_TINY.read_text())},
+        "run": {"device": "cpu", "env_overrides": env_overrides},
         "eval": {"episodes_per_tier": episodes_per_tier, "tiers": list(tiers), "holdout_maps": None},
     })
+
+
+_PLUMBING_TICKS = 50  # 10 decisions an episode: see `_eval_tcfg`
 
 
 class _StubModel:
@@ -1170,7 +1185,7 @@ class _StubModel:
 
 
 def test_evaluator_reports_every_tier_with_the_requested_episode_count():
-    tcfg = _eval_tcfg(episodes_per_tier=3, tiers=("easy", "hard"))
+    tcfg = _eval_tcfg(episodes_per_tier=3, tiers=("easy", "hard"), ticks=_PLUMBING_TICKS)
     ev = TierEvaluator(tcfg)
     assert ev.n_envs == 6
     results = ev.evaluate(_StubModel())
@@ -1184,27 +1199,20 @@ def test_evaluator_reports_every_tier_with_the_requested_episode_count():
         assert 0.0 <= r["win_rate"] <= 1.0
 
 
-def test_evaluator_is_reproducible_across_calls():
+def test_evaluator_is_reproducible_and_unaffected_by_the_training_curriculum():
     """Same seed, same scenarios: two evaluations of the SAME policy must agree exactly, or the
-    metric is measuring env noise rather than the policy."""
-    tcfg = _eval_tcfg()
-    ev = TierEvaluator(tcfg)
-    model = _StubModel()
-    first, second = ev.evaluate(model), ev.evaluate(model)
-    ev.close()
-    assert first == second
+    metric is measuring env noise rather than the policy. And the whole point of "stationary":
+    a TRAINING curriculum walked to its hardest stage between the two shares the tier
+    definitions but not the env, so it must not move these numbers by one bit either.
 
-
-def test_evaluator_is_unaffected_by_the_training_curriculum():
-    """The whole point of "stationary": advancing the training curriculum must not move the
-    eval env's bots, because the two use separate hooks on separate envs."""
+    One test since 2026-10-20: the reproducibility test's two evaluations and the isolation
+    test's two were the same pair, since nothing attaches the walked manager to the eval env
+    (only shared tier state could leak, and the walk between the two calls covers that)."""
     tcfg = _eval_tcfg()
     ev = TierEvaluator(tcfg)
     model = _StubModel()
     before = ev.evaluate(model)
 
-    # Walk a TRAINING curriculum all the way to its hardest stage. It shares the tier
-    # definitions but not the env, so it must not move these numbers by one bit.
     gen = torch.Generator(device="cpu"); gen.manual_seed(0)
     training_mgr = CurriculumManager(tcfg.curriculum, device="cpu", gen=gen)
     while training_mgr.advance():
@@ -1215,14 +1223,13 @@ def test_evaluator_is_unaffected_by_the_training_curriculum():
     ev.close()
 
     assert isinstance(ev.sim.params_hook, FixedTierHook)
-    assert ev.sim.params_hook is not training_mgr
-    assert before == after, "advancing the training curriculum changed the eval numbers"
+    assert before == after, "a second evaluation, after a training curriculum walk, changed the numbers"
 
 
 def test_eval_callback_logs_per_tier_scalars_and_tier_event_dirs(tmp_path):
     from brawl_sim.training.callbacks import TierEvalCallback
 
-    tcfg = _eval_tcfg()
+    tcfg = _eval_tcfg(ticks=_PLUMBING_TICKS)
     ev = TierEvaluator(tcfg)
     recorded = {}
     cb = TierEvalCallback(ev, every_timesteps=1000, log_dir=tmp_path,
@@ -1261,10 +1268,9 @@ def test_eval_callback_fires_once_per_interval_not_once_per_overshoot(tmp_path):
     identical weights."""
     from brawl_sim.training.callbacks import TierEvalCallback
 
-    tcfg = _eval_tcfg()
-    ev = TierEvaluator(tcfg)
     calls = []
-    cb = TierEvalCallback(ev, every_timesteps=100, log_dir=tmp_path, at_start=False, verbose=0)
+    cb = TierEvalCallback(_CannedEvaluator(), every_timesteps=100, log_dir=tmp_path,
+                          at_start=False, verbose=0)
     cb.model = SimpleNamespace(logger=SimpleNamespace(record=lambda *a, **k: None))
     cb._evaluate = lambda: calls.append(cb.num_timesteps)
 
@@ -1273,7 +1279,6 @@ def test_eval_callback_fires_once_per_interval_not_once_per_overshoot(tmp_path):
     for t in (50, 1000, 1050, 1100, 1101):
         cb.num_timesteps = t
         cb._on_step()
-    ev.close()
     assert calls == [1000, 1100], f"expected two evals, got {calls}"
 
 
@@ -1298,7 +1303,7 @@ def test_evaluator_counts_the_gadgets_a_real_rollout_throws(model_cls, per_episo
     """Every hero spawns with its gadget charged, so one press on the first decision is one throw
     in every slot, and the idle policy throws none. This reads the REAL env's mask: a count keyed
     to the super's column would find an uncharged super there and report 0.0 for both."""
-    ev = TierEvaluator(_eval_tcfg(episodes_per_tier=3))
+    ev = TierEvaluator(_eval_tcfg(episodes_per_tier=3, ticks=_PLUMBING_TICKS))
     results = ev.evaluate(model_cls())
     ev.close()
     assert {name: r["gadgets_used"] for name, r in results.items()} == {
@@ -1307,8 +1312,10 @@ def test_evaluator_counts_the_gadgets_a_real_rollout_throws(model_cls, per_episo
 
 class _ScriptedVenv:
     """Four slots with scripted gadget legality and dones, for the count's two gates. The mask is
-    the wrapper's real layout, written out: 17 move columns, then [no-fire, attack, super, gadget],
-    so the gadget is column 20 of 21 (brawl_sim/wrappers/sb3_vecenv.action_masks)."""
+    the wrapper's real layout under train.yaml, written out: 17 move columns, then [no-fire,
+    attack, super, gadget, auto-aim], so the gadget is column 20 of 22
+    (brawl_sim/wrappers/sb3_vecenv.action_masks). The auto-aim column holds the gadget's
+    OPPOSITE, so a count reading the last column instead of the gadget's cannot pass."""
     def __init__(self, gadget_legal, dones):
         self.gadget_legal, self.dones, self.t = gadget_legal, dones, 0
 
@@ -1320,8 +1327,9 @@ class _ScriptedVenv:
         return self._obs()
 
     def action_masks(self):
-        masks = np.ones((4, 21), dtype=bool)
+        masks = np.ones((4, 22), dtype=bool)
         masks[:, 20] = self.gadget_legal[self.t]
+        masks[:, 21] = np.logical_not(self.gadget_legal[self.t])
         return masks
 
     def step(self, action):
@@ -1345,6 +1353,7 @@ def test_evaluator_counts_a_gadget_only_where_legal_and_only_in_the_first_episod
     count; slot 2's first press and slot 3's last are masked out, which the sim does not throw.
     Per slot that is 1, 2, 2, 2, and easy holds slots 0-1, hard 2-3."""
     ev = TierEvaluator(_eval_tcfg(episodes_per_tier=2))
+    assert sum(ev.env_cfg.action_nvec) == 22   # the layout _ScriptedVenv writes out
     ev.venv = _ScriptedVenv(gadget_legal=[[1, 1, 0, 1], [1, 1, 1, 1], [1, 1, 1, 0]],
                             dones=[[1, 0, 0, 0], [0, 1, 0, 0], [1, 1, 1, 1]])
     results = ev.evaluate(_AlwaysGadgetModel())
@@ -1909,7 +1918,11 @@ def test_watch_builds_its_env_and_its_spec_from_the_same_overrides(monkeypatch):
 def test_train_script_smoke_then_watch_the_checkpoint(tmp_path):
     """The whole pipeline in one pass, since training is the expensive part:
     config -> env + curriculum hook -> MaskablePPO -> learn (with stationary eval) -> save,
-    then load the saved checkpoint back and play a watchable match against a pinned tier."""
+    then load the saved checkpoint back and play a watchable match against a pinned tier.
+
+    --smoke exactly as it ships: 8192 timesteps on 64 envs, its four forced stage advances, its
+    checkpoint and eval intervals. (Its 64 envs were 8 until 2026-10-21; scripts/train.py's
+    `_SMOKE` says why.)"""
     pytest.importorskip("sb3_contrib")
     from scripts.train import main as train_main
 
@@ -1918,11 +1931,18 @@ def test_train_script_smoke_then_watch_the_checkpoint(tmp_path):
     assert (run_dir / "final_model.zip").exists()
     assert (run_dir / "train.yaml").exists()
     assert (run_dir / "best_model.zip").exists(), "stationary eval never saved a best model"
-    assert json.loads((run_dir / "curriculum.json").read_text())["n_stages"] == 5
+    curriculum = json.loads((run_dir / "curriculum.json").read_text())
+    assert curriculum["n_stages"] == 5
+    # the curriculum hook really moved: --smoke's stage budget forces an advance every 2048
+    # timesteps, so the run walks every stage, and the checkpoint callback fired on its interval
+    assert curriculum["stage_index"] == curriculum["n_stages"] - 1
+    assert len(curriculum["history"]) == curriculum["n_stages"] - 1
+    assert sorted(p.name for p in (run_dir / "checkpoints").glob("model_*_steps.zip")) == [
+        "model_4096_steps.zip", "model_8192_steps.zip"]
 
     # eval columns reached the machine-readable log, and each tier got its own event dir
     header = (run_dir / "logs" / "progress.csv").read_text().splitlines()[0]
-    for tier in ("easy", "medium", "hard", "elite"):
+    for tier in ("easy", "medium", "hard", "veteran", "expert", "elite"):   # train.yaml's eval.tiers
         assert f"eval/win_rate_{tier}" in header
         assert list((run_dir / "logs" / f"eval_{tier}").glob("events.out.tfevents.*"))
 
@@ -1985,8 +2005,8 @@ def test_the_model_sees_the_grid_channels_first_as_the_env_builds_it():
 
     tcfg = _tiny_run_tcfg()
     model, venv, _ = build_run(tcfg)
-    # deploy5 since 2026-09-25 (the operator moved train.yaml to it); its grid is deploy4's 13 channels
-    assert tcfg.run.agent_obs == "configs/agent_obs_deploy5.yaml"
+    # deploy6 since 2026-10-12 (the operator moved train.yaml to it); its grid is deploy4's 13 channels
+    assert tcfg.run.agent_obs == "configs/agent_obs_deploy6.yaml"
     assert venv.observation_space["grid"].shape == (13, 10, 14)
     assert model.observation_space["grid"].shape == (13, 10, 14)
     assert model.policy.features_extractor.cnn[0].in_channels == 13
@@ -2089,8 +2109,10 @@ def test_restart_schedules_runs_the_config_schedules_over_the_resumed_steps_only
 @pytest.mark.slow
 def test_train_script_logs_holdout_columns_next_to_the_training_map_ones(tmp_path, monkeypatch):
     """scripts/train.py's own wiring of the second evaluator, end to end: --smoke's sizes on a
-    60x60 world that trains on two maps and holds the shipped pair out. 1024 decisions is two
-    rollouts and two evals (at_start + end of training); nothing here needs the policy to learn.
+    60x60 world that trains on two maps and holds the shipped pair out. 1024 timesteps is two
+    rollouts (8 decisions of 64 envs each: the sim is dispatch-bound, so 16 wide decisions cost a
+    fraction of 128 narrow ones) and two evals (at_start + end of training); nothing here needs
+    the policy to learn.
 
     The column NAMES alone cannot show the wiring is right: hand the callback the training-map
     evaluator twice and every eval/holdout_* column still appears, as a copy of the training-map
@@ -2113,6 +2135,7 @@ def test_train_script_logs_holdout_columns_next_to_the_training_map_ones(tmp_pat
     assert train_main([
         "--smoke", "--out-dir", str(tmp_path),
         "--set", "run.name=smoke_holdout", "--set", "run.total_timesteps=1024",
+        "--set", "run.n_envs=64", "--set", "ppo.n_steps=8",
         "--set", "run.env_overrides.world.map_h=60", "--set", "run.env_overrides.world.map_w=60",
         "--set", "run.env_overrides.world.maps=[open, bushy]",
         "--set", "run.env_overrides.world.map_selection=uniform",
@@ -2128,6 +2151,9 @@ def test_train_script_logs_holdout_columns_next_to_the_training_map_ones(tmp_pat
     assert callback.evaluator.sim.cfg.map_names == ("open", "bushy")
     assert callback.holdout_evaluator.sim.cfg.map_names == ("split_river", "hollow_ring")
     assert callback.holdout_evaluator is not callback.evaluator
+    # both evaluators score against pinned tiers, never a curriculum's
+    assert isinstance(callback.evaluator.sim.params_hook, FixedTierHook)
+    assert isinstance(callback.holdout_evaluator.sim.params_hook, FixedTierHook)
     # ...and every eval of the run scored the holdout maps, on all six tiers
     assert callback.history
     for entry in callback.history:
@@ -2176,10 +2202,16 @@ def test_watch_builds_a_real_matplotlib_view(tmp_path):
     viewer._draw_frame(frames["ent_pos"].shape[0] - 1)
 
 
-@pytest.mark.slow
-def test_watch_rejects_a_mismatched_train_config(tmp_path):
-    """A model trained under a different observation layout must fail with a pointer at the
-    config, not a bare shape error from inside the policy's first Linear layer."""
+def test_watch_finds_the_runs_train_yaml_and_refuses_to_guess_without_one(tmp_path):
+    """`find_train_config` reads the config next to a run's model and next to its checkpoints'
+    parent, and with neither raises rather than falling back to configs/train.yaml, whose
+    env_overrides may not be the ones the model trained under. (The observation-layout check
+    this test was once named after is `_check_spaces`, tested in test_audit_attack_cadence.py.)"""
     from scripts.watch import find_train_config
+    run = tmp_path / "run"
+    (run / "checkpoints").mkdir(parents=True)
+    (run / "train.yaml").write_text("{}")
+    assert find_train_config(run / "final_model.zip") == run / "train.yaml"
+    assert find_train_config(run / "checkpoints" / "model_8_steps.zip") == run / "train.yaml"
     with pytest.raises(FileNotFoundError, match="no train.yaml"):
         find_train_config(tmp_path / "nowhere" / "model.zip")

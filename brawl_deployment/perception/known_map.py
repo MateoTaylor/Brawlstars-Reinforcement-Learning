@@ -1,5 +1,5 @@
-"""A hand-labelled game map, for the deploy loop to localize against. KNOWN_MAP_LOCALIZATION_PLAN.md
-sections 2, 4 and 7.
+"""A hand-labelled game map, for the deploy loop to localize against.
+archive/KNOWN_MAP_LOCALIZATION_PLAN.md sections 2, 4 and 7.
 
 The label is `brawl_deployment/data/maps/<name>.csv`, drawn with `scripts/map_label.py` over a
 top-down image of the map (`<name>.png`; the lattice it was drawn against is in `<name>.json`,

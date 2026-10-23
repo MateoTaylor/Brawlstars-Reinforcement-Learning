@@ -1,5 +1,5 @@
-"""Label a whole game map cell by cell, over a top-down image of it. KNOWN_MAP_LOCALIZATION_PLAN.md
-sections 4 and 5.
+"""Label a whole game map cell by cell, over a top-down image of it.
+archive/KNOWN_MAP_LOCALIZATION_PLAN.md sections 4 and 5.
 
     .venv/Scripts/python.exe scripts/map_label.py dark_passage --image <path to the png>
     .venv/Scripts/python.exe scripts/map_label.py dark_passage                 # resume

@@ -10,6 +10,7 @@ The one structural claim is `BULL_SLUG`: sharing Shelly's `Proj` member would ha
 in every behavioural test here and still wrong, because `kind_onehot` is the only categorical
 weapon signal the policy receives.
 """
+import copy
 import math
 from dataclasses import dataclass
 
@@ -22,6 +23,11 @@ from brawl_sim.core import projectiles as proj
 from brawl_sim.core.state import allocate
 
 CONFIGS_DEFAULT = "configs/default.yaml"
+#: default.yaml + brawlers.yaml, parsed once; every `_setup` gets its own deep copy.
+_BASE_SPEC = {
+    **yaml.safe_load(open(CONFIGS_DEFAULT).read()),
+    **yaml.safe_load(open("configs/brawlers.yaml").read()),
+}
 BULL = int(Kind.BOT_BULL)
 SHELLY = int(Kind.BOT_RIFLE)
 PELLET_DAMAGE = 880.0
@@ -37,13 +43,9 @@ def _setup(map_h=40, map_w=40):
         "world": {"map_h": map_h, "map_w": map_w},
         "observation": {"include_world_grid": False},
     })
-    spec = {
-        **yaml.safe_load(open(CONFIGS_DEFAULT).read()),
-        **yaml.safe_load(open("configs/brawlers.yaml").read()),
-    }
     gen = torch.Generator(device="cpu")
     gen.manual_seed(0)
-    params = build_params(cfg, n_envs=1, device="cpu", gen=gen, spec=spec)
+    params = build_params(cfg, n_envs=1, device="cpu", gen=gen, spec=copy.deepcopy(_BASE_SPEC))
 
     state = allocate(cfg, n_envs=1, device="cpu", verbose=False)
     state.ent_alive.fill_(True)

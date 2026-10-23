@@ -32,13 +32,6 @@ DIMENSIONS = {
     "vine_springs": (60, 60), "vine_canal": (60, 60), "vine_hollow": (60, 60),
 }
 ALL_MAPS = list(DIMENSIONS)
-GENERATED_MAPS = [
-    "broken_wall", "stone_fort", "twin_ponds", "cross_creek", "split_river", "narrow_pass",
-    "dry_gulch", "thorn_field", "reed_marsh", "hollow_ring",
-    "pond_maze", "canal_maze", "picket_maze", "lagoon_ring", "square_lakes", "bush_halo",
-    "bramble_ponds", "bramble_bend", "bramble_stars", "moon_gate", "half_moon", "moon_pools",
-    "vine_springs", "vine_canal", "vine_hollow",
-]
 # The real maps have one spawn per player, ten, and the spawner needs one per entity (the hero
 # plus default.yaml's nine enemies), so the transcriptions keep exactly ten.
 SCREENSHOT_MAPS = ["hot_maze", "ghost_point", "shadow_spirits", "crescent_lakes", "twisting_vines"]
@@ -134,14 +127,8 @@ def test_walled_has_water():
     assert sum(row.count("~") for row in grid) > 0
 
 
-@pytest.mark.parametrize("name", GENERATED_MAPS)
-def test_generated_map_has_exactly_sixteen_spawns(name):
-    """The generator places `N_SPAWNS = 16` markers -- a hand edit that
-    drops or duplicates one would still pass the >= 12 minimum above, so the exact count is
-    pinned here. The literal 16 is deliberate: reading `generate.N_SPAWNS` would let the test
-    follow a changed constant."""
-    grid = _read_grid(name)
-    assert sum(row.count("S") for row in grid) == 16
+# The generated maps' exact 16 spawns are pinned in tests/test_maps.py (with validate_map), and
+# every generated CSV byte for byte against its seed there too; the copy here went 2026-10-20.
 
 
 @pytest.mark.parametrize("name", ALL_MAPS)

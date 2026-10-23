@@ -1,5 +1,9 @@
+import copy
+from pathlib import Path
+
 import pytest
 import torch
+import yaml
 
 from brawl_sim.config import _deep_merge, load_config, build_params, validate
 from brawl_sim.constants import Tile, TILE_BLOCKS_UNIT
@@ -8,6 +12,13 @@ from brawl_sim.core.state import allocate
 from brawl_sim.maps.loader import MAX_BOX_SPOTS
 
 CONFIGS_DEFAULT = "configs/default.yaml"
+# The brawler spec, parsed once per module: until 2026-10-20 every helper call re-read both YAML
+# files (~16 ms a call). Each call merges into its own DEEP copy: `_deep_merge` copies only the
+# dicts it patches and shares the rest with its input.
+_SPEC = {
+    **yaml.safe_load(Path(CONFIGS_DEFAULT).read_text()),
+    **yaml.safe_load(Path("configs/brawlers.yaml").read_text()),
+}
 
 
 def _cfg_and_params(n_envs=1, max_boxes=16, n_boxes=8, cubes=None):
@@ -20,15 +31,11 @@ def _cfg_and_params(n_envs=1, max_boxes=16, n_boxes=8, cubes=None):
         "cubes": cubes or {},
     }
     cfg = load_config(CONFIGS_DEFAULT, overrides=overrides)
-    import yaml
     # `n_boxes` and the cube numbers are PER-ENV PARAMS, read by build_params from the spec, not
     # from cfg -- so the overrides have to reach the spec too. Until 2026-09-25 they reached only
     # cfg, and every `n_boxes=` below was a no-op that default.yaml's own 8 happened to satisfy;
     # the day default.yaml went to 48 (every marked spot), the 8-crate assertions failed.
-    spec = _deep_merge({
-        **yaml.safe_load(open(CONFIGS_DEFAULT).read()),
-        **yaml.safe_load(open("configs/brawlers.yaml").read()),
-    }, overrides)
+    spec = _deep_merge(copy.deepcopy(_SPEC), overrides)
     gen = torch.Generator(device="cpu")
     gen.manual_seed(0)
     params = build_params(cfg, n_envs=n_envs, device="cpu", gen=gen, spec=spec)
@@ -177,7 +184,11 @@ def test_damage_boxes_clamps_at_zero():
 
 
 def test_breaking_a_box_yields_exactly_cubes_per_box():
-    cfg, params, gen = _cfg_and_params(n_boxes=1)
+    """One pickup per broken crate, holding `cubes_per_box` cubes. Run at 3, not the shipped 1: a
+    pickup holding 1 is also what writing the alive flag (or any constant 1) into `pku_cubes`
+    would produce. Until 2026-10-20 it ran at 1 and compared against the param itself."""
+    cfg, params, gen = _cfg_and_params(n_boxes=1, cubes={"cubes_per_box": 3})
+    assert int(params.cubes_per_box[0]) == 3, "the cubes_per_box override never reached params"
     state = _fresh_state(cfg)
     bank = _fake_bank(_KNOWN_FLOOR_SPOTS)
     reset_mask = torch.ones(1, dtype=torch.bool)
@@ -195,7 +206,7 @@ def test_breaking_a_box_yields_exactly_cubes_per_box():
     claimed = state.pku_alive[0]
     assert int(claimed.sum()) == 1
     pickup_idx = int(torch.nonzero(claimed)[0, 0])
-    assert int(state.pku_cubes[0, pickup_idx]) == int(params.cubes_per_box[0].item())
+    assert int(state.pku_cubes[0, pickup_idx]) == 3
 
 
 def test_resolve_broken_boxes_ignores_undamaged_boxes():
@@ -302,11 +313,9 @@ def test_a_broken_crate_puts_its_pickup_at_its_landing_spot():
 
 
 def test_validate_rejects_a_scatter_band_upside_down():
-    import yaml
     band = {"cubes": {"box_scatter_min_tiles": 2.0, "box_scatter_max_tiles": 1.0}}
     cfg = load_config(CONFIGS_DEFAULT, overrides=band)   # the real map size, so nothing else trips
-    spec = {**yaml.safe_load(open(CONFIGS_DEFAULT).read()),
-            **yaml.safe_load(open("configs/brawlers.yaml").read())}
+    spec = copy.deepcopy(_SPEC)
     params = build_params(cfg, n_envs=1, device="cpu", gen=torch.Generator().manual_seed(0), spec=spec)
     with pytest.raises(ValueError, match="box_scatter"):
         validate(cfg, params)
