@@ -5,8 +5,10 @@ The live path end to end -- `VisionStack.build` (the shipped detectors, classifi
 tracker, grid, shadow and dead-bin mask exactly as `scripts/deploy_run.py` wires them -- with three
 substitutions and nothing else: the capture hands the loop the clip's frames (resized to the
 calibrated viewport, `brawl_deployment.capture.to_viewport`), the controls drive a `NullBackend`,
-and the window guard always answers "fine". The loop's clock is the clip's: the shadow hero is
-advanced by the gap between the frames it was fed, not by how long a CPU detector took.
+and the window guard always answers "fine". The loop's clocks are the clip's. The shadow hero is
+advanced by the gap between the frames it was fed, not by how long a CPU detector took. Match time
+(`meta.time_frac` and the match watchdog) is clip seconds since the gate opened, so a replay's
+decisions don't depend on how fast the CPU ran it.
 
 What it answers: does the policy, on the footage where the
 deployed agent stood pushing into a wall, pick a legal bin once the dead-bin mask is on? With
@@ -22,6 +24,8 @@ Usage (repo root, the venv's python; `--device cpu` keeps every model off the GP
     .venv/Scripts/python.exe scripts/probes/replay_clip.py <clip> --run runs/<deploy5 run> --mask on
     .venv/Scripts/python.exe scripts/probes/replay_clip.py <clip> --map dark_passage --mask on \
         --device cpu --csv <out.csv>       # archive/KNOWN_MAP_LOCALIZATION_PLAN.md step K4
+    .venv/Scripts/python.exe scripts/probes/replay_clip.py <clip> --map dark_passage \
+        --terrain dark_passage --mask on --device cpu   # the classifier before Starfruit's labels
 
 `--start` skips the clip's head (the gate still has to open, so leave a few seconds before the
 window); `--window` is the stretch reported in detail. Writes nothing; `--csv` dumps every tick's
@@ -59,7 +63,7 @@ from brawl_deployment.perception.known_map import KnownMap              # noqa: 
 from brawl_deployment.policy import DeployedPolicy                      # noqa: E402
 from brawl_sim.constants import TILE_TO_CHAR, Tile                      # noqa: E402
 from brawl_vision.clips import ClipReader                               # noqa: E402
-from brawl_vision.config import load_vision_config                      # noqa: E402
+from brawl_vision.config import TERRAIN_MODELS, load_vision_config      # noqa: E402
 from brawl_vision.terrain.labeling import CLASSES                       # noqa: E402
 from brawl_vision.terrain.occupancy import OccupancyMap, compare_to_truth  # noqa: E402
 
@@ -157,7 +161,7 @@ def build_loop(dcfg, *, vision, policy, log):
     buttons = Buttons(null,
                       attack=(dcfg.control_attack_tap[0] * w, dcfg.control_attack_tap[1] * h),
                       super_=cal.button("super"), gadget=cal.button("gadget"),
-                      aim_radius_px=dcfg.control_aim_radius_px)
+                      aim_radius_px=dcfg.control_aim_radius_px, screen=cal.screen)
     controls = Controls(backend=null,
                         joystick=Joystick(null, cal.joystick_anchor, cal.joystick_radius_px,
                                           n_bins=int(policy.cfg.n_move_bins)),
@@ -183,8 +187,10 @@ def replay(clip, dcfg, *, vision, policy, start: float, stop: float | None, quie
     # Record a stop and keep going: on a clip the point is to see every decision, and the reason
     # is reported with its timestamp.
     loop._stop = lambda reason: stops.append((capture.pending.t, reason))
-    clock = {"dt": loop.tick_seconds}
+    # Both of the loop's clocks are the clip's (module docstring).
+    clock = {"dt": loop.tick_seconds, "t": 0.0}
     loop._elapsed_since_last_tick = lambda now: clock["dt"]
+    loop._match_clock = lambda: clock["t"]
 
     rows = []
     period = loop.tick_seconds
@@ -206,6 +212,7 @@ def replay(clip, dcfg, *, vision, policy, start: float, stop: float | None, quie
             # like `DeployLoop._pace`.
             next_t = frame.t + period if (next_t is None or frame.t - next_t > period) else next_t + period
             clock["dt"] = period if last_t is None else max(frame.t - last_t, 1e-3)
+            clock["t"] = frame.t
             last_t = frame.t
             capture.pending = dataclasses.replace(frame, image=to_viewport(frame.image))
             loop.tick()
@@ -299,6 +306,10 @@ def main(argv=None) -> int:
     ap.add_argument("--map", default=None,
                     help="labelled map to localize on (dark_passage); default "
                          "configs/deployment.yaml map.name")
+    ap.add_argument("--terrain", default=None, choices=sorted(TERRAIN_MODELS),
+                    help="shipped terrain classifier: default (terrain.pt), dark_passage (the "
+                         "one before Starfruit Supernova's labels) or truth (trained with "
+                         "Truth's labels as well); default configs/deployment.yaml terrain.model")
     ap.add_argument("--mask", choices=("off", "on", "both"), default="both")
     ap.add_argument("--device", default="cpu", help="cpu keeps the detectors and policy off the GPU")
     ap.add_argument("--start", type=float, default=0.0, help="clip seconds to skip before feeding")
@@ -309,6 +320,10 @@ def main(argv=None) -> int:
     ap.add_argument("--max-misses", type=int, default=None,
                     help="the enemy tracks' coast in decisions, in place of the run's "
                          "slots.max_misses (12 replays a deploy6 run's memory)")
+    ap.add_argument("--star-power", choices=("on", "off"), default=None,
+                    help="the clip's star power, in place of configs/deployment.yaml's "
+                         "loadout.star_power (design 5.2). The Nulls Brawl clips' Bull has "
+                         "Berserker, so replay those with 'on'")
     ap.add_argument("--quiet", action="store_true")
     args = ap.parse_args(argv)
 
@@ -319,6 +334,10 @@ def main(argv=None) -> int:
         overrides.setdefault("run", {})["checkpoint"] = args.checkpoint
     if args.map:
         overrides["map"] = {"name": args.map}
+    if args.terrain:
+        overrides["terrain"] = {"model": args.terrain}
+    if args.star_power:
+        overrides["loadout"] = {"star_power": args.star_power == "on"}
     base = load_deployment_config(overrides=overrides)
     policy = DeployedPolicy.from_run(ROOT / base.run_dir, checkpoint=base.run_checkpoint,
                                      device=args.device, deterministic=True)
@@ -327,9 +346,9 @@ def main(argv=None) -> int:
         vcfg = load_vision_config(overrides={"detector": {"device": "cpu"},
                                              "projectile": {"device": "cpu"},
                                              "classifier": {"device": "cpu"}})
-    vision = VisionStack.build(vision_cfg=vcfg)
+    vision = VisionStack.build(vision_cfg=vcfg, terrain=base.terrain_model)
     print(f"clip {Path(args.clip).name}  run {base.run_dir}  checkpoint {base.run_checkpoint}  "
-          f"map {base.map_name}  device {args.device}  "
+          f"map {base.map_name}  terrain {base.terrain_model}  device {args.device}  "
           f"feed from {args.start:.1f}s  window {args.window[0]:.0f}-{args.window[1]:.0f}s")
 
     runs = {}
@@ -346,6 +365,8 @@ def main(argv=None) -> int:
         notes = Counter(r["note"] or "decided" for r in rows)
         print(f"    {fed} ticks, {len(rows)} decision ticks in {time.perf_counter() - t0:.0f} s; "
               f"notes {dict(notes)}")
+        if loop.loadout_note:
+            print(f"    {loop.loadout_note}")
         for t, m in logs:
             if "match" in m or "gate" in m or m.startswith("map:"):
                 print(f"    log t={t:6.1f}s: {m}")

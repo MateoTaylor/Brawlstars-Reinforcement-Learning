@@ -9,8 +9,8 @@ import torch
 import yaml
 
 from brawl_sim.config import (
-    KIND_YAML_NAMES,
     _deep_merge,
+    kind_yaml_names,
     build_params,
     load_config,
     load_randomization,
@@ -76,8 +76,8 @@ def test_every_shipped_bot_kind_authors_both_difficulty_axes():
     this reads them off the BUILT tensors rather than the YAML dict so a misspelled key
     (`agression:`) fails here too. The hero block authors neither -- nothing reads them for it."""
     _, params = _build_and_validate()
-    for k, name in enumerate(KIND_YAML_NAMES):
-        if k == int(Kind.HERO_MORTIS):
+    for k, name in enumerate(kind_yaml_names()):
+        if k == int(Kind.HERO):
             assert float(params.aggression[:, k].max()) == 0, "the hero block authors no aggression"
             assert float(params.hero_focus[:, k].max()) == 0, "the hero block authors no hero_focus"
             continue
@@ -93,13 +93,13 @@ def test_the_shipped_hero_authors_the_gadget_as_specified_and_no_bot_has_one():
     built tensors so a renamed or misspelled key fails here rather than as a gadget that never
     fires. `gadget_cooldown: 0` on every bot is what "no gadget" means."""
     _, params = _build_and_validate()
-    h = int(Kind.HERO_MORTIS)
+    h = int(Kind.HERO)
     assert float(params.gadget_cooldown[0, h]) == 18.0
     assert float(params.gadget_range[0, h]) == 2.0
     assert abs(float(params.gadget_flight_seconds[0, h]) - 0.2) < 1e-6
     assert float(params.gadget_damage[0, h]) == 2000.0
     assert float(params.gadget_radius[0, h]) == 1.0
-    for k, name in enumerate(KIND_YAML_NAMES):
+    for k, name in enumerate(kind_yaml_names()):
         if k != h:
             assert float(params.gadget_cooldown[:, k].max()) == 0, f"{name} must not have a gadget"
 
@@ -718,3 +718,123 @@ def test_training_skips_the_raw_los_fields_and_default_yaml_keeps_them():
     assert load_config(CONFIGS / "default.yaml").obs_include_raw_los is True
     merged = load_config(CONFIGS.parent / tcfg.run.env_config, overrides=tcfg.run.env_overrides or None)
     assert merged.obs_include_raw_los is False
+
+
+# ---- configs/agent_obs_bull.yaml: deploy6 for Bull (BULL_HERO_PLAN.md D6) -----------------------
+#
+# The hero is a run setting, `entities.hero` (D1, the row swap), and the spec is the run's other
+# choice, so a Bull run names both and nothing ties one to the other. Bull's spec is deploy6 with
+# D6's changes and no others, pinned group by group below, so every rule deploy6's tests above
+# hold for the actor (no type leak, no cube count, nothing unsuppliable) holds here unchanged.
+# `hero.slow_window` comes from the live shadow (Phase 7b, built 2026-10-28), and the deploy-spec
+# coverage tests in test_deployment_shadow.py and test_deployment_zone.py reach this file by name.
+
+BULL_SPEC = CONFIGS / "agent_obs_bull.yaml"
+
+# The run command the yaml header gives, as `--set`s.
+BULL_RUN_SETS = ("run.agent_obs=configs/agent_obs_bull.yaml", "run.env_overrides.entities.hero=bull")
+
+# D6. Out: the long-dash pair, 0 on every Bull step. In: the Stomper's window after the gadget
+# pair, and the three status timers after the critic's `entities.dashing`.
+LONG_DASH_FIELDS = ("hero.long_dash_ready", "hero.long_dash_frac")
+SLOW_WINDOW_FIELD = "hero.slow_window"
+STATUS_TIMER_FIELDS = ("entities.slowed_t", "entities.stunned_t", "entities.airborne_t")
+
+
+def test_bull_agent_obs_yaml_loads_as_a_real_agent_spec():
+    """deploy6's groups at its caps, `self` one column narrower and `critic_enemies` three wider.
+    The column numbers are the ones the yaml header and docs/AGENT_OBS_BULL.md document."""
+    from brawl_sim.core.obs_select import agent_obs_index_map, agent_space, load_agent_spec
+    from brawl_sim.wrappers.sb3_features import BrawlFeaturesExtractor, default_policy_kwargs
+
+    cfg = load_config(CONFIGS / "default.yaml")
+    spec = load_agent_spec(BULL_SPEC, cfg)
+    assert spec.fair is True and spec.normalize is True
+    assert {g.name: g.shape for g in spec.all_groups} == {
+        "self": (26,), "enemies": (9, 10), "projectiles": (12, 6), "zone": (5,),
+        "history": (78,), "grid": (13, 13, 21), "critic_enemies": (9, 28), "critic_world": (6,),
+    }
+    assert [g.critic for g in spec.all_groups] == [False] * 6 + [True] * 2
+
+    index = agent_obs_index_map(spec, cfg)
+    assert index["self"]["hero.gadget_ready"] == (21, 22)
+    assert index["self"]["hero.gadget_charge_frac"] == (22, 23)
+    assert index["self"][SLOW_WINDOW_FIELD] == (23, 24), (
+        "right after the gadget pair, so the Stomper's three inputs read together")
+    assert index["self"]["meta.n_enemies_alive"] == (25, 26)
+    assert [index["critic_enemies"][f] for f in ("entities.dashing", *STATUS_TIMER_FIELDS)] == [
+        (19, 20), (20, 21), (21, 22), (22, 23)]
+
+    kwargs = default_policy_kwargs(spec, cfg)
+    fe = BrawlFeaturesExtractor(agent_space(spec, cfg), **kwargs["features_extractor_kwargs"])
+    assert fe.cnn[0].in_channels == 13
+    assert fe.mlp[0].in_features == 271 == 26 + 9 * 10 + 12 * 6 + 5 + 78
+    assert fe.features_dim - fe.actor_dim == 258 == 9 * 28 + 6
+
+
+def test_the_bull_run_command_trains_bull_at_its_pinned_input_widths():
+    """The two `--set`s the yaml header gives, through `parse_overrides` and configs/train.yaml as
+    scripts/train.py loads them: Bull fills Kind.HERO, every env override train.yaml already makes
+    (the 12-decision coast, auto-aim, the gas pace) survives the deep merge, and the extractor
+    takes 13 grid channels and 274 actor floats, deploy6's 275 less the one column D6 nets out,
+    with 258 critic floats set aside for the value head."""
+    from brawl_sim.core import obs_select
+    from brawl_sim.training.config import load_train_config, parse_overrides
+    from brawl_sim.wrappers.sb3_features import default_policy_kwargs
+
+    header = BULL_SPEC.read_text(encoding="utf-8")
+    assert all(f"--set {s}" in header for s in BULL_RUN_SETS), "the yaml header's run command"
+    plain = load_train_config(CONFIGS / "train.yaml").run.env_overrides
+    tcfg = load_train_config(CONFIGS / "train.yaml", overrides=parse_overrides(BULL_RUN_SETS))
+    assert tcfg.run.agent_obs == "configs/agent_obs_bull.yaml"
+    assert tcfg.run.env_overrides == {
+        **plain, "entities": {**plain.get("entities", {}), "hero": "bull"}}
+
+    repo = CONFIGS.parent
+    env_cfg = load_config(repo / tcfg.run.env_config, overrides=tcfg.run.env_overrides)
+    assert env_cfg.hero == "bull" and env_cfg.auto_aim is True
+    spec = obs_select.load_agent_spec(repo / tcfg.run.agent_obs, env_cfg)
+    kwargs = default_policy_kwargs(spec, env_cfg)
+    fe = kwargs["features_extractor_class"](obs_select.agent_space(spec, env_cfg),
+                                            **kwargs["features_extractor_kwargs"])
+    assert fe.critic_keys == ("critic_enemies", "critic_world")
+    assert fe.cnn[0].in_channels == 13
+    assert fe.mlp[0].in_features == 274
+    assert fe.features_dim - fe.actor_dim == 258
+
+
+def test_bull_differs_from_deploy6_by_exactly_d6():
+    """Pinned the way deploy6 is against low-info: group by group in column order, so a column
+    means the same thing in both files wherever D6 did not move it, and every group's kind, rows
+    and grid planes are deploy6's."""
+    from brawl_sim.core.obs_select import load_agent_spec
+
+    cfg = load_config(CONFIGS / "default.yaml")
+    d6 = load_agent_spec(DEPLOY6, cfg)
+    bull = load_agent_spec(BULL_SPEC, cfg)
+    assert (bull.fair, bull.normalize) == (d6.fair, d6.normalize)
+
+    want = {g.name: list(g.fields) for g in d6.all_groups}
+    want["self"] = [f for f in want["self"] if f not in LONG_DASH_FIELDS]
+    i = want["self"].index("hero.gadget_charge_frac") + 1
+    want["self"][i:i] = [SLOW_WINDOW_FIELD]
+    i = want["critic_enemies"].index("entities.dashing") + 1
+    want["critic_enemies"][i:i] = STATUS_TIMER_FIELDS
+    assert {g.name: list(g.fields) for g in bull.all_groups} == want
+
+    d6_groups = {g.name: g for g in d6.all_groups}
+    for g in bull.all_groups:
+        d = d6_groups[g.name]
+        assert (g.per_entity, g.dtype, g.slots, g.max_slots, g.view_channels, g.critic) == (
+            d.per_entity, d.dtype, d.slots, d.max_slots, d.view_channels, d.critic), g.name
+
+
+def test_bulls_new_columns_stay_inside_the_magnitudes_deploy6_already_reads_raw():
+    """All four are seconds, which `normalize: true` passes through undivided, so the sim's own
+    timings are their scale: the window and `slowed_t` reach the landing's slow, `stunned_t` the
+    stomp's stun, `airborne_t` the charge's flight. Each stays within the 3.0 s that deploy6's
+    `memory.age_s` already feeds the policy raw under the run's 12-decision coast."""
+    _, params = _build_and_validate(overrides={"entities": {"hero": "bull"}})
+    longest = max(float(getattr(params, name).max()) for name in (
+        "super_slow_seconds", "stomp_slow_seconds", "stomp_stun_seconds", "super_airborne_seconds"))
+    assert 0.0 < longest <= 3.0

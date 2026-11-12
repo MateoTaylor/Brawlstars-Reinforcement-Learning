@@ -3,7 +3,8 @@
 # also described in prose in CHARACTER_DETAILS.md, and the two must agree: a number changed here
 # needs its description changed there.
 #
-#     hero_mortis    MORTIS (the agent)
+#     hero_mortis    MORTIS (the agent, entities.hero: mortis)
+#     hero_bull      BULL   (the agent, entities.hero: bull -- BULL_HERO_PLAN.md, in progress)
 #     bot_sniper     BROCK
 #     bot_artillery  GROM
 #     bot_melee      BUZZ
@@ -13,7 +14,10 @@
 #     bot_bull       BULL
 #
 # Only Mortis has a Super and a Gadget; Star Powers and Hypercharges are out of scope
-# (BRAWL_SIM_DESIGN.md §2).
+# (BRAWL_SIM_DESIGN.md §2). Hero Bull's kit is being added (BULL_HERO_PLAN.md).
+#
+# One hero block fills Kind.HERO's column per run: `entities.hero` in default.yaml picks it
+# (config.kind_yaml_names). The other hero block is not loaded at all.
 # ===============================================================================================
 #
 # Where a stat is a conversion rather than a spec, the source is Supercell's datamined game files,
@@ -102,7 +106,10 @@
 #   proj_flight_seconds                a TIMED lob (lands after N seconds whatever the distance)
 #   split_* / on_hit_area_*            split shards (Grom), lingering hazards (Brock)
 #   super_*                            a Super. `super_charge_hits: 0` means "this kind has none";
-#                                      nothing about the mechanic is hero-specific.
+#                                      nothing about the mechanic is hero-specific. `super_type`
+#                                      picks BOLT (the default: Mortis's projectile) or CHARGE
+#                                      (Bull's rush, which adds super_charge_speed and the
+#                                      wind-up, knockback, airborne and landing-slow fields)
 #
 # `validate()` in config.py rejects the combinations that load fine and then quietly do nothing --
 # read its per-kind loop before assuming a field is optional.
@@ -111,7 +118,8 @@
 # Every value accepts scalar-or-range: base_hp: 3800  OR  base_hp: {low: 3200, high: 4400}
 # hero_mortis has no attack_range/proj_kind/aim_noise_*/decision_period_ticks: those are
 # bot-AI-only fields. The hero's "Attack" input drives start_dash() directly, not a separate
-# ranged attack.
+# ranged attack. hero_bull has no dash, so his "Attack" fires the volley his proj_* fields
+# describe.
 
 hero_mortis:                        # Undertaker / mortis -- characters.csv, UndertakerWeapon
   base_hp: 8000                     # Hitpoints=4000 x2
@@ -167,7 +175,84 @@ hero_mortis:                        # Undertaker / mortis -- characters.csv, Und
   gadget_damage: 2000
   gadget_radius: 1.0
 
-bot_sniper:                         # BROCK -- see CHARACTER_DETAILS.md
+hero_bull:                          # BULL as the agent -- BULL_HERO_PLAN.md
+  # His whole kit: the volley, the charge super, Stomper and Berserker (plan Phases 1-5). His
+  # weapon started as bot_bull's, copied rather than shared, so changing the bot (D7) never moves
+  # the hero. Range, pellet speed and reload are now measured; bot_bull took the range and pellet
+  # speed too (2026-11-01, the user's call) and keeps its quoted reload.
+  # No bot-AI fields: nothing reads them for column 0. Milestone M1, the attack alone, sets
+  # super_charge_hits, gadget_cooldown and reload_boost_below_hp_frac to 0.
+  # PROVISIONAL marks a number Phase 0's recordings will replace.
+  base_hp: 10000
+  base_damage: 880                  # PER PELLET, five of them
+  # MEASURED 2026-11-01 (Phase 0 a): the walk reads 2.68 tiles/s, where the stat card's FAST
+  # (Speed 770 / 300 = 2.57) is 4 % slow. The user set 2.68, for bot_bull too (D7).
+  move_speed: 2.68
+  # MEASURED 2026-11-01 (Phase 0 b): the aim indicator reaches 5.17-5.21 tiles in three directions
+  # and the pellets vanish at 5.2-5.5; the user set 5.2, for bot_bull too.
+  attack_range: 5.2
+  max_ammo: 3
+  # MEASURED 2026-10-28 (Phase 0 f): measure_reload read 1.60 and 1.63 s pip to pip, full HP in
+  # Training Grounds, and the user set 1.6. bot_bull keeps its quoted 2.0 (D7: the hero's numbers
+  # only).
+  reload_seconds: 1.6
+  attack_cooldown: 0.25             # the floor
+  # No dash: `dash_distance: 0` is what routes the hero's attack to spawn_volley instead of
+  # start_dash (env._attack_phase), and what keeps every dash and long-dash term at 0.
+  proj_kind: BULL_SLUG
+  # MEASURED 2026-11-01 (Phase 0 b): 8.8-9.0 tiles/s on a sideways shot; the user set 9.0, for
+  # bot_bull too.
+  proj_speed: 9.0
+  proj_radius: 0.30
+  proj_count: 5
+  # MEASURED 2026-11-01 (Phase 0 b): the pellets' own fan opens 0.51 tiles per tile travelled,
+  # 0.50 rad (the drawn cone is wider, ~0.71). Settles plan Q9.
+  proj_spread_rad: 0.5
+  aoe_radius: 0.0
+  # --- Super: Bulldozer (plan Phase 4, D2). A CHARGE, not a bolt. After a standing start he
+  # rushes along the aim at a fixed speed for super_range tiles, or stops where his body first
+  # touches a wall or water (user decision 2026-10-23, D3). Until it ends he cannot walk, attack
+  # or super (`dash_t`). Each player he runs into takes super_damage once, is pushed straight away
+  # from his centre at contact and is launched (airborne: untargetable and stunned). Where he
+  # lands, everyone else within super_slow_radius is slowed once. Crates are passed untouched,
+  # as Mortis's bolt passes them. Nine pellet hits charge it, two full volleys (user, 2026-10-23);
+  # the charge's own hits charge nothing.
+  super_type: CHARGE
+  super_charge_hits: 9              # per PELLET that lands on a player
+  super_range: 11.0                 # measured (plan §1): the rush's length
+  super_charge_speed: 6.7           # measured, tiles/s
+  super_windup_seconds: 0.20        # measured
+  super_radius: 1.0                 # on centres; 2026-11-01 clip: hit at 0.94 off his line, missed 1.33
+  super_damage: 2000                # the card. Flat: no cube bonus, like Mortis's bolt
+  super_knockback_tiles: 2.5        # MEASURED 2026-11-01 (Phase 0 d): 2.55, maybe wall-cut; the user set 2.5
+  super_airborne_seconds: 0.5       # the user's
+  super_slow_radius: 3.0            # the landing circle, measured 2.8-3.0 tiles
+  super_slow_frac: 0.4              # the user kept it 2026-11-01 (plan Q2: not measurable on dummies)
+  super_slow_seconds: 1.5           # the user kept it 2026-11-01 (plan Q2; footage blurred by a stun)
+  # --- Gadget: Stomper (plan Phase 5; the current wiki's numbers, user decision 2026-10-23). A
+  # STOMP, not a spinner: stomp_windup_seconds after the tap, a pulse around his own body slows
+  # every other player within stomp_radius of his centre, or stuns one already slowed by anything,
+  # his landing slow included. No damage, and an airborne player is skipped. It starts charged, as
+  # Mortis's does, and the charge super holds it closed until he lands (user, plan Q5).
+  gadget_type: STOMP
+  gadget_cooldown: 20.0             # the card; the clip's button counts 20 -> 16 over f384-f525
+  # The wiki's radius. 2026-11-01 (Phase 0 h) a dummy 3.19 tiles from his centre was missed, and
+  # 2.4-3.1 all fit; the user kept 2.67.
+  stomp_radius: 2.67
+  # MEASURED 2026-11-01 (Phase 0 e): tap to pulse 0.30-0.33 s over three stomps (the 10-23 clip
+  # read 0.23-0.30); the user set 0.30.
+  stomp_windup_seconds: 0.30
+  stomp_slow_frac: 0.5              # the wiki
+  stomp_slow_seconds: 1.0           # the wiki
+  # On a player already slowed. MEASURED 2026-11-01 (Phase 0 d): the stun sparkle lasted ~1.4 s
+  # (the wiki says 1.0); the user set 1.4.
+  stomp_stun_seconds: 1.4
+  # --- Star power: Berserker (user decision 2026-10-23, plan Q1). Below 60 % of his max HP, cubes'
+  # bonus included, he reloads twice as fast; healing back to 60 % ends it.
+  reload_boost_below_hp_frac: 0.6
+  reload_boost_mult: 2.0
+
+bot_sniper:                        # BROCK -- see CHARACTER_DETAILS.md
   base_hp: 6000
   base_damage: 2320                 # a single rocket
   move_speed: 2.40                  # Speed=720 / 300
@@ -492,31 +577,31 @@ bot_spike:                          # SPIKE -- named for the brawler, not a role
 bot_bull:                           # BULL -- named for the brawler, not a role (constants.Kind)
   base_hp: 10000                    # ties Buzz for the tankiest frame in the roster
   base_damage: 880                  # PER PELLET. Five of them, so a point-blank volley is 4400.
-  # Speed=650 / 300 -- the SLOW tier, one full step below Shelly's NORMAL 720 (2.40). The user
-  # confirmed it as Bull's real tier, so this is an ordinary CSV conversion like every other
-  # move_speed in the file, not a hand-picked "slightly slower" figure.
-  #
-  # It is the slowest brawler in the roster, and that is the counterweight to the block above: 4400
-  # in one volley on a 10000 HP frame is the game's biggest burst on a body that TIES Buzz for
-  # tankiest, and the thing that keeps it fair is that he cannot close the 7 tiles to use it.
-  # Mortis and Edgar both move 2.73 -- 26% faster -- so disengaging from Bull is always an option.
-  move_speed: 2.17
-  attack_range: 7.0                 # "1 tile shorter range" than Shelly's 8.0
+  # MEASURED 2026-11-01 on the hero (BULL_HERO_PLAN.md Phase 0 a: 2.68 tiles/s; his stat card
+  # says FAST, 770 / 300 = 2.57), and the user set the bot to match (D7). It was 2.17, the SLOW
+  # 650 / 300 tier, which made him the roster's slowest brawler and was meant as the counterweight
+  # to 4400 in one volley on the joint-tankiest frame. Now only Mortis and Edgar (2.73) outrun
+  # him, by 2 %, so a Bull that wants the 5.2 tiles mostly gets them.
+  move_speed: 2.68
+  # MEASURED 2026-11-01 on the hero (BULL_HERO_PLAN.md Phase 0 b), and the user set the bot to
+  # match. It was 7.0, quoted as "1 tile shorter range" than Shelly's 8.0.
+  attack_range: 5.2
   max_ammo: 3
   reload_seconds: 2.0               # "reloads 1 ammo every 2 seconds"
   attack_cooldown: 0.25             # the floor, same as Shelly
   proj_kind: BULL_SLUG
   # Same pellet physics as Shelly (constant-speed PROJECTILE class, dies on the first thing it
-  # touches) at the same speed, so his shorter range also means a shorter time to target:
-  # 7.0 / 6.4 = 1.09 s against her 1.25 s. Closing on Bull is worse than closing on Shelly.
-  proj_speed: 6.4
+  # touches), MEASURED 2026-11-01 on the hero at 9.0 tiles/s (it was Shelly's 6.4), and the user
+  # set the bot to match. Range over speed: 5.2 / 9.0 = 0.58 s against her 1.25 s.
+  proj_speed: 9.0
   proj_radius: 0.30
   proj_count: 5                     # exactly core/projectiles.MAX_PROJ_PER_ENTITY -- see that
                                     # constant before raising it for anyone
   # "Slightly less width to his circle" than Shelly's 0.6. RADIANS, TOTAL span (see her block):
-  # 0.5 rad is 28.6 deg tip to tip, +-14.3 deg. At his 7-tile range that puts the outermost pellets
-  # 3.46 tiles apart -- 0.87 between neighbours, against the 1.40 each one covers -- so his fan
-  # overlaps more heavily than hers over its whole length. A tighter, shorter, harder-hitting cone.
+  # 0.5 rad is 28.6 deg tip to tip, +-14.3 deg. At his 5.2-tile range that puts the outermost
+  # pellets 2.57 tiles apart -- 0.64 between neighbours, against the 1.40 each one covers -- so his
+  # fan overlaps more heavily than hers over its whole length. A tighter, shorter, harder-hitting
+  # cone.
   proj_spread_rad: 0.5
   aoe_radius: 0.0
   # --- fire rule, the same shape as Shelly's: a shotgun bot wants a physical line, and holds fire
@@ -528,9 +613,10 @@ bot_bull:                           # BULL -- named for the brawler, not a role 
   fire_lateral_speed_limit: 2.0
   fire_lateral_hold_range_fraction: 0.6
   aim_model: LEAD
-  # Lower than Shelly's 0.75 on purpose. A KITE Bull holding 75% of a 7-tile range is a 10000 HP
+  # Lower than Shelly's 0.75 on purpose. A KITE Bull holding 75% of his range is a 10000 HP
   # brawler fighting at the edge of its reach with the weakest per-pellet spread it has; 0.6 puts
-  # him at 4.2 tiles, where enough of the fan connects to justify the health he is spending.
+  # him at 3.1 tiles (4.2 before the 5.2 range), where enough of the fan connects to justify the
+  # health he is spending.
   desired_range_fraction: 0.6
   # --- difficulty-axis bases, multiplied per tier by configs/train.yaml (glossary above).
   hero_focus: 0.5

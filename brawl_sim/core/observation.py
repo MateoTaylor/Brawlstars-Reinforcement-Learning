@@ -271,6 +271,9 @@ def build_obs(state, bank, vis: torch.Tensor, raw_los: torch.Tensor | None, para
         "super_ready": super_ready_all[:, _HERO],
         "super_charge": state.ent_super_charge[:, _HERO],
         "super_charge_frac": super_frac_all[:, _HERO],
+        # Seconds left on the slow his last charge landing applied (core/state.py's
+        # ent_slow_window_t): a stomp landing inside it stuns whoever that landing caught.
+        "slow_window": state.ent_slow_window_t[:, _HERO],
         "long_dash_ready": long_dash_ready_all[:, _HERO],
         "long_dash_frac": long_dash_frac_all[:, _HERO],
         "gadget_ready": gadget_ready_all[:, _HERO],
@@ -340,6 +343,11 @@ def build_obs(state, bank, vis: torch.Tensor, raw_los: torch.Tensor | None, para
         "dash_t": state.ent_dash_t,
         "dash_dir": state.ent_dash_dir,
         "invuln": state.ent_invuln_t > 0,
+        # The status effects (core/status.py), seconds left on each. CV cannot read them off an
+        # enemy, so only a spec's `critic:` section reads them (configs/agent_obs_bull.yaml).
+        "slowed_t": state.ent_slow_t,
+        "stunned_t": state.ent_stun_t,
+        "airborne_t": state.ent_airborne_t,
         "in_bush": in_bush_all,
         "in_zone": in_zone_all,
         "tile": torch.stack(terrain.to_tile(state.ent_pos), dim=-1),

@@ -104,6 +104,81 @@ def test_a_moving_sprite_over_part_of_the_frame_does_not_capture_the_estimate(pl
     # cause to distrust the frame as terrain evidence, even though the median survived it.
     assert r.tracking and not r.ok
     assert r.segment == 0
+    # The windows on the sprite move together while the rest read zero. That is the overlay
+    # rule's trigger too, so this is the case its pixel vote must hand back to the still windows.
+    assert r.overlay_vote is not None, "the windows did not split: the overlay rule went untested"
+    assert r.overlay_vote < 0.5
+
+
+def test_a_static_overlay_over_a_moving_world_does_not_freeze_the_estimate(plan):
+    """The SHOWDOWN banner (MAP_ONBOARDING.md, Truth). The camera follows the hero, so anything
+    drawn in screen space reads zero shift, and at walking speed zero sits within
+    max_disagreement_tiles of the true motion. A screen-static block over most of the windows
+    used to take the median while every window still agreed: `ok`, and frozen.
+
+    Here a static block covers 8 of the 11 windows but only about a third of the view, and the
+    world slides under it. The answer is known independently: the world's own shift."""
+    world = _textured(plan)
+    banner = _textured(plan, seed=7)
+    w, h = plan.size_px
+    box = (slice(int(0.20 * h), int(0.65 * h)), slice(int(0.25 * w), int(0.80 * w)))
+
+    def under_banner(img):
+        out = img.copy()
+        out[box] = banner[box]
+        return out
+
+    dx, dy = -9, 5                     # ~0.2 tiles: a walk at the deployed 12 Hz
+    ppt = plan.pixels_per_tile
+    results = {}
+    for name, cfg in (("off", VisionConfig(odometry_overlay_share=1.0)), ("on", VisionConfig())):
+        odo = Odometry(plan, cfg)
+        odo.update(under_banner(world))
+        results[name] = odo.update(under_banner(_shift(world, dx, dy)))
+
+    off = results["off"]
+    assert off.status == "ok" and np.hypot(*off.delta_tiles) < 0.05, \
+        "the premise fails: without the rule the banner no longer freezes the estimate"
+    r = results["on"]
+    assert r.overlay_vote is not None and r.overlay_vote > 0.5
+    assert r.delta_tiles[0] == pytest.approx(-dx / ppt, abs=0.01)
+    assert r.delta_tiles[1] == pytest.approx(-dy / ppt, abs=0.01)
+    # Trusted, not merely tracked: the deploy holds the action and stops depositing on anything
+    # but `ok`, and a banner lasts seconds.
+    assert r.status == "ok" and r.inlier_ratio == 1.0
+
+
+def test_screen_static_windows_do_not_cost_a_brisk_walk_its_trust(plan):
+    """The same screen-static content as a minority. A brisk walk passes max_disagreement_tiles
+    per 12 Hz tick, so windows on the hero and its name tag counted against a correct median and
+    the frame came back `uncertain`. That was 17% of in-match ticks on the Truth replay, each one
+    a held action. Here a static block holds 4 of the 11 windows and the world moves 0.29 tiles."""
+    world = _textured(plan)
+    hero = _textured(plan, seed=11)
+    w, h = plan.size_px
+    box = (slice(int(0.21 * h), int(0.632 * h)), slice(int(0.40 * w), int(0.667 * w)))
+
+    def with_hero(img):
+        out = img.copy()
+        out[box] = hero[box]
+        return out
+
+    dx, dy = 14, 0
+    ppt = plan.pixels_per_tile
+    results = {}
+    for name, cfg in (("off", VisionConfig(odometry_overlay_share=1.0)), ("on", VisionConfig())):
+        odo = Odometry(plan, cfg)
+        odo.update(with_hero(world))
+        results[name] = odo.update(with_hero(_shift(world, dx, dy)))
+
+    off = results["off"]
+    assert off.delta_tiles[0] == pytest.approx(-dx / ppt, abs=0.01)
+    assert off.status == "uncertain", \
+        "the premise fails: without the rule the still windows no longer cost the frame its trust"
+    r = results["on"]
+    assert r.overlay_vote is not None and r.overlay_vote > 0.5
+    assert r.delta_tiles[0] == pytest.approx(-dx / ppt, abs=0.01)
+    assert r.status == "ok"
 
 
 # ---------------------------------------------------------------------------
@@ -252,3 +327,43 @@ def test_tracking_holds_across_a_long_real_clip(plan, clip):
     assert len(ok) > 0.97 * (len(results) - 1)
     assert np.median([r.agreement_tiles for r in ok]) < 0.02
     assert min(r.inlier_ratio for r in ok) >= 0.75
+
+
+TRUTH_CLIP = "bluestacks-truth-west-upper"
+
+
+@pytest.mark.vision
+def test_the_showdown_banner_does_not_freeze_the_camera():
+    """f2620-f2820 of the Truth onboarding clip, sampled at the deployed 12 Hz. "SHOWDOWN!" comes
+    up at two brawlers left while Bull walks. 5 of the 8 emulator windows read zero for 3 s of
+    it, and 3 or 4 for most of the rest. The window median read (6.04, -2.59) tiles of camera
+    travel here, most of it `ok`, and the localizer dropped its fix and refixed a tile off.
+
+    The answer comes from image registration against the Truth map (MAP_ONBOARDING.md, Truth
+    section): (6.69, -5.69) over f2620-f2720 and (7.07, 3.04) over f2720-f2820. The tolerance
+    is a few percent of that travel. The failure was half of it."""
+    from brawl_vision.clips import load_bounds
+    from brawl_vision.config import load_vision_config
+    from brawl_vision.gameplay import walk_frames
+    from brawl_vision.terrain.labeling import find_clip, hud_plans
+
+    try:
+        path = find_clip(TRUTH_CLIP)
+    except FileNotFoundError:
+        pytest.skip(f"{TRUTH_CLIP} is gitignored game footage")
+    plan = hud_plans()["emulator"]
+    cap = cv2.VideoCapture(str(path))
+    fps = cap.get(cv2.CAP_PROP_FPS)
+    cap.release()
+    frames = sorted({2620 + int(round(k * fps / 12)) for k in range(int(200 * 12 / fps) + 1)})
+    odo = Odometry(plan, load_vision_config())
+    results = []
+    for _, image in walk_frames(path, tuple(load_bounds(path)["content_box"]), frames):
+        if image.shape[1::-1] != tuple(plan.viewport):
+            image = cv2.resize(image, plan.viewport, interpolation=cv2.INTER_AREA)
+        results.append(odo.update(plan.rectify(image)))
+
+    registered = np.array([6.69 + 7.07, -5.69 + 3.04])
+    assert np.linalg.norm(odo.position - registered) < 1.0, f"measured {odo.position}"
+    assert all(r.status != "lost" for r in results[1:])
+    assert sum(r.ok for r in results[1:]) >= 0.9 * (len(results) - 1)

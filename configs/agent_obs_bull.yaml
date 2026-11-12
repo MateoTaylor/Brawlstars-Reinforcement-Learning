@@ -1,0 +1,96 @@
+# BULL's agent view (BULL_HERO_PLAN.md D6, Phase 6a): configs/agent_obs_deploy6.yaml with the
+# long-dash pair swapped for the Stomper's window, and the status timers in the critic. Every
+# other group is byte-identical to deploy6's. tests/test_configs_files.py pins this file against
+# deploy6: every field it drops and adds, and each group's column order.
+#
+#   python scripts/train.py --set run.agent_obs=configs/agent_obs_bull.yaml \
+#       --set run.env_overrides.entities.hero=bull
+#
+# The two go together. `entities.hero` picks which `hero_<name>` block of configs/brawlers.yaml
+# fills Kind.HERO (D1, the row swap), and nothing checks it against this file: Mortis under this
+# spec reads a window that never opens, and Bull under deploy6 cannot see one.
+#
+# WHAT THIS CHANGES
+# -----------------
+#   self      Drops hero.long_dash_ready and hero.long_dash_frac: Bull has no long dash, so both
+#             are 0 on every step. Adds hero.slow_window after the gadget pair: seconds left on
+#             the slow his last charge landing applied, 0 when none runs. A stomp that lands
+#             while it runs stuns the players that landing slowed, and slows the rest, so this is
+#             the whole "will this stomp stun?" decision. The stomp lands 0.25 s after the tap.
+#             hero.dashing, hero.dash_t and hero.dash_dir stay: under Bull's charge super they
+#             read as charging, dash_t counting down from 1.84 s (a 0.20 s wind-up and 11 tiles
+#             at 6.7 tiles/s; Mortis's dash counts from 0.30). The tap's own decision runs five
+#             ticks of it, so an obs reads at most 1.59 (BULL_HERO_PLAN.md §5.6, Phase 6b).
+#   critic    critic_enemies adds entities.slowed_t, entities.stunned_t and entities.airborne_t
+#             after entities.dashing, beside the other "can this bot act" columns: what his
+#             charge and his stomp did to each bot, which no CV reader recovers.
+#
+# Normalization: all four new fields are seconds and pass through. hero.slow_window and
+# entities.slowed_t run 0 to 1.5 (the landing slow; the stomp's own slow is 1.0), stunned_t 0 to
+# 1.0 and airborne_t 0 to 0.5, all within deploy6's react_t and memory.age_s magnitudes.
+#
+# WIDTHS (configs/default.yaml): self 26 (deploy6: 27), so the extractor takes 13 grid channels
+# and 271 actor floats (deploy6: 272), 274 under train.yaml's action.auto_aim (deploy6: 275). The
+# critic adds 9 x 28 + 6 = 258 floats on the value side (deploy6: 231). A width change, so it
+# trains from scratch: no deploy6 checkpoint loads under it.
+#
+# WHAT SUPPLIES THE NEW FIELDS LIVE
+# ---------------------------------
+#   hero.slow_window   The shadow, from when its own charge landed: BULL_HERO_PLAN.md Phase 7b.
+#                      NOT BUILT. Until it is, this file is not a deploy spec, and the
+#                      `agent_obs_deploy*.yaml` coverage tests (test_deployment_shadow.py,
+#                      test_deployment_zone.py) do not reach it.
+#   critic             Nothing: live play never runs the value head.
+fair: true
+normalize: true
+groups:
+  - name: self                          # deploy6's, minus the long dash, plus the window
+    per_entity: false
+    dtype: float32
+    fields: [hero.pos_norm, hero.vel, hero.facing_vec, hero.hp, hero.ammo_frac,
+             hero.ammo_whole, hero.attack_cd, hero.can_attack, hero.dashing,
+             hero.dash_t, hero.dash_dir, hero.invuln, hero.in_bush, hero.in_zone,
+             hero.near_edge,
+             hero.super_ready, hero.super_charge_frac,
+             hero.gadget_ready, hero.gadget_charge_frac, hero.slow_window,
+             meta.time_frac, meta.n_enemies_alive]
+  - name: enemies                       # deploy6's, unchanged
+    per_entity: true
+    slots: tracked
+    dtype: float32
+    fields: [memory.tracked, memory.seen, memory.rel_pos, memory.dist, memory.rel_vel,
+             memory.hp, memory.in_bush, memory.age_s]
+  - name: projectiles                   # deploy6's, unchanged
+    per_entity: true
+    max_slots: 12
+    dtype: float32
+    fields: [projectiles.alive, projectiles.rel_pos, projectiles.vel,
+             projectiles.time_to_closest]
+  - name: zone                          # deploy6's, unchanged
+    per_entity: false
+    dtype: float32
+    fields: [zone.hero_margin_local, zone.active]
+  - name: history                       # deploy6's, unchanged
+    per_entity: false
+    dtype: float32
+    fields: [hist.valid, hist.move_onehot, hist.attack_onehot, hist.hp, hist.ammo_frac,
+             hist.displacement]
+  - name: grid                          # deploy6's, unchanged
+    dtype: uint8
+    view_channels: [blocks_unit, blocks_projectile, is_bush, is_water, in_zone,
+                    enemy_revealed, hero, box, pickup, projectile,
+                    enemy_hist1, enemy_hist2, enemy_hist3]
+critic:   # value head only: the policy never reads these, and live play zero-fills them
+  - name: critic_enemies                # deploy6's, plus the three status timers
+    per_entity: true
+    dtype: float32
+    fields: [entities.alive, entities.kind_onehot, entities.rel_pos, entities.dist,
+             entities.rel_vel, entities.hp, entities.max_hp, entities.cubes,
+             entities.ammo_frac, entities.can_attack, entities.dashing,
+             entities.slowed_t, entities.stunned_t, entities.airborne_t, entities.in_bush,
+             entities.revealed_to_hero, entities.hero_revealed_to,
+             entities.privileged.targets_hero, entities.privileged.react_t]
+  - name: critic_world                  # deploy6's, unchanged
+    per_entity: false
+    dtype: float32
+    fields: [hero.cubes, zone.hero_margin, zone.safe_area_frac]

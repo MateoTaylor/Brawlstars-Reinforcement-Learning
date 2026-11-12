@@ -16,6 +16,8 @@ CONFIGS_TINY = yaml.safe_load(open("configs/presets/debug_tiny.yaml").read())
 AGENT_OBS_YAML = "configs/agent_obs.yaml"
 # The deploy spec in use. The five before it are in archive/configs/.
 DEPLOY6_YAML = "configs/agent_obs_deploy6.yaml"
+# Bull's (BULL_HERO_PLAN.md D6): deploy6 with the Stomper's window and the status timers.
+BULL_YAML = "configs/agent_obs_bull.yaml"
 
 
 def _cfg(overrides=None):
@@ -346,12 +348,13 @@ def test_build_agent_obs_reuses_the_same_out_buffer_tensors():
 
 # ---- docs/AGENT_OBS*.md match a fresh render of their spec -------------------------------
 
-@pytest.mark.parametrize("spec_path", [AGENT_OBS_YAML, DEPLOY6_YAML])
+@pytest.mark.parametrize("spec_path", [AGENT_OBS_YAML, DEPLOY6_YAML, BULL_YAML])
 def test_each_agent_obs_doc_matches_a_fresh_render_of_its_spec(spec_path):
     # 2026-10-20: this rendered the default spec twice and compared the renders, which a stale
     # doc passes; each committed doc is now compared with a fresh render of its own spec.
     # 2026-10-21: deploy4's and deploy5's docs went to archive/ and their specs to
     # archive/configs/, frozen, so only the docs of the specs in use are held to a render.
+    # 2026-10-27: Bull's joined them (Phase 6a).
     import importlib
     dump_mod = importlib.import_module("scripts.dump_obs_schema")
     fresh = dump_mod.render_agent_obs(spec_path)
@@ -370,6 +373,7 @@ def test_each_spec_renders_to_a_doc_named_after_itself():
     assert dump_mod.agent_docs_path("configs/agent_obs.yaml") == dump_mod.AGENT_DOCS_PATH
     assert dump_mod.agent_docs_path("configs/agent_obs.yaml").name == "AGENT_OBS.md"
     assert dump_mod.agent_docs_path(DEPLOY6_YAML).name == "AGENT_OBS_DEPLOY6.md"
+    assert dump_mod.agent_docs_path(BULL_YAML).name == "AGENT_OBS_BULL.md"
     assert dump_mod.agent_docs_path("configs/agent_obs_lowinfo.yaml").name == "AGENT_OBS_LOWINFO.md"
 
 
@@ -901,3 +905,30 @@ def test_critic_false_leaves_the_critic_buffers_untouched():
     assert not any(buffers[g.name].any() for g in spec.critic_groups)
     obs_select.build_agent_obs(full, spec, cfg, buffers)
     assert all(buffers[g.name].any() for g in spec.critic_groups)
+
+
+def test_bulls_spec_reads_the_window_and_each_bots_status_timers_as_the_state_holds_them():
+    """configs/agent_obs_bull.yaml (BULL_HERO_PLAN.md D6): `self` reads the hero's window, and each
+    `critic_enemies` row its bot's three timers, in seconds, which `normalize: true` passes
+    through. Entity 1 is slowed and in the air, entity 2 stunned, each by a value no other column
+    holds."""
+    over = _deep_merge(CONFIGS_TINY, {"entities": {"hero": "bull"}})
+    cfg = load_config(CONFIGS_DEFAULT, overrides=over)
+    spec = _deep_merge({**yaml.safe_load(pathlib.Path(CONFIGS_DEFAULT).read_text()),
+                        **yaml.safe_load(pathlib.Path("configs/brawlers.yaml").read_text())}, over)
+    env = BrawlVecEnv(cfg, n_envs=1, device="cpu", seed=0, spec=spec, verbose=False)
+    env.reset()
+    st = env.state
+    st.ent_slow_window_t[0, 0] = 0.85
+    st.ent_slow_t[0, 1], st.ent_slow_frac[0, 1] = 1.2, 0.4
+    st.ent_airborne_t[0, 1] = 0.35
+    st.ent_stun_t[0, 2] = 0.65
+    full = _rebuild(env, cfg)
+
+    spec = obs_select.load_agent_spec(BULL_YAML, cfg)
+    out = _build(full, spec, cfg)
+    assert out["self"][_columns(spec, cfg, "self")["hero.slow_window"]].tolist() == pytest.approx([0.85])
+    c = _columns(spec, cfg, "critic_enemies")
+    timers = [c[f] for f in ("entities.slowed_t", "entities.stunned_t", "entities.airborne_t")]
+    assert [out["critic_enemies"][0, t].item() for t in timers] == pytest.approx([1.2, 0.0, 0.35])
+    assert [out["critic_enemies"][1, t].item() for t in timers] == pytest.approx([0.0, 0.65, 0.0])

@@ -323,6 +323,8 @@ def _reward_inputs(n=4, device="cpu"):
         "attack_in_reach_tick": torch.zeros(n, dtype=torch.int32, device=device),
         "gadget_hit_tick": torch.zeros(n, dtype=torch.int32, device=device),
         "move_reversal_tick": torch.zeros(n, dtype=torch.int32, device=device),
+        "attack_miss_tick": torch.zeros(n, dtype=torch.int32, device=device),
+        "gadget_miss_tick": torch.zeros(n, dtype=torch.int32, device=device),
     }
     return obs, info
 

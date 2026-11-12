@@ -15,6 +15,7 @@ This document replaces the sim's plan documents: the build plan, the bot overhau
 
 **Built.**
 - Mortis against seven data-driven bot kinds, with his dash, long dash, super, gadget and auto-aimed attack.
+- Since 2026-10-23, Bull as the hero instead (`entities.hero: bull`, BULL_HERO_PLAN.md Phases 1–5): his aimed volley, the slow, stun and airborne timers, his charge super, his Stomper gadget and his Berserker star power. No run has trained him.
 - Bot personalities, difficulty tiers and cube farming.
 - A camera-window reveal with tracked enemy slots, `hero.near_edge`, a latched `zone.active` and three decisions of local history.
 - Gas timed from the real game.
@@ -32,7 +33,7 @@ This document replaces the sim's plan documents: the build plan, the bot overhau
 
 | # | Item | Owner |
 |---|---|---|
-| 3 | **The super ignores cubes.** `super_damage` and `super_heal` are flat, while attacks and the gadget get +10 % per cube. No decision is on record either way. | user |
+| 3 | **The super ignores cubes.** `super_damage` and `super_heal` are flat, while attacks and the gadget get +10 % per cube. Bull's charge (2000) is built flat by the same rule. No decision is on record either way. | user |
 | 4 | **Same-tick pickup revive.** Pickups (phase 12) run before deaths (phase 13) and check `ent_alive`, not HP > 0. A unit at 0 HP can therefore take a cube, gain 400 HP and survive. | user |
 | 5 | **Same-tick double death.** `compute_rank` ties same-tick deaths. A hero who dies on the same tick as the last bot ranks first and is paid `win_bonus` and `death_penalty` together. | user |
 | 6 | **Off-screen gadget aim and in-reach pay.** `hero.gadget_target` and the `attack_in_reach` flag read concealment-only visibility. So the spinner can bear toward an unconcealed enemy off camera (still at most 2 tiles), and the reward can pay an attack whose only in-reach enemy is off screen. The second is rare, because the 3.77-tile reach sits inside the window. | user |
@@ -87,6 +88,7 @@ These are settled. Do not re-open one without new evidence. "User" marks the use
 | Regen follows the official rule: 13 % of max HP per second after 3 s without attacking or being hit. | Disengaging to heal is intended; the gas punishes it. | 2026-08-18 |
 | Gas damage is a fraction of each unit's own max HP: 0.20/s, +0.04 per shrink. | Nobody should survive ~5 s in the gas whatever their HP; a flat rate let cube-stacked tanks ignore it. | 2026-08-18 |
 | No attack animations. `attack_cooldown` is a window with no attack and no reload; the floor is 0.25 s (one decision), Mortis has 0.35 and Buzz 1.00. | This removed an animation subsystem. | 2026-08-18 |
+| `attack_cd` counts down in whole ticks (`status.count_down`), as the status timers and the gadget cooldown do, so a 0.25 s cooldown blocks exactly 5 ticks. | Plain float32 subtraction left 7.45e-9 s after the 5th tick and held every 0.25-s kind a 6th (BULL_HERO_PLAN.md §5.5). | user, 2026-10-23 |
 | Mortis's reload pause during his cooldown is his attack animation. Never measure it or propose removing it (`reload_seconds` refits are fine). | | user, 2026-09-11 |
 | One projectile buffer with three classes (PROJECTILE, ARTILLERY, HAZARD). There is no second buffer and no new obs group. | | 2026-08-18 |
 | Brock's sphere ticks at 2 s and 4 s. It stacks, never hurts its owner, and ignores walls. | It is burning ground, not a shot. | 2026-08-18 |
@@ -141,13 +143,15 @@ These are settled. Do not re-open one without new evidence. "User" marks the use
 | The curriculum keeps its forced advance (`max_timesteps_at_stage`). | A run always reaches elite, even when no gate clears. | user, 2026-09-25 |
 | `reward.attack_in_reach` 0.05. | "A small reward for attacking when in range". | user, 2026-09-21 |
 | `reward.gadget_hit` 0.3, paid per landed gadget that hurts a player; crates alone never count. | "A bonus rwd for the agent if it uses the gadget on another player (not a crate)". | user, 2026-09-30 |
+| Bull's Stomper, which deals no damage, earns `gadget_hit` once per stomp that slows or stuns at least one player. | Otherwise the term would never fire for Bull. "Any slow or stun" (BULL_HERO_PLAN.md D9). | user, 2026-10-23 |
 | `reward.move_reversal` −0.01, charged per decision whose move bin swung 135° or more from the previous decision's, both non-idle. | The policy reversed on about a quarter of its decisions, as often with no enemy in view as with one near. "Add the 0.01 reversal penalty." | user, 2026-10-07 |
 | `n_steps` stays 128 and `gae_lambda` 0.98. Tune the horizon through gamma, critic quality and LR floors, never through shorter rollouts or a lower lambda. | The user wants planning from the start of a match to its end. | user, 2026-09-26 |
 
 **Accepted divergences from the game:**
-- No Star Powers or Hypercharges; only Mortis has a super and a gadget.
+- No Hypercharges, and the only Star Power is Bull's Berserker (§5, Reload). Only the hero has a super (Mortis's bolt or Bull's charge) and a gadget (Mortis's spinner or Bull's Stomper).
 - 16 move bins.
-- Units pass through each other, and there is no knockback, stun or slow.
+- Units pass through each other. The only knockback is Bull's charge (§4), which also applies airborne and the landing slow (§5). Only his Stomper stuns (§4).
+- Bull's charge stops at the first wall or water, as Mortis's dash does. The game's bulldozes through walls and bushes and destroys them. "Stop at the first wall" (user, 2026-10-23; BULL_HERO_PLAN.md D3).
 - Only attacking reveals a bush-hider; taking damage does not.
 - The smallest non-zero latency is one 50 ms tick.
 - No cube redistribution and no timed cube spawns.
@@ -242,7 +246,7 @@ These are settled. Do not re-open one without new evidence. "User" marks the use
 **Legality.**
 - Attack and auto-aim need: alive, `attack_cd` ≤ 0, `dash_t` ≤ 0, and ammo ≥ 1.
 - The super needs the same, with "charged" in place of ammo.
-- The gadget needs only alive and `gadget_cd` ≤ 0. It is legal mid-dash, during the cooldown and on an empty clip.
+- The gadget needs only alive and `gadget_cd` ≤ 0. It is legal mid-dash, during the cooldown and on an empty clip. Bull's charge is the exception: it holds the gadget closed through its wind-up and rush (user, 2026-10-23).
 - Illegal values are silent no-ops: decode gates them, and the attack phase gates them again.
 
 **Dash (the attack).**
@@ -255,10 +259,16 @@ These are settled. Do not re-open one without new evidence. "User" marks the use
 **Long dash.** After 4.5 s without attacking, the next dash goes twice as far in the same unscaled 0.30 s (5.34 tiles at 17.8 tiles/s). Only an attack or a super resets the stopwatch (`attack_idle_t`); damage and the gadget do not.
 
 **Super.**
-- **Charging:** +1 per player hit per tick, from dash, melee or projectile hits, up to 5. Crate hits and the gadget never charge it; super hits count toward the next charge.
-- **Firing:** zeroes the charge, takes `attack_cooldown`, and launches one piercing bolt (`projectiles.spawn_supers`).
-- **Aim:** along the move bin. On an idle bin it aims like the game's tap-to-fire (`hero.super_aim_target`): at the nearest alive enemy within the bolt's reach, `super_range` + `super_radius` + `unit_radius` = 11.1 tiles, even off screen, and along facing with none. It skips crates, which the bolt passes through, and the long dash does not stretch it. `env._attack_phase` builds the aim as its own `super_dir`, as the dash has `dash_dir`, so no firing row hands `spawn_supers` a zero aim.
+- **Charging:** +1 per player per tick that a dash or melee hit lands on, and +1 per projectile that lands on a player, each pellet and blast its own (`step_projectiles`' `charge_hits` count), up to `super_charge_hits`: 5 for Mortis, 9 for Bull, two full volleys (user, 2026-10-23). Crate hits and the gadget never charge it. Mortis's bolt hits count toward the next charge; Bull's charge hits do not.
+- **Firing:** zeroes the charge, takes `attack_cooldown`, and launches one piercing bolt (`projectiles.spawn_supers`), or under `super_type: CHARGE` starts Bull's charge (below).
+- **Aim:** along the move bin. On an idle bin it aims like the game's tap-to-fire (`hero.super_aim_target`): at the nearest alive enemy within the bolt's reach, `super_range` + `super_radius` + `unit_radius` = 11.1 tiles, even off screen, and along facing with none. It skips crates, which the bolt passes through, and the long dash does not stretch it. `env._attack_phase` builds the aim as its own `super_dir`, as the dash has `dash_dir`, so no firing row hands `spawn_supers` a zero aim. Bull's charge hits on centres, so its reach drops the body: `super_range` + `super_radius` = 12.0 tiles.
 - **The bolt:** it flies 10 tiles through walls and past its first victim, hitting each player once (`prj_hits`) for a flat 1800 and healing Mortis 1800 per player hit. It ignores crates.
+- **Bull's charge** (`hero.start_charge`, then `hero.advance_dash`; BULL_HERO_PLAN.md D2–D4) rides the dash's state: `ent_dash_super` flags it and `ent_dash_windup_t` holds the wind-up. So every `dash_t` gate holds him for the whole charge, and `hero.dashing`, `hero.dash_t` and `hero.dash_dir` read as charging.
+  - He stands still 0.20 s, then rushes 11.0 tiles at a fixed 6.7 tiles/s: 1.84 s, 37 ticks. `terrain.body_travel` stops his body at the first wall or water, as it stops a dash (user, 2026-10-23). At the fixed speed, a blocked charge ends sooner rather than slower.
+  - Each player whose centre comes within 1.0 of his takes a flat 2000, once. It is pushed 1.0 tile straight away from his centre at the moment of contact: along the charge for a head-on hit, off at an angle for a glancing one (user, 2026-10-23). A wall or water stops the push, and the player is airborne for 0.5 s. Crates are passed untouched, as the bolt passes them.
+  - On its last tick, everyone else alive within 3.0 tiles of the landing, airborne or not, is slowed once: 40 % for 1.5 s (unmeasurable on dummies; the user kept both, 2026-11-01).
+  - The same tick sets his `ent_slow_window_t` to that 1.5 s, whether the landing caught anyone or not. The window counts down beside the slows, so it equals each caught player's slow; Bull's spec reads it as `hero.slow_window` (BULL_HERO_PLAN.md D6).
+  - All of it sits behind a Python switch on `params.charge_ray_tiles`, which is 0 in a spec with no CHARGE kind, so a Mortis run never executes it.
 
 **Gadget.**
 - **Throwing:** one ARTILLERY `GADGET_SPINNER` (`hero.gadget_target`, then `projectiles.spawn_gadget`) flies `min(2.0, distance)` toward the nearest enemy in the thrower's concealment visibility, or along facing when none is visible or the target stands on him.
@@ -266,6 +276,13 @@ These are settled. Do not re-open one without new evidence. "User" marks the use
 - **Blast:** after 0.2 s it deals 2000 (+10 % per cube) within radius 1.0 to enemies and crates. It never hurts its owner and never charges the super.
 - **Side effects:** a throw sets `gadget_cd` 18.0 and nothing else. It spends no ammo, starts no cooldown, leaves the long-dash stopwatch alone, and is not an attack for `attack_in_reach`; a landing that hurts a player pays `gadget_hit` instead (§10). It does reveal Mortis and break out-of-combat regen.
 - **Timing:** the earliest second throw is decision 73, 18.25 s after the first. `tests/test_gadget.py` pins this, and the deployment shadow must match it.
+- **Bull's Stomper** (`gadget_type: STOMP`; BULL_HERO_PLAN.md §5.5) is a pulse around his own body, not a projectile.
+  - The tap sets `gadget_cd` 20.0 and arms `ent_stomp_t` for 0.30 s (`hero.start_stomp`; measured 2026-11-01, the wiki said 0.25). Six ticks later, tick phase 5b (`env._stomp_phase`, `hero.advance_stomp`) lands it before that tick's attacks.
+  - The pulse catches every other alive player within 2.67 tiles of his centre, on centres, wherever he stands by then. A player already slowed, by anything, is stunned for 1.4 s (measured 2026-11-01, the wiki said 1.0) and keeps its slow. Any other is slowed 50 % for 1.0 s. Airborne players are skipped, and nothing takes damage (the wiki's numbers otherwise, user, 2026-10-23).
+  - So a stomp tapped after the obs reads a window `w` stuns the players his landing slowed iff `w` > 0.35. The six wind-up ticks, plus the countdown on the pulse tick, spend 0.35 before phase 5b. At action_repeat 5 that is the first 4 or 5 decisions after a landing, depending on which of its decision's ticks the landing fell on (`tests/test_charge_super.py`: a 0.40 read stuns, a 0.35 read slows).
+  - He walks and acts through the wind-up. A stomp that catches a player pays `gadget_hit` (§10), and the tap reveals him as a throw does.
+  - The second stomp is legal on decision 81, 20.25 s after the first (`tests/test_stomper.py`). The gadget cooldown snaps to whole ticks as the status timers do; plain float32 subtraction would hold 20.0 s for 401 ticks.
+  - All of it sits behind `params.stomp_radius_tiles`, which is 0 in a spec with no STOMP kind, so a Mortis run never executes it.
 
 **Auto-aim (value 4).**
 - It dashes at the nearest alive enemy or unbroken crate within the current dash reach (long dash included, plus `dash_radius` and the target's body), even off screen, like the game's tap.
@@ -283,12 +300,13 @@ These are settled. Do not re-open one without new evidence. "User" marks the use
 - `dominant_attacker` credits a victim's tick to whoever dealt it the most.
 - `last_hit_by` is written only when damage lands on a unit that is alive with HP > 0, so the gas (phase 10) cannot steal a finisher's credit. A death's cause is ZONE only when `last_hit_by` < 0.
 
-**Decision-boundary cap.** The mask is read only at decision boundaries. After a dash, the next legal attack is 0.50 s later (10 ticks), not 0.35 s: 70 % of the weapon's rate. The cadence audit's `phasing_loss` measures this; the deferred latch (§1 #24) would remove it.
+**Decision-boundary cap.** The mask is read only at decision boundaries. After a dash, the next legal attack is 0.50 s later (10 ticks), not 0.35 s: 70 % of the weapon's rate. Bull's 0.25 s chains at the same 0.50 s, 50 % of his: a shot on a decision's first tick leaves 0.05 s at the next boundary. The cadence audit's `phasing_loss` measures this; the deferred latch (§1 #24) would remove it.
 
-**Reload** accrues only while `attack_cd` ≤ 0, so sustained fire costs `attack_cooldown + reload_seconds` per shot.
+**Reload** accrues only while `attack_cd` ≤ 0, so sustained fire costs `attack_cooldown + reload_seconds` per shot. `attack_cd` snaps to whole ticks as the status timers do (user, 2026-10-23). Plain float32 subtraction had held every 0.25-s kind's next shot and its reload six ticks, not five. Bull's star power, Berserker (user, 2026-10-23), doubles the gain while his HP is strictly below 60 % of his current max HP, cubes' bonus included (`reload_boost_below_hp_frac`, `reload_boost_mult`). `hero.tick_timers` reads the HP before the tick's damage. There is no latch, so healing back to 60 % ends it.
 
 **Melee.**
 - **Hit test:** a cone plus wall LOS (budget `cone_ray_tiles`). All melee resolves in one `melee_hitscan` pass, with a per-entity cone direction; lifesteal applies after damage.
+- **Only cone kinds (`attack_arc_rad > 0`) fire it.** Until 2026-10-23 every attack that wasn't a dash did. A ranged kind's zero arc still passed a body exactly on its facing ray, so bots landed free full-damage hits, nearly all of them on crates (BULL_HERO_PLAN.md §5.3).
 - **Edgar's lifesteal:** 35 % of damage dealt. It counts entities only (crates are excluded), and overkill counts.
 - **Swept melee (Buzz, `core/melee_sweep`):** `hitscan_count` > 1 spreads that many cones across `attack_cooldown`, sweeping clockwise on screen. Sub-swing k is centred at `facing - sweep/2 + k*sweep/(count-1)`. The clock is `ent_attack_cd`. Movement freezes facing for swept kinds only while `attack_cd` > 0. A whole sweep costs 1 ammo, not 1 per sub-swing (user-confirmed).
 - **Stateless schedules:** sub-swings and hazard ticks both fire on floor crossings of an age or cooldown, so nothing needs keeping in sync or resetting, and no tick is dropped or doubled when `dt` doesn't divide the interval.
@@ -320,6 +338,13 @@ Only hazards and the gadget spinner spare their owner; artillery can hurt its th
 - A pickup heals by the max-HP increase. `enemy_hp_mult` and `enemy_damage_mult` scale the totals.
 - Regen (0.13 × max HP per second, after 3.0 s) runs in tick phase 2, before this tick's attack resets its stopwatch, so it never undoes a fatal hit landed later in the tick.
 - `hp_healed` = regen + super lifesteal + melee lifesteal, counted as HP actually restored. The cube max-HP bump is excluded.
+
+**Status effects** (`core/status.py`, BULL_HERO_PLAN.md D4). Four (N,E) fields, zeroed on reset: `ent_slow_t` with `ent_slow_frac`, `ent_stun_t` and `ent_airborne_t`. `hero.tick_timers` counts them down in phase 2 and snaps a timer to exactly 0 once less than half a tick is left; plain float32 subtraction would hold 0.25, 0.3, 1.5, 2.0, 2.5 and 3.0 s one tick too long.
+- **Slow:** walking speed × (1 − frac). A dash is not slowed.
+- **Stun:** no walking, turning, attack, super or gadget (the hero's mask and `_attack_phase`'s gates, which also stop an override). A melee sub-swing that falls inside the stun is dropped; later ones land on schedule, because `attack_cd` keeps running.
+- **Airborne:** a stun that also makes the unit untargetable. Shots fly through it, and blasts, melee cones, dash and charge capsules, the hero's auto-aim, his super tap and the reward's in-reach flag all skip it. The gas still burns it, and bots still aim at it.
+- Only Bull applies them (§4). His charge launches each player it hits and slows everyone around its landing. His Stomper slows, or stuns a player already slowed.
+- A new slow replaces a running one only if it lasts longer, and then whole, fraction and all. A second launch or stun never shortens the first, and a stun leaves a running slow alone. In a Mortis run every timer stays zero and every gate is a no-op, so the run is bit-identical (`scripts/probes/hero_seam_digest.py`).
 
 ## 6. Terrain, movement and maps
 
@@ -491,7 +516,7 @@ Every reset leaves the gadget charged and the history empty, so an episode's fir
 
 **Latching.** Outcomes latch at the sub-tick the episode ended. The world keeps ticking, so `final_observation` can be up to `action_repeat` − 1 ticks stale; this is accepted.
 
-**Per-decision info:** `damage_matrix`, `damage_dealt_tick`, `damage_taken_tick` (combat only), `hp_healed_tick`, `kills_tick`, `deaths_tick`, `death_cause_tick`, `cubes_gained_tick`, `boxes_broken_tick`, `shots_fired_tick` (a proxy), `dash_hits_tick`, `attack_in_reach_tick`, `gadget_hit_tick`, `move_reversal_tick` (0 or 1 per decision), `hero_rank`, `hero_alive`, `alive_ticks`, `in_zone_ticks`, `n_ticks`.
+**Per-decision info:** `damage_matrix`, `damage_dealt_tick`, `damage_taken_tick` (combat only), `hp_healed_tick`, `kills_tick`, `deaths_tick`, `death_cause_tick`, `cubes_gained_tick`, `boxes_broken_tick`, `shots_fired_tick` (a proxy), `dash_hits_tick`, `attack_in_reach_tick`, `gadget_hit_tick`, `move_reversal_tick` (0 or 1 per decision), `attack_miss_tick`, `gadget_miss_tick` (counts, Bull's alone), `hero_rank`, `hero_alive`, `alive_ticks`, `in_zone_ticks`, `n_ticks`.
 
 ## 9. Observation
 
@@ -563,6 +588,12 @@ Its live counterpart is `TrackerResult.hero_offset`: the player box's tile minus
 | critic_enemies | 9×25, critic only: every bot's true state in entity order, `privileged.targets_hero` and `react_t` included |
 | critic_world | 6, critic only: `hero.cubes`, `zone.hero_margin`, `zone.safe_area_frac` |
 
+**Bull's spec, `agent_obs_bull.yaml`** (BULL_HERO_PLAN.md D6, 2026-10-27), is deploy6 with two changes:
+- `self` drops `hero.long_dash_ready` and `hero.long_dash_frac`, which are always 0 for Bull. It adds `hero.slow_window`, the seconds left on the slow his last charge landing applied (`ent_slow_window_t`), so 26 floats. The window is what decides whether a stomp stuns.
+- `critic_enemies` adds `entities.slowed_t`, `entities.stunned_t` and `entities.airborne_t`, so 9×28.
+
+That gives 274 actor floats (271 without auto-aim) and 258 critic floats, pinned in `test_configs_files.py`. The shadow cannot supply the window yet (BULL_HERO_PLAN.md §5.7b), so it is not a deploy spec.
+
 `projectiles.class_onehot` exists in the schema but deploy5 and deploy6 omit it. `train.yaml` turns off the world grid and `raw_los` (the (N,E,E) LOS used only by `entities.los_from_hero` and `visibility.los`); turn either back on only if a spec reads it. The camera and slot dataclass defaults equal the shipped yaml, so older frozen configs get the same camera.
 
 ## 10. Reward
@@ -588,6 +619,8 @@ Its live counterpart is `TrackerResult.hero_offset`: the player box's tile minus
 | `attack_in_reach` | 0.05 | |
 | `gadget_hit` | 0.3 | |
 | `move_reversal` | −0.01 | 0 in `RewardConfig`, so a run without the key never pays it. |
+| `attack_miss` | −0.10 | Bull's volleys only. 0 in `RewardConfig`. Was −0.05 for the first fine-tune. |
+| `gadget_miss` | −0.15 | Bull's stomps only. 0 in `RewardConfig`. |
 
 **`attack_in_reach`** counts the hero's attacks and supers made while an enemy he can see stands inside his uncharged dash reach: `dash_distance + dash_radius + unit_radius` = 3.77 tiles, the cadence audit's utilization radius. It is capped at one per decision.
 - `env._attack_phase` computes it before `start_dash`.
@@ -595,10 +628,11 @@ Its live counterpart is `TrackerResult.hero_offset`: the player box's tile minus
 - A whole episode of in-reach attacks is worth about 3, against 10 for a win.
 
 **`gadget_hit`** counts landings of the hero's gadget spinner that hurt at least one player: one per landing, however many players the blast catches, paid on top of `damage_dealt`.
-- `env._projectile_phase` computes it as the hero's hits that `charge_hit` leaves out, since the spinner is the one projectile that charges no super.
+- `env._projectile_phase` computes it as the hero's player hits that `charge_hits` counts nothing for, since the spinner is the one projectile that charges no super.
 - A landing on crates alone, or on nothing, pays nothing: box damage never enters `dmg_by`.
 - The 18 s cooldown allows about ten throws a match, so about 3 at most, against 10 for a win.
 - A super bolt that hits the same player on the landing tick hides the spinner's hit on that player (rare).
+- **Bull's Stomper** deals no damage, so the term pays a stomp that slows or stuns at least one player instead, once per stomp (user, 2026-10-23). `_run_tick` ORs tick phase 5b's flag into the spinner's. A stomp that catches nobody, or only airborne players, pays nothing. At the shipped action_repeat 5 the stomp lands on the next decision's first sub-tick, so the term is paid one decision after the tap. The 20 s cooldown allows about ten stomps in a 185 s episode, so about 3 at most, as for the spinner.
 
 **`move_reversal`** counts decisions whose move bin swung 135° or more from the previous decision's (6 or more of 16 bins), both non-idle (user, 2026-10-07).
 - `core/events.move_reversals` reads the previous decision off history slot 0 in `env.step`, before `history.push` overwrites it. So an episode's first decision never counts: the reset empties the ring.
@@ -606,11 +640,18 @@ Its live counterpart is `TrackerResult.hero_offset`: the player box's tile minus
 - The first run trained with it, `runs/mortis_ppo-20261007-161117`, reverses on 11 % (watch) to 16 % (train) of its decisions, on the probe's count (pairs of non-idle moves). The 2026-09-30 policy reverses on 28 % on the same count and seeds (measured 2026-10-10). The rate was already that low at 200M (archive/MODEL_SIZE_STUDY.md).
 - The policy sees its last three moves (`hist.move_onehot`), so the cost is a function of what it observes.
 
+**`attack_miss`** and **`gadget_miss`** charge the hero's whiffs (user, 2026-11-02; BULL_HERO_PLAN.md §5.8). Only Bull pays them: Mortis's dash fires no pellets, and a spinner's misses are not scored.
+- `attack_miss` counts volleys none of whose pellets landed on a player or a crate. `projectiles._settle_hero_volleys` keys each hero pellet (owner 0, `PROJECTILE`, not piercing) by its spawn tick in a 32-column ring, `state.hero_volley_hit`. Bull's pellets fly 12 ticks and he can fire every 5, so two volleys are often in the air at once, and the ring scores them apart.
+- A volley closes on the tick its last pellet ends. A shot that runs to full range is charged 11 ticks later, on the third decision at action_repeat 5.
+- `gadget_miss` counts stomps that landed on nobody, or only on airborne players: the complement of `gadget_hit`'s stomps. `hero.advance_stomp` returns the landing for it.
+- The 300M Bull run (`runs/mortis_ppo-20261101-133724`, elite, 128 episodes, measured 2026-11-02) whiffed 5.7 of its 19.5 volleys a match (29 %) and 1.96 of its 2.22 stomps (88 %). At these weights that is about −0.6 a match, against 10 for a win.
+- `attack_miss` started at −0.05, equal and opposite to `attack_in_reach`, so a whiff with someone in reach netted 0. A 100M fine-tune on it (2026-11-03) left the whiff share almost where it was (22.4 % to 21.3 %), so the user raised it to −0.10: every whiff now costs. Against `gadget_hit`'s 0.3, a stomp breaks even at a one-in-three chance of catching someone.
+
 **Invariants and guards.**
 - The terminal payoff must dominate `survive_per_step`.
 - Raising `hp_healed` far enough makes going into the gas and regenerating afterwards profitable.
 - `builder.check_reward_is_observable` refuses a `cube_pickup` weight under a spec that cannot see pickups.
-- `TERM_NAMES` keeps a stable order, each new term appended (`attack_in_reach`, then `gadget_hit`, then `move_reversal`), so term curves stay comparable across runs.
+- `TERM_NAMES` keeps a stable order, each new term appended (`attack_in_reach`, then `gadget_hit`, then `move_reversal`, then `attack_miss` and `gadget_miss`), so term curves stay comparable across runs.
 
 ## 11. Training
 
@@ -676,7 +717,7 @@ The PPO buffer lives in host RAM, proportional to `n_steps` × `n_envs` × agent
 - **Counting:** only each slot's first episode counts. Short episodes are deaths, so counting every finish would bias the rate down.
 - **Holdout:** a twin evaluator on the holdout maps logs `eval/holdout_win_rate[_<tier>]` and `eval/holdout_gap`. Read the gap's trend from the at-start row, not its sign. `best_model.zip` is picked on the training-map mean only, since picking on the holdout would spend it.
 - **Validation:** `validate_train_config` refuses a holdout map that is unknown, duplicated, a bare string, in the training rotation, or unloadable. Readers that never build the holdout env (`DeployedPolicy.from_run`, `watch.py`, the cadence audit, probes) pass `check_holdout=False`.
-- **`gadgets_used`:** throws per episode, counted from the evaluator's own actions by the sim's rule.
+- **`gadgets_used`:** throws (Bull: stomps) per episode, counted from the evaluator's own actions by the sim's rule.
 
 **Logging.** `progress.csv` and `log.txt` always, and TensorBoard if installed. `train/*` never resets, while `curriculum/win_rate` resets at each transition. Compare runs on `eval/*`, never on train win rate.
 
@@ -699,7 +740,7 @@ Speed is read off a real run's `time/fps` (§2). This section records what shape
 
 **Levers in place.**
 - **Training config:** the world grid and `raw_los` are off in training.
-- **March budgets per call:** the melee cone LOS uses `cone_ray_tiles`, the bots' crate LOS `attack_ray_tiles`, the dash `dash_ray_tiles`, and the projectile wall march `shot_step_tiles` (the farthest a wall-stoppable shot moves in one tick; supers are excluded because they pierce).
+- **March budgets per call:** the melee cone LOS uses `cone_ray_tiles`, the bots' crate LOS `attack_ray_tiles`, the dash `dash_ray_tiles`, Bull's charge `charge_ray_tiles` and its push `knockback_ray_tiles`, and the projectile wall march `shot_step_tiles` (the farthest a wall-stoppable shot moves in one tick; supers are excluded because they pierce).
 - **Bot LOS:** target-only (N,E), instead of (N,E,E).
 - **Crate collisions** test only nearby tiles. `_box_grid` is an int16 tile-to-crate map rebuilt by one scatter each tick. `_box_candidates` searches within `box_reach_tiles` and falls back to every crate when the window would be too large. This relies on at most one alive crate per tile, which `boxes.spawn_boxes` guarantees and `check_invariants` enforces.
 - **Split shards** are assigned from the slot side: each free slot finds its (shell, arm) by `searchsorted` into the demand cumsum.

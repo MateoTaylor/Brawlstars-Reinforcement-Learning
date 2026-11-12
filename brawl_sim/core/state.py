@@ -6,6 +6,11 @@ import torch
 
 F32, I64, I32, BOOL = torch.float32, torch.int64, torch.int32, torch.bool
 
+# Ticks of spawn history `hero_volley_hit` keeps, one column per tick. It must outlast the longest
+# flight of any hero pellet, or two volleys in flight would share a column: Bull's 5.2 tiles at
+# 9 tiles/s is 12 ticks (tests/test_miss_penalties.py pins the margin).
+HERO_VOLLEY_RING = 32
+
 # (field name, shape(N,E,P,B,U,L,K) -> tuple, dtype). Declarative so allocate() and the memory
 # report share one source of truth for shapes/dtypes. K = cfg.history_frames, read only by the
 # _HISTORY_FIELDS rings below; every other lambda ignores it.
@@ -27,7 +32,13 @@ _ENTITY_FIELDS = (
     # The crates this entity's current dash has already damaged, read only under
     # `boxes.dash_hits_once` (hero.advance_dash); zeroed at dash start and finish like ent_dash_hits.
     ("ent_dash_box_hits", lambda N, E, P, B, U, L, K: (N, E, B), BOOL),
-    ("ent_invuln_t", lambda N, E, P, B, U, L, K: (N, E), F32),
+    # A CHARGE super (Bull; BULL_HERO_PLAN.md D2) rides the dash fields above. `ent_dash_super`
+    # marks a dash that is one: super_damage over super_radius, knockback, airborne, the landing
+    # slow, no crates (hero.advance_dash). `ent_dash_windup_t` is the seconds left of its
+    # standing start, which `ent_dash_t` also counts. Both are zero outside a charge.
+    ("ent_dash_super", lambda N, E, P, B, U, L, K: (N, E), BOOL),
+    ("ent_dash_windup_t", lambda N, E, P, B, U, L, K: (N, E), F32),
+    ("ent_invuln_t",lambda N, E, P, B, U, L, K: (N, E), F32),
     ("ent_reveal_t", lambda N, E, P, B, U, L, K: (N, E), F32),
     ("ent_react_t", lambda N, E, P, B, U, L, K: (N, E), F32),
     ("ent_out_of_combat_t", lambda N, E, P, B, U, L, K: (N, E), F32),
@@ -42,6 +53,25 @@ _ENTITY_FIELDS = (
     # is also "starts charged". hero.tick_timers counts it down and env._attack_phase sets it to
     # `gadget_cooldown` on a throw. Per-entity like ent_super_charge (only `hero_mortis` has one).
     ("ent_gadget_cd", lambda N, E, P, B, U, L, K: (N, E), F32),
+    # Seconds left of an armed STOMP gadget's wind-up (Bull's Stomper, BULL_HERO_PLAN.md §5.5):
+    # set by hero.start_stomp on the tap, counted down by hero.advance_stomp, which lands the pulse
+    # on the tick it reaches 0. zero_'s 0 is "nothing armed"; a SPINNER kind never sets it.
+    ("ent_stomp_t", lambda N, E, P, B, U, L, K: (N, E), F32),
+    # Status effects (core/status.py; BULL_HERO_PLAN.md D4): seconds left on each, counted down to
+    # exactly 0 by hero.tick_timers, and the slow's speed fraction, cleared with its timer. zero_'s
+    # 0 is "unaffected". Only the hero applies them: his charge super (airborne, the landing slow)
+    # and his Stomper (a slow, or a stun on a player already slowed).
+    ("ent_slow_t", lambda N, E, P, B, U, L, K: (N, E), F32),
+    ("ent_slow_frac", lambda N, E, P, B, U, L, K: (N, E), F32),
+    ("ent_stun_t", lambda N, E, P, B, U, L, K: (N, E), F32),
+    ("ent_airborne_t", lambda N, E, P, B, U, L, K: (N, E), F32),
+    # The CHARGER's side of the landing slow: seconds left on the slow this entity's last charge
+    # landing applied around it (hero.advance_dash), counted down beside the slow itself
+    # (status.tick), so it equals every caught player's ent_slow_t for as long as theirs lasts.
+    # Set on every landing, caught or not: the live shadow knows when its charge landed, not
+    # whom it slowed. The obs' `hero.slow_window` (BULL_HERO_PLAN.md D6), the Stomper's "will
+    # this stomp stun?". zero_'s 0 is "none running".
+    ("ent_slow_window_t", lambda N, E, P, B, U, L, K: (N, E), F32),
     ("ent_target", lambda N, E, P, B, U, L, K: (N, E), I64),
     ("ent_move_smooth", lambda N, E, P, B, U, L, K: (N, E, 2), F32),
     # The velocity bots read a target by: ent_vel through a low-pass of `bots_lead_velocity_tau`
@@ -117,6 +147,11 @@ _ZONE_EPISODE_FIELDS = (
     ("step_count", lambda N, E, P, B, U, L, K: (N,), I32),
     ("n_alive", lambda N, E, P, B, U, L, K: (N,), I32),
     ("boxes_broken", lambda N, E, P, B, U, L, K: (N,), I32),
+    # Which of the hero's attack volleys still in flight have landed a pellet on a player or a
+    # crate: one column per tick they were spawned on, mod HERO_VOLLEY_RING. Written only by
+    # projectiles._settle_hero_volleys, for the reward's `attack_miss`. zero_'s False is "nothing
+    # landed yet".
+    ("hero_volley_hit", lambda N, E, P, B, U, L, K: (N, HERO_VOLLEY_RING), BOOL),
 )
 
 _LATENCY_FIELDS = (
@@ -219,8 +254,8 @@ def check_invariants(state: SimState, cfg, params) -> None:
     as a safety net. Not sync-free and not meant to be: this replaces the guarantees
     functional purity would have given, so it deliberately checks everything it can.
 
-    Takes `params` because the cube, dash_t and gadget_cd bounds are per-env/per-kind SimParams
-    fields, not EnvConfig ones.
+    Takes `params` because the cube, dash_t, gadget_cd and stomp_t bounds are per-env/per-kind
+    SimParams fields, not EnvConfig ones.
     """
     if not cfg.debug_checks:
         return
@@ -256,15 +291,54 @@ def check_invariants(state: SimState, cfg, params) -> None:
     if not torch.all(state.ent_cubes <= params.max_cubes.unsqueeze(-1)):
         raise ValueError("check_invariants: ent_cubes exceeds max_cubes")
 
+    # A dash lasts its kind's dash_duration. A CHARGE super lasts its wind-up plus the time its
+    # longest rush, super_range, takes at super_charge_speed (hero.start_charge), which is the
+    # bound for Bull, whose dash_duration is 0.
     dash_duration = torch.gather(params.dash_duration, 1, state.ent_kind)
-    if not torch.all(state.ent_dash_t <= dash_duration + 1e-3):
-        raise ValueError("check_invariants: ent_dash_t exceeds dash_duration")
+    charge_speed = torch.gather(params.super_charge_speed, 1, state.ent_kind)
+    charge_seconds = torch.where(
+        charge_speed > 0,
+        torch.gather(params.super_windup_seconds, 1, state.ent_kind)
+        + torch.gather(params.super_range, 1, state.ent_kind) / torch.clamp(charge_speed, min=1e-6),
+        torch.zeros_like(charge_speed),
+    )
+    if not torch.all(state.ent_dash_t <= torch.maximum(dash_duration, charge_seconds) + 1e-3):
+        raise ValueError("check_invariants: ent_dash_t exceeds dash_duration (or the charge's duration)")
+    # The charge's flag and wind-up live only inside a running dash, and the wind-up is the
+    # first stretch of it, so it never outlasts the dash.
+    if not torch.all(~state.ent_dash_super | (state.ent_dash_t > 0)):
+        raise ValueError("check_invariants: ent_dash_super set with no dash running")
+    if not torch.all(state.ent_dash_super | (state.ent_dash_windup_t == 0)):
+        raise ValueError("check_invariants: ent_dash_windup_t set outside a charge")
+    if not torch.all((state.ent_dash_windup_t >= 0) & (state.ent_dash_windup_t <= state.ent_dash_t + 1e-6)):
+        raise ValueError("check_invariants: ent_dash_windup_t out of [0, ent_dash_t]")
 
     # A countdown that clamps at 0 (hero.tick_timers) and is only ever SET to the kind's
     # gadget_cooldown, so either bound failing means a write path other than those two.
     gadget_cooldown = torch.gather(params.gadget_cooldown, 1, state.ent_kind)
     if not torch.all((state.ent_gadget_cd >= 0) & (state.ent_gadget_cd <= gadget_cooldown + 1e-3)):
         raise ValueError("check_invariants: ent_gadget_cd out of [0, gadget_cooldown]")
+    # An armed stomp counts down from its kind's `stomp_windup_seconds` (hero.start_stomp,
+    # hero.advance_stomp), which is 0 on every kind without a Stomper, so this also keeps the
+    # timer at 0 on every other kind.
+    stomp_windup = torch.gather(params.stomp_windup_seconds, 1, state.ent_kind)
+    if not torch.all((state.ent_stomp_t >= 0) & (state.ent_stomp_t <= stomp_windup + 1e-3)):
+        raise ValueError("check_invariants: ent_stomp_t out of [0, stomp_windup_seconds]")
+
+    # Status timers count down to exactly 0 (status.count_down), and the slow's fraction is
+    # cleared with its timer, so a fraction left without one means a write path that set only one.
+    for name in ("ent_slow_t", "ent_stun_t", "ent_airborne_t"):
+        if not torch.all(getattr(state, name) >= 0):
+            raise ValueError(f"check_invariants: {name} is negative")
+    if not torch.all((state.ent_slow_frac >= 0) & (state.ent_slow_frac <= 1)):
+        raise ValueError("check_invariants: ent_slow_frac out of [0, 1]")
+    if not torch.all((state.ent_slow_t > 0) | (state.ent_slow_frac == 0)):
+        raise ValueError("check_invariants: ent_slow_frac set with no ent_slow_t")
+    # Only ever set to the charger's own `super_slow_seconds`, which is 0 on every kind without a
+    # CHARGE super, so this also keeps the window at 0 on every other kind.
+    slow_window = torch.gather(params.super_slow_seconds, 1, state.ent_kind)
+    if not torch.all((state.ent_slow_window_t >= 0) & (state.ent_slow_window_t <= slow_window + 1e-3)):
+        raise ValueError("check_invariants: ent_slow_window_t out of [0, super_slow_seconds]")
 
     if not torch.all(state.prj_alive.sum(dim=-1) <= state.prj_alive.shape[-1]):
         raise ValueError("check_invariants: live projectile count exceeds P slots")

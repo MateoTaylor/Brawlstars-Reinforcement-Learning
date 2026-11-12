@@ -333,6 +333,9 @@ class ObservationAssembler:
             "super_charge_frac": self._f(s["super_charge_frac"])[:, 0],
             "gadget_ready": self._b(s["gadget_ready"]),
             "gadget_charge_frac": self._f(s["gadget_charge_frac"])[:, 0],
+            # Bull's (BULL_HERO_PLAN.md §5.7b): from the shadow's own charge landing, 0 for a kit
+            # without a charge. Only a spec that names it reads it.
+            "slow_window": self._f(s["slow_window"])[:, 0],
         }
         # Clamped, and the clamp is the part that matters: the sim truncates at time_frac == 1, so
         # the column's whole training range is bounded by 1 and a long match would feed it 1.33.

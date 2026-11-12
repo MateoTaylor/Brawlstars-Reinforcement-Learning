@@ -488,6 +488,14 @@ super fired while moving keeps the drag along the move bin. The shadow models no
 needs no estimate of the game's target, unlike value 4. Still unmeasured live: the game's tap
 reach, and whether it picks enemies in bushes or off screen.
 
+**A charge super drags to the screen edge (added 2026-10-28, BULL_HERO_PLAN.md §5.7b, Q6).**
+Bull's charge length is the drag's, unlike Mortis's fixed-distance bolt, and the shadow models
+every charge at the full 11 tiles (the user's call). So for a hero whose `super_type` is CHARGE,
+the loop presses with `full=True`, and `Buttons` drags the super along the bearing to 2 px inside
+the screen edge rather than 75 px. Not off-screen: the ADB backend clamps an off-screen point one
+axis at a time, which bends the bearing. On the shipped calibration the shortest such drag is
+176 px, straight down. An idle super stays a tap.
+
 ### 4.5 Calibration — BUILT 2026-09-08, see §6.14
 
 `control/calibration.py`, run once per resolution/UI-scale, output to
@@ -690,6 +698,38 @@ Mortis a hypercharge and the disc gains a charge meter that fills during a match
 exactly what disqualifies the Super here. Re-measure this gate if the brawler or its unlocks
 change.
 
+**Corrected 2026-10-28: the premise is wrong.** The operator's Mortis has a hypercharge. It builds
+during a match and is used later, as Bull's does, and it cannot be unequipped. The disc has no
+meter. It has two looks: dull purple while building or after use, bright magenta with a lightning
+bolt while ready. In all 16 live Mortis matches on record (10-13, 10-14; 8 to 80 s each) it stayed
+dull and the gate held 0.989 with no exits, because no match lasted long enough to light it. Lit,
+on Bull's Training Grounds clips, it scores 0.17 at this gate's r 35.9. So a long enough match will
+very likely drop the gate and stop the agent. BULL_HERO_PLAN.md §5.7d has the measurements and
+the fix options. All of them wait on a real-match recording in which the hypercharge lights.
+
+**Settled 2026-11-01 by that recording: the gate holds, and nothing changed.** The 10-28 entry was
+wrong twice. The disc does have a meter: a magenta arc fills around it before it lights. And the
+0.17 was a Training Grounds artifact: there the disc sits on bright grass with no dark track
+around it, and that venue is invalid for the gate. In a real Bull match (now the fixture
+`bluestacks-bull-hypercharge.mp4`), scored every frame at the refined r 35.9:
+- the dull disc read 0.98 falling to 0.80 as the meter filled;
+- lit, it read a median of 0.68 for its last 15 s;
+- the frame it lit dipped to 0.24 for 3 frames (100 ms), the only in-match dip, and one sample
+  short of `exit_samples` 4;
+- the results screen read 0.000.
+
+Nothing the agent does presses the hypercharge, so the lit look runs to the end of the match.
+`test_gate_holds_while_the_hypercharge_fills_and_lights_on_real_footage` pins all of it.
+Lowering `exit_samples` to 3 fails that test, because the gate then drops at the lighting.
+Mortis's lit disc is unmeasured, but it is the same disc frame with a different face. A gate
+refined on a lit disc (r 43) would never open on the next match's dull disc, which is one more
+reason to start the loop before the battle is queued.
+
+**Extended 2026-11-04 (§5.2): the hypercharge is the first look, no longer the only one.** The
+real app's account plays a brawler that has no hypercharge, so the game draws no disc there and
+the gate never opened. It now also looks at the Super's two faces, and the gadget is read per
+match.
+
 **One constant blocks auto-calibration: `RADIUS_PX = (40, 115)`.** `calibrate_buttons` returns
 **zero anchors** on this footage — not a scoring failure but a search-range one. The measured radii
 run 30 to 35, so the buttons are never proposed to `HoughCircles` in the first place. Re-running
@@ -710,7 +750,7 @@ entirely in the loop. Per-frame cost is then three `ring_score_at` evaluations. 
 ```
 gadget       (1675.9,  997.0)  r 30.2
 super        (1559.9,  901.1)  r 33.3
-hypercharge  (1463.0,  998.0)  r 34.4      <- in-match gate anchor
+hypercharge  (1463.0,  998.0)  r 34.4      <- the gate's first look (§5.2 adds the Super's two)
 ```
 
 There is no `attack` entry, deliberately: the attack is an AREA, not a button (§6.8), so
@@ -811,6 +851,121 @@ what stops the agent hammering the end-of-round menu. It should be a hard interl
 — the control layer refuses to emit unless `match_state.in_match` is true — not a politeness the
 caller is trusted to observe. It should also fire on: window focus lost, capture stall, and
 policy exception. **Fail closed.**
+
+### 5.2 The real app draws no hypercharge: three looks, and the gadget read per match — BUILT 2026-11-04
+
+**What failed.** The first run against the real Brawl Stars app (the operator's own account,
+Starfruit Supernova, BlueStacks at 1440p) waited through a whole match and pressed nothing. Its log
+said `waiting for the match gate` and nothing after it. The cause was not the input path. Touches
+go through adb at calibrated device points, so the BlueStacks keymap plays no part, and §6.9 hides
+its overlay for the run anyway. Nor was it the layout: the discs the game does draw sit on the
+stored centres. **It was the account.** Its brawler, Shelly at power 3, owns no gadget and no
+hypercharge, and the game draws no disc for either. The gate's one anchor was the hypercharge
+(§5), so it watched an empty patch of HUD and never opened. Nulls Brawl hid this for two months,
+because every brawler there owns everything and all three discs are always drawn.
+
+**The gate is the best of three LOOKS** (`match_gate.looks` in `control_calibration.json`,
+`match_state.GateLook`). Each is a disc at a radius; the score is the best look's; the 0.45
+threshold and the 6-in / 4-out hysteresis are unchanged.
+
+```
+  look               viewport r   refine span   drawn when
+  hypercharge          35.87        +/-12 px     the brawler owns one; FIRST, nothing presses it
+  super, uncharged     34.72        +/-3.49 px   every brawler: empty, recharging, or just spent
+  super, charged       41.71        +/-3.49 px   every brawler, ready to fire (40.0 device px)
+```
+
+- **One disc, two looks.** The Super's two faces are different rings: the charged face scores
+  0.02-0.10 at the uncharged radius, which is why the one-radius scratch gate in
+  MAP_ONBOARDING.md flickered as the Super lit. A spent Super turns into a dark disc with a
+  recharge arc and scores like the uncharged face (median 0.761). It does not grey out of the gate.
+- **Each Super look refines within half the gap between the two radii**, so neither face's refit
+  can jump onto the other. The hypercharge keeps ±12 px. `refine` takes a refit only for the looks
+  drawn at the open, keeps the stored radius for the rest, and raises if none is drawn.
+  `MatchState.drawn` names the drawn ones, and the `match started` log line prints them.
+- `refine_radius`'s grid is now symmetric about the stored radius. A 3.49 span used to scan
+  r0−3.49 to r0+3.01 and never r0 itself. For the old ±12 and ±4 spans the grid is unchanged.
+
+Measured on the real match (`bluestacks-starfruit-supernova-west-upper.mp4`, 30 fps), replayed
+through `MatchState.update` at the live 12 Hz:
+
+```
+  gate                 lobby max   opens at   in-match dips under 0.45 (ticks)
+  hypercharge alone      0.312      never      --
+  three looks            0.208      15.73 s    1, 3, 1, 2, 3     (exit_samples 4)
+```
+
+The three longer dips are the player holding a Super drag, the disc pulled off its centre. The two
+single ticks are shallow (0.36, 0.42). The agent's own drag lasts one tick before it lifts
+(`control.buttons`). **This is the cost of looking at a disc the policy presses**, which §5 ruled
+out for a gate resting on that disc alone. Here a press can only dim one of the looks, and the
+measured dip is a tick short of an exit. Do not trim `exit_samples`. On the Nulls clips the three
+looks open and close exactly where the hypercharge alone did: Bull at 7.3 s and 85.4 s, Mortis at
+8.0 s and 35.1 s. The Bull clip's one in-match dip, the tick its hypercharge lights, is gone,
+because the Super covers it.
+
+**The gadget is read off the screen, once per match.** The game unlocks a gadget at power 7, so the
+account's brawler can lack one the policy's kit has, and a throw would tap empty HUD.
+- Every match starts with the gadget masked. `ShadowHero.equip_gadget(False)` is the sim's own
+  "this kind has no gadget", a zero cooldown: never legal, a charge of 0.0, and `act` refuses the
+  throw.
+- `DeployLoop._look_for_gadget` reads the disc (`MatchState.button_drawn`, ±4 px against 0.45)
+  every tick for `GADGET_LOOK_SECONDS`, 1.0 s from the gate. The first sighting equips it, before
+  that tick's decision. A window with no sighting logs `no gadget disc in the first 1 s of the
+  match` and leaves the gadget masked to the end. The next match looks again.
+- **Not one look on the gate's own tick**, because the disc flashes white as the match starts. On
+  the Bull clip it reads 0.9 on the first frame of the controls, falls to 0.19-0.27 from +133 to
+  +233 ms, and is back at 0.975 by +367 ms. The live gate opens about 0.42 s in, after the flash,
+  but an every-frame replay opens inside it.
+- **And not the whole match**: the real app's empty spot peaks at 0.132 over the 1 s window, but
+  reached 0.548 on one mid-match frame.
+- A missed disc fails closed: one match with the gadget held back, never a tap on nothing.
+
+**Out of distribution, but true.** In the sim the gadget is charged at every gate. Masked, it reads
+`gadget_ready` False and `gadget_charge_frac` 0.0 for a whole match, a state the sim produces
+only for the 18 s after a throw. That was accepted because the alternative is feeding the policy
+a charged gadget that does not exist.
+
+**A shut gate now says why.** A disc the account does not draw is a closed gate with no error, so
+a waiting loop logs each look's peak every `WAIT_LOG_SECONDS` (10 s): `waiting: gate peaks over
+10 s: hypercharge …, super (uncharged) …, super (charged) … (opens at 0.45 held for 6 ticks)`.
+`deploy_run.py`'s startup line names the looks. Read the peaks before re-measuring anything.
+
+**Pinned by** `test_gate_opens_on_the_real_app_where_no_hypercharge_is_drawn` (the table above,
+plus no gadget across the window), the synthetic look tests in `test_deployment_control.py`, the
+loadout and waiting-log tests in `test_deployment_loop.py`, and the `equip_gadget` tests in
+`test_deployment_shadow.py`.
+
+**Decided 2026-11-04 (the user): the live test queues Bull**, the hero the served run
+(`runs/mortis_ppo-20261103-092146`) was trained as. Shelly's match stays on record for the gate
+alone. Loadout masking makes a Bull without a gadget or hypercharge safe to deploy. Three things
+about the account's Bull draw no disc, so the operator reads them off the brawler screen before
+queueing:
+
+- **The power level, because the real app plays a brawler at its own.** MEASURED on the recorded
+  match: Shelly reads 4680 at full health (0.5 s after the gate), which is her power-1 3900 × 1.2,
+  power 3, not the power-11 7800. `configs/brawlers.yaml`'s header says Showdown boosts everyone
+  to power 11; on this account it did not. The sim's Bull is the power-11 card (10000 HP, 880 per
+  pellet), and the actor's `hero.hp`, `hist.hp` and `memory.hp` are absolute. So a lower Bull
+  starts the match reading like a hurt sim Bull: a power-3 one would show 6000, the sim's 60 %.
+- **The gadget.** If he owns one (power 7 and up), it must be Stomper. The gadget read sees a disc,
+  not which gadget it is: T-Bone Injector heals, and every gadget the policy chooses was trained as
+  a stomp.
+- **The star power.** The shadow models Berserker (BULL_HERO_PLAN.md §5.7b). Below power 9, or with
+  Tough Guy, the game does not reload twice as fast under 60 % HP. A shadow that did would run its
+  clip ahead of the game's, and the attack mask could open on an empty clip (the ammo canary shows
+  that first). **Decided 2026-11-04 (the user): the account's Bull has Stomper and no
+  Berserker.** BUILT the same day: `loadout.star_power: false` in `configs/deployment.yaml` builds
+  the shadow from `ShadowParams.without_star_power()`, which reloads at the base rate at every
+  HP, and the startup log says which (`DeployLoop.loadout_note`). Nothing on screen shows a star
+  power, so the switch is the operator's word. The policy still trained with Berserker and may
+  count on a fast reload when hurt that the game no longer gives; only a retrain without it would
+  change that. The Nulls Brawl footage's Bull has Berserker (BULL_HERO_PLAN.md Q1), so
+  `scripts/probes/replay_clip.py --star-power on` replays those clips with it.
+
+Only a power-11 Bull with Stomper and Berserker equipped is the kit the policy trained with (gears
+never modelled). The account's Bull differs in the star power, and in the power level if it is
+under 11.
 
 ---
 
@@ -1182,7 +1337,7 @@ issue, using the same `configs/brawlers.yaml` params the sim loads. Re-auditing 
 | `hero.vel` | CV | Frame-to-frame position. |
 | `hero.hp` | CV | `hp_detection` — the **numeral**, which is what `read.py` produces. Replaced `hero.hp_frac` in §9.10: its denominator is max_hp, and a power cube adds a flat +400 to that with nothing on screen saying who holds how many. |
 | `hero.ammo_frac`, `ammo_whole` | CV + shadow | The ammo bar in the hero's own box stack, below the HP bar — `hp_detection/locate.py` documents the layout and `find_bar` already reads bars there. Also dead-reckonable, which makes it the **desync canary** (below). |
-| `hero.super_ready`, `super_charge_frac` | CV | Two sources: the super-charge bar in the box stack (same `find_bar`) or the button's fill. Prefer the bar — it is the same reader as ammo. |
+| `hero.super_ready`, `super_charge_frac` | CV | The Super button: the disc's colour for ready, the arc in its ring for charge (`perception/super_button.py`). *The box-stack bar this row once preferred is Mortis's long-dash meter, not his super — §6.4, 2026-11-02.* |
 | `hero.in_bush` | CV | Terrain lookup at hero tile. |
 | `hero.in_zone` | CV | `terrain/zone.py` at hero tile. |
 | `hero.cubes` | ~~CV~~ | **Dropped** — §9.8. Recoverable (the pip row is in the same box stack as the HP bar), but no reader will be built, so it leaves the spec rather than being fed a constant. |
@@ -1238,6 +1393,19 @@ vacuously. `ammo`, `attack_cd`, `dash_t`, `attack_idle_t` and `ammo_whole` are a
 equal, not approximately: they are the same float32 operations in the same order, and a tolerance
 there would hide the one thing that genuinely needed measuring.
 
+**The kit is the run's hero (2026-10-28, BULL_HERO_PLAN.md §5.7b).** `ShadowParams.load(kind)` takes
+the run's `hero_<name>` block. Besides Mortis's dash, `ShadowHero` models Bull's kit:
+- the volley (a fire with no dash: one ammo and `attack_cd`);
+- the charge super, always at full length, masking everything for its 1.84 s, its landing
+  starting `hero.slow_window` at 1.5 s;
+- Berserker, which doubles the reload below 60 % of the most HP the loop has read (`set_hp`);
+- the 20 s Stomper.
+
+`attack_cd`, `gadget_cd` and `slow_window` count down with the sim's `status.count_down`. The
+parity tests run over both heroes, with Bull's charge, Berserker and Stomper each checked
+against the sim exactly. `loop.SHADOW_KINDS` lists the heroes the shadow models, and any other
+hero is refused at startup.
+
 **Timers must be float32, and that is not cosmetic.** The sim's are float32 tensors with `cfg.dt`
 promoted into them. Counting `x = max(0, x - 0.05)` down from Mortis's `attack_cooldown: 0.35`
 takes **seven** ticks in float32 and **eight** in float64, where a residue of 4.2e-17 keeps it
@@ -1277,9 +1445,10 @@ tick a cooldown expires, and it can never offer an action the game will refuse.
 `core/hero.add_super_charge` counts hits landed on living players — boxes are excluded by
 `env._bookkeeping` precisely so a hero cannot farm his super off crates. Whether our dash connected
 is not in our action stream, so `super_charge` cannot be reckoned **upward** at all. It is CV,
-from `read_super`, and the shadow does three things with it that CV alone cannot: gate it on the
-cooldown and the dash (which only the shadow knows), spend it the instant we tap, and **latch that
-spend** so a stale frame still showing magenta cannot re-arm the mask. That last one is not
+read off the Super button (`super_button.read_super`, §6.4), and the shadow does three things with
+it that CV alone cannot: gate it on the cooldown and the dash (which only the shadow knows), spend
+it the instant we tap, and **latch that spend** so a stale frame still showing a ready disc cannot
+re-arm the mask. That last one is not
 hypothetical housekeeping: a super costs charge rather than ammo, so a double-tapped super is
 exactly the desync the ammo canary cannot see.
 
@@ -1408,8 +1577,9 @@ already classifies by NCC against ten mean templates.
 
 **`ammo` was the one to build first**, because this section's whole drift guard depends on it —
 and it is the only one of the three where being wrong is silent rather than obvious. All three
-now exist and are measured: `hero_bars.read_ammo`, `hero_bars.read_super`, and
-`brawl_vision/hud.py:HudReader.brawlers_left`. §6.4 carries what each of them measured.
+now exist and are measured: `hero_bars.read_ammo`, `super_button.read_super` (the Super
+button, since 2026-11-02), and `brawl_vision/hud.py:HudReader.brawlers_left`. §6.4 carries what
+each of them measured.
 
 **One correction to the row above, from building it.** `meta.n_enemies_alive` is *not* what the
 HUD says. The game counts brawlers **including you**, so the observation is the reading minus
@@ -1417,7 +1587,7 @@ one — and only while the hero is alive, because the game stops counting you th
 `BrawlersLeft.enemies_alive(hero_alive=...)` takes that operand with no default rather than
 letting the call site guess, since the error it prevents is a plausible integer either way.
 
-`meta.time_frac` is the one field in this group with neither a reader nor a shadow, and it needs neither: §9 item 6 resolved it to **wall-clock seconds since the gate went true ÷ 150, clamped to [0, 1]**. `loop.py` owns it, because `loop.py` owns the gate.
+`meta.time_frac` is the one field in this group with neither a reader nor a shadow, and it needs neither: §9 item 6 resolved it to **wall-clock seconds since the gate went true ÷ 150, clamped to [0, 1]**. `loop.py` owns it, because `loop.py` owns the gate. The seconds come from `DeployLoop._match_clock`, which is the wall clock live. `scripts/probes/replay_clip.py` swaps it for the clip's (2026-11-04). On the wall clock, a replay's time_frac measured how fast the CPU got through the clip, and a decision near a tie came out differently from run to run.
 
 #### The `history` group of deploy4, BUILT 2026-09-21
 
@@ -1506,7 +1676,9 @@ which is the same rule `hp_detection`'s own docstring uses to justify sitting in
 #### The readout stack, measured
 
 `locate.py` documents the order — power pip, name, HP number, HP bar, *"and — for your own
-brawler only — an ammo bar and a super-charge bar."* Those last two are what this section reads.
+brawler only — an ammo bar and a super-charge bar."* Those last two are what this section read.
+**The second is not the super** — it is Mortis's long-dash meter; see "Super, read off the
+button" below.
 Row offsets below the HP bar's own row, over 40 frames:
 
     dy  0–9    HP bar          hue 56, sat ~195, val ~250
@@ -1580,6 +1752,15 @@ now runs at 0.1 and the reader is unchanged.
 
 #### Super — and the third colour state that would otherwise be a disaster
 
+> **Superseded 2026-11-02 — this subsection measured the wrong widget.** The bar it reads, one
+> track under the ammo pips, is **Mortis's long-dash meter**: lined up against the Super button on
+> `bluestacks-example-new.mp4`, it empties on every ammo drop, refills in ~4.5 s and turns magenta
+> when full, while the Super button sits uncharged for the whole clip. Bull has no such bar, so the
+> reader returned None on every frame and the shadow held the super illegal all match (live
+> telemetry 2026-11-01: legal on 0 of 155 decisions). The measurements below are kept as a record
+> of that widget; the reader, its config and its tests are gone. What replaced it is "Super, read
+> off the button" below.
+
     super_charge_frac = yellow run length / track length
     super_ready       = the track is MAGENTA
 
@@ -1593,10 +1774,11 @@ the test for it comes first.
 gates action masking at inference: an uncharged super means bin 2 is masked the way `MaskablePPO`
 saw it in training.
 
-The alternative source — the super BUTTON in the bottom-right HUD, at a fixed position — was
+~~The alternative source — the super BUTTON in the bottom-right HUD, at a fixed position — was
 considered and is worse for this purpose. It is essentially binary (lit / not lit), so it can
 support `super_ready` but not `super_charge_frac`, and the continuous field is the one the policy
-was trained on. It stays available as a free cross-check.
+was trained on. It stays available as a free cross-check.~~ **Wrong (2026-11-02):** the button
+draws the charge as an arc in its ring, so it supplies both fields, and it is what is read now.
 
 **Built, and the design above survived measurement — including the magenta warning, which was
 right.** `hero_bars.read_super`, `tests/test_vision_hero_bars.py` (18 more tests, synthetic;
@@ -1637,6 +1819,39 @@ ones; a drifting extent shows up as *upward* jumps. Over 161 consecutive pairs: 
 0.20**, 22 between 0.05 and 0.20, 55 small positives, 60 flat, and exactly 2 large drops — the two
 times the super was used. Median |Δ| 0.012. That is what a correct denominator looks like, and it
 is asserted in the footage test rather than left as a number in prose.
+
+#### Super, read off the button (2026-11-02)
+
+`brawl_deployment/perception/super_button.py`, `tests/test_deployment_super_button.py` (18
+synthetic tests, 4 footage tests under `@pytest.mark.vision`). The button is the game's own readout
+of the super, drawn the same way for every brawler, and needs no hero box: its centre is
+`control_calibration.json`'s `super`, the disc the controls already press, at
+`Calibration.viewport_button("super")`. Three looks, measured on the BlueStacks clips (OpenCV HSV):
+
+| look | where | hue | sat | val |
+|---|---|---|---|---|
+| charging disc | 0.6–0.95 r | 104–107 | 144–170 | — |
+| its ring (the arc's track) | 1.08–1.30 r | 114–118 | — | 52–58 |
+| the arc, growing clockwise from 6 o'clock | 1.08–1.30 r | 20–33 | — | 200–250 |
+| **ready** disc, swollen past the ring | 0.6–0.95 r | median 21–23 | p10 196–205 | — |
+| hit flash over the disc / arc / ready disc | | 91–107 / 29–43 / 21–31 | 44–115 / 23–81 / 71–96 | |
+| intro and death screens (salmon) | everywhere | 7–11 | 116–136 | |
+
+`super_charge_frac` is the share of 72 angular bins in the ring whose pixels are lit arc (a count,
+not a run from 6 o'clock, so one occluded bin costs 1/72 rather than the reading). `super_ready`
+is the disc's colour, never `charge >= 1`. The blue and arc tests are on hue with a low saturation
+floor, so a flash over a charging button reads as the state under it. **The ready test also needs
+saturation**, because the salmon screens pass a hue-only test for it: on hue alone
+`bluestacks-example3.mp4` read a ready super through its intro and its death screen. The price is a
+ready disc under a flash, which reads None for its 1–2 frames, and the shadow's 1.0 s staleness
+hold covers that. Anything else (the knob dragged off centre while a super is aimed, a results
+screen) reads None, "could not read".
+
+**Every frame of the four clips:** `bluestacks-bull-hypercharge.mp4` reads empty to 15.8 s,
+charging 15.9–21.8 s (0.04 → 0.62 → 0.72 → 0.93), **ready 21.9–79.8 s** with only 3–4-frame None
+gaps at the flashes, then charging again after the spend. The three Mortis clips never read ready
+(none of those matches charged the super), and their intro and death screens read None. ~0.2 ms a
+frame. In the loop, `DeployLoop._read_own_bars` reads it every decision, before the hero-box check.
 
 #### Brawlers left — built, and the templates transferred
 
@@ -2118,6 +2333,46 @@ the same screen — `mss` grabs the desktop, so whatever is in front is what the
 Pausing on occlusion is what makes that survivable rather than fatal: alt-tab away and the agent
 stands still; come back and it resumes.
 
+#### The emulator's own overlay is hidden, because no probe can see it (MEASURED 2026-11-04)
+
+The first run on the real Brawl Stars app refused to start: "2 HD-Player.exe windows are open, so
+it is ambiguous which one the adb serial addresses". The second window was 'BlueStacks Keymap
+Overlay', from the keymap BlueStacks ships for Brawl Stars (`bluestacks.conf`:
+`key_controls_overlay_enabled="1"`, opacity 50). Nulls Brawl has no such keymap, so no earlier run
+had met it. Win32 listed it as:
+- owned by 'BlueStacks App Player', in the same process;
+- styled `WS_EX_LAYERED | WS_EX_TRANSPARENT | WS_EX_TOOLWINDOW`;
+- with a client area of 2560×1439 against the player's 2560×1440.
+
+The fix has two halves.
+
+**Selection.** A window that another player window owns belongs to that instance; it is not a
+second one. `select_emulator` counts only windows that no player window owns, so two real
+instances still raise.
+
+**Pixels.** Ignoring the window does not ignore what it draws. Its own surface (`PrintWindow`)
+holds W/A/S/D around the joystick and Space, Shift, E, Q and F on the buttons. `mss` grabs with
+`CAPTUREBLT`, so those glyphs are in every frame, on the discs that the gate and the button
+readers score. The occlusion probe cannot see the window. Measured with two throwaway windows,
+`WindowFromPoint` passes through a layered `WS_EX_TRANSPARENT` window to the one beneath, and it
+hits the same window once `WS_EX_TRANSPARENT` is removed. So `WindowGuard` hides the overlay for
+the run:
+- `suppress_overlays` runs before the first frame. It uses `ShowWindowAsync`, polls until the
+  window is hidden, then calls `DwmFlush` so the next grab is composed without it.
+- `check()` hides it again on its cadence.
+- `restore_overlays` shows it again in `run`'s `finally`. `deploy_calibrate` does the same.
+- An overlay that will not hide is a recoverable `occluded` fault.
+- `window.hide_overlays: false` is the off switch.
+
+Measured: the window was hidden within 50 ms and stayed hidden for 6 s while BlueStacks was
+unfocused. A 5 s dry run of the deploy command hid it and showed it again. Whether BlueStacks shows
+it again by itself, on focus or on a change of control scheme, is untested; the cadence bounds the
+cost to `check_every_n_ticks` frames.
+
+Hiding is limited to click-through windows that the emulator owns. Another program's click-through
+overlay (a chat or GPU overlay) is just as invisible to the probe, but it is not the emulator's to
+hide.
+
 ### 6.10 `config.py` + `configs/deployment.yaml` — BUILT
 
 Ordinary in shape — the same frozen dataclass, dotted-path table and absent-key-keeps-the-default
@@ -2571,7 +2826,7 @@ verification here is defined on a **game-state consequence** instead:
 | job | question | evidence | why nowhere else |
 |---|---|---|---|
 | `tap` | does `control_attack_tap` fire? | the ammo bar drops | venue-independent; the §6.8 failure |
-| `super` | does the Super button fire? | `read_super` stops reading `ready` | best-effort — an uncharged Super is skipped, never passed |
+| `super` | does the Super button fire? | the button (`super_button.read_super`) stops reading `ready` | best-effort — an uncharged Super is skipped, never passed |
 | `move` | does the camera go where we steer? | odometry displacement vs the commanded bin | Training Grounds does not scroll, so odometry correctly reads ~0 |
 | `buttons` | where are the buttons on THIS source? | Hough + `ring_score_at` on a live median | radii do not transfer between frame sources (§4.5) |
 
@@ -2855,8 +3110,9 @@ Comfortable. The risk is not steady-state, it is **unbounded growth**, so three 
 what the policy was handed: `attack_legal` (the shadow's `attack_mask()` as a bitmask, bit i =
 attack column i, so `& 0b10` is "the dash was legal"), `attack_cd_shadow` and `attack_idle_t_shadow`
 (the shadow's two timers at the decision), `enemy_in_reach` (any enemy track within
-`dash_distance + dash_radius + unit_radius` tiles of the hero, `loop.dash_reach_tiles` from the
-configs; since 2026-10-12 a track coasting past `AIM_MAX_MISSES`, 3 misses, does not count), and `resync` / `resync_error` (the ammo canary tripped on this decision, with the CV-minus-
+the sim's `hero.in_reach_radius` of the hero, `loop.attack_reach_tiles`, 3.77 tiles for Mortis's
+`dash_distance + dash_radius + unit_radius` and 5.42 for Bull's volley (5.61 before his measured 5.2-tile range, 2026-11-01), renamed from
+`dash_reach_tiles` 2026-10-28; since 2026-10-12 a track coasting past `AIM_MAX_MISSES`, 3 misses, does not count), and `resync` / `resync_error` (the ammo canary tripped on this decision, with the CV-minus-
 shadow error that tripped it; the mask on that row is the post-resync one). `-1` / `-1.0` where there
 was no decision. The audit's `ammo` is the existing `ammo_shadow`, which the loop now writes on every
 decision that reaches the bars, hero box or not (the shadow always has a clip; a sentinel beside a
@@ -4017,7 +4273,7 @@ stopped agent is recoverable by hand; an agent mashing inputs into a menu is not
     for value 4 that redirect is the point. `ShadowHero.act(move, attack, aim=)` takes the loop's
     estimate of the game's target, `DeployLoop._auto_aim`: the nearest enemy track (coasting ones
     included, the closest thing this side has to an out-of-view enemy) or confirmed crate within
-    `auto_aim_reach_tiles`, the sim's radii read from the same files as `dash_reach_tiles`; None
+    `auto_aim_reach_tiles`, the sim's own `hero.weapon_reach` plus the target's body; None
     means nothing in reach and the shadow dashes along the bin. The shadow's fifth mask bit is
     the attack's, `check_spaces` names a flag mismatch in both directions, `TickRow.attack`
     records the 4 and `scripts/audit_attack_cadence.py` counts it as an attack.

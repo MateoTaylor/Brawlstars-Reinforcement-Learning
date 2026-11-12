@@ -13,8 +13,9 @@ using the same `FixedTierHook` `training/evaluation.py` uses -- so what you watc
 is exactly the population `eval/win_rate_hard` scores.
 
 Controls in the viewer come from `render/viewer.py`'s `ReplayViewer`: space pauses, left/right
-scrub, and the match is a scrubbable recording rather than a live stream, so you can step back
-through the moment the hero died instead of watching it once at 20 Hz.
+scrub, `e` toggles the status-effect labels (stun, slow, airborne, Bull's slow window), and the
+match is a scrubbable recording rather than a live stream, so you can step back through the moment
+the hero died instead of watching it once at 20 Hz.
 
 **The run's own `train.yaml` is found automatically** next to the model (or one directory up, for
 a checkpoint) and used to rebuild the environment. That matters for more than convenience:

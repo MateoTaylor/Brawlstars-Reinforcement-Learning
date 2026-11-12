@@ -5,6 +5,8 @@ the Win32 calls that produce that list are monkeypatched. That is deliberate rat
 convenient -- the cases worth testing (two instances open, a window dragged off-screen, a
 multi-monitor layout) are ones this machine cannot produce on demand.
 """
+from dataclasses import replace
+
 import pytest
 
 from brawl_deployment import window as W
@@ -17,9 +19,19 @@ MONITORS = [{"left": 0, "top": 0, "width": 4480, "height": 1440}, MON_1440, MON_
 
 
 def _win(hwnd=1000, exe=r"C:\Program Files\BlueStacks_nxt\HD-Player.exe",
-         client=(0, 0, 2560, 1440), title="Pie64", minimized=False, cls="Qt5152QWindowIcon"):
+         client=(0, 0, 2560, 1440), title="Pie64", minimized=False, cls="Qt5152QWindowIcon",
+         owner=0, ex=0):
     return W.WindowInfo(hwnd=hwnd, title=title, class_name=cls, exe=exe,
-                        rect=client, client=client, minimized=minimized)
+                        rect=client, client=client, minimized=minimized, owner=owner, ex_style=ex)
+
+
+# The pair listed live on 2026-11-04, the first run on the real Brawl Stars app: handles, titles,
+# classes, client rects, owner and extended style (WS_EX_TRANSPARENT | WS_EX_TOOLWINDOW |
+# WS_EX_LAYERED) exactly as Win32 reported them. Both belong to the same HD-Player.exe process.
+APP_PLAYER = _win(hwnd=0xA806A2, title="BlueStacks App Player", cls="Qt672QWindowIcon")
+KEYMAP_OVERLAY = _win(hwnd=0x708CE, title="BlueStacks Keymap Overlay",
+                      cls="Qt672QWindowToolSaveBits", client=(0, 0, 2560, 1439),
+                      owner=0xA806A2, ex=0x000800A0)
 
 
 # ---------------------------------------------------------------------------------------------
@@ -66,6 +78,37 @@ def test_no_unreadable_processes_leaves_that_clause_out():
     with pytest.raises(LookupError) as exc:
         W.select_emulator([_win(exe=r"C:\Windows\explorer.exe")])
     assert "could not be read" not in str(exc.value)
+
+
+def test_the_keymap_overlay_is_part_of_its_instance_not_a_second_one():
+    """The run of 2026-11-04 refused to start. 'BlueStacks Keymap Overlay' belongs to
+    HD-Player.exe too, so the two windows read as two instances. The overlay is owned by the
+    player window, and that ownership is what decides it, whichever order Win32 lists them in.
+    It listed the overlay first, since an owned window sits above its owner."""
+    for windows in ([KEYMAP_OVERLAY, APP_PLAYER], [APP_PLAYER, KEYMAP_OVERLAY]):
+        assert W.select_emulator(windows) == APP_PLAYER
+
+
+def test_two_instances_still_raise_when_each_has_its_overlay():
+    """Ownership decides which of an instance's windows to drive. It must not hide the ambiguity
+    between two instances, which is what the error exists for."""
+    other = _win(hwnd=2, title="BlueStacks App Player 1")
+    windows = [KEYMAP_OVERLAY, APP_PLAYER, replace(KEYMAP_OVERLAY, hwnd=3, owner=2), other]
+    with pytest.raises(LookupError, match="2 HD-Player.exe windows are open") as exc:
+        W.select_emulator(windows)
+    assert "Keymap Overlay" not in str(exc.value)
+
+
+def test_the_overlays_to_hide_are_the_click_through_windows_the_emulator_owns():
+    """Each property alone describes something else (`overlays_of`). An owned window that takes
+    clicks is a dialog, which `find_occluders` sees and the loop pauses for. A click-through
+    window nobody owns belongs to another program."""
+    dialog = _win(hwnd=5, title="Game controls", owner=APP_PLAYER.hwnd)
+    foreign = _win(hwnd=6, exe=r"C:\Program Files\Other\overlay.exe", ex=W.CLICK_THROUGH)
+    windows = [KEYMAP_OVERLAY, dialog, foreign, APP_PLAYER]
+    assert W.overlays_of(APP_PLAYER, windows) == [KEYMAP_OVERLAY]
+    assert KEYMAP_OVERLAY.click_through and not APP_PLAYER.click_through
+    assert not _win(ex=W.WS_EX_LAYERED).click_through      # layered alone still takes clicks
 
 
 # ---------------------------------------------------------------------------------------------
@@ -126,11 +169,32 @@ def test_every_sample_point_is_strictly_inside_the_rect():
 
 @pytest.fixture
 def patched(monkeypatch):
-    """Drives `WindowGuard` off a mutable list instead of the desktop."""
-    state = {"windows": [_win()], "monitor": (0, 0, 2560, 1440), "occluders": []}
+    """Drives `WindowGuard` off a mutable list instead of the desktop.
+
+    Hiding a window takes it out of the list and showing it puts it back, unless its handle is
+    in `stuck`, which models a window that ignores `ShowWindowAsync` and stays listed.
+    """
+    state = {"windows": [_win()], "monitor": (0, 0, 2560, 1440), "occluders": [],
+             "stuck": set(), "hid": [], "offscreen": {}}
+
+    def hide(hwnds, timeout_s=0.5):
+        state["hid"].append(list(hwnds))
+        for w in [w for w in state["windows"] if w.hwnd in hwnds and w.hwnd not in state["stuck"]]:
+            state["windows"].remove(w)
+            state["offscreen"][w.hwnd] = w
+        return [h for h in hwnds if h in state["stuck"]]
+
+    def show(hwnds):
+        for h in hwnds:
+            if h in state["offscreen"]:
+                state["windows"].append(state["offscreen"].pop(h))
+        return list(hwnds)
+
     monkeypatch.setattr(W, "enumerate_windows", lambda: list(state["windows"]))
     monkeypatch.setattr(W, "monitor_rect", lambda hwnd: state["monitor"])
     monkeypatch.setattr(W, "find_occluders", lambda w, inset=0.25: list(state["occluders"]))
+    monkeypatch.setattr(W, "hide_windows", hide)
+    monkeypatch.setattr(W, "show_windows", show)
     return state
 
 
@@ -227,6 +291,56 @@ def test_geometry_is_checked_before_occlusion(patched):
     patched["windows"] = [_win(client=(10, 10, 2570, 1450))]
     patched["occluders"] = [4242]
     assert guard.check().kind == "moved"
+
+
+def test_the_guard_hides_the_keymap_overlay_for_the_run_and_shows_it_again(patched):
+    """The overlay puts BlueStacks' key hints on the HUD buttons, and the grab includes them, so
+    it is hidden for the run. It is shown again after, since the operator may still want it."""
+    patched["windows"] = [KEYMAP_OVERLAY, APP_PLAYER]
+    guard = W.WindowGuard(APP_PLAYER, MONITORS)
+    assert guard.suppress_overlays() == [KEYMAP_OVERLAY]
+    assert patched["windows"] == [APP_PLAYER]
+    assert guard.check() is None
+    assert guard.restore_overlays() == [KEYMAP_OVERLAY]
+    assert KEYMAP_OVERLAY in patched["windows"]
+    assert guard.restore_overlays() == []                  # once, however often it is called
+
+
+def test_an_overlay_shown_again_mid_run_is_hidden_at_the_next_check(patched):
+    """Whether BlueStacks shows it again by itself is untested (it stayed hidden while
+    unfocused), so `check()` does not assume it won't."""
+    patched["windows"] = [KEYMAP_OVERLAY, APP_PLAYER]
+    guard = W.WindowGuard(APP_PLAYER, MONITORS)
+    guard.suppress_overlays()
+    patched["windows"] = [KEYMAP_OVERLAY, APP_PLAYER]      # BlueStacks shows it again
+    assert guard.check() is None
+    assert patched["windows"] == [APP_PLAYER]
+    assert patched["hid"] == [[KEYMAP_OVERLAY.hwnd]] * 2
+
+
+def test_an_overlay_that_will_not_hide_pauses_the_run(patched):
+    """It is still drawn over the game, so it gets the same response as any window on top: a
+    recoverable fault. Here the guard is the only thing that can report it, because the
+    occlusion probe sees straight through it."""
+    patched["windows"] = [KEYMAP_OVERLAY, APP_PLAYER]
+    patched["stuck"] = {KEYMAP_OVERLAY.hwnd}
+    guard = W.WindowGuard(APP_PLAYER, MONITORS)
+    assert guard.suppress_overlays() == []
+    fault = guard.check()
+    assert fault.kind == "occluded" and fault.recoverable
+    assert "BlueStacks Keymap Overlay" in fault
+    # It was tried, so it is shown again at the end too: a hide that lands late gets undone.
+    assert guard.restore_overlays() == [KEYMAP_OVERLAY]
+
+
+def test_hiding_overlays_can_be_switched_off(patched):
+    """`window.hide_overlays: false`. Nothing else catches the overlay then, since it is
+    click-through: that is the cost of turning the switch off."""
+    patched["windows"] = [KEYMAP_OVERLAY, APP_PLAYER]
+    guard = W.WindowGuard(APP_PLAYER, MONITORS, hide_overlays=False)
+    assert guard.suppress_overlays() == []
+    assert guard.check() is None
+    assert patched["hid"] == [] and guard.restore_overlays() == []
 
 
 # ---------------------------------------------------------------------------------------------

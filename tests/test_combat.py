@@ -6,10 +6,11 @@ import pytest
 import torch
 import yaml
 
-from brawl_sim.config import load_config, build_params
+from brawl_sim.config import _deep_merge, load_config, build_params
 from brawl_sim.constants import DeathCause, Kind, Tile, TILE_BLOCKS_PROJ
 from brawl_sim.core import combat, hero, stats, terrain
 from brawl_sim.core.state import allocate
+from brawl_sim.env import BrawlVecEnv
 
 CONFIGS = Path(__file__).resolve().parent.parent / "configs"
 # The brawler spec, parsed once per module: until 2026-10-20 every `_cfg_and_params` call re-read
@@ -59,7 +60,7 @@ def _cfg_and_params(n_envs=1, map_h=20, map_w=20, extra_overrides=None):
 def _fresh_state(cfg, params, n_envs=1):
     state = allocate(cfg, n_envs=n_envs, device="cpu", verbose=False)
     state.ent_alive.fill_(True)
-    state.ent_kind[:, 0] = int(Kind.HERO_MORTIS)
+    state.ent_kind[:, 0] = int(Kind.HERO)
     for e in range(1, cfg.n_entities):
         state.ent_kind[:, e] = int(Kind.BOT_MELEE)
     state.map_id.fill_(0)
@@ -391,6 +392,52 @@ def test_melee_never_hits_self_or_non_firing():
     assert torch.all(dmg_by[0, 2] == 0)  # the non-firing entity deals nothing
 
 
+@pytest.mark.parametrize("kind", ["sniper", "artillery", "rifle", "spike", "bull"])
+def test_a_ranged_shot_lands_nothing_in_the_attack_phase_even_dead_on_its_facing_ray(kind):
+    """Only a cone swinger (`attack_arc_rad > 0`) runs the melee hitscan. A ranged kind's arc is 0,
+    yet `geo.point_in_cone` passes a body whose bearing equals the facing EXACTLY (`diff <= 0`),
+    so until 2026-10-23 every ranged attack also landed its full damage, on the trigger tick, on
+    whatever sat dead on its facing ray, in practice a crate (BULL_HERO_PLAN.md §5.3).
+
+    `_attack_phase` alone, so no projectile has flown yet: a ranged shot's damage is its
+    projectile's, later in the tick. Every ranged kind reaches 7.0 tiles or more, so the hero 1.5
+    tiles and the crate 3.0 tiles down the ray were both inside the old cone."""
+    tiny = yaml.safe_load((CONFIGS / "presets" / "debug_tiny.yaml").read_text())
+    merged = _deep_merge(tiny, {"entities": {"randomize_enemy_types": False,
+                                             "fixed_enemy_types": [kind, "rifle"]}})
+    cfg = load_config(CONFIGS / "default.yaml", overrides=merged)
+    env = BrawlVecEnv(cfg, n_envs=1, device="cpu", seed=0,
+                      spec=_deep_merge(copy.deepcopy(_SPEC), merged), verbose=False)
+    env.reset()
+    st = env.state
+    assert cfg.n_entities == 3 and st.box_pos.shape[1] >= 1
+    st.ent_pos[0, 1] = torch.tensor([9.5, 10.5])   # the shooter, facing +x
+    st.ent_pos[0, 0] = torch.tensor([11.0, 10.5])  # the hero, 1.5 tiles down its ray
+    st.ent_pos[0, 2] = torch.tensor([3.0, 3.0])
+    st.ent_facing.zero_()
+    st.box_alive.fill_(False)
+    st.box_alive[0, 0] = True
+    st.box_pos[0, 0] = torch.tensor([12.5, 10.5])  # a crate, 3.0 tiles down the same ray
+    st.box_max_hp[0, 0] = 4000.0
+    st.box_hp[0, 0] = 4000.0
+    hero_hp = float(st.ent_hp[0, 0])
+
+    fire = torch.zeros(1, 3, dtype=torch.bool)
+    fire[0, 1] = True
+    aim_dir = torch.zeros(1, 3, 2)
+    aim_dir[0, 1, 0] = 1.0
+    aim_point = st.ent_pos.clone()
+    aim_point[0, 1] = torch.tensor([12.5, 10.5])
+    no = torch.zeros(1, 3, dtype=torch.bool)
+    dmg_by, _, _ = env._attack_phase(torch.zeros(1, 3, 2), fire, no, aim_dir, aim_point, no,
+                                     torch.ones(1, 3, 3, dtype=torch.bool))
+
+    assert bool((st.prj_alive[0] & (st.prj_owner[0] == 1)).any()), "the shot went"
+    assert float(dmg_by.sum()) == 0.0
+    assert float(st.ent_hp[0, 0]) == hero_hp
+    assert float(st.box_hp[0, 0]) == 4000.0
+
+
 # ---- resolve_deaths --------------------------------------------------------------
 
 def test_entity_at_exactly_zero_hp_is_dead():
@@ -532,7 +579,7 @@ def test_collect_pickups_preserves_hp_deficit():
     state.pku_alive[0, 0] = True
     state.ent_pos[0, 0] = torch.tensor([10.0, 10.0])
     state.ent_cubes[0, 0] = 0
-    max_hp_before = params.base_hp[0, int(Kind.HERO_MORTIS)].item()
+    max_hp_before = params.base_hp[0, int(Kind.HERO)].item()
     state.ent_max_hp[0, 0] = max_hp_before
     state.ent_hp[0, 0] = max_hp_before - 100.0  # already missing 100 hp
 

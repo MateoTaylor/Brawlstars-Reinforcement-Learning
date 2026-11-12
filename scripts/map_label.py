@@ -4,29 +4,42 @@ archive/KNOWN_MAP_LOCALIZATION_PLAN.md sections 4 and 5.
     .venv/Scripts/python.exe scripts/map_label.py dark_passage --image <path to the png>
     .venv/Scripts/python.exe scripts/map_label.py dark_passage                 # resume
     .venv/Scripts/python.exe scripts/map_label.py dark_passage --review        # look, do not edit
+    .venv/Scripts/python.exe scripts/map_label.py dark_passage --mark 20,13 6,39   # ring cells
 
 Files live in `brawl_deployment/data/maps/`: `<name>.png` (the image; `--image` copies it in the
 first time), `<name>.csv` (the label, `perception/known_map.py` has the format) and `<name>.json`
 (the lattice the label was drawn against, so a reopened label sits where it was drawn).
 
-Controls
---------
+The window
+----------
+The image is on the left and the label on the right. The label panel paints every cell opaque in
+its class colour, with each colour's key and count in the legend on top, so what is labelled never
+depends on how a map's own colours mix with a tint. Both panels share one view and either takes
+paint. Under the cursor, both panels box the cell and outline in yellow its cluster, the cells `c`
+would fill; the line under the panels gives the cell's (col, row) and class and the cluster's
+make-up.
+
     1 . floor   2 # wall   3 b bush   4 ~ water   5 f fence   6 S spawn   0 ? clear
     click / drag  paint the held class onto cells
-    c             give the held class to the WHOLE CLUSTER under the cursor (spawns keep theirs;
-                  paint over one by hand to change it)
-    g             cycle the overlay: label, clusters, bare image
+    c             give the held class to the WHOLE CLUSTER under the cursor, the outlined one
+                  (spawns keep theirs; paint over one by hand to change it)
     u             undo the last stroke or cluster fill
+    g             cycle what the image panel draws over the image: nothing, clusters, label tint
+    scroll        zoom both panels about the cursor      right-drag  pan      h  the whole map
+    n             centre the next --mark cell (ringed in cyan)
     s             save          q  save and quit
 
-Zoom and pan with the toolbar. Clicks paint only while no toolbar tool is active.
+Closing the window saves unsaved edits too (`--review` never writes). The toolbar's zoom and pan
+also work, but while one is on, clicks zoom or pan instead of painting; the line under the panels
+says so.
 
 The first pass
 --------------
 With no CSV yet, the tool fits the lattice, stamps every spawn (the white ring the image draws on
-one), and leaves the terrain `?` with the cluster overlay up. Name each cluster with `c`, then fix
-the stragglers. Save runs `known_map.check` and prints what it says, the count of each class, and
-the spawn cells; a label that fails is still written.
+one), and leaves the terrain `?`, magenta on the label panel. Hover a cell, press its class's key,
+then `c`: the outlined cluster turns that class's colour on the label panel. Then fix the
+stragglers. Save runs `known_map.check` and prints what it says, the count of each class, and the
+spawn cells; a label that fails is still written.
 
 There are no crates to label: power cube boxes spawn semi-randomly each match, so a map image shows
 only the fixed terrain. The blue-and-green sprites on Dark Passage are candles, which are walls.
@@ -50,6 +63,10 @@ from pathlib import Path
 import cv2
 import matplotlib
 import matplotlib.pyplot as plt
+from matplotlib import patheffects
+from matplotlib.collections import LineCollection, PatchCollection
+from matplotlib.colors import to_rgba
+from matplotlib.patches import Circle, Patch, Rectangle
 import numpy as np
 
 REPO = Path(__file__).resolve().parents[1]
@@ -63,16 +80,21 @@ from brawl_sim.constants import TILE_TO_CHAR, Tile                   # noqa: E40
 from brawl_sim.render.viewer import TILE_COLORS                      # noqa: E402
 
 KEYS = {"1": ".", "2": "#", "3": "b", "4": "~", "5": "f", "6": "S", "0": UNLABELLED}
-_OURS = set(KEYS) | {"c", "g", "s", "u", "q"}
+KEY_OF = {char: key for key, char in KEYS.items()}
+_OURS = set(KEYS) | {"c", "g", "s", "u", "q", "n", "h"}
 NAMES = {TILE_TO_CHAR[t]: t.name for t in Tile} | {UNLABELLED: "CLEAR"}
+SHOWN = {char: name.lower() for char, name in NAMES.items()} | {UNLABELLED: "unlabelled"}
 ORDER = tuple(LEGEND) + (UNLABELLED,)      # how counts are listed
 MARKERS = ("S",)                           # cells a cluster fill leaves alone
 
-# The sim palette, except that it draws SPAWN as floor. Floor is faint, so the image shows through
-# the 70% of the map it covers.
-COLOURS = {TILE_TO_CHAR[t]: TILE_COLORS[t] for t in Tile} | {"S": "#ffffff"}
-ALPHA = {".": 0.15, UNLABELLED: 0.25}
-UNLABELLED_COLOUR = "#ff00ff"
+# The label panel paints each cell opaque in the sim palette, so a map's own colours never blend
+# into a class: on Crystal Eye Castle's purple floor the old 15% floor tint and 25% magenta `?`
+# looked alike (2026-11-03). SPAWN gets its own colour; the sim draws it as floor.
+PANEL = {TILE_TO_CHAR[t]: TILE_COLORS[t] for t in Tile} | {"S": "#e8342a", UNLABELLED: "#ff00ff"}
+TINT_ALPHA = {".": 0.0, UNLABELLED: 0.35}  # the image panel's label tint; other classes 0.5
+HOVER, CURSOR, MARK = "#ffe600", "#ffffff", "#00e5ff"   # cluster outline, cell box, --mark rings
+ZOOM_STEP = 1.25                           # per scroll-wheel notch
+MARK_VIEW = 8                              # tiles each way of a cell `n` centres
 
 BAND_ROWS = (0.18, 0.44)
 BAND_COLS = (0.2, 0.8)
@@ -274,137 +296,423 @@ def first_pass(img: np.ndarray, lat: Lattice) -> np.ndarray:
 # ---------------------------------------------------------------------------
 
 class MapLabeller:
-    MODES = ("label", "clusters", "image")
+    """The window: the image on the left, the label on the right (the module docstring has the
+    controls). Both panels share one view, so zooming or panning either moves both."""
+    MODES = ("none", "clusters", "label")      # what the image panel draws over the image
 
-    def __init__(self, name, img, lat, chars, clusters, paths, review=False, mode="label"):
+    def __init__(self, name, img, lat, chars, clusters, paths, review=False, mode="none",
+                 marks=()):
         self.name, self.img, self.lat, self.chars = name, img, lat, chars
         self.clusters, self.paths, self.review, self.mode = clusters, paths, review, mode
+        self.marks = list(marks)               # (col, row), in the order `n` visits them
         self.held = "."
         self.strokes: list[list[tuple[int, int, str]]] = []
         self.painting = False
-        self.fig, self.ax = plt.subplots(figsize=(11, 11))
-        self.fig.canvas.manager.set_window_title(f"map label {name}")
+        self.pan_from = None                   # where a right-button drag started
+        self.hover = None                      # (row, col) under the cursor
+        self.outlined = None                   # (clusters array, cluster id) the outline shows
+        self.visits = 0                        # `n` presses so far
+        self.dirty = False                     # edits since the last save
+        self.message = ""                      # what the last key did
         h, w = img.shape[:2]
-        self.ax.imshow(cv2.cvtColor(img, cv2.COLOR_BGR2RGB), extent=(0, w, h, 0),
-                       interpolation="nearest")
-        x0, x1, y1, y0 = lat.extent
+        self.full = ((0.0, float(w)), (float(h), 0.0))
+        self.fig, (self.ax, self.ax_label) = plt.subplots(1, 2, sharex=True, sharey=True,
+                                                          figsize=(18, 9.6))
+        self.axes = (self.ax, self.ax_label)
+        self.fig.subplots_adjust(left=0.005, right=0.995, top=0.935, bottom=0.075, wspace=0.01)
+        # RGBA uint8 draws ~15% faster than RGB; the image is the costliest thing in a redraw.
+        rgba = np.dstack([cv2.cvtColor(img, cv2.COLOR_BGR2RGB), np.full((h, w), 255, np.uint8)])
+        self.ax.imshow(rgba, extent=(0, w, h, 0), interpolation="nearest")
+        # The cell layers are meshes: a 60 x 60 image is resampled to the panel's full size on
+        # every draw (~33 ms each at 2560 x 1340), a mesh fills 3600 quads (~2 ms).
         cols, rows = MAP_TILES
-        self.ax.vlines(x0 + np.arange(cols + 1) * lat.pitch[0], y0, y1, colors="w", lw=0.3,
-                       alpha=0.3)
-        self.ax.hlines(y0 + np.arange(rows + 1) * lat.pitch[1], x0, x1, colors="w", lw=0.3,
-                       alpha=0.3)
-        self.overlay = self.ax.imshow(self._rgba(), interpolation="nearest", extent=lat.extent)
-        self.ax.set_xlim(0, w)
-        self.ax.set_ylim(h, 0)
-        self.ax.set_xticks([])
-        self.ax.set_yticks([])
-        self.title = self.ax.set_title("", fontsize=9)
-        self._retitle()
-        for event, handler in (("key_press_event", self.on_key),
+        self.edges = (lat.origin[0] + np.arange(cols + 1) * lat.pitch[0],
+                      lat.origin[1] + np.arange(rows + 1) * lat.pitch[1])
+        self.overlay = self.ax.pcolormesh(*self.edges, self._tint(), antialiased=False,
+                                          edgecolors="none")
+        self.ax_label.set_facecolor("#9a9a9a")
+        self.label_view = self.ax_label.pcolormesh(*self.edges, self._panel(),
+                                                   antialiased=False, edgecolors="none")
+        self.ax_label.set_aspect("equal")      # imshow sets it on the image panel; a mesh does not
+        self._furnish()
+        self.ax.set_xlim(*self.full[0])
+        self.ax.set_ylim(*self.full[1])
+        toolbar = getattr(self.fig.canvas, "toolbar", None)
+        if toolbar is not None:
+            toolbar.push_current()   # the toolbar's Home button: this whole-map view
+        self.legend = self.fig.legend(
+            handles=[Patch(facecolor=PANEL[c], edgecolor="black", linewidth=0.6)
+                     for c in KEYS.values()],
+            labels=[SHOWN[c] for c in KEYS.values()], loc="upper center", ncol=len(KEYS),
+            frameon=False, fontsize=11, bbox_to_anchor=(0.5, 0.995), columnspacing=2.5)
+        self.status = self.fig.text(0.006, 0.047, "", fontsize=10, family="monospace")
+        self.note = self.fig.text(0.006, 0.015, "", fontsize=10, family="monospace")
+        # The hover layer is blitted over the last full draw, so following the mouse never
+        # redraws the map image (_blit). Listed in drawing order: the outline under the box.
+        self.hover_layer = [*self.outlines, *self.cursors, self.status, self.note]
+        for artist in self.hover_layer:
+            artist.set_animated(True)
+        self.background = None
+        self._refresh()
+        for event, handler in (("draw_event", self._on_draw),
+                               ("key_press_event", self.on_key),
                                ("button_press_event", self.on_press),
                                ("button_release_event", self.on_release),
-                               ("motion_notify_event", self.on_move)):
+                               ("motion_notify_event", self.on_move),
+                               ("scroll_event", self.on_scroll),
+                               ("close_event", self.on_close)):
             self.fig.canvas.mpl_connect(event, handler)
+        self._maximise()
 
-    def _rgba(self) -> np.ndarray:
-        from matplotlib.colors import to_rgba
-        img = np.zeros(self.chars.shape + (4,), np.float32)
+    # -- drawing ----------------------------------------------------------------
+
+    def _furnish(self):
+        """Grid lines, the cluster outline, the cursor box and the --mark rings, on both panels.
+        The outline is two plain line collections, black under yellow: a path-effect halo would
+        draw its few thousand edges one at a time on every hover."""
+        lat = self.lat
+        x0, x1, y1, y0 = lat.extent
+        xs, ys = self.edges
+        halo = [patheffects.withStroke(linewidth=3.5, foreground="black")]
+        self.outlines, self.cursors = [], []
+        for ax, grid, alpha in ((self.ax, "white", 0.3), (self.ax_label, "black", 0.15)):
+            ax.vlines(xs, y0, y1, colors=grid, lw=0.3, alpha=alpha)
+            ax.hlines(ys, x0, x1, colors=grid, lw=0.3, alpha=alpha)
+            for colour, width in (("black", 3.2), (HOVER, 1.4)):
+                edges = LineCollection([], colors=colour, linewidths=width, zorder=5)
+                ax.add_collection(edges, autolim=False)
+                self.outlines.append(edges)
+            box = Rectangle((x0, y0), *lat.pitch, fill=False, edgecolor=CURSOR, linewidth=1.8,
+                            zorder=6, visible=False, path_effects=halo)
+            ax.add_patch(box)
+            self.cursors.append(box)
+            if self.marks:
+                rings = PatchCollection(
+                    [Circle(self._centre(c, r), 0.8 * max(lat.pitch)) for c, r in self.marks],
+                    facecolors="none", edgecolors=MARK, linewidths=1.8, zorder=7,
+                    path_effects=halo)
+                ax.add_collection(rings, autolim=False)
+            ax.set_xticks([])
+            ax.set_yticks([])
+
+    def _maximise(self):
+        """Fill the screen on Tk, this repo's backend on Windows; elsewhere keep the figsize.
+        Deferred: the window is still withdrawn here, and `plt.show` deiconifies it."""
+        window = getattr(self.fig.canvas.manager, "window", None)
+        if hasattr(window, "after") and hasattr(window, "state"):
+            window.after(200, _zoom_window, window)
+
+    def _centre(self, col, row) -> tuple[float, float]:
+        (px, py), (ox, oy) = self.lat.pitch, self.lat.origin
+        return ox + (col + 0.5) * px, oy + (row + 0.5) * py
+
+    def _colours(self, alpha) -> np.ndarray:
+        """`(rows, cols, 4)`: each cell in its class colour at opacity `alpha(char)`."""
+        out = np.zeros(self.chars.shape + (4,), np.float32)
+        for char in np.unique(self.chars):
+            out[self.chars == char] = to_rgba(PANEL.get(char, PANEL[UNLABELLED]), alpha(char))
+        return out
+
+    def _panel(self) -> np.ndarray:
+        """The label panel: opaque, so what it shows never depends on the map's colours."""
+        return self._colours(lambda char: 1.0)
+
+    def _tint(self) -> np.ndarray:
+        """What the image panel draws over the image, by `mode`."""
         if self.mode == "clusters":
-            img[:] = plt.get_cmap("tab20")((self.clusters % 20) / 19.0)
-            img[..., 3] = 0.5
-        elif self.mode == "label":
-            for char in np.unique(self.chars):
-                colour = COLOURS.get(char, UNLABELLED_COLOUR)
-                img[self.chars == char] = to_rgba(colour, ALPHA.get(char, 0.55))
-        return img
+            out = matplotlib.colormaps["tab20"](self.clusters % 20).astype(np.float32)
+            out[..., 3] = 0.5
+            return out
+        if self.mode == "label":
+            return self._colours(lambda char: TINT_ALPHA.get(char, 0.5))
+        return np.zeros(self.chars.shape + (4,), np.float32)
 
-    def _retitle(self):
-        counts = "  ".join(f"{c}:{int((self.chars == c).sum())}" for c in ORDER)
-        self.title.set_text(
-            f"{self.name}   holding {NAMES[self.held]} ({self.held})   overlay: {self.mode}   "
-            f"{counts}" + ("   [REVIEW ONLY]" if self.review else ""))
-        self.overlay.set_data(self._rgba())
+    def _outline(self, mask: np.ndarray) -> np.ndarray:
+        """`(n, 2, 2)`: the cell edges between `mask` and the rest, in image pixels."""
+        (px, py), (ox, oy) = self.lat.pitch, self.lat.origin
+        m = np.pad(mask, 1)
+        r, c = np.nonzero(m[1:-1, 1:] != m[1:-1, :-1])        # the left edge of cell (r, c)
+        x = ox + c * px
+        down = np.stack([x, oy + r * py, x, oy + (r + 1) * py], 1)
+        r, c = np.nonzero(m[1:, 1:-1] != m[:-1, 1:-1])        # the top edge of cell (r, c)
+        y = oy + r * py
+        across = np.stack([ox + c * px, y, ox + (c + 1) * px, y], 1)
+        return np.concatenate([down, across]).reshape(-1, 2, 2)
+
+    def _refresh(self):
+        """Redraw everything the label decides. Every edit calls it, so both panels always show
+        the label as it is now."""
+        self.label_view.set_array(self._panel())
+        self.overlay.set_array(self._tint())
+        self.overlay.set_visible(self.mode != "none")
+        for text, char in zip(self.legend.get_texts(), KEYS.values()):
+            text.set_text(f"{KEY_OF[char]}  {SHOWN[char]}  {int((self.chars == char).sum())}")
+            text.set_fontweight("bold" if char == self.held else "normal")
+        self.ax.set_title(f"image   overlay: {self.mode}   (g: none, clusters, label)",
+                          fontsize=10)
+        self.ax_label.set_title("label: what is saved"
+                                + ("   (REVIEW ONLY: nothing is saved)" if self.review else ""),
+                                fontsize=10)
+        self.fig.canvas.manager.set_window_title(
+            f"map label {self.name}" + ("  (unsaved edits)" if self.dirty else ""))
+        self._status()
         self.fig.canvas.draw_idle()
 
+    def _status(self):
+        """The two lines under the panels: the hovered cell and its cluster; then what is held,
+        anything blocking a click, whether edits are unsaved, and what the last key did."""
+        if self.hover is None:
+            line = "hover a cell: its (col, row), its class and its cluster show here"
+        else:
+            row, col = self.hover
+            cid = int(self.clusters[row, col])
+            chars, counts = np.unique(self.chars[self.clusters == cid], return_counts=True)
+            pairs = sorted(zip(counts.tolist(), chars.tolist()), reverse=True)
+            mix = ", ".join(f"{SHOWN[c]} {n}" for n, c in pairs)
+            marked = "  [marked]" if (col, row) in self.marks else ""
+            line = (f"(col {col}, row {row}) {SHOWN[self.chars[row, col]].upper()}{marked}   "
+                    f"cluster {cid}, outlined: {int(counts.sum())} cells ({mix})")
+        self.status.set_text(line)
+        bits = [f"holding {SHOWN[self.held].upper()} (key {KEY_OF[self.held]})"]
+        tool = self._toolbar_mode()
+        if tool:
+            bits.append(f"TOOLBAR {tool.upper()} IS ON: clicks do not paint until you click "
+                        f"its button again")
+        if self.review:
+            bits.append("review only")
+        elif self.dirty:
+            bits.append("unsaved edits: s saves, and so does closing the window")
+        if self.message:
+            bits.append(self.message)
+        self.note.set_text("   |   ".join(bits))
+
+    def _on_draw(self, _event):
+        """After every full draw, keep the picture without the hover layer, then add the layer.
+        Saving a figure draws the layer too, but must not replace the window's background."""
+        if not self.fig.canvas.is_saving():
+            self.background = self.fig.canvas.copy_from_bbox(self.fig.bbox)
+        for artist in self.hover_layer:
+            self.fig.draw_artist(artist)
+
+    def _blit(self):
+        """Redraw only the hover layer over the last full draw. A full draw resamples the map
+        image, ~60 ms at 2560 x 1340: too slow to follow the mouse."""
+        canvas = self.fig.canvas
+        if self.background is None:
+            canvas.draw_idle()
+            return
+        canvas.restore_region(self.background)
+        for artist in self.hover_layer:
+            self.fig.draw_artist(artist)
+        canvas.blit(self.fig.bbox)
+
+    # -- the cursor -------------------------------------------------------------
+
     def _cell(self, event):
-        if event.inaxes is not self.ax or event.xdata is None:
+        """`(row, col)` under the cursor on either panel, or None."""
+        if event.inaxes not in self.axes or event.xdata is None:
             return None
         col, row = self.lat.cell_of(event.xdata, event.ydata)
         cols, rows = MAP_TILES
         return (row, col) if 0 <= col < cols and 0 <= row < rows else None
 
-    def _toolbar_busy(self) -> bool:
-        return bool(getattr(getattr(self.fig.canvas, "toolbar", None), "mode", ""))
+    def _toolbar_mode(self) -> str:
+        """The toolbar tool that owns clicks ('zoom rect', 'pan/zoom'), or '' if none does."""
+        return str(getattr(getattr(self.fig.canvas, "toolbar", None), "mode", "") or "")
 
-    def _paint(self, cell, char, stroke):
-        row, col = cell
-        if self.review or self.chars[row, col] == char:
-            return
-        stroke.append((row, col, str(self.chars[row, col])))
-        self.chars[row, col] = char
+    def _toolbar_busy(self) -> bool:
+        return bool(self._toolbar_mode())
+
+    def _set_hover(self, cell) -> bool:
+        """Box `cell` on both panels and outline its cluster; True if the hover moved."""
+        if cell == self.hover:
+            return False
+        self.hover = cell
+        for box in self.cursors:
+            box.set_visible(cell is not None)
+            if cell is not None:
+                box.set_xy((self.lat.origin[0] + cell[1] * self.lat.pitch[0],
+                            self.lat.origin[1] + cell[0] * self.lat.pitch[1]))
+        cid = None if cell is None else int(self.clusters[cell])
+        shown = self.outlined
+        if shown is None or shown[0] is not self.clusters or shown[1] != cid:
+            self.outlined = (self.clusters, cid)
+            edges = np.zeros((0, 2, 2)) if cid is None else self._outline(self.clusters == cid)
+            for lines in self.outlines:
+                lines.set_segments(edges)
+        self._status()
+        return True
+
+    # -- mouse ------------------------------------------------------------------
 
     def on_press(self, event):
-        if event.button != 1 or self._toolbar_busy():
+        if self._toolbar_busy() or event.inaxes not in self.axes:
+            return
+        if event.button == 3:                  # right-drag pans
+            self.pan_from = (event.x, event.y, self.ax.get_xlim(), self.ax.get_ylim())
             return
         cell = self._cell(event)
-        if cell is None:
+        if event.button != 1 or cell is None:
             return
         self.painting = True
         self.strokes.append([])
         self._paint(cell, self.held, self.strokes[-1])
-        self._retitle()
+        self.message = ""
+        self._refresh()
 
     def on_release(self, _event):
         self.painting = False
+        self.pan_from = None
         if self.strokes and not self.strokes[-1]:
             self.strokes.pop()
 
     def on_move(self, event):
-        if self.painting:
-            cell = self._cell(event)
-            if cell is not None:
-                self._paint(cell, self.held, self.strokes[-1])
-                self._retitle()
+        if self.pan_from is not None:
+            self._pan(event)
+            return
+        cell = self._cell(event)
+        moved = self._set_hover(cell)
+        if self.painting and cell is not None and self._paint(cell, self.held, self.strokes[-1]):
+            self._refresh()
+        elif moved:
+            self._blit()
+
+    def _pan(self, event):
+        """Drag the view with the cursor: the point grabbed stays under it."""
+        x0, y0, (xa, xb), (ya, yb) = self.pan_from
+        box = self.ax.bbox
+        dx = (event.x - x0) * (xb - xa) / box.width
+        dy = (event.y - y0) * (yb - ya) / box.height
+        self.ax.set_xlim(xa - dx, xb - dx)
+        self.ax.set_ylim(ya - dy, yb - dy)
+        self.fig.canvas.draw_idle()
+
+    def on_scroll(self, event):
+        """Zoom both panels about the cursor, a notch at a time, out to the whole image."""
+        if event.inaxes not in self.axes or event.xdata is None:
+            return
+        f = ZOOM_STEP ** -(event.step or (1 if event.button == "up" else -1))
+        (xa, xb), (ya, yb) = self.ax.get_xlim(), self.ax.get_ylim()
+        if (xb - xa) * f >= self.full[0][1] - self.full[0][0]:
+            self._home()
+            return
+        if (xb - xa) * f < 4 * self.lat.pitch[0]:
+            return
+        x, y = event.xdata, event.ydata
+        self.ax.set_xlim(x - (x - xa) * f, x + (xb - x) * f)
+        self.ax.set_ylim(y - (y - ya) * f, y + (yb - y) * f)
+        self.fig.canvas.draw_idle()
+
+    def _home(self):
+        self.ax.set_xlim(*self.full[0])
+        self.ax.set_ylim(*self.full[1])
+        self.fig.canvas.draw_idle()
+
+    # -- keys -------------------------------------------------------------------
 
     def on_key(self, event):
-        if event.key in KEYS:
-            self.held = KEYS[event.key]
+        key = event.key
+        if key in KEYS:
+            self.held = KEYS[key]
             print(f"holding {NAMES[self.held]} ({self.held})")
-        elif event.key == "g":
+        elif key == "g":
             self.mode = self.MODES[(self.MODES.index(self.mode) + 1) % len(self.MODES)]
-        elif event.key == "c":
-            cell = self._cell(event)
-            if cell is None:
-                print("hover the cursor over a cell before pressing c")
-            else:
-                stroke = []
-                for r, c in np.argwhere(self.clusters == self.clusters[cell]):
-                    if self.chars[r, c] not in MARKERS:
-                        self._paint((r, c), self.held, stroke)
-                if stroke:
-                    self.strokes.append(stroke)
-                print(f"cluster fill: {len(stroke)} cells to {NAMES[self.held]}")
-        elif event.key == "u":
-            if self.strokes:
-                for row, col, prev in reversed(self.strokes.pop()):
-                    self.chars[row, col] = prev
-        elif event.key == "s":
+        elif key == "c":
+            self._fill(self._cell(event))
+        elif key == "u":
+            self._undo()
+        elif key == "n":
+            self._next_mark()
+        elif key == "h":
+            self._home()
+        elif key == "s":
             self.save()
-        elif event.key == "q":
+        elif key == "q":
             self.save()
             plt.close(self.fig)
             return
-        self._retitle()
+        else:
+            return
+        self._refresh()
+
+    def _paint(self, cell, char, stroke) -> bool:
+        row, col = cell
+        if self.review or self.chars[row, col] == char:
+            return False
+        stroke.append((row, col, str(self.chars[row, col])))
+        self.chars[row, col] = char
+        self.dirty = True
+        return True
+
+    def _fill(self, cell):
+        """`c`: the held class onto every cell of the cluster under the cursor but the spawns."""
+        if cell is None:
+            print("hover the cursor over a cell before pressing c")
+            self.message = "c needs the cursor on a cell"
+            return
+        cid = int(self.clusters[cell])
+        stroke = []
+        for r, c in np.argwhere(self.clusters == cid):
+            if self.chars[r, c] not in MARKERS:
+                self._paint((r, c), self.held, stroke)
+        if stroke:
+            self.strokes.append(stroke)
+        print(f"cluster fill: {len(stroke)} cells to {NAMES[self.held]}")
+        self.message = (f"cluster {cid}: {len(stroke)} cells -> {NAMES[self.held]}"
+                        + ("   (u undoes)" if stroke else "   (nothing to change)"))
+
+    def _undo(self):
+        if not self.strokes:
+            self.message = "nothing to undo"
+            return
+        stroke = self.strokes.pop()
+        for row, col, prev in reversed(stroke):
+            self.chars[row, col] = prev
+        self.dirty = True
+        self.message = f"undid {len(stroke)} cells"
+
+    def _next_mark(self):
+        """`n`: centre the next --mark cell, MARK_VIEW tiles each way."""
+        if not self.marks:
+            self.message = "no cells to visit: start the tool with --mark C,R ..."
+            return
+        i = self.visits % len(self.marks)
+        self.visits += 1
+        col, row = self.marks[i]
+        x, y = self._centre(col, row)
+        px, py = self.lat.pitch
+        self.ax.set_xlim(x - MARK_VIEW * px, x + MARK_VIEW * px)
+        self.ax.set_ylim(y + MARK_VIEW * py, y - MARK_VIEW * py)
+        self.message = (f"mark {i + 1} of {len(self.marks)}: (col {col}, row {row}), now "
+                        f"{SHOWN[self.chars[row, col]]}")
+
+    # -- saving -----------------------------------------------------------------
 
     def save(self):
         if self.review:
             print("review mode: not saving")
+            self.message = "review only: nothing saved"
             return
         csv, meta = self.paths
         write_chars(csv, self.chars)
         write_sidecar(meta, self.img, self.lat)
+        self.dirty = False
         print(f"wrote {csv} and {meta.name}")
-        report(self.chars)
+        self.message = f"saved {csv.name}: checks {report(self.chars)}"
+
+    def on_close(self, _event):
+        """Closing the window keeps the work: the user's first two sessions on Crystal Eye Castle
+        (2026-11-03) ended at the window's X, and nothing was written."""
+        if self.dirty and not self.review:
+            print("window closed with unsaved edits: saving them")
+            self.save()
+
+
+def _zoom_window(window) -> None:
+    try:
+        window.state("zoomed")
+    except Exception:           # tkinter.TclError: X11's Tk has no "zoomed" state
+        pass
 
 
 def write_sidecar(meta: Path, img: np.ndarray, lat: Lattice) -> None:
@@ -416,17 +724,20 @@ def write_sidecar(meta: Path, img: np.ndarray, lat: Lattice) -> None:
     }, indent=1) + "\n")
 
 
-def report(chars: np.ndarray) -> None:
-    """What the save prints: the checks' verdict, the class counts, the spawn cells."""
+def report(chars: np.ndarray) -> str:
+    """What the save prints: the checks' verdict, the class counts, the spawn cells. Returns the
+    verdict."""
     try:
         check(chars)
-        print("checks: PASS")
+        verdict = "PASS"
     except ValueError as e:
-        print(f"checks: FAIL, {e}")
+        verdict = f"FAIL, {e}"
+    print(f"checks: {verdict}")
     print("  " + "  ".join(f"{NAMES[c]} {int((chars == c).sum())}" for c in ORDER))
     for marker in MARKERS:
         cells = [(int(c), int(r)) for r, c in np.argwhere(chars == marker)]
         print(f"  {NAMES[marker]} {len(cells)}: " + " ".join(f"({c},{r})" for c, r in cells))
+    return verdict
 
 
 # ---------------------------------------------------------------------------
@@ -474,6 +785,18 @@ def _lattice(args, meta: Path, img: np.ndarray) -> Lattice:
     return lat
 
 
+def _mark(text: str) -> tuple[int, int]:
+    """`--mark 20,13` (or `(20,13)`) as `(col, row)`, a cell on the map."""
+    try:
+        col, row = (int(v) for v in text.strip("() ").split(","))
+    except ValueError:
+        raise SystemExit(f"--mark takes col,row pairs like 20,13, not {text!r}") from None
+    cols, rows = MAP_TILES
+    if not (0 <= col < cols and 0 <= row < rows):
+        raise SystemExit(f"--mark {text} is off the {cols} x {rows} map")
+    return col, row
+
+
 def main(argv=None) -> int:
     p = argparse.ArgumentParser(description=__doc__,
                                 formatter_class=argparse.RawDescriptionHelpFormatter)
@@ -489,7 +812,10 @@ def main(argv=None) -> int:
                         "whose floor has no checkerboard to fit")
     p.add_argument("--clusters", type=int, default=12, help="k for the colour grouping")
     p.add_argument("--review", action="store_true", help="open read-only; never writes")
+    p.add_argument("--mark", nargs="+", default=[], metavar="C,R",
+                   help="cells to ring on both panels, col,row each (20,13 6,39); n visits them")
     args = p.parse_args(argv)
+    marks = [_mark(text) for text in args.mark]
 
     png, csv, meta = (MAPS_DIR / f"{args.name}{ext}" for ext in (".png", ".csv", ".json"))
     _adopt_image(args.image, png)
@@ -501,17 +827,15 @@ def main(argv=None) -> int:
             raise SystemExit(f"{csv} is {chars.shape[1]} x {chars.shape[0]}, not "
                              f"{MAP_TILES[0]} x {MAP_TILES[1]}")
         print(f"resuming {csv}")
-        mode = "label"
     else:
         chars = first_pass(img, lat)
-        print(f"first pass: {int((chars == 'S').sum())} spawns; terrain is yours, name the "
-              f"clusters with c")
-        mode = "clusters"
+        print(f"first pass: {int((chars == 'S').sum())} spawns; terrain is yours: hover a cell, "
+              f"press its class's key, then c to name its whole cluster")
     report(chars)
 
     _release_matplotlib_keys()
     labeller = MapLabeller(args.name, img, lat, chars, propose_clusters(img, lat, args.clusters),
-                           (csv, meta), review=args.review, mode=mode)
+                           (csv, meta), review=args.review, marks=marks)
     # `mpl_connect` holds bound methods behind WEAK references: an unreferenced labeller is
     # collected at once and every key and click is silently ignored (vision_label.py hit this).
     labeller.fig._brawl_labeller = labeller

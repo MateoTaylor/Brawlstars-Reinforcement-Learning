@@ -431,7 +431,7 @@ def test_shipped_roster_rules_match_the_documented_table():
                     Kind.BOT_MELEE: AimModel.DIRECT, Kind.BOT_RIFLE: AimModel.LEAD,
                     Kind.BOT_EDGAR: AimModel.DIRECT, Kind.BOT_SPIKE: AimModel.LOB,
                     Kind.BOT_BULL: AimModel.LEAD}
-    assert set(expected_los) == {k for k in Kind if k is not Kind.HERO_MORTIS}, \
+    assert set(expected_los) == {k for k in Kind if k is not Kind.HERO}, \
         "a bot kind is missing from this table"
     for kind, los in expected_los.items():
         assert int(params.fire_needs_los[0, int(kind)]) == los, kind
@@ -473,7 +473,7 @@ def test_no_nan_in_combat_output_for_any_kind_in_any_state():
     test_rifle), each randomizing a different subset of these fields from the unseeded global
     RNG, and none covered Edgar, Spike or Bull."""
     torch.manual_seed(0)  # every draw below comes from the global RNG
-    bot_kinds = [k for k in Kind if k is not Kind.HERO_MORTIS]
+    bot_kinds = [k for k in Kind if k is not Kind.HERO]
     n_envs = 8
     cfg, params, gen = cfg_and_params(n_envs=n_envs, n_enemies=len(bot_kinds))
     state = fresh_state(cfg, params, n_envs=n_envs)
@@ -550,5 +550,5 @@ def test_validate_rejects_a_bot_with_no_desired_range_but_allows_the_hero():
         validate(cfg, params)
 
     cfg, params, _gen = cfg_and_params(map_h=40, map_w=40)
-    assert float(params.desired_range_fraction[0, int(Kind.HERO_MORTIS)]) == 0.0
+    assert float(params.desired_range_fraction[0, int(Kind.HERO)]) == 0.0
     validate(cfg, params)  # must not raise

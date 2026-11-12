@@ -64,7 +64,7 @@ def _fresh_state(cfg, n_envs=1):
     places one or two enemies deliberately is not surprised by the rest), all immortal."""
     state = allocate(cfg, n_envs=n_envs, device="cpu", verbose=False)
     state.ent_alive.fill_(True)
-    state.ent_kind[:, _HERO] = int(Kind.HERO_MORTIS)
+    state.ent_kind[:, _HERO] = int(Kind.HERO)
     for e in range(1, cfg.n_entities):
         state.ent_kind[:, e] = int(Kind.BOT_SNIPER)
     state.map_id.fill_(0)

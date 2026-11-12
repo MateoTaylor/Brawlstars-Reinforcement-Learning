@@ -72,7 +72,9 @@ python scripts/sb3_smoke.py               # proves the SB3 plumbing connects (no
 Run `dump_obs_schema.py` first: its two docs are gitignored, and they are the field-by-field
 reference for everything the sim observes (`docs/OBSERVATION.md`) and what a policy receives
 (`docs/AGENT_OBS.md`). `--spec configs/agent_obs_deploy6.yaml` renders the spec training uses to
-`docs/AGENT_OBS_DEPLOY6.md`, which is kept in the repo rather than gitignored.
+`docs/AGENT_OBS_DEPLOY6.md`, which is kept in the repo rather than gitignored, and
+`--spec configs/agent_obs_bull.yaml` renders Bull's (BULL_HERO_PLAN.md D6) to
+`docs/AGENT_OBS_BULL.md`, kept the same way.
 
 **Play it yourself** — WASD to move, space to fire, `g` to throw the gadget, at the real 20 Hz
 (the super has no key, by user decision). The human feel-check for Mortis's dash, and the fastest
@@ -257,6 +259,7 @@ single-env `gymnasium.Env` for `check_env` and interactive play.
 | `brawl_sim/maps/README.md` | map CSV format, the tile legend, and how to design a map for this sim |
 | `docs/OBSERVATION.md`, `docs/AGENT_OBS.md` | generated and gitignored — run `scripts/dump_obs_schema.py` |
 | `docs/AGENT_OBS_DEPLOY6.md` | generated, kept in the repo — the layout of the spec training and deployment use (`dump_obs_schema.py --spec configs/agent_obs_deploy6.yaml`) |
+| `docs/AGENT_OBS_BULL.md` | generated, kept in the repo — Bull's spec, deploy6 plus his slow window and three critic-only status timers (`dump_obs_schema.py --spec configs/agent_obs_bull.yaml`; BULL_HERO_PLAN.md D6) |
 | `archive/` | finished and parked work: known-map localization, the critic + memory plan, the 10-06 sim issues, the model size study, the terrain relabel worklist (38 of its 100 frames labelled, none since 09-17), the unbuilt Edgar plan, the 10-20 test audit, the older sim and obs overhauls, the deploy4/deploy5 obs docs, and the five deploy specs before deploy6 (`archive/configs/`, frozen with the runs that name them) |
 
 ## Known divergences from the real game

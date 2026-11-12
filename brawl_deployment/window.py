@@ -34,10 +34,20 @@ is what `WindowGuard` checks:
   and which the cached content box cannot: an occluder appearing mid-session corrupts pixels
   inside an unchanged crop. That is the mid-session half of the hazard whose startup half
   `DeployCapture.MIN_HEIGHT_COVERAGE` closes.
+
+**The emulator's own overlays are hidden for the run, because nothing could detect them**
+(2026-11-04). For the real Brawl Stars app, BlueStacks draws its keymap hints in a window of its
+own: W/A/S/D around the joystick, Space, Shift, E, Q and F on the buttons. That window is owned
+by the player window, layered, and `WS_EX_TRANSPARENT`. `mss` grabs with `CAPTUREBLT`, so the hints
+are in every frame, on the HUD discs that the gate and the button readers score. `find_occluders`
+cannot see the window, MEASURED: `WindowFromPoint` passes through a layered `WS_EX_TRANSPARENT`
+window to the one beneath it. So `WindowGuard` hides it and shows it again when the run ends
+(`window.hide_overlays`). The agent touches over adb, so the keymap plays no part in a run.
 """
 from __future__ import annotations
 
 import ctypes
+import time
 from ctypes import wintypes
 from dataclasses import dataclass
 from pathlib import Path
@@ -60,6 +70,15 @@ GA_ROOT = 2
 PROCESS_QUERY_LIMITED_INFORMATION = 0x1000
 MONITOR_DEFAULTTONULL = 0
 MONITORINFOF_PRIMARY = 1
+GW_OWNER = 4
+GWL_EXSTYLE = -20
+WS_EX_TRANSPARENT = 0x00000020
+WS_EX_LAYERED = 0x00080000
+SW_HIDE = 0
+SW_SHOWNA = 8
+# Both bits, the shape of a click-through overlay: drawn, while clicks and `WindowFromPoint` go
+# through it to the window beneath.
+CLICK_THROUGH = WS_EX_LAYERED | WS_EX_TRANSPARENT
 
 _dpi_aware = False
 
@@ -110,6 +129,13 @@ def _user32() -> ctypes.WinDLL:
     u.GetAncestor.argtypes = [wintypes.HWND, wintypes.UINT]
     u.MonitorFromWindow.restype = wintypes.HMONITOR
     u.MonitorFromWindow.argtypes = [wintypes.HWND, wintypes.DWORD]
+    u.GetWindow.restype = wintypes.HWND
+    u.GetWindow.argtypes = [wintypes.HWND, wintypes.UINT]
+    u.GetWindowLongPtrW.restype = ctypes.c_ssize_t
+    u.GetWindowLongPtrW.argtypes = [wintypes.HWND, ctypes.c_int]
+    u.IsWindow.argtypes = [wintypes.HWND]
+    u.IsWindowVisible.argtypes = [wintypes.HWND]
+    u.ShowWindowAsync.argtypes = [wintypes.HWND, ctypes.c_int]
     return u
 
 
@@ -171,6 +197,8 @@ class WindowInfo:
     rect: Rect            # includes the frame and title bar
     client: Rect          # the drawn area, in SCREEN coordinates -- what the game fills
     minimized: bool
+    owner: int = 0        # the window that owns this one (`GW_OWNER`); 0 for an application window
+    ex_style: int = 0     # `GWL_EXSTYLE`
 
     @property
     def client_size(self) -> tuple[int, int]:
@@ -179,6 +207,10 @@ class WindowInfo:
     @property
     def exe_name(self) -> str:
         return Path(self.exe).name if self.exe else ""
+
+    @property
+    def click_through(self) -> bool:
+        return self.ex_style & CLICK_THROUGH == CLICK_THROUGH
 
 
 def enumerate_windows() -> list[WindowInfo]:
@@ -203,6 +235,8 @@ def enumerate_windows() -> list[WindowInfo]:
             rect=_rect(wr),
             client=(origin.x, origin.y, origin.x + int(cr.right), origin.y + int(cr.bottom)),
             minimized=bool(u.IsIconic(hwnd)),
+            owner=int(u.GetWindow(hwnd, GW_OWNER) or 0),
+            ex_style=int(u.GetWindowLongPtrW(hwnd, GWL_EXSTYLE)) & 0xFFFFFFFF,
         ))
         return True
 
@@ -219,6 +253,14 @@ def select_emulator(windows: list[WindowInfo], exe_name: str = PLAYER_EXE) -> Wi
     and `find_adb_serial` returns the port of *one* of them. Driving the window of one instance
     with the adb connection of another produces an agent that sees a game it is not playing --
     which is a bad afternoon to debug and a one-line message to prevent.
+
+    **A window that another player window owns belongs to that instance; it is not a second
+    one.** Windows keeps an owned window above its owner and hides it along with it. BlueStacks
+    draws its keymap overlay for the real Brawl Stars app this way. MEASURED 2026-11-04:
+    'BlueStacks Keymap Overlay', owned by 'BlueStacks App Player', same process. Counted as an
+    instance, it made the first run on the real app refuse to start. Ownership is the test,
+    because titles and classes are not stable (module docstring). A second instance's window has
+    no owner, so two instances still raise.
     """
     named = [w for w in windows if w.exe_name.lower() == exe_name.lower()]
     if not named:
@@ -230,10 +272,12 @@ def select_emulator(windows: list[WindowInfo], exe_name: str = PLAYER_EXE) -> Wi
             f"started? ({len(windows)} visible top-level windows"
             + (f", {unreadable} whose process could not be read" if unreadable else "") + ")"
         )
-    usable = [w for w in named if w.client_size[0] > 0 and w.client_size[1] > 0]
+    handles = {w.hwnd for w in named}
+    instances = [w for w in named if w.owner not in handles]
+    usable = [w for w in instances if w.client_size[0] > 0 and w.client_size[1] > 0]
     if not usable:
         raise LookupError(
-            f"found {len(named)} {exe_name} window(s), all with an empty client area. The "
+            f"found {len(instances)} {exe_name} window(s), all with an empty client area. The "
             f"instance is probably still booting."
         )
     if len(usable) > 1:
@@ -248,6 +292,51 @@ def select_emulator(windows: list[WindowInfo], exe_name: str = PLAYER_EXE) -> Wi
 def find_emulator_window(exe_name: str = PLAYER_EXE) -> WindowInfo:
     """The emulator's window. Raises `LookupError` if it is not running or is ambiguous."""
     return select_emulator(enumerate_windows(), exe_name)
+
+
+def overlays_of(window: WindowInfo, windows: list[WindowInfo]) -> list[WindowInfo]:
+    """The visible click-through windows that `window` owns: drawn over it, and invisible to
+    `find_occluders`.
+
+    BlueStacks' keymap overlay is one (module docstring). A window needs both properties, because
+    each alone describes something else:
+    - An owned window that takes clicks is a dialog. `find_occluders` sees it, and the loop pauses.
+      Hiding a dialog would be wrong, since it may be asking the operator something.
+    - A click-through window nobody owns is some other program's, and not the emulator's to hide.
+    """
+    return [w for w in windows if w.owner == window.hwnd and w.click_through]
+
+
+def hide_windows(hwnds: list[int], timeout_s: float = 0.5) -> list[int]:
+    """Hide each window. Returns the ones still visible after `timeout_s`.
+
+    `ShowWindowAsync`, not `ShowWindow`. These windows belong to the emulator's process, and the
+    synchronous call waits on that process's UI thread, so a hung emulator would hang the loop.
+    The async call returns at once, hence the poll. MEASURED 2026-11-04: BlueStacks' overlay was
+    already hidden at the first 50 ms poll and stayed hidden. Then `DwmFlush`, which returns
+    after the compositor's next frame, so the next screen grab is the first one without them.
+    """
+    u = _user32()
+    for h in hwnds:
+        u.ShowWindowAsync(h, SW_HIDE)
+    deadline = time.perf_counter() + timeout_s
+    while True:
+        showing = [h for h in hwnds if u.IsWindow(h) and u.IsWindowVisible(h)]
+        if not showing or time.perf_counter() >= deadline:
+            break
+        time.sleep(0.005)
+    ctypes.WinDLL("dwmapi").DwmFlush()
+    return showing
+
+
+def show_windows(hwnds: list[int]) -> list[int]:
+    """Show each window again if it still exists; returns those. `SW_SHOWNA` does not activate
+    the window, so restoring an overlay does not take focus from whatever the operator is using."""
+    u = _user32()
+    alive = [h for h in hwnds if u.IsWindow(h)]
+    for h in alive:
+        u.ShowWindowAsync(h, SW_SHOWNA)
+    return alive
 
 
 def monitor_index_for(rect: Rect, monitors: list[dict]) -> int:
@@ -396,12 +485,25 @@ class WindowGuard:
     window means every calibrated coordinate is wrong and the run is over, while a window on top
     means some frames are unreadable and the run could reasonably continue once it goes away. The
     loop is entitled to treat those differently; this class does not decide for it.
+
+    **It also hides the emulator's own overlays for the run** (`overlays_of`, `hide_overlays`).
+    `suppress_overlays` runs before the first frame, `check()` hides them again on its cadence,
+    and `restore_overlays` shows them when the run ends. This is the one thing here that changes
+    the desktop rather than reading it. It lives in the guard for two reasons: hiding them is what
+    makes the capture match the calibration (module docstring), and the guard is what the loop
+    already consults on a cadence. Whether BlueStacks shows its overlay again by itself, on focus
+    or a control-scheme change, is untested. While unfocused it stayed hidden. An overlay that
+    comes back appears in at most `window.check_every_n_ticks` frames.
     """
 
     def __init__(self, window: WindowInfo, monitors: list[dict], *,
-                 require_fullscreen: bool = True, check_occlusion: bool = True):
+                 require_fullscreen: bool = True, check_occlusion: bool = True,
+                 hide_overlays: bool = True):
         self.require_fullscreen = require_fullscreen
         self.check_occlusion = check_occlusion
+        self.hide_overlays = hide_overlays
+        # The overlays this guard has hidden, by handle, for `restore_overlays`.
+        self.hidden: dict[int, WindowInfo] = {}
         self.state = WindowState(
             hwnd=window.hwnd,
             title=window.title,
@@ -430,9 +532,13 @@ class WindowGuard:
         The return is a `WindowFault` -- a string, so every caller that logs or formats it is
         unchanged, carrying a `kind` for the callers that must BRANCH on it. See `WindowFault`
         for why that tag exists rather than the obvious substring test.
+
+        It re-hides any of the emulator's overlays that are showing again (class docstring). An
+        overlay that will not hide is a recoverable fault, like any other window over the game.
         """
+        windows = enumerate_windows()
         try:
-            current = self._current()
+            current = self._current(windows)
         except LookupError as exc:
             return WindowFault("gone", f"the emulator window is gone: {exc}")
         if current.minimized:
@@ -445,6 +551,14 @@ class WindowGuard:
                 f"the emulator window moved or resized: client area was "
                 f"{self.state.client}, is now {current.client}. The content box was computed "
                 f"once at startup and is now cropping the wrong pixels.")
+        if self.hide_overlays:
+            _, showing = self._suppress(current, windows)
+            if showing:
+                return WindowFault(
+                    "occluded",
+                    f"the emulator's own overlay window(s) "
+                    f"{[w.title for w in showing]} would not hide. The capture is showing "
+                    f"them over the game.")
         if self.check_occlusion:
             covering = find_occluders(current)
             if covering:
@@ -454,11 +568,49 @@ class WindowGuard:
                     f"(hwnd {covering}). The capture is showing them, not the game.")
         return None
 
-    def _current(self) -> WindowInfo:
+    def suppress_overlays(self) -> list[WindowInfo]:
+        """Hide the emulator's own overlays now, and return the ones this call hid.
+
+        Used at the start of a run, so the first frame is clean; `check()` repeats it. If one
+        will not hide, `check()` reports it.
+        """
+        if not self.hide_overlays:
+            return []
+        windows = enumerate_windows()
+        try:
+            current = self._current(windows)
+        except LookupError:
+            return []                  # `check()` reports the missing window
+        return self._suppress(current, windows)[0]
+
+    def restore_overlays(self) -> list[WindowInfo]:
+        """Show every overlay this guard hid that still exists, and return those. Calling it
+        again does nothing."""
+        if not self.hidden:
+            return []
+        alive = set(show_windows(list(self.hidden)))
+        restored = [w for h, w in self.hidden.items() if h in alive]
+        self.hidden.clear()
+        return restored
+
+    def _suppress(self, current: WindowInfo,
+                  windows: list[WindowInfo]) -> tuple[list[WindowInfo], list[WindowInfo]]:
+        """`(hidden, still_showing)` for the overlays `current` has showing. Every one it tries
+        is recorded for `restore_overlays`, including one that hides late."""
+        showing = overlays_of(current, windows)
+        if not showing:
+            return [], []
+        for w in showing:
+            self.hidden.setdefault(w.hwnd, w)
+        stuck = set(hide_windows([w.hwnd for w in showing]))
+        return ([w for w in showing if w.hwnd not in stuck],
+                [w for w in showing if w.hwnd in stuck])
+
+    def _current(self, windows: list[WindowInfo]) -> WindowInfo:
         """Re-read the pinned window by handle, so a *second* instance opening mid-run cannot
         silently redirect the guard to it -- `select_emulator` would raise on the ambiguity, which
         is right at startup and wrong here, where we already know which window we chose."""
-        for w in enumerate_windows():
+        for w in windows:
             if w.hwnd == self.state.hwnd:
                 return w
         raise LookupError(f"no visible window with handle {self.state.hwnd} "

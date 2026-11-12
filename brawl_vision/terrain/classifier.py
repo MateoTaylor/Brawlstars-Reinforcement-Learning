@@ -263,7 +263,7 @@ def train(examples: list[Example], epochs: int = 200, lr: float = 3e-3, seed: in
     opt = torch.optim.Adam(net.parameters(), lr=lr)
     net.train()
     for epoch in range(epochs):
-        total = 0.0
+        total, scored = 0.0, 0
         for ex in rng.permutation(len(examples)):
             e = examples[ex]
             rect, target = e.rect, e.target
@@ -277,9 +277,16 @@ def train(examples: list[Example], epochs: int = 200, lr: float = 3e-3, seed: in
             opt.zero_grad()
             loss.backward()
             opt.step()
-            total += float(loss.detach())
+            # A frame with no supervised cell (every target IGNORE_INDEX, as an all-'?' label is)
+            # makes the mean 0/0 = NaN. Its gradient is zero, so the step above is Adam's momentum
+            # alone and the weights stay finite, but in the log one such frame made every epoch
+            # print "loss nan". The log skips it; the training does not, so it stays as it was.
+            value = float(loss.detach())
+            if np.isfinite(value):
+                total += value
+                scored += 1
         if log_every and epoch % log_every == 0:
-            print(f"epoch {epoch:3d}  loss {total / max(len(examples), 1):.4f}")
+            print(f"epoch {epoch:3d}  loss {total / max(scored, 1):.4f}")
     return TerrainClassifier(net=net, device=device)
 
 

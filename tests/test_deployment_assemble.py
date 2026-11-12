@@ -32,7 +32,7 @@ import pytest
 import torch
 import yaml
 
-from brawl_sim.config import load_config
+from brawl_sim.config import _deep_merge, load_config
 from brawl_sim.core import camera, obs_select
 from brawl_deployment.perception.assemble import (DecisionSnapshot, MapFrame,
                                                   ObservationAssembler)
@@ -131,6 +131,7 @@ def _suppliers_from(full, cfg, spec, env_i=0, history=()):
         "super_charge_frac": float(at(hero["super_charge_frac"])),
         "gadget_ready": bool(at(hero["gadget_ready"])),
         "gadget_charge_frac": float(at(hero["gadget_charge_frac"])),
+        "slow_window": float(at(hero["slow_window"])),
     }
     hero_pos = tuple(at(hero["pos"]).tolist())
     hero_vel = tuple(at(hero["vel"]).tolist())
@@ -322,17 +323,26 @@ def test_deploy6_assembles_whole():
         assert not bool(terminated[0] or truncated[0]), "a reset would clear the sim's ring"
 
 
-def test_deploy6_assembles_every_actor_group_and_leaves_the_critic_at_zero():
+@pytest.mark.parametrize("spec_path, hero", [(DEPLOY6, "mortis"),
+                                             ("configs/agent_obs_bull.yaml", "bull")])
+def test_deploy6_assembles_every_actor_group_and_leaves_the_critic_at_zero(spec_path, hero):
     """deploy6 against a live env at the run's 12-miss coast: every actor group equals the sim's
     at every decision, `enemies` included, read from memory -- a coasting slot's last sighting
     and its age -- and both critic groups stay zero, since the assembler builds with
     critic=False. The sim side gets its own buffers: its build fills the critic groups, and
-    sharing the assembler's would hand those values back through `assemble`."""
+    sharing the assembler's would hand those values back through `assemble`.
+
+    Bull's spec too (BULL_HERO_PLAN.md §5.7b): deploy6 plus `hero.slow_window`, which the shadow
+    supplies. A super is charged by hand and fired at step 2, so the window is compared while it
+    runs, not only at its idle 0."""
     from brawl_sim.env import BrawlVecEnv
 
-    cfg = load_config(CONFIGS, overrides={**TINY, "slots": {"max_misses": 12}})
-    env = BrawlVecEnv(cfg, n_envs=1, device="cpu", seed=0)
-    asm = _assembler(DEPLOY6, cfg)
+    overrides = _deep_merge(TINY, {"slots": {"max_misses": 12}, "entities": {"hero": hero}})
+    cfg = load_config(CONFIGS, overrides=overrides)
+    sim_spec = _deep_merge({**yaml.safe_load(open(CONFIGS).read()),
+                            **yaml.safe_load(open("configs/brawlers.yaml").read())}, overrides)
+    env = BrawlVecEnv(cfg, n_envs=1, device="cpu", seed=0, spec=sim_spec)
+    asm = _assembler(spec_path, cfg)
     spec = asm.spec
     sim_buffers = _sim_buffers(spec, cfg)
     assert [g.name for g in spec.critic_groups] == ["critic_enemies", "critic_world"]
@@ -340,8 +350,9 @@ def test_deploy6_assembles_every_actor_group_and_leaves_the_critic_at_zero():
     full = env.reset()
     gen = torch.Generator().manual_seed(4)
     history = deque(maxlen=3)
-    coasting = projectile_frames = 0
+    coasting = projectile_frames = slowed = 0
     for step in range(40):
+        slowed += int(float(full["hero"]["slow_window"][0]) > 0)
         want = obs_select.build_agent_obs(full, spec, cfg, sim_buffers)
         want = {k: v[0].clone().numpy() for k, v in want.items()}
         got = asm.assemble(**_suppliers_from(full, cfg, spec, history=history))
@@ -363,12 +374,17 @@ def test_deploy6_assembles_every_actor_group_and_leaves_the_critic_at_zero():
             env.state.ent_alive[0, 1] = False
         move = int(torch.randint(0, cfg.n_move_bins + 1, (1,), generator=gen))
         attack = int(torch.randint(0, 2, (1,), generator=gen))
+        if hero == "bull" and step == 2:
+            env.state.ent_super_charge[0, 0] = 9           # Bull's super_charge_hits
+            move, attack = 1, 2
         history.appendleft(_snapshot_of(full, move, attack))
         full, _, terminated, truncated, _ = env.step(torch.tensor([[move, attack]], dtype=torch.int64))
         if bool(terminated[0] or truncated[0]):
             history.clear()                     # the reset cleared the sim's ring too
     assert coasting >= 10, f"a slot coasted in only {coasting} decisions of 40"
     assert projectile_frames > 0, "no frame with live projectiles was compared"
+    if hero == "bull":
+        assert slowed >= 3, f"the slow window ran in only {slowed} decisions"
 
 
 def test_a_coasting_memory_row_assembles_to_the_sims_row():
@@ -605,7 +621,7 @@ def _base_kwargs(asm, **overrides):
               "can_attack": True, "dashing": False, "dash_t": 0.0, "dash_dir": (0.0, 0.0),
               "invuln": False, "long_dash_ready": True, "long_dash_frac": 1.0,
               "super_ready": False, "super_charge_frac": 0.4,
-              "gadget_ready": False, "gadget_charge_frac": 0.3}
+              "gadget_ready": False, "gadget_charge_frac": 0.3, "slow_window": 0.0}
     kwargs = dict(
         hero_pos=(10.0, 10.0), hero_vel=(0.5, -0.5), shadow=shadow, hero_hp=8000.0,
         n_enemies_alive=4.0, elapsed_s=42.0, hero_in_bush=False, hero_in_zone=False,

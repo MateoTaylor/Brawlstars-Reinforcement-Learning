@@ -165,7 +165,7 @@ def test_move_smooth_converges_toward_raw_target_over_many_ticks():
     cfg, params, gen = _cfg_and_params(n_enemies=1)
     state = allocate(cfg, n_envs=1, device="cpu", verbose=False)
     state.ent_alive.fill_(True)
-    state.ent_kind[:, 0] = int(Kind.HERO_MORTIS)
+    state.ent_kind[:, 0] = int(Kind.HERO)
     state.ent_kind[:, 1] = int(Kind.BOT_SNIPER)
     state.map_id.fill_(0)
     state.ent_target.fill_(-1)
@@ -202,7 +202,7 @@ def test_decision_period_gates_fire_to_staggered_ticks():
     cfg, params, gen = _cfg_and_params(n_enemies=1)
     state = allocate(cfg, n_envs=1, device="cpu", verbose=False)
     state.ent_alive.fill_(True)
-    state.ent_kind[:, 0] = int(Kind.HERO_MORTIS)
+    state.ent_kind[:, 0] = int(Kind.HERO)
     state.ent_kind[:, 1] = int(Kind.BOT_SNIPER)
     state.map_id.fill_(0)
     state.ent_target.fill_(-1)
@@ -241,7 +241,7 @@ def test_entity_zero_and_dead_entities_get_zeroed_intent():
     cfg, params, gen = _cfg_and_params(n_enemies=2)
     state = allocate(cfg, n_envs=1, device="cpu", verbose=False)
     state.ent_alive.fill_(True)
-    state.ent_kind[:, 0] = int(Kind.HERO_MORTIS)
+    state.ent_kind[:, 0] = int(Kind.HERO)
     state.ent_kind[:, 1] = int(Kind.BOT_SNIPER)
     state.ent_kind[:, 2] = int(Kind.BOT_SNIPER)
     state.map_id.fill_(0)
@@ -277,7 +277,7 @@ def test_changing_aim_noise_changes_behavior_through_the_dispatcher():
     cfg, params, gen = _cfg_and_params(n_enemies=1)
     state = allocate(cfg, n_envs=1, device="cpu", verbose=False)
     state.ent_alive.fill_(True)
-    state.ent_kind[:, 0] = int(Kind.HERO_MORTIS)
+    state.ent_kind[:, 0] = int(Kind.HERO)
     state.ent_kind[:, 1] = int(Kind.BOT_SNIPER)
     state.map_id.fill_(0)
     state.ent_target.fill_(-1)
@@ -342,7 +342,7 @@ def test_dispatcher_passes_hero_focus_through_to_target_selection():
         params.hero_focus[:, int(Kind.BOT_SNIPER)] = hero_focus
         state = allocate(cfg, n_envs=1, device="cpu", verbose=False)
         state.ent_alive.fill_(True)
-        state.ent_kind[:, 0] = int(Kind.HERO_MORTIS)
+        state.ent_kind[:, 0] = int(Kind.HERO)
         state.ent_kind[:, 1] = int(Kind.BOT_SNIPER)
         state.ent_kind[:, 2] = int(Kind.BOT_SNIPER)
         state.map_id.fill_(0)
@@ -376,7 +376,7 @@ def test_kite_brock_hold_distance_scales_with_aggression():
         params.aggression[:, int(Kind.BOT_SNIPER)] = aggression
         state = allocate(cfg, n_envs=1, device="cpu", verbose=False)
         state.ent_alive.fill_(True)
-        state.ent_kind[:, 0] = int(Kind.HERO_MORTIS)
+        state.ent_kind[:, 0] = int(Kind.HERO)
         state.ent_kind[:, 1] = int(Kind.BOT_SNIPER)
         state.map_id.fill_(0)
         state.ent_target.fill_(-1)
@@ -404,14 +404,14 @@ def test_kite_hold_distance_is_capped_at_each_kinds_fire_reach():
         Shelly  8.0    0.9        7.2    8.4 -> 7.2     7.5 -> 7.2    6.0
         Spike   8.0    unset      8.0    8.4 -> 8.0     7.5           6.0
         Grom    7.33   unset      7.33   7.1834         6.41375       5.131
-        Bull    7.0    0.9        6.3    5.88           5.25          4.2
+        Bull    5.2    0.9        4.68   4.368          3.9           3.12
     """
     table = {
         Kind.BOT_SNIPER: (8.0, (8.0, 8.0, 6.8)),
         Kind.BOT_RIFLE: (7.2, (7.2, 7.2, 6.0)),
         Kind.BOT_SPIKE: (8.0, (8.0, 7.5, 6.0)),
         Kind.BOT_ARTILLERY: (7.33, (7.1834, 6.41375, 5.131)),
-        Kind.BOT_BULL: (6.3, (5.88, 5.25, 4.2)),
+        Kind.BOT_BULL: (4.68, (4.368, 3.9, 3.12)),
     }
     for kind, (reach, holds) in table.items():
         for aggression, want in zip((0.6, 0.8, 1.0), holds):
@@ -419,7 +419,7 @@ def test_kite_hold_distance_is_capped_at_each_kinds_fire_reach():
             params.aggression[:, int(kind)] = aggression
             state = allocate(cfg, n_envs=1, device="cpu", verbose=False)
             state.ent_alive.fill_(True)
-            state.ent_kind[:, 0] = int(Kind.HERO_MORTIS)
+            state.ent_kind[:, 0] = int(Kind.HERO)
             state.ent_kind[:, 1] = int(kind)
             state.map_id.fill_(0)
             state.ent_target.fill_(-1)

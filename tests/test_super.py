@@ -20,7 +20,7 @@ from brawl_sim.core.state import allocate
 from brawl_sim.env import BrawlVecEnv
 
 CONFIGS = "configs"
-_HERO = int(Kind.HERO_MORTIS)
+_HERO = int(Kind.HERO)
 _TINY = yaml.safe_load(open(f"{CONFIGS}/presets/debug_tiny.yaml"))
 
 

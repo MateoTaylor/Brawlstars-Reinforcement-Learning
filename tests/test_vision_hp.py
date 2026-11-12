@@ -63,7 +63,7 @@ def _digit_mask(bank, digit, height=16):
 
 
 def synth_frame(bank, number, *, label="player", pitch_gap=2, cover=None, erase=None,
-                erase2=None, drop_first=False, shift=0, size=(300, 400)):
+                erase2=None, drop_first=False, shift=0, bridge=None, size=(300, 400)):
     """A BGR frame with one HP readout on it, plus the `Detection` that encloses it.
 
     Built from the shipped templates rather than from a captured crop, so the test states what it
@@ -74,6 +74,8 @@ def synth_frame(bank, number, *, label="player", pitch_gap=2, cover=None, erase=
     way the game floats a damage number. `erase=i` deletes digit `i` outright. Both take an INDEX
     rather than a flag because both failures depend on WHICH digit goes: one lost off an end is a
     truncation, one lost from the middle is a gap, and they are caught by different code.
+    `bridge=i` joins digit `i` to the next with a one-pixel white run, the way a `4`'s arm
+    reaches the `0` before it.
     """
     h, w = size
     frame = np.full((h, w, 3), 40, np.uint8)
@@ -90,6 +92,8 @@ def synth_frame(bank, number, *, label="player", pitch_gap=2, cover=None, erase=
             frame[y:y + m.shape[0], x:x + m.shape[1]][m] = (250, 250, 250)
         spans.append((x, x + m.shape[1]))
         x += m.shape[1] + pitch_gap
+    if bridge is not None:
+        frame[y + 10, spans[bridge][1] - 3:spans[bridge + 1][0] + 3] = (250, 250, 250)
     # bar: green (hue ~56) for player, red for enemy, under the digits
     color = (60, 230, 90) if label == "player" else (60, 60, 230)
     frame[y + 20:y + 30, (w - 120) // 2:(w + 120) // 2] = color
@@ -277,6 +281,42 @@ def test_two_adjacent_missing_digits_are_caught_too(bank):
     reading = HealthReader(bank).read(*synth_frame(bank, 10400, erase=1, erase2=2))
     assert reading.hp != 100
     assert reading.hp is None and reading.status == GAP
+
+
+@needs_templates
+def test_two_touching_glyphs_are_cut_apart_rather_than_dropped(bank):
+    """`10400`, Bull's full HP with one cube. On real footage the `4`'s arm touches the `0` before
+    it, so the pair segments as ONE blob too wide for a glyph. Dropping it left a hole the gap test
+    rejected, and the hero's HP went unread for as long as he stayed at full (2026-11-02)."""
+    import cv2
+    frame, det = synth_frame(bank, 10400, bridge=1)
+    n, _ = cv2.connectedComponents(locate.white_mask(cv2.cvtColor(frame, cv2.COLOR_BGR2HSV),
+                                                     70, 175), connectivity=8)
+    assert n - 1 == 4, "the bridge must really join the `0` and the `4`, or this tests nothing"
+    reading = HealthReader(bank).read(frame, det)
+    assert reading.status == OK and reading.hp == 10400
+
+
+@pytest.mark.vision
+@needs_templates
+def test_bull_s_full_hp_reads_off_real_footage():
+    """The same `10400` on the clip it was found on: from 26.8 s to 40.8 s every frame came back
+    `gap` until the touching pair was cut apart, and the deploy loop skipped every decision."""
+    from pathlib import Path
+
+    pytest.importorskip("onnxruntime")
+    from brawl_deployment.capture import to_viewport
+    from brawl_vision.clips import ClipReader
+    from brawl_vision.object_detection import ObjectDetector
+
+    clip = Path("tests/fixtures/vision/bluestacks-bull-hypercharge.mp4")
+    if not clip.exists():
+        pytest.skip(f"{clip} is gitignored game footage")
+    cfg = load_vision_config()
+    with ClipReader(clip, cfg, trim_tail=False) as frames:
+        image = to_viewport(next(f for f in frames if f.t >= 33.0).image)
+    player = next(d for d in ObjectDetector.from_config(cfg).predict(image) if d.label == "player")
+    assert HealthReader.from_config(cfg).read(image, player).hp == 10400
 
 
 def test_the_gap_test_is_absolute_and_not_a_ratio_against_the_row():

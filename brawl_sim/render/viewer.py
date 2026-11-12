@@ -20,8 +20,20 @@ camera, so there is nothing to call out there. Ground truth is always drawn rega
 ring -- this viewer shows full information, unlike `render_ascii`'s `mode="agent"`; the ring
 only ANNOTATES why the hero's own obs would consider an entity hidden.
 
+**Status-effect labels ('e' toggle, BULL_HERO_PLAN.md D4):** under each living entity, one line
+per status timer still running, in seconds left, most disabling first: `AIR` (`ent_airborne_t`),
+`STUN` (`ent_stun_t`), `slow N%` (`ent_slow_t`, with `ent_slow_frac` the share of speed taken),
+and on a charger `slow window` (`ent_slow_window_t`, the policy's `hero.slow_window`: the landing
+slow left on every player his last charge caught). The label takes its first line's colour. All
+five are plain SimState fields, so a recording made before them (Phase 3, 6a) just shows no
+label. A dead entity's timers keep counting down (`combat.resolve_deaths` leaves them), but its
+label hides with the rest of its artists. A charge carries the bots it hits to its landing, so the
+charger's label and theirs start side by side; labels that would cover each other therefore stack
+downward, top of the screen first, each still centred on its own entity (`_unstack_status_labels`).
+
 **Entities get dedicated per-slot artists (Circle body, HP-bar Rectangle pair, ammo Text,
-reveal-ring Circle), one fixed set per `n_entities` slot, updated in place every frame.** Boxes,
+reveal-ring Circle, status Text), one fixed set per `n_entities` slot, updated in place every
+frame.** Boxes,
 pickups, and projectiles instead share one (or one-per-kind) `Axes.scatter`/PathCollection:
 entity annotations (HP/ammo/dash/reveal) are per-instance and `n_entities` is small
 (`1 + n_enemies`), while boxes/pickups/projectiles are larger, visually homogeneous populations.
@@ -45,7 +57,8 @@ world camera stays on the fast blit path, the panned "view" mode is correct but 
 
 Key bindings (bound in `show()`; also reachable directly via `on_key(event)` for tests that
 don't want to drive a real event loop): space=pause/resume, left/right=scrub one frame,
-+/-=playback speed (halves/doubles), v=reveal overlay, c=view-rect outline, g=world/view pan.
++/-=playback speed (halves/doubles), v=reveal overlay, e=status-effect labels, c=view-rect
+outline, g=world/view pan.
 """
 import argparse
 import itertools
@@ -80,9 +93,17 @@ _DEFAULT_RADIUS = 0.4  # fallback when a bare snapshot (no `unit_radius` extra) 
 # keeps drawing its existing Circle/scatter fallback; sprites and fallbacks are never mixed
 # within the same artist, so there's no per-frame cost to leaving assets out.
 _ASSETS_DIR = Path(__file__).resolve().parent / "assets"
-_ENTITY_SPRITE_PATHS = {k: _ASSETS_DIR / "entities" / f"{k.name.lower()}.png" for k in Kind}
 _BOX_SPRITE_PATH = _ASSETS_DIR / "items" / "box.png"
 _PICKUP_SPRITE_PATH = _ASSETS_DIR / "items" / "pickup.png"
+
+
+def entity_sprite_paths(hero: str) -> dict:
+    """Kind -> PNG path. Bots by their member name (`bot_edgar.png`); Kind.HERO by the brawler the
+    run plays (`hero_mortis.png`, `hero_bull.png`), since one member stands for every hero."""
+    paths = {k: _ASSETS_DIR / "entities" / f"{k.name.lower()}.png" for k in Kind}
+    paths[Kind.HERO] = _ASSETS_DIR / "entities" / f"hero_{hero}.png"
+    return paths
+
 
 # Sprites are drawn larger than the collision circle they replace (Brawl Stars character art
 # extends well past the hitbox -- weapon, shadow, wind-up frames) but boxes/pickups are simple
@@ -118,7 +139,7 @@ TILE_CMAP = ListedColormap([TILE_COLORS[t] for t in Tile])
 # IntEnum members hash/compare as their int value, so these dicts are also indexable by a
 # plain int (e.g. `_KIND_COLOR.get(int(ent_kind[e]), ...)`) with no explicit enum conversion.
 _KIND_COLOR = {
-    Kind.HERO_MORTIS: "#e8342a",
+    Kind.HERO: "#e8342a",
     Kind.BOT_SNIPER: "#2a6ae8",
     Kind.BOT_ARTILLERY: "#e8a52a",
     Kind.BOT_MELEE: "#8a2ae8",
@@ -145,6 +166,33 @@ _DASH_RING_COLOR = "#ffffff"
 _REVEAL_RING_COLOR = "#ffe040"
 _ZONE_COLOR = "#2ae82a"
 _ZONE_ALPHA = 0.30
+# Status-effect label lines; a label takes its first (most disabling) line's colour.
+_AIRBORNE_COLOR = "#ffffff"
+_STUN_COLOR = "#ffd24a"
+_SLOW_COLOR = "#8fd3ff"
+_WINDOW_COLOR = "#ffa040"
+# Room kept around each label's text when stacking, in points (its dark box pads the text by 0.9).
+_STATUS_GAP_PT = 1.5
+
+
+def _status_label(frame: dict, e: int) -> tuple[str, str | None]:
+    """Entity `e`'s status-effect label in one frame: (text, colour), or ("", None) when no timer
+    runs. Every field is optional (module docstring), so a recording without them gets no label."""
+    air, stun = frame.get("ent_airborne_t"), frame.get("ent_stun_t")
+    slow_t, slow_frac = frame.get("ent_slow_t"), frame.get("ent_slow_frac")
+    window = frame.get("ent_slow_window_t")
+    lines = []
+    if air is not None and air[e] > 0:
+        lines.append((f"AIR {float(air[e]):.2f}", _AIRBORNE_COLOR))
+    if stun is not None and stun[e] > 0:
+        lines.append((f"STUN {float(stun[e]):.2f}", _STUN_COLOR))
+    if slow_t is not None and slow_frac is not None and slow_t[e] > 0:
+        lines.append((f"slow {float(slow_frac[e]):.0%} {float(slow_t[e]):.2f}", _SLOW_COLOR))
+    if window is not None and window[e] > 0:
+        lines.append((f"slow window {float(window[e]):.2f}", _WINDOW_COLOR))
+    if not lines:
+        return "", None
+    return "\n".join(text for text, _ in lines), lines[0][1]
 
 
 class ReplayViewer:
@@ -160,6 +208,7 @@ class ReplayViewer:
         self.paused = False
         self.speed = 1.0
         self.show_reveal = True
+        self.show_status = True
         self.show_view_rect = False
         self.crop_to_view = False
 
@@ -202,7 +251,7 @@ class ReplayViewer:
 
         # Sprite lookups resolved once at construction (a rollout never changes what PNGs exist
         # on disk mid-playback), so the per-frame path is just "is this entry None or not".
-        self._entity_sprite_imgs = {k: _load_sprite(p) for k, p in _ENTITY_SPRITE_PATHS.items()}
+        self._entity_sprite_imgs = {k: _load_sprite(p) for k, p in entity_sprite_paths(self.cfg.hero).items()}
         self._box_sprite_img = _load_sprite(_BOX_SPRITE_PATH)
         self._pickup_sprite_img = _load_sprite(_PICKUP_SPRITE_PATH)
 
@@ -264,6 +313,7 @@ class ReplayViewer:
 
         self.body, self.sprite, self.dash_ring = [], [], []
         self.hp_bg, self.hp_fill, self.ammo_text, self.reveal_ring = [], [], [], []
+        self.status_text = []
         for e in range(self.n_entities):
             body = Circle((0, 0), _DEFAULT_RADIUS, facecolor="#888888", edgecolor="none", zorder=4)
             self.ax.add_patch(body)
@@ -285,6 +335,13 @@ class ReplayViewer:
 
             text = self.ax.text(0, 0, "", fontsize=6, ha="center", va="center", color="white", zorder=6)
             self.ammo_text.append(text)
+
+            # Hung under the ammo count, on a dark box so it reads over any tile.
+            status = self.ax.text(
+                0, 0, "", fontsize=6, ha="center", va="top", zorder=6, visible=False,
+                bbox=dict(boxstyle="round,pad=0.15", facecolor="black", alpha=0.55, linewidth=0),
+            )
+            self.status_text.append(status)
 
             # The dash cue is its own ring, not the body Circle's edge, so it also shows on top
             # of a sprite.
@@ -313,7 +370,7 @@ class ReplayViewer:
             + list(self.proj_scatter.values()) + self.hazard_circles + self.super_bolt_circles
             + self.box_sprites + self.pickup_sprites
             + self.body + self.sprite + self.dash_ring + self.hp_bg + self.hp_fill
-            + self.ammo_text + self.reveal_ring + [self.facing_lines, self.title]
+            + self.ammo_text + self.status_text + self.reveal_ring + [self.facing_lines, self.title]
         )
 
     # ---- per-frame update -----------------------------------------------------------------
@@ -395,10 +452,11 @@ class ReplayViewer:
         for e in range(self.n_entities):
             body, sprite, dash, ring = self.body[e], self.sprite[e], self.dash_ring[e], self.reveal_ring[e]
             hp_bg, hp_fill, text = self.hp_bg[e], self.hp_fill[e], self.ammo_text[e]
+            status = self.status_text[e]
             alive = bool(f["ent_alive"][e])
 
             if not alive:
-                for artist in (body, sprite, dash, hp_bg, hp_fill, text, ring):
+                for artist in (body, sprite, dash, hp_bg, hp_fill, text, status, ring):
                     artist.set_visible(False)
                 facing_segments.append(((-1000.0, -1000.0), (-1000.0, -1000.0)))
                 continue
@@ -439,6 +497,13 @@ class ReplayViewer:
             text.set_position((px, py + radius + 0.2))
             text.set_text(str(int(np.floor(f["ent_ammo"][e]))))
 
+            label, color = _status_label(f, e) if self.show_status else ("", None)
+            status.set_visible(bool(label))
+            if label:
+                status.set_position((px, py + radius + 0.45))
+                status.set_text(label)
+                status.set_color(color)
+
             bush_hidden_from_hero = (
                 e != _HERO and self.show_reveal and revealed is not None and los is not None
                 and bool(los[e]) and not bool(revealed[e])
@@ -464,9 +529,31 @@ class ReplayViewer:
             self.ax.set_ylim(float(hero_pos[1]) + self.cfg.view_h / 2.0, float(hero_pos[1]) - self.cfg.view_h / 2.0)
             self.fig.canvas.draw()  # forces blit's cached background to resync -- see module docstring
 
+        self._unstack_status_labels()   # after the crop: it measures the labels on screen
         self.title.set_text(ascii_status_line(f))
 
         return self._artists()
+
+    def _unstack_status_labels(self) -> None:
+        """Moves each shown status label down past any label it would cover, top of the screen
+        first, so a label only ever moves down and keeps its own entity's x."""
+        pad = _STATUS_GAP_PT * self.fig.dpi / 72.0
+        placed = []
+        shown = [s for s in self.status_text if s.get_visible()]
+        for status in sorted(shown, key=lambda s: s.get_position()[1]):  # +y is down the screen
+            box = status.get_window_extent().padded(pad)
+            drop, hit = 0.0, True
+            while hit:  # clearing one label can land on another, so look again
+                hit = False
+                for other in placed:
+                    if box.overlaps(other):
+                        step = box.y1 - other.y0 + 1.0  # display y runs up the screen
+                        box, drop, hit = box.translated(0.0, -step), drop + step, True
+            if drop:  # only y goes through the screen; x stays its entity's, to the bit
+                x, y = status.get_position()
+                sx, sy = self.ax.transData.transform((x, y))
+                status.set_position((x, self.ax.transData.inverted().transform((sx, sy - drop))[1]))
+            placed.append(box)
 
     # ---- interaction ------------------------------------------------------------------------
 
@@ -499,6 +586,10 @@ class ReplayViewer:
             self._apply_speed()
         elif key == "v":
             self.show_reveal = not self.show_reveal
+            self._draw_frame(self.frame_idx)
+            self.fig.canvas.draw_idle()
+        elif key == "e":
+            self.show_status = not self.show_status
             self._draw_frame(self.frame_idx)
             self.fig.canvas.draw_idle()
         elif key == "c":

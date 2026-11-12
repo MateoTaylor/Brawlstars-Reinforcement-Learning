@@ -9,6 +9,7 @@ Every assertion about "no input" is against `backend.events`, which is the only 
 come from. Checking `phase` instead would pass for a loop that set the right phase and pressed the
 button anyway, which is the exact bug the interlock exists to make impossible.
 """
+from dataclasses import replace
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -30,6 +31,7 @@ from brawl_deployment.perception.assemble import ObservationAssembler
 from brawl_deployment.perception.known_map import KnownMap
 from brawl_deployment.perception.lattice import LatticePhase
 from brawl_deployment.perception.loot import crate_occlusion
+from brawl_deployment.perception.shadow import ShadowParams
 from brawl_deployment.policy import Decision
 from brawl_deployment.window import WindowFault
 from brawl_sim.config import load_config
@@ -143,20 +145,60 @@ class _Guard:
 
     def __init__(self, reason=None):
         self.reason = reason
+        self.calls: list[str] = []          # suppress/restore order, for the run-lifecycle test
 
     def check(self):
         return self.reason
 
+    def suppress_overlays(self):
+        self.calls.append("suppress")
+        return []
+
+    def restore_overlays(self):
+        self.calls.append("restore")
+        return []
+
+
+class _Cal:
+    """`Calibration.viewport_button`, for the Super button the loop reads its charge off, and the
+    two hysteresis numbers the waiting log quotes."""
+
+    threshold = 0.45
+    enter_samples = 6
+
+    def viewport_button(self, name):
+        return {"super": (1627.0, 939.0, 34.7)}[name]
+
 
 class _Match:
     def __init__(self):
+        self.cal = _Cal()
         self.gate = False
         self.refine_ok = True
         self.refines = 0
         self.exits = 0
+        # The real gate's per-look surface, `MatchState.looks` / `last_scores` / `drawn`, which
+        # the loop's waiting and match-start logs read. `scores` is what the next `update` scores.
+        self.looks = (("hypercharge", 1563.2, 1032.9, 35.9),
+                      ("super (uncharged)", 1627.0, 939.0, 34.7))
+        self.scores = (0.10, 0.05)
+        self.last_scores = self.scores
+        self.last_score = max(self.scores)
+        self.drawn = ("hypercharge",)
+        # `button_drawn(frame, "gadget")`, the loop's per-match gadget window (§5.2). True by
+        # default, the Nulls account's Bull: every other test's gadget is equipped as before.
+        self.gadget_drawn = True
+        self.gadget_looks = 0
 
     def update(self, frame):
+        self.last_scores = self.scores
+        self.last_score = max(self.scores)
         return self.gate
+
+    def button_drawn(self, frame, button):
+        assert button == "gadget", button       # the loop looks at no other disc this way
+        self.gadget_looks += 1
+        return self.gadget_drawn, (0.97 if self.gadget_drawn else 0.06)
 
     def refine(self, frame, min_score=None):
         self.refines += 1
@@ -380,13 +422,13 @@ class _Policy:
 
 
 def _patch_vision(monkeypatch):
-    """The three vision reads the fixture stubs out: the zone, and the ammo and super bars."""
+    """The three vision reads the fixture stubs out: the zone, the ammo bar and the Super button."""
     monkeypatch.setattr("brawl_vision.terrain.zone.detect_zone",
                         lambda rect, plan, cfg=None: _Zone())
     monkeypatch.setattr("brawl_vision.object_detection.hp_detection.hero_bars.read_ammo",
                         lambda image, det, cfg=None: None)
-    monkeypatch.setattr("brawl_vision.object_detection.hp_detection.hero_bars.read_super",
-                        lambda image, det, cfg=None: None)
+    monkeypatch.setattr("brawl_deployment.perception.super_button.read_super",
+                        lambda image, button: None)
 
 
 @pytest.fixture
@@ -396,13 +438,14 @@ def loop(monkeypatch):
     return _build_loop(_Policy())
 
 
-def _build_loop(policy):
-    """The fixture's loop around `policy`; `_patch_vision` first."""
+def _build_loop(policy, cfg=None, log=None):
+    """The fixture's loop around `policy`; `_patch_vision` first. `cfg` defaults to the
+    dataclass's defaults; `log` sees what the loop logs while it is built."""
     backend = _Backend()
     controls = Controls(backend=backend,
                         joystick=Joystick(backend, (345.6, 669.6), 110.0, n_bins=16),
                         buttons=Buttons(backend, attack=(1690.0, 594.0), super_=(1462.5, 1000.5),
-                                        gadget=(1559.9, 901.1)))
+                                        gadget=(1559.9, 901.1), screen=(1920, 1080)))
     vision = VisionStack(plan=_Plan(), odometry=_Odometry(), occupancy=_Occupancy(),
                          classifier=_Classifier(),
                          entities=_Detector([_Detection("player", HERO_PX)]),
@@ -410,7 +453,7 @@ def _build_loop(policy):
                          health=_Health([_Reading("player", 8000)]),
                          hud=_Hud(), cfg=None)
     lp = DeployLoop(capture=_Capture(), guard=_Guard(), match=_Match(), vision=vision,
-                    policy=policy, controls=controls, cfg=DeploymentConfig())
+                    policy=policy, controls=controls, cfg=cfg or DeploymentConfig(), log=log)
     lp.backend = backend                       # test handle; the loop never reads it
     lp.vision.warm = lambda image: None         # no detectors to JIT
     return lp
@@ -708,6 +751,45 @@ def test_the_match_watchdog_stops_a_match_that_never_ends(loop):
     assert not loop.controls.joystick.is_down
 
 
+def _until_decision(loop, limit=50):
+    """Tick until the loop hands the policy one more observation; that call's keywords."""
+    calls = loop.policy.assembler.calls
+    n = len(calls)
+    for _ in range(limit):
+        loop.tick()
+        if len(calls) > n:
+            return calls[-1]
+    raise AssertionError(f"no decision in {limit} ticks")
+
+
+def test_time_frac_reads_the_match_clock(loop):
+    """`meta.time_frac`'s seconds come from `_match_clock`, the clock a replay swaps for the clip's
+    (`scripts/probes/replay_clip.py`). When they came from `time.perf_counter`, a replay's
+    time_frac measured how fast the CPU got through the clip, and one Starfruit decision came out
+    differently from run to run (MAP_ONBOARDING.md, Starfruit Supernova)."""
+    now = [500.0]
+    loop._match_clock = lambda: now[0]
+    _play(loop, 1)                                  # the gate opens at 500 s on the match clock
+    assert loop.phase is Phase.PLAYING
+    now[0] = 512.5
+    assert _until_decision(loop)["elapsed_s"] == pytest.approx(12.5)
+
+
+def test_the_match_watchdog_reads_the_match_clock(loop):
+    """The watchdog times the match on the same clock. In a replay, a match lasts as long as the
+    clip says, not as long as the CPU took."""
+    now = [0.0]
+    loop._match_clock = lambda: now[0]
+    _play(loop, 2)
+    now[0] = loop.cfg.safety_max_match_seconds - 1.0
+    loop.tick()
+    assert loop.phase is Phase.PLAYING
+    now[0] = loop.cfg.safety_max_match_seconds + 1.0
+    loop.tick()
+    assert loop.phase is Phase.STOPPED
+    assert "safety_max_match_seconds" in loop.stop_reason
+
+
 # -- odometry ----------------------------------------------------------------------------------
 
 def test_a_brief_odometry_loss_does_not_stop_the_loop(loop):
@@ -923,6 +1005,126 @@ def test_a_gadget_decision_is_a_bare_tap_on_the_gadget_button(loop):
     assert second.attack_legal == 0b0011
     assert second.attack == ATTACK_NONE
     assert [e for e in loop.backend.log[before:] if e[1] == SLOT_TAP] == []
+
+
+# -- the loadout: is there a gadget at all (§5.2) ---------------------------------------------
+
+def test_a_gadget_disc_never_drawn_keeps_the_gadget_masked_for_the_match(loop):
+    """The 11-04 real account: Shelly at power 3 owns no gadget, so its disc is never drawn. The
+    window looks for `gadget_look_ticks` and stops; every decision of the match has bit 3 clear;
+    the policy asking for a throw anyway taps nothing, because `ShadowHero.act` refuses it."""
+    messages = []
+    loop.log = messages.append
+    loop.match.gadget_drawn = False
+    loop.policy.decision = Decision(move_bin=5, attack=ATTACK_GADGET,
+                                    legal=(True, True, False, True))
+    _play(loop, loop.gadget_look_ticks + 3 * loop.decision_every)
+
+    assert loop.match.gadget_looks == loop.gadget_look_ticks    # the window, then no more looks
+    assert not loop.shadow.gadget_equipped
+    decisions = _decisions(loop)
+    assert len(decisions) > 3
+    assert all(not r.attack_legal & 0b1000 for r in decisions)
+    assert all(r.attack == ATTACK_NONE for r in decisions)
+    assert not [e for e in loop.backend.events if e[1] == SLOT_TAP]
+    said = [m for m in messages if m.startswith("no gadget disc")]
+    assert len(said) == 1 and "best ring 0.06" in said[0], messages
+
+
+def test_a_gadget_disc_seen_inside_the_window_equips_it_from_that_tick(loop):
+    """A disc first seen a few ticks in, as on footage where the gate opens inside the disc's
+    white flash: equipped on the sighting, the window closed, and a decision on that tick may
+    already throw. Logged, because a late sighting is the case worth seeing in a run's log."""
+    messages = []
+    loop.log = messages.append
+    loop.match.gadget_drawn = False
+    _play(loop, 2)
+    assert not loop.shadow.gadget_equipped
+    loop.match.gadget_drawn = True
+    _play(loop, 1)
+    assert loop.shadow.gadget_equipped
+    looks = loop.match.gadget_looks
+    assert looks == 3
+    _play(loop, 2 * loop.decision_every)
+    assert loop.match.gadget_looks == looks                      # one sighting closes the window
+    assert [m for m in messages if m.startswith("gadget disc seen")], messages
+    assert all(r.attack_legal & 0b1000 for r in _decisions(loop)[1:])
+
+
+def test_every_match_looks_for_its_gadget_again(loop):
+    """The loadout is read per match, never carried: a match that lacked the disc says nothing
+    about the next, which may be another brawler. And the shadow's `reset` keeps the equip,
+    so it is `_begin_match` that clears it, before the window opens."""
+    loop.match.gadget_drawn = False
+    _play(loop, loop.gadget_look_ticks + 1)
+    assert not loop.shadow.gadget_equipped
+    loop.match.gate = False
+    loop.tick()
+    assert loop.phase is Phase.WAITING
+
+    loop.match.gadget_drawn = True
+    _play(loop, 1)
+    assert loop.phase is Phase.PLAYING and loop.shadow.gadget_equipped
+    loop.match.gate = False
+    loop.tick()
+    loop.match.gadget_drawn = False
+    _play(loop, 1)
+    assert not loop.shadow.gadget_equipped                        # the last match's disc is gone
+
+
+def test_a_kit_with_no_gadget_never_looks_for_one(loop):
+    """No disc to find: the window closes on its first tick without a look and without a line."""
+    messages = []
+    loop.log = messages.append
+    loop.shadow.p = replace(loop.shadow.p, gadget_cooldown=0.0)
+    _play(loop, loop.gadget_look_ticks + 1)
+    assert loop.match.gadget_looks == 0
+    assert not [m for m in messages if m.startswith(("gadget disc", "no gadget disc"))], messages
+
+
+def test_a_shut_gate_logs_the_peak_of_each_look(loop):
+    """The 11-04 live run waited through a whole match without a word: its one look was a disc
+    the account's brawler does not draw. A waiting loop now logs each look's PEAK every
+    `WAIT_LOG_SECONDS`: what a silent run needs is whether anything came close in between, and
+    one tick's scores cannot say. Each line covers only the ticks since the last."""
+    messages = []
+    loop.log = messages.append
+    loop.match.scores = (0.31, 0.05)
+    loop.tick()
+    loop.match.scores = (0.10, 0.20)
+    for _ in range(loop.wait_log_ticks - 2):
+        loop.tick()
+    assert not [m for m in messages if m.startswith("waiting")]
+    loop.tick()
+    waiting = [m for m in messages if m.startswith("waiting")]
+    assert len(waiting) == 1
+    assert "hypercharge 0.31, super (uncharged) 0.20" in waiting[0], waiting
+    assert "opens at 0.45 held for 6 ticks" in waiting[0], waiting
+
+    for _ in range(loop.wait_log_ticks):
+        loop.tick()
+    waiting = [m for m in messages if m.startswith("waiting")]
+    assert len(waiting) == 2 and "hypercharge 0.10, super (uncharged) 0.20" in waiting[1], waiting
+    assert loop.backend.touches == []
+
+
+def test_a_match_starting_restarts_the_waiting_log(loop):
+    """A wait cut short by a match leaves nothing half-counted: the first line after the match
+    covers a full `WAIT_LOG_SECONDS` of waiting ticks, not the leftover of the last wait."""
+    messages = []
+    loop.log = messages.append
+    for _ in range(loop.wait_log_ticks - 2):
+        loop.tick()
+    # The gate's opening tick still waits when it scores (`_note_waiting` runs before the
+    # transition): one tick short of a line, and then `_begin_match` drops the count.
+    _play(loop, 2)
+    loop.match.gate = False
+    loop.tick()                         # the match ends here; this tick no longer waits
+    for _ in range(loop.wait_log_ticks - 1):
+        loop.tick()
+    assert not [m for m in messages if m.startswith("waiting")], messages
+    loop.tick()
+    assert len([m for m in messages if m.startswith("waiting")]) == 1
 
 
 def test_a_policy_exception_fails_closed_before_it_propagates(loop):
@@ -1657,6 +1859,42 @@ def test_the_run_loop_enters_the_capture_and_always_releases(loop):
     assert not loop.controls.joystick.is_down
 
 
+def test_the_run_hides_the_emulators_overlays_before_its_first_frame(loop):
+    """BlueStacks draws its keymap hints over the HUD buttons, and the grab includes them
+    (window.py, 2026-11-04). Hidden before the capture opens, so no frame of the run has them."""
+    capture_open = []
+    real = loop.guard.suppress_overlays
+    loop.guard.suppress_overlays = lambda: capture_open.append(loop.capture.entered) or real()
+    loop.run(max_seconds=0.0, max_matches=None)
+    assert capture_open == [False]
+    assert loop.guard.calls == ["suppress", "restore"]
+
+
+def test_a_run_that_dies_still_shows_the_overlays_again(loop):
+    """In the `finally`, after the contacts: the operator gets their overlay back however the run
+    ended."""
+    def tick():
+        raise RuntimeError("tick blew up")
+    loop.tick = tick
+    with pytest.raises(RuntimeError, match="tick blew up"):
+        loop.run(max_seconds=5.0)
+    assert loop.guard.calls == ["suppress", "restore"]
+    assert not loop.controls.joystick.is_down
+
+
+def test_an_overlay_that_cannot_be_shown_again_does_not_replace_the_stop(loop):
+    """Showing the overlay again runs in a `finally`. If it raised, the error would replace the
+    exception or stop reason that explains why the run ended."""
+    def restore():
+        raise OSError("the emulator closed")
+    loop.guard.restore_overlays = restore
+    lines = []
+    loop.log = lines.append
+    reason = loop.run(max_seconds=0.0, max_matches=None)
+    assert reason == "max_seconds reached"
+    assert any("could not show the emulator's overlay again" in s for s in lines)
+
+
 # ------------------------------------------------------------------------------------------------
 # `test_nothing_is_emitted_before_the_gate_opens` runs without the fixture's monkeypatching to
 # prove the silence does not depend on it: a loop that never opens the gate never reaches a vision
@@ -1706,11 +1944,10 @@ def test_pin_thread_pools_caps_torch_and_cv2_from_the_config():
         cv2.setNumThreads(cv2_before)
 
 
-def test_vision_stack_build_hands_the_detector_pool_settings_to_both_sessions(monkeypatch):
-    """Both detectors, not one: each ORT session has its own pool, and a spinning pool on the
-    session that was forgotten costs the same cores as the one that was not."""
-    import brawl_deployment.loop as loop_mod
-
+def _stub_vision_stack(monkeypatch) -> dict:
+    """Every stage `VisionStack.build` loads, replaced by a stub that records what it was handed:
+    each detector's ORT pool settings under its class name, and the classifier's weights path under
+    `terrain`."""
     seen = {}
 
     class _Det:
@@ -1732,11 +1969,17 @@ def test_vision_stack_build_hands_the_detector_pool_settings_to_both_sessions(mo
         def from_config(cls, cfg):
             return cls()
 
+    class _Terrain(_Any):
+        @classmethod
+        def from_config(cls, cfg, path=None):
+            seen["terrain"] = path
+            return cls()
+
     monkeypatch.setattr("brawl_vision.object_detection.detector.ObjectDetector", _Det)
     monkeypatch.setattr("brawl_vision.object_detection.projectile_detection.detect.ProjectileDetector",
                         _Proj)
-    for target in ("brawl_vision.terrain.classifier.TerrainClassifier",
-                   "brawl_vision.terrain.occupancy.OccupancyMap",
+    monkeypatch.setattr("brawl_vision.terrain.classifier.TerrainClassifier", _Terrain)
+    for target in ("brawl_vision.terrain.occupancy.OccupancyMap",
                    "brawl_vision.object_detection.hp_detection.smooth.HealthTracker",
                    "brawl_vision.hud.HudReader"):
         monkeypatch.setattr(target, _Any)
@@ -1745,14 +1988,42 @@ def test_vision_stack_build_hands_the_detector_pool_settings_to_both_sessions(mo
     monkeypatch.setattr("brawl_vision.camera.load_camera_model", lambda: None)
     monkeypatch.setattr("brawl_vision.camera.load_hud_mask", lambda *a: None)
     monkeypatch.setattr("brawl_vision.config.load_vision_config", lambda: None)
+    return seen
 
+
+def test_vision_stack_build_hands_the_detector_pool_settings_to_both_sessions(monkeypatch):
+    """Both detectors, not one: each ORT session has its own pool, and a spinning pool on the
+    session that was forgotten costs the same cores as the one that was not."""
+    import brawl_deployment.loop as loop_mod
+
+    seen = _stub_vision_stack(monkeypatch)
     loop_mod.VisionStack.build(detector_threads=2, detector_spin=False)
-    assert seen == {"_Det": {"cpu_threads": 2, "spin": False},
-                    "_Proj": {"cpu_threads": 2, "spin": False}}
+    assert {k: seen[k] for k in ("_Det", "_Proj")} == {"_Det": {"cpu_threads": 2, "spin": False},
+                                                       "_Proj": {"cpu_threads": 2, "spin": False}}
 
     seen.clear()
     loop_mod.VisionStack.build()
     assert seen["_Det"] == {"cpu_threads": None, "spin": True}, "a script running alone keeps the library defaults"
+
+
+def test_vision_stack_build_loads_the_terrain_classifier_it_is_named(monkeypatch):
+    """`terrain` picks a shipped classifier by name: `default` is terrain.pt, `dark_passage` the way
+    back to the one every live Dark Passage session ran (MAP_ONBOARDING.md, Starfruit Supernova).
+    A name that was never shipped fails before a single model loads."""
+    import brawl_deployment.loop as loop_mod
+    from brawl_vision.config import TERRAIN_MODELS, TERRAIN_WEIGHTS_PATH
+
+    seen = _stub_vision_stack(monkeypatch)
+    loop_mod.VisionStack.build()
+    assert seen["terrain"] == TERRAIN_WEIGHTS_PATH
+
+    loop_mod.VisionStack.build(terrain="dark_passage")
+    assert seen["terrain"] == TERRAIN_MODELS["dark_passage"]
+
+    seen.clear()
+    with pytest.raises(ValueError, match="no terrain model called 'dark-passage'"):
+        loop_mod.VisionStack.build(terrain="dark-passage")
+    assert not seen, "nothing was built"
 
 
 
@@ -1764,11 +2035,19 @@ def test_vision_stack_build_hands_the_detector_pool_settings_to_both_sessions(mo
 # configs/brawlers.yaml (hero_mortis) and configs/default.yaml (entities.unit_radius), and the
 # test would be worthless if it re-added them.
 
-def test_dash_reach_is_the_audits_radius_from_the_configs(loop):
-    from brawl_deployment.loop import dash_reach_tiles
+def test_attack_reach_is_the_audits_radius_from_the_configs(loop):
+    """Mortis: his dash (2.67, x2 when the long dash is charged) + dash_radius 0.70, plus a body:
+    0.40 for an enemy, 0.50 for a crate. Bull: 5.42 for the audit (most of the volley still
+    lands) but his whole range for the auto-aim, 5.50 + 0.40, and no long dash to grow it."""
+    from brawl_deployment.loop import attack_reach_tiles, auto_aim_reach_tiles
 
     assert loop.reach_tiles == pytest.approx(3.77)
-    assert dash_reach_tiles(loop.shadow.p) == pytest.approx(3.77)
+    assert attack_reach_tiles("mortis") == pytest.approx(3.77)
+    assert loop._aim_reach[False] == pytest.approx((3.77, 3.87))
+    assert loop._aim_reach[True] == pytest.approx((6.44, 6.54))
+    assert attack_reach_tiles("bull") == pytest.approx(5.42, abs=0.01)
+    assert auto_aim_reach_tiles("bull") == pytest.approx((5.90, 6.00))
+    assert auto_aim_reach_tiles("bull", long_dash=True) == pytest.approx((5.90, 6.00))
 
 
 def test_a_decision_with_a_legal_attack_and_an_enemy_two_tiles_away_records_both(loop):
@@ -1921,18 +2200,91 @@ def test_a_decision_taken_while_the_hero_track_coasts_carries_the_shadows_ammo(l
     assert second.ammo_cv == -1.0
 
 
-def test_the_reach_and_the_shadow_share_one_brawler_kind(loop):
-    """`ShadowParams` does not record which brawlers.yaml block it came from, so the loop names
-    the kind once (`HERO_KIND`) and hands it to both `ShadowParams.load` and `dash_reach_tiles`;
-    a second default in either would let `dash_distance` and `dash_radius` come from two
-    brawlers. Numbers are Mortis's, as literals."""
-    from brawl_deployment.loop import HERO_KIND, dash_reach_tiles
-
-    assert HERO_KIND == "hero_mortis"
+def test_the_hero_comes_from_the_run_and_one_the_shadow_cannot_model_is_refused(loop, monkeypatch):
+    """BULL_HERO_PLAN.md D8: the run's `entities.hero` names the hero, and the shadow's block and
+    both reaches follow it. A hero whose kit the shadow does not model is refused at startup
+    rather than played on another hero's timers: Bull, with the list as it stood before §5.7b."""
+    assert loop.hero_kind == "hero_mortis"
     assert float(loop.shadow.p.dash_distance) == pytest.approx(2.67)
-    assert dash_reach_tiles(loop.shadow.p, kind=HERO_KIND) == pytest.approx(3.77)
-    with pytest.raises(KeyError, match="hero_nobody"):
-        dash_reach_tiles(loop.shadow.p, kind="hero_nobody")
+    assert not loop.shadow.p.charge_super
+
+    monkeypatch.setattr("brawl_deployment.loop.SHADOW_KINDS", ("hero_mortis",))
+    bull = load_config("configs/default.yaml", overrides={"entities": {"hero": "bull"}})
+    with pytest.raises(ValueError, match=r"hero_bull.*models only"):
+        _build_loop(_Policy(cfg=bull, spec_path="configs/agent_obs_bull.yaml"))
+
+
+def test_a_bull_run_charges_to_the_screen_edge_and_supplies_its_slow_window(monkeypatch):
+    """§5.7b end to end, on the real assembler, which raises on any field the Bull spec names and
+    the loop does not supply. The shadow loads Bull's block, a charge super drags to the screen
+    edge along the bin (Q6: the drag sets the length, the shadow models full length), the charge
+    masks every attack while it runs, the landing starts `hero.slow_window`, and the HP read
+    reaches Berserker's running max."""
+    from brawl_deployment.perception.super_button import SuperReading
+
+    _patch_vision(monkeypatch)
+    monkeypatch.setattr("brawl_deployment.perception.super_button.read_super",
+                        lambda image, button: SuperReading(charge=1.0, ready=True, state="ready"))
+    bull = load_config("configs/default.yaml", overrides={"entities": {"hero": "bull"}})
+    lp = _build_loop(_Policy(cfg=bull, spec_path="configs/agent_obs_bull.yaml",
+                             real_assembler=True))
+    assert lp.hero_kind == "hero_bull" and lp.shadow.p.charge_super
+    _play(lp, lp.decision_every)
+    assert lp.shadow.super_ready and lp.shadow.max_hp == 8000.0
+
+    lp.policy.decision = Decision(move_bin=1, attack=ATTACK_SUPER, legal=(True, True, True, True))
+    btn = lp.controls.buttons
+    down, (move,), up = _tap_steps_per_tick(lp, lp.decision_every)
+    assert down == [("down", SLOT_TAP, *btn.super_)]
+    assert move[:2] == ("move", SLOT_TAP)
+    assert move[2:] == pytest.approx((btn.screen[0] - 1 - 2.0, btn.super_[1]), abs=1e-3)
+    assert up == [("up", SLOT_TAP)]
+    # The loop spends REAL elapsed seconds and this fixture's ticks take microseconds, so the
+    # shadow's clock is run by hand, as the auto-aim test does.
+    lp.shadow.advance(0.05)
+    assert lp.shadow.charging and lp.shadow.attack_mask() == (True, False, False, False)
+    lp.shadow.advance(2.0)                                # the 1.84 s charge has landed
+    assert not lp.shadow.charging
+    left = lp.shadow.observe()["slow_window"]
+    assert 0.0 < left < 1.5
+
+    lp.policy.decision = Decision(move_bin=0, attack=ATTACK_NONE, legal=(True, True, False, True))
+    _play(lp, lp.decision_every)
+    col, _ = agent_obs_index_map(lp.policy.spec, bull)["self"]["hero.slow_window"]
+    assert float(lp.policy.obs[0]["self"][col]) == 0.0
+    assert float(lp.policy.obs[-1]["self"][col]) == pytest.approx(left, abs=0.06)
+
+
+def test_the_accounts_loadout_drops_a_star_power_no_disc_shows(monkeypatch):
+    """Design §5.2. `loadout.star_power: false` (the user's Bull, 2026-11-04: Stomper, no
+    Berserker) builds the shadow from the run's kit without its star power, and `loadout_note`
+    says so for the startup lines. The default keeps the kit whole. Mortis's kit has none, so it
+    is untouched and there is no note.
+
+    The constructor itself logs nothing. replay_clip's log reads the capture it builds only
+    after the loop, and a constructor that logged crashed it; `boom` stands in for that log."""
+    _patch_vision(monkeypatch)
+    bull = load_config("configs/default.yaml", overrides={"entities": {"hero": "bull"}})
+
+    def boom(message):
+        raise AssertionError(f"the constructor logged: {message!r}")
+
+    def bull_loop(**kw):
+        return _build_loop(_Policy(cfg=bull, spec_path="configs/agent_obs_bull.yaml",
+                                   real_assembler=True), log=boom, **kw)
+
+    kit = ShadowParams.load("hero_bull")
+    whole = bull_loop()
+    assert whole.shadow.p == whole.hero_kit == kit and kit.star_power
+    assert "star power on" in whole.loadout_note
+
+    bare = bull_loop(cfg=DeploymentConfig(loadout_star_power=False))
+    assert bare.shadow.p == kit.without_star_power() and bare.hero_kit == kit
+    assert "hero_bull" in bare.loadout_note and "base rate" in bare.loadout_note
+
+    mortis = _build_loop(_Policy(), cfg=DeploymentConfig(loadout_star_power=False), log=boom)
+    assert mortis.shadow.p == ShadowParams.load("hero_mortis")
+    assert mortis.loadout_note is None
 
 
 # -- the dead-bin move mask (design 6.16) ------------------------------------------------------
@@ -2049,12 +2401,11 @@ def test_an_idle_super_is_a_bare_tap_and_a_moving_one_a_drag(monkeypatch, move_b
     """The sim aims an idle super like the game's tap-to-fire and a moving one along the bin
     (`hero.super_aim_target`), so the device taps the super button on the idle bin, down on the
     decision tick and up on the next, and drags it along the bin otherwise (bin 5 is +y)."""
-    from brawl_vision.object_detection.hp_detection.hero_bars import SuperReading
+    from brawl_deployment.perception.super_button import SuperReading
 
     _patch_vision(monkeypatch)
-    monkeypatch.setattr("brawl_vision.object_detection.hp_detection.hero_bars.read_super",
-                        lambda image, det, cfg=None: SuperReading(
-                            charge=1.0, ready=True, state="ready", track_px=118, row=120))
+    monkeypatch.setattr("brawl_deployment.perception.super_button.read_super",
+                        lambda image, button: SuperReading(charge=1.0, ready=True, state="ready"))
     lp = _build_loop(_Policy())
     lp.vision.entities.detections = [_Detection("player", HERO_PX)]
     _play(lp, lp.decision_every)
@@ -2115,3 +2466,20 @@ def test_aim_and_reach_count_a_lost_track_for_aim_max_misses_decisions_only(monk
     tr.misses = AIM_MAX_MISSES + 1
     assert lp._auto_aim(hero, [tr]) is None
     assert lp._enemy_in_reach(hero, [tr]) is False
+
+
+def test_the_super_is_read_off_the_calibrated_super_button(monkeypatch):
+    """Not off the hero's readout stack: Bull has no bar under his ammo pips, and Mortis's is the
+    long-dash meter (perception/super_button.py). The loop hands the reader the SUPER button's
+    viewport centre and radius, from the calibration `MatchState` holds."""
+    from brawl_deployment.perception.super_button import SuperReading
+
+    _patch_vision(monkeypatch)
+    seen = []
+    monkeypatch.setattr("brawl_deployment.perception.super_button.read_super",
+                        lambda image, button: seen.append(button)
+                        or SuperReading(charge=0.5, ready=False, state="charging"))
+    lp = _build_loop(_Policy())
+    _play(lp, lp.decision_every)
+    assert seen and set(seen) == {lp.match.cal.viewport_button("super")}
+    assert lp.shadow.super_charge_frac == 0.5 and not lp.shadow.super_ready

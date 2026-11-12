@@ -26,8 +26,11 @@ policy's observation was built from:
   5. ammo_at_first_attack  ammo at the first attack of each fight, a histogram
 
 "Enemy in reach" is any enemy alive, revealed to the hero (bots/perception.visibility row 0) and
-within `dash_distance + dash_radius + unit_radius` tiles -- the uncharged dash; a charged one
-reaches further, so this is the conservative "certainly could have hit" criterion.
+within `hero.in_reach_radius` tiles, the reward term's own radius. For Mortis that is
+`dash_distance + dash_radius + unit_radius`, the uncharged dash; a charged one reaches further, so
+this is the conservative "certainly could have hit" criterion. For Bull (no dash) it is where most
+of his volley can land, 5.61 tiles (BULL_HERO_PLAN.md §5.2). The `--telemetry` side still reads
+the deployment's dash reach (Phase 7).
 
 The recorder is called by the driver at each decision boundary with the action the policy chose
 (`CadenceRecorder.record(sim, action)`, BEFORE `step()`), not installed as `BrawlVecEnv.tick_hook`:
@@ -101,7 +104,7 @@ if str(REPO) not in sys.path:
 
 from brawl_sim.bots import perception  # noqa: E402 -- after the sys.path insert above
 from brawl_sim.core import geometry as geo
-from brawl_sim.core import hero, obs_select, stats
+from brawl_sim.core import hero, obs_select
 
 FIELDS = ("env", "step_count", "can_attack", "attack_cd", "dash_t", "ammo",
           "long_dash_ready", "attack_idle_t", "attack_col", "enemy_in_reach")
@@ -128,9 +131,8 @@ class CadenceRecorder:
 
         hero_pos = state.ent_pos[:, 0:1, :]
         dist = geo.safe_norm(state.ent_pos - hero_pos, dim=-1)              # (N,E)
-        dash_distance = stats.gather_kind(params.dash_distance, state.ent_kind)[:, 0]
-        dash_radius = stats.gather_kind(params.dash_radius, state.ent_kind)[:, 0]
-        reach = (dash_distance + dash_radius + params.unit_radius).unsqueeze(-1)  # (N,1)
+        # env._attack_phase's radius for the reward's in-reach term, so the two stay one number.
+        reach = hero.in_reach_radius(state, params).unsqueeze(-1)                # (N,1)
         in_reach = state.ent_alive & vis[:, 0, :] & (dist <= reach)
         in_reach[:, 0] = False
         enemy_in_reach = in_reach.any(dim=-1)

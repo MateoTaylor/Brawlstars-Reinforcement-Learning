@@ -729,10 +729,9 @@ def _probe_gates(cal, frame):
 
     Keyed off `cal.gate_anchor` rather than a literal, because which disc gates is now a property
     of the shipped file: it moved off the Super on 2026-09-22 and these fixtures must move with
-    it, or they assert the probe against a gate the probe does not use.
+    it, or they assert the probe against a gate the probe does not use. Since 2026-11-04 that is
+    the gate's FIRST look; the production gate carries all of them.
     """
-    from dataclasses import replace
-
     from brawl_deployment.match_state import MatchState
     anchor = MatchState(cal)
     for _ in range(cal.enter_samples):
@@ -742,7 +741,7 @@ def _probe_gates(cal, frame):
     for name in cal.buttons:
         if name == cal.gate_anchor:
             continue
-        gates[name] = MatchState(replace(cal, gate_anchor=name))
+        gates[name] = MatchState.on(cal, name)
         gates[name].refine(frame, min_score=0.0)
     return gates
 
@@ -807,8 +806,8 @@ def test_the_probe_records_each_anchor_through_the_real_gate_class():
     """The gadget disc vanishes for six ticks after the tap and comes back, which is what a
     recharge looks like. A gate anchored on the gadget would exit on the fourth dark tick and could
     not re-enter for five more (enter_samples is 6) -- and that shadow gate is recorded.
-    The PRODUCTION gate is on `hypercharge`, which the tap does not touch, so it holds
-    straight through: after 2026-09-22 that separation is the point of the whole probe."""
+    The PRODUCTION gate reads the hypercharge and the Super, neither of which the tap touches, so
+    it holds straight through: after 2026-09-22 that separation is the point of the whole probe."""
     mod = _load_calibrate_script()
     cal = _probe_cal()
     lit = _button_frame(cal, {"gadget": 200, "super": 200, "hypercharge": 200})
@@ -830,14 +829,15 @@ def test_the_probe_records_each_anchor_through_the_real_gate_class():
 
 
 def test_the_probe_never_taps_through_a_closed_gate():
-    """The interlock every press obeys. The `hypercharge` disc, which is what the gate reads, goes
-    dark on tick 2, so the production gate exits on tick 5 and reads out of match at the tap tick:
-    nothing goes down, and the trace ends there saying why. The gadget stays lit throughout, so
-    this asserts the interlock rather than the tapped button's own state."""
+    """The interlock every press obeys. Every disc the production gate looks at, the hypercharge
+    and the Super (design §5.2), goes dark on tick 2, so the gate exits on tick 5 and reads out of
+    match at the tap tick: nothing goes down, and the trace ends there saying why. The gadget
+    stays lit throughout, so this asserts the interlock rather than the tapped button's own
+    state. Darkening the hypercharge alone no longer closes it: a lit Super is a match too."""
     mod = _load_calibrate_script()
     cal = _probe_cal()
     lit = _button_frame(cal, {"gadget": 200, "super": 200, "hypercharge": 200})
-    dark = _button_frame(cal, {"gadget": 200, "super": 200})
+    dark = _button_frame(cal, {"gadget": 200})
     frames = iter([lit] * 2 + [dark] * 20)
     null = NullBackend()
     trace = _record(mod, lambda: next(frames), _probe_gates(cal, lit), _probe_buttons(null))

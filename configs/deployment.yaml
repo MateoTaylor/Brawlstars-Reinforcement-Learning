@@ -101,6 +101,12 @@ window:                   # design 6.9
   # Note the consequence, which is an operating constraint and not a bug: on a single monitor
   # there is no arrangement where someone watches the agent in another window on the same screen.
   check_occlusion: true
+  # Hide the emulator's own click-through overlays while a run (or deploy_calibrate) is going, and
+  # show them again when it ends. On the real Brawl Stars app, BlueStacks draws its keymap hints
+  # (W/A/S/D, Space, Shift, E, Q, F) on top of the HUD buttons. The grab includes them, and
+  # check_occlusion cannot see a click-through window (2026-11-04). The agent touches over adb,
+  # so the keymap plays no part in a run.
+  hide_overlays: true
   # Ticks between occlusion probes; 20 is once a second at the derived capture rate. Five
   # WindowFromPoint calls cost microseconds, so this is not a cost tuning -- it is how long the
   # agent may keep playing into a covered screen before it notices.
@@ -147,8 +153,9 @@ control:
   # after; the lift fires. Never a bare tap: the game auto-aims those at the nearest enemy, which
   # the policy never trained on.
   #
-  # Direction only -- the dash and the super travel a fixed distance -- so this just has to clear
-  # the game's aim deadzone. 75 is ~70% of the movement stick's 110 px ring. The ceiling is still
+  # Direction only -- Mortis's dash and super travel a fixed distance -- so this just has to clear
+  # the game's aim deadzone. Bull's charge super is the exception: its length is the drag's, so it
+  # drags to the screen edge instead (control/buttons.py, BULL_HERO_PLAN.md Q6). 75 is ~70% of the movement stick's 110 px ring. The ceiling is still
   # the super button, but it is now 179 px above the bottom edge rather than 81: the 81 px disc
   # was never the Super (2026-09-22). A radius past the ceiling is refused at startup, because an
   # off-screen point is clamped to the edge and the shot would go the wrong way.
@@ -189,6 +196,15 @@ shadow:                   # design 6.3
   # Resyncs inside one match before the run is called lost. Sustained desync means our actions are
   # not landing, and an agent whose model of itself is wrong is worse than a stopped one.
   max_resyncs: 5
+
+loadout:                  # design 5.2
+  # Whether the account's brawler has the star power the run's kit models (Bull: Berserker, a
+  # double-speed reload under 60 % HP). Nothing on screen shows a star power, so this is the
+  # operator's word; the gadget and the hypercharge are read off their discs every match. false:
+  # the shadow reloads at the base rate at every HP, as the game then does. The policy still
+  # trained with the boost. A kit with no star power (Mortis) ignores this.
+  # The user, 2026-11-04: the account's Bull has Stomper and no Berserker.
+  star_power: false
 
 safety:
   # The match gate is the primary interlock; this is the backstop for the gate itself being wrong.
@@ -239,3 +255,21 @@ map:                      # archive/KNOWN_MAP_LOCALIZATION_PLAN.md
   wrong_map_agreement: 0.55 # the landing search's best under this means the wrong map
   search_tiles: 4           # after an odometry cut, how far the fix is searched for
   search_seconds: 5.0       # landing: spawn windows only for this long; a cut: time to confirm
+
+terrain:                  # MAP_ONBOARDING.md, Starfruit Supernova
+  # Which shipped terrain classifier reads the screen, by name (brawl_vision/config.py's
+  # TERRAIN_MODELS), never a path. default is brawl_vision/data/terrain.pt: since 2026-11-04 the
+  # classifier trained with Starfruit Supernova's projected labels (held-out blocking F1 0.946
+  # there against the old one's 0.502; on the Dark Passage tuning clips the same fixes, at +0.03 to
+  # +0.05 agreement). dark_passage is the old one, which every live Dark Passage session ran, kept
+  # as brawl_vision/data/terrain_dark_passage.pt. truth (brawl_vision/data/terrain_truth.pt,
+  # 2026-11-05) is default's labels plus Truth's projected ones, for sessions on Truth
+  # (MAP_ONBOARDING.md, Truth). doom_shroom (brawl_vision/data/terrain_doom_shroom.pt, 2026-11-11)
+  # adds both Doom Shroom recordings' projected labels as well, with the map's fences as walls, for
+  # sessions on Doom Shroom, where default never fixes (MAP_ONBOARDING.md, Doom Shroom).
+  # rockwall_brawl (brawl_vision/data/terrain_rockwall_brawl.pt, 2026-11-11) adds Rockwall Brawl's
+  # projected labels to doom_shroom's, for sessions on Rockwall Brawl, where no older classifier
+  # fixes (MAP_ONBOARDING.md, Rockwall Brawl). Usually set for one session with
+  # `deploy_run.py --terrain dark_passage`, `--map truth --terrain truth`, `--map doom_shroom
+  # --terrain doom_shroom` or `--map rockwall_brawl --terrain rockwall_brawl` instead of here.
+  model: default

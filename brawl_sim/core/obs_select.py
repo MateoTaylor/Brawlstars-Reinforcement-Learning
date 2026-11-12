@@ -98,7 +98,7 @@ _FAIRNESS_MASK_FIELD = {
 _NORM_DIVISOR_TILES = lambda cfg: float(max(cfg.map_w, cfg.map_h))
 # Divisor for `normalize: true`'s "tiles/s" fields, from configs/brawlers.yaml: Mortis's charged
 # dash (5.34 tiles in 0.30 s, 17.8 tiles/s) is the fastest mover, his Super bolt (12.0) the
-# fastest projectile, and a walk (2.17-2.73) lands at ~0.12. A relative velocity passes 1.0 only
+# fastest projectile, and a walk (2.40-2.73) lands at ~0.12. A relative velocity passes 1.0 only
 # slightly, when a charged dash meets a walker head-on.
 _NORM_SPEED_SCALE = 20.0
 

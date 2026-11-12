@@ -11,6 +11,7 @@ held, then phases 16-17 run once.
      3  decode the hero's action    `_decode`
      4  bot intents                 `_bot_phase` (its visibility is reused by phase 6)
      5  external overrides          `_override_phase`
+    5b  stomps                      `_stomp_phase`: armed Stompers whose wind-up ran out land
      6  attacks                     `_attack_phase`: dashes start, supers, gadgets, volleys, melee
      7  movement                    `_movement_phase`, non-dashing entities only
      8  dash advance                `_dash_phase`
@@ -24,8 +25,10 @@ held, then phases 16-17 run once.
     16  observation, info, reward   `_observe`, once per decision
     17  autoreset                   `_autoreset`, once per decision
 
-Attacks (6) resolve before movement (7), so a dash replaces that tick's walk. Regen (2) runs
-before any damage, so it cannot undo a lethal hit. Deaths (13) resolve after every damage source
+Attacks (6) resolve before movement (7), so a dash replaces that tick's walk. Stomps (5b) land
+before the attacks, so a stomp armed in phase 6 lands exactly its wind-up later, and a stun it
+applies stops that same tick's attack and walk. Regen (2) runs before any damage, so it cannot
+undo a lethal hit. Deaths (13) resolve after every damage source
 (6-10), so simultaneous kills work.
 
 **Autoreset happens inside `step()`.** A finished env is reset in place within the same call, so
@@ -75,11 +78,12 @@ import yaml
 
 from .bots import perception, policy
 from .config import (
-    EnvConfig, apply_randomization, body_radius_tiles, build_params, load_randomization, validate,
+    EnvConfig, apply_randomization, body_radius_tiles, build_params, load_randomization, spec_hero,
+    validate,
 )
-from .constants import DeathCause
+from .constants import DeathCause, GadgetType, SuperType
 from .core import boxes, camera, combat, events, geometry as geo, hero, history, melee_sweep, movement
-from .core import observation, projectiles, slots, spawn, stats, zone
+from .core import observation, projectiles, slots, spawn, stats, status, zone
 from .core.reward import ZeroReward
 from .core.state import allocate, check_invariants, snapshot
 from .maps.loader import build_map_bank
@@ -146,8 +150,15 @@ class BrawlVecEnv:
         # Applied once: the spec keeps {low, high} ranges, which resample_params redraws on
         # every reset.
         self.spec = apply_randomization(base_spec, randomization_spec) if randomization_spec else base_spec
+        # The class docstring's trap, for the one key both halves read: `cfg.hero` names the hero
+        # (viewer, validate's messages) while the spec's copy decides whose stats fill column 0.
+        if spec_hero(self.spec) != cfg.hero:
+            raise ValueError(
+                f"cfg.hero is {cfg.hero!r} but the spec's entities.hero is {spec_hero(self.spec)!r}; "
+                f"pass the spec merged with the same overrides as the cfg"
+            )
 
-        self.bank = build_map_bank(cfg, device=self.device, body_radius=body_radius_tiles(self.spec))
+        self.bank =build_map_bank(cfg, device=self.device, body_radius=body_radius_tiles(self.spec))
         self.params = build_params(cfg, n_envs=n_envs, device=self.device, gen=self.gen, spec=self.spec)
         validate(cfg, self.params)
         self.state = allocate(cfg, n_envs=n_envs, device=self.device, verbose=verbose)
@@ -198,11 +209,11 @@ class BrawlVecEnv:
         history.push(self.state, action, self._obs_hero_view)
 
         (dmg_by_total, newly_dead, newly_broken, cubes_gained, hp_healed, attacks_in_reach,
-         gadget_hits, decision) = self._run_decision(action, override)
+         gadget_hits, attack_misses, gadget_misses, decision) = self._run_decision(action, override)
 
         obs_before_reset, info, reward = self._observe(
             dmg_by_total, newly_dead, newly_broken, cubes_gained, hp_healed, attacks_in_reach,
-            gadget_hits, decision, move_reversals,
+            gadget_hits, attack_misses, gadget_misses, decision, move_reversals,
         )
         # Cloned here, and the local dropped before `_autoreset` rebuilds the observation: this
         # reference would otherwise keep the pre-reset grids (large at thousands of envs) alive
@@ -257,13 +268,23 @@ class BrawlVecEnv:
         move_dir, fire, super_fire, gadget_fire, aim_dir, aim_point, vis = self._bot_phase(
             hero_move_dir, hero_fire, hero_super, hero_gadget)
         move_dir, fire = self._override_phase(move_dir, fire, override)
+        stomp = self._stomp_phase()
 
         dmg_by_melee, melee_healed, attack_in_reach = self._attack_phase(
             move_dir, fire, super_fire, aim_dir, aim_point, gadget_fire, vis, hero_auto=hero_auto)
         self._movement_phase(move_dir)
-        dmg_by_dash = self._dash_phase()
+        dmg_by_dash, charging = self._dash_phase()
         policy.track_seen_velocity(self.state, self.cfg)  # ent_vel is final once the dash moved
-        dmg_by_proj, super_healed, proj_charge_hit, gadget_hit = self._projectile_phase()
+        dmg_by_proj, super_healed, proj_charge_hits, gadget_hit, attack_miss = self._projectile_phase()
+        # The reward's `gadget_hit` pays a spinner that hurt a player and a stomp that slowed or
+        # stunned one alike (user decision 2026-10-23, plan D9). A spec with no STOMP kind has no
+        # stomp phase, so its flag stays the spinner's alone. Its `gadget_miss` is a stomp that
+        # landed on nobody (user decision 2026-11-02, BULL_HERO_PLAN.md §5.8); a spinner's miss is
+        # not scored, so without a stomp phase the flag stays False.
+        gadget_miss = torch.zeros_like(gadget_hit)
+        if stomp is not None:
+            gadget_hit = gadget_hit | stomp[0]
+            gadget_miss = stomp[1]
         self._zone_phase()
         newly_broken = self._box_phase()
         cubes_gained = self._pickup_phase()
@@ -276,19 +297,24 @@ class BrawlVecEnv:
         # cube's max-HP bump also raises current HP (core/stats.py) but is not counted: it is a
         # pickup, priced by the reward's `cube_pickup` term, not HP won back from a wound.
         hp_healed = regen_healed + super_healed + melee_healed
-        # Super charge: melee and dash hits charge as their damage matrices say; the projectile
-        # phase hands up `dmg_by_proj > 0` minus the gadget spinner's hits (the gadget charges no
-        # super).
-        charge_hit = (dmg_by_melee > 0) | (dmg_by_dash > 0) | proj_charge_hit
-        self._bookkeeping(dmg_by_total, charge_hit)
+        # Super charge, per (attacker, victim) pair: a melee or dash hit counts 1, and the
+        # projectile phase hands up how many of the attacker's projectiles hit, the gadget
+        # spinner's left out (the gadget charges no super). So each of Bull's pellets counts
+        # (user decision 2026-10-23: 9 hits, two full volleys). The larger count stands on a pair
+        # that both hit this tick, which keeps Mortis's dash-plus-bolt tick at 1, as the OR it
+        # replaced gave. A CHARGE super's own hits charge nothing: the user counts the meter in
+        # projectile hits.
+        dash_hit = (dmg_by_dash > 0) & ~charging.unsqueeze(-1)
+        charge_hits = torch.maximum(((dmg_by_melee > 0) | dash_hit).to(proj_charge_hits.dtype), proj_charge_hits)
+        self._bookkeeping(dmg_by_total, charge_hits)
         return (dmg_by_total, newly_dead, newly_broken, cubes_gained, hp_healed, attack_in_reach,
-                gadget_hit)
+                gadget_hit, attack_miss, gadget_miss)
 
     def _run_decision(self, action: torch.Tensor, override: torch.Tensor | None):
         """One AGENT DECISION: `cfg.action_repeat` `_run_tick` calls holding the same action.
-        Returns `_run_tick`'s seven values summed over the sub-ticks, plus the `core/events`
-        decision tally. Its two (N,) bool flags, attack-in-reach and gadget-hit, become int32
-        counts.
+        Returns `_run_tick`'s nine values summed over the sub-ticks, plus the `core/events`
+        decision tally. Its three (N,) bool flags, attack-in-reach, gadget-hit and gadget-miss,
+        become int32 counts, like the attack-miss count beside them.
 
         The loop is a static `range` over a config int, so it stays sync-free (no `.any()` check
         for "every env finished") and `torch.compile` only ever sees `_run_tick`.
@@ -300,26 +326,31 @@ class BrawlVecEnv:
         **Sub-ticks 2..K hold the move bin but drop the attack column** (`_held`), so one
         decision is at most one attack attempt (see the module docstring)."""
         (dmg_by, newly_dead, newly_broken, cubes_gained, hp_healed, in_reach,
-         gadget_hit) = self._tick_fn(action, override)
+         gadget_hit, attack_miss, gadget_miss) = self._tick_fn(action, override)
         # COUNTS from here on, int32 like the tally's counters. At most 1 attack per decision,
         # since `_held` drops the fire bit; with action latency the attack can land on a later
         # sub-tick, so the loop below adds it under the same `live` gate as every other delta. A
         # spinner lands `gadget_flight_seconds` after its throw, so its hit can fall on a later
-        # sub-tick or decision than the throw.
+        # sub-tick or decision than the throw. A stomp lands `stomp_windup_seconds` after its tap:
+        # Bull's 0.30 s is 6 ticks, so at action_repeat 5 it lands on the next decision's second
+        # sub-tick (both shifted alike by any action latency). A volley's miss is scored when its
+        # last pellet ends, up to 12 ticks after the shot, so it too falls on a later decision.
         attacks_in_reach = in_reach.to(torch.int32)
         gadget_hits = gadget_hit.to(torch.int32)
+        attack_misses = attack_miss
+        gadget_misses = gadget_miss.to(torch.int32)
         decision = events.new_decision_tally(self.state, self.cfg)
         self._run_tick_hook()
         if self.cfg.action_repeat == 1:
             # Keeps the `_held` clones below off the action_repeat=1 path.
             return (dmg_by, newly_dead, newly_broken, cubes_gained, hp_healed, attacks_in_reach,
-                    gadget_hits, decision)
+                    gadget_hits, attack_misses, gadget_misses, decision)
 
         held_action, held_override = self._held(action), self._held(override)
         for _ in range(self.cfg.action_repeat - 1):
             live = ~decision["done"]
             (tick_dmg, tick_dead, tick_broken, tick_cubes, tick_healed, tick_in_reach,
-             tick_gadget_hit) = self._tick_fn(held_action, held_override)
+             tick_gadget_hit, tick_attack_miss, tick_gadget_miss) = self._tick_fn(held_action, held_override)
             live_e = live.unsqueeze(-1)
             dmg_by = dmg_by + tick_dmg * live.view(-1, 1, 1)
             newly_dead = newly_dead | (tick_dead & live_e)
@@ -328,11 +359,13 @@ class BrawlVecEnv:
             hp_healed = hp_healed + tick_healed * live_e
             attacks_in_reach = attacks_in_reach + (tick_in_reach & live).to(torch.int32)
             gadget_hits = gadget_hits + (tick_gadget_hit & live).to(torch.int32)
+            attack_misses = attack_misses + tick_attack_miss * live.to(torch.int32)
+            gadget_misses = gadget_misses + (tick_gadget_miss & live).to(torch.int32)
             decision = events.advance_decision_tally(decision, self.state, self.cfg)
             self._run_tick_hook()
 
         return (dmg_by, newly_dead, newly_broken, cubes_gained, hp_healed, attacks_in_reach,
-                gadget_hits, decision)
+                gadget_hits, attack_misses, gadget_misses, decision)
 
     @staticmethod
     def _held(action: torch.Tensor | None) -> torch.Tensor | None:
@@ -428,7 +461,8 @@ class BrawlVecEnv:
         this tick's FAIR `(N,E,E)` visibility, handed on so `_attack_phase` can aim the gadget
         spinner at what each thrower can see without a second `perception.visibility` pass:
         nothing between here and phase 6 moves an entity or touches a reveal timer
-        (`_override_phase` is pure), so it is exactly what phase 6 would compute."""
+        (`_override_phase` is pure, and `_stomp_phase` writes status timers only), so it is exactly
+        what phase 6 would compute."""
         state, cfg = self.state, self.cfg
         vis = perception.visibility(state, self.bank, self.params, cfg)
         intent = policy.all_bot_intents(state, vis, self.bank, self.params, cfg, self.gen)
@@ -446,8 +480,9 @@ class BrawlVecEnv:
         # slot can be True.
         gadget_fire = torch.zeros_like(fire)
         gadget_fire[:, 0] = hero_gadget
-        # The hero has no ranged aim (his dash follows move_dir). These placeholders are read for
-        # entity 0 only by spawn_volley, and hero_mortis's proj_count is 0, so they are inert.
+        # Placeholders for the hero's row. `_attack_phase` replaces aim_dir's with his volley aim
+        # (Bull's shotgun; Mortis's dash follows move_dir and his proj_count is 0). aim_point is
+        # read only by a lobbed shot, and no hero lobs.
         aim_dir = intent.aim_dir.clone()
         aim_dir[:, 0] = geo.from_angle(state.ent_facing[:, 0])
         aim_point = intent.aim_point.clone()
@@ -482,13 +517,28 @@ class BrawlVecEnv:
         fire = torch.where(has_override, override_fire, fire)
         return move_dir, fire
 
+    # -- phase 5b --
+    def _stomp_phase(self) -> tuple[torch.Tensor, torch.Tensor] | None:
+        """Lands every armed Stomper whose wind-up runs out this tick (`hero.advance_stomp`), on
+        the positions this tick's attacks are decided on. Running before `_attack_phase`, where a
+        stomp is armed, makes a k-tick wind-up land exactly k ticks after its tap, and lets a stun
+        it applies stop this same tick's attack and walk. Returns two (N,) bools for the hero's
+        stomp: "slowed or stunned at least one player", which `_run_tick` ORs into the reward's
+        `gadget_hit`, and "landed on nobody", its `gadget_miss`. None in a spec with no STOMP
+        kind (`params.stomp_radius_tiles` 0): every Mortis run skips the phase in Python."""
+        if self.params.stomp_radius_tiles <= 0:
+            return None
+        caught, lands = hero.advance_stomp(self.state, self.params, self.cfg)
+        hit = caught[:, 0].any(dim=-1)  # row 0: the hero
+        return hit, lands[:, 0] & ~hit
+
     # -- phase 6 --
     def _attack_phase(self, move_dir: torch.Tensor, fire: torch.Tensor,
                       super_fire: torch.Tensor, aim_dir: torch.Tensor, aim_point: torch.Tensor,
                       gadget_fire: torch.Tensor, vis: torch.Tensor,
                       hero_auto: torch.Tensor | None = None):
         """Gates every attack source, starts dashes (clipping their paths now), spends ammo,
-        fires supers, throws gadgets, spawns volleys and resolves melee.
+        fires supers, throws gadgets or arms stomps, spawns volleys and resolves melee.
 
         `hero_auto` is the (N,) bool `hero.decode_action` returns for attack value 4 (the
         auto-aimed attack, `cfg.auto_aim`); `None`, which tests pass by omission, means no row
@@ -496,7 +546,8 @@ class BrawlVecEnv:
         `hero.start_dash`); `fire` already carries the attack itself.
 
         `gadget_fire` is (N,E) bool and `vis` the fair (N,E,E) visibility `_bot_phase` computed
-        this tick: the gadget spinner homes on the nearest enemy its thrower can SEE.
+        this tick: the gadget spinner homes on the nearest enemy its thrower can SEE. A STOMP
+        kind's gadget fire arms its stomp instead (`hero.start_stomp`), which `_stomp_phase` lands.
 
         Returns (dmg_by (N,E,E), healed (N,E), attack_in_reach (N,) bool). `healed` is melee
         lifesteal as ACTUALLY applied (`apply_heal` drops it for dead entities and clips it at max
@@ -510,24 +561,29 @@ class BrawlVecEnv:
 
         # Safety net: bot-sourced and hero-sourced fire are already gated on this (fire_gate /
         # action_mask), but override-sourced fire has no such gate -- this makes it impossible
-        # for ANY source to force an illegal attack through.
-        can_attack = state.ent_alive & (state.ent_ammo >= 1.0) & (state.ent_attack_cd <= 0) & (state.ent_dash_t <= 0)
+        # for ANY source to force an illegal attack through. A stunned or airborne entity
+        # (core/status.py) is gated here and below like any other: a bot's intent does not know.
+        stopped = status.disabled(state)
+        can_attack = (
+            state.ent_alive & (state.ent_ammo >= 1.0) & (state.ent_attack_cd <= 0) & (state.ent_dash_t <= 0)
+            & ~stopped
+        )
         fire = fire & can_attack
 
         # A SUPER costs charge, not ammo, so its gate omits the ammo term (an empty clip must not
-        # block it) but keeps the cooldown and no-dashing terms. Same safety-net role as
+        # block it) but keeps the cooldown, no-dashing and stun terms. Same safety-net role as
         # `can_attack`: `action_mask` already gates the hero's, this gates ANY source.
         can_super = (
             state.ent_alive & (state.ent_attack_cd <= 0) & (state.ent_dash_t <= 0)
-            & hero.super_ready(state, params)
+            & hero.super_ready(state, params) & ~stopped
         )
         super_fire = super_fire & can_super
 
-        # The GADGET's gate is its own timer and nothing else: no ammo, no `attack_cd`, no `dash_t`
-        # (the game lets a gadget go mid-dash). `hero.gadget_ready` is the predicate `action_mask`
-        # publishes, so a gadget requested while masked (cooldown running, dead, or a kind with no
-        # gadget, i.e. every bot) is a silent no-op from ANY source.
-        gadget_fire = gadget_fire & hero.gadget_ready(state, params)
+        # The GADGET's gate is its own timer and the stun, nothing else: no ammo, no `attack_cd`,
+        # no `dash_t` (the game lets a gadget go mid-dash). `hero.gadget_ready` is the predicate
+        # `action_mask` publishes, so a gadget requested while masked (cooldown running, dead, or
+        # a kind with no gadget, i.e. every bot) is a silent no-op from ANY source.
+        gadget_fire = gadget_fire & hero.gadget_ready(state, params) & ~stopped
 
         dash_distance = stats.gather_kind(params.dash_distance, state.ent_kind)
         is_dash_attack = fire & (dash_distance > 0)
@@ -536,16 +592,16 @@ class BrawlVecEnv:
         # Attack in reach (user decision, 2026-09-21; BRAWL_SIM_DESIGN.md §10), the one input of
         # the reward's `attack_in_reach` term: is an enemy the hero can SEE (`vis` row 0) inside
         # his uncharged dash reach? The radius is scripts/audit_attack_cadence.py's (dash_distance
-        # + dash_radius + unit_radius), so the term pays for exactly what the audit measures. Read
-        # before `hero.start_dash`, off the positions the decision was made on, and ANDed with
-        # `attacked` below.
-        hero_reach = (
-            dash_distance[:, 0] + stats.gather_kind(params.dash_radius, state.ent_kind)[:, 0]
-            + params.unit_radius
-        )
+        # + dash_radius + unit_radius), so the term pays for exactly what the audit measures. A
+        # hero with no dash (Bull) uses the distance where most of his volley can land instead
+        # (`hero.in_reach_radius`; user decision 2026-10-23). Read before `hero.start_dash`, off
+        # the positions the decision was made on, and ANDed with `attacked` below. An airborne
+        # enemy (core/status.py) is not in reach: nothing the hero throws can land on it.
+        hero_reach = hero.in_reach_radius(state, params)
         enemy_dist = geo.safe_norm(state.ent_pos[:, 1:] - state.ent_pos[:, :1], dim=-1)  # (N,E-1)
         enemy_in_reach = (
-            state.ent_alive[:, 1:] & vis[:, 0, 1:] & (enemy_dist <= hero_reach.unsqueeze(-1))
+            state.ent_alive[:, 1:] & ~status.airborne(state)[:, 1:] & vis[:, 0, 1:]
+            & (enemy_dist <= hero_reach.unsqueeze(-1))
         ).any(dim=-1)
 
         # The auto-aimed attack (attack value 4, `cfg.auto_aim`; user decision, 2026-09-26): on the
@@ -556,10 +612,11 @@ class BrawlVecEnv:
         # `move_dir` is read again by the super's aim below and by `_movement_phase`, and the
         # hero's walk must not bend toward the target.
         dash_dir = move_dir
+        auto_swap = None
         if hero_auto is not None and cfg.auto_aim:
             auto_dir, has_target = hero.auto_aim_target(state, params, cfg)
-            swap = (hero_auto & has_target).unsqueeze(-1)                       # (N,1)
-            hero_dir = torch.where(swap, auto_dir, move_dir[:, 0])
+            auto_swap = (hero_auto & has_target).unsqueeze(-1)                  # (N,1)
+            hero_dir = torch.where(auto_swap, auto_dir, move_dir[:, 0])
             dash_dir = torch.cat([hero_dir.unsqueeze(1), move_dir[:, 1:]], dim=1)
 
         # The SUPER's aim, its own tensor for the same reason. It follows the move bin, but an idle
@@ -571,6 +628,18 @@ class BrawlVecEnv:
         # facing, off the state the decision was made on.
         idle = (move_dir[..., 0] == 0) & (move_dir[..., 1] == 0)                   # (N,E)
         super_dir = torch.where(idle.unsqueeze(-1), geo.from_angle(state.ent_facing), move_dir)
+
+        # The hero's VOLLEY aim, for a hero whose attack is a volley rather than a dash (Bull;
+        # BULL_HERO_PLAN.md D5): the dash's own rule, applied to the shot. Value 1 fires along the
+        # move bin, or along facing when the bin is idle (`super_dir`'s row before the tap swap
+        # below), and value 4 at `auto_aim_target`'s nearest enemy or crate in his volley's reach.
+        # Live, value 1 is already a drag along the bin and value 4 a bare tap. Mortis's row is
+        # never read: his proj_count is 0, so spawn_volley spawns nothing for him.
+        hero_aim = super_dir[:, 0]
+        if auto_swap is not None:
+            hero_aim = torch.where(auto_swap, auto_dir, hero_aim)
+        aim_dir = torch.cat([hero_aim.unsqueeze(1), aim_dir[:, 1:]], dim=1)
+
         tap_dir, _has_target = hero.super_aim_target(state, params, cfg)          # (N,2)
         hero_super_dir = torch.where(idle[:, :1], tap_dir, super_dir[:, 0])
         super_dir = torch.cat([hero_super_dir.unsqueeze(1), super_dir[:, 1:]], dim=1)
@@ -618,7 +687,7 @@ class BrawlVecEnv:
         state.ent_attack_cd.copy_(torch.where(is_other_attack, attack_cooldown, state.ent_attack_cd))
         state.ent_shots_fired.copy_(torch.where(is_other_attack, state.ent_shots_fired + 1, state.ent_shots_fired))
 
-        # --- super: spend the whole charge, take the cooldown, launch the bolt ---
+        # --- super: spend the whole charge, take the cooldown, launch the bolt or start the charge ---
         # Charge is zeroed rather than decremented by `super_charge_hits`: `add_super_charge` caps
         # it there, so the two agree, but "firing spends the meter" stays true if a brawler ever
         # banks more than one.
@@ -627,9 +696,17 @@ class BrawlVecEnv:
         )
         state.ent_attack_cd.copy_(torch.where(super_fire, attack_cooldown, state.ent_attack_cd))
         state.ent_shots_fired.copy_(torch.where(super_fire, state.ent_shots_fired + 1, state.ent_shots_fired))
-        projectiles.spawn_supers(state, super_fire, state.ent_pos, super_dir, params, cfg)
+        # A CHARGE kind's super (Bull) is his body's rush, on the dash's state, not a bolt; both
+        # follow `super_dir`. `params.charge_ray_tiles` is 0 in a spec with no CHARGE kind, so a
+        # Mortis run skips the split and launches every super as a bolt, as it always did.
+        bolt_fire = super_fire
+        if params.charge_ray_tiles > 0:
+            charge_kind = stats.gather_kind(params.super_type, state.ent_kind) == int(SuperType.CHARGE)
+            bolt_fire = super_fire & ~charge_kind
+            hero.start_charge(state, super_fire & charge_kind, super_dir, bank, params, cfg)
+        projectiles.spawn_supers(state, bolt_fire, state.ent_pos, super_dir, params, cfg)
 
-        # --- gadget: start the cooldown, throw the spinner ---
+        # --- gadget: start the cooldown, throw the spinner or arm the stomp ---
         # The ONLY writer of `ent_gadget_cd` besides `tick_timers`' countdown. It touches neither
         # ammo, `attack_cd` nor `ent_shots_fired`: the gadget is a separate button, not an attack,
         # so it neither pauses the reload nor counts as a shot. `gadget_target` runs for every
@@ -641,9 +718,19 @@ class BrawlVecEnv:
         # term), so `limits.max_projectiles` must keep headroom above that bound for both.
         gadget_cooldown = stats.gather_kind(params.gadget_cooldown, state.ent_kind)
         state.ent_gadget_cd.copy_(torch.where(gadget_fire, gadget_cooldown, state.ent_gadget_cd))
+        # A STOMP kind's gadget (Bull's Stomper) is a pulse around his own body once a wind-up
+        # runs out, armed here (hero.start_stomp) and landed by `_stomp_phase`; it takes no
+        # projectile slot, so no overflow drops it. `params.stomp_radius_tiles` is 0 in a spec with
+        # no STOMP kind, so a Mortis run skips the split and throws every gadget as a spinner, as
+        # it always did.
+        spinner_fire = gadget_fire
+        if params.stomp_radius_tiles > 0:
+            stomp_kind = stats.gather_kind(params.gadget_type, state.ent_kind) == int(GadgetType.STOMP)
+            spinner_fire = gadget_fire & ~stomp_kind
+            hero.start_stomp(state, gadget_fire & stomp_kind, params)
         gadget_dir, gadget_travel = hero.gadget_target(state, vis, params, bank, cfg)
         gadget_damage = stats.effective_gadget_damage(state.ent_kind, state.ent_cubes, params)
-        projectiles.spawn_gadget(state, gadget_fire, state.ent_pos, gadget_dir, gadget_travel,
+        projectiles.spawn_gadget(state, spinner_fire, state.ent_pos, gadget_dir, gadget_travel,
                                  gadget_damage, params, cfg)
 
         damage = stats.effective_damage(state.ent_kind, state.ent_cubes, params)
@@ -661,9 +748,22 @@ class BrawlVecEnv:
         # ONE melee_hitscan call with a per-entity cone direction, not two: it is a dense (N,E,E)
         # cone + LOS march, the most expensive thing in this phase, and the two populations are
         # disjoint per entity.
+        #
+        # A stun drops the sub-swings that fall inside it (`is_other_attack` is already gated, and
+        # `sweep_fire` is ANDed here). Any left once it ends still land on schedule: the clock is
+        # `ent_attack_cd`, which a stun does not pause.
+        #
+        # Only a kind that swings a cone (`attack_arc_rad > 0`, the rule config.cone_ray_tiles and
+        # bots/combat_rules read) runs the hitscan. A ranged kind's arc is 0, but
+        # `geo.point_in_cone` passes `diff <= 0`, so until 2026-10-23 every ranged attack also
+        # landed its full damage on a unit or crate EXACTLY on its facing ray, in practice a crate
+        # (measured in BULL_HERO_PLAN.md §5.3). The gate is also what keeps melee_hitscan's
+        # shortened LOS march sound: its budget covers cone reach only.
         sweep_fire, sweep_dir = melee_sweep.sweep_cone_dir(state, params, cfg)
+        sweep_fire = sweep_fire & ~stopped
         swept = melee_sweep.is_swept(state, params)
-        melee_fire = (is_other_attack & ~swept) | sweep_fire
+        swings_cone = stats.gather_kind(params.attack_arc_rad, state.ent_kind) > 0
+        melee_fire = (is_other_attack & swings_cone & ~swept) | sweep_fire
         cone_dir = torch.where(sweep_fire, sweep_dir, state.ent_facing)
 
         dmg_ent, dmg_by, dmg_box = combat.melee_hitscan(state, melee_fire, bank, params, cfg, cone_dir=cone_dir)
@@ -679,37 +779,44 @@ class BrawlVecEnv:
     def _movement_phase(self, move_dir: torch.Tensor) -> None:
         """ONLY non-dashing entities: apply_movement's `active = alive & dash_t<=0` gate excludes
         anyone who just started a dash in _attack_phase, which is what makes the dash replace
-        the walk this same tick."""
+        the walk this same tick. The same gate holds a stunned or airborne entity still."""
         movement.apply_movement(self.state, move_dir, self.bank, self.params, self.cfg)
 
     # -- phase 8 --
-    def _dash_phase(self) -> torch.Tensor:
-        dmg_ent, dmg_by, dmg_box = hero.advance_dash(self.state, self.params, self.cfg)
+    def _dash_phase(self) -> tuple[torch.Tensor, torch.Tensor]:
+        """(dmg_by (N,E,E), charging (N,E) bool). The second marks the dashers whose dash is a
+        CHARGE super, read BEFORE advance_dash clears the flag on a charge's last tick: their hits
+        charge no super (`_run_tick`)."""
+        charging = self.state.ent_dash_super & (self.state.ent_dash_t > 0)
+        dmg_ent, dmg_by, dmg_box = hero.advance_dash(self.state, self.params, self.cfg, self.bank)
         combat.apply_damage(self.state, dmg_ent, int(DeathCause.COMBAT), combat.dominant_attacker(dmg_by), self.params, self.cfg)
         boxes.damage_boxes(self.state, dmg_box)
-        return dmg_by
+        return dmg_by, charging
 
     # -- phase 9 --
-    def _projectile_phase(self) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
-        """(dmg_by (N,E,E), healed (N,E), charge_hit (N,E,E), gadget_hit (N,)) -- the second is
-        the lifesteal ACTUALLY applied, which is not `heal_ent`: apply_heal drops it for dead
-        owners and clips it at max HP. The third is step_projectiles' super-charging hit mask
-        (its `dmg_by > 0` minus the gadget spinner), passed up untouched for `_bookkeeping`. The
-        fourth is "the hero's gadget spinner hurt at least one player this tick", which the
-        reward's `gadget_hit` term pays."""
-        dmg_ent, dmg_by, dmg_box, heal_ent, charge_hit = projectiles.step_projectiles(
-            self.state, self.bank, self.params, self.cfg)
+    def _projectile_phase(self) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor,
+                                         torch.Tensor]:
+        """(dmg_by (N,E,E), healed (N,E), charge_hits (N,E,E) int32, gadget_hit (N,), attack_miss
+        (N,) int32) -- the second is the lifesteal ACTUALLY applied, which is not `heal_ent`:
+        apply_heal drops it for dead owners and clips it at max HP. The third is step_projectiles'
+        super-charging hit count (the projectiles behind `dmg_by`, the gadget spinner's left out),
+        passed up untouched for `_run_tick`. The fourth is "the hero's gadget spinner hurt at
+        least one player this tick", which the reward's `gadget_hit` term pays. The fifth counts
+        the hero's attack volleys that ended this tick with no pellet on a player or a crate
+        (`projectiles._settle_hero_volleys`), which its `attack_miss` term charges."""
+        dmg_ent, dmg_by, dmg_box, heal_ent, charge_hits, attack_miss = projectiles.step_projectiles(
+            self.state, self.bank, self.params, self.cfg, volleys=True)
         combat.apply_damage(self.state, dmg_ent, int(DeathCause.COMBAT), combat.dominant_attacker(dmg_by), self.params, self.cfg)
         # Lifesteal AFTER damage, so a super that trades with something lethal still resolves
         # the death first -- healing a corpse is rejected by apply_heal's own alive gate.
         healed = combat.apply_heal(self.state, heal_ent)
         boxes.damage_boxes(self.state, dmg_box)
         # The spinner is the one projectile whose hits charge no super, so the hero's hits in
-        # `dmg_by` that `charge_hit` leaves out are its hits. Box damage never enters `dmg_by`, so
-        # a spinner that lands only on crates is no hit. Blind spot: a super bolt that hits the
+        # `dmg_by` that `charge_hits` leaves out are its hits. Box damage never enters `dmg_by`,
+        # so a spinner that lands only on crates is no hit. Blind spot: a super bolt that hits the
         # same player on the landing tick hides the spinner's hit on that player.
-        gadget_hit = ((dmg_by[:, 0] > 0) & ~charge_hit[:, 0]).any(dim=-1)  # row 0: the hero
-        return dmg_by, healed, charge_hit, gadget_hit
+        gadget_hit = ((dmg_by[:, 0] > 0) & (charge_hits[:, 0] == 0)).any(dim=-1)  # row 0: the hero
+        return dmg_by, healed, charge_hits, gadget_hit, attack_miss
 
     # -- phase 10 --
     def _zone_phase(self) -> None:
@@ -737,7 +844,7 @@ class BrawlVecEnv:
         zone.step_zone(self.state, self.params, self.cfg)
 
     # -- phase 15 --
-    def _bookkeeping(self, dmg_by_total: torch.Tensor, charge_hit: torch.Tensor) -> None:
+    def _bookkeeping(self, dmg_by_total: torch.Tensor, charge_hits: torch.Tensor) -> None:
         """Credits damage dealt and super charge, then advances time and step_count. The other
         cumulative counters are already current, each written as its event happened
         (resolve_deaths: n_alive/kills; resolve_broken_boxes: boxes_broken; _attack_phase:
@@ -746,18 +853,19 @@ class BrawlVecEnv:
         attacker x victim matrix -- combat damage only, matching core/events.py's
         damage_dealt_tick (zone damage has no attacker to credit).
 
-        `charge_hit` (N,E,E) bool is the super-charging subset of `dmg_by_total > 0`: identical
-        for melee and dash damage, minus the gadget spinner for projectiles. Damage dealt still
-        counts the spinner; only the charge does not."""
+        `charge_hits` (N,E,E) int32 counts the super-charging hits behind `dmg_by_total > 0`
+        (`_run_tick` builds it): 1 for a melee or dash hit, one per projectile that hit, and
+        nothing for the gadget spinner or a CHARGE super's own rush. Damage dealt still counts
+        both; only the charge does not."""
         state, cfg = self.state, self.cfg
         state.ent_damage_dealt.copy_(state.ent_damage_dealt + dmg_by_total.sum(dim=2))
 
-        # SUPER CHARGE: one per (attacker, victim) pair that connected this tick. From the
-        # attacker x victim matrix because it is the only place that separates hits on PLAYERS
-        # from hits on boxes (box damage never enters `dmg_by`), so a hero cannot farm his super
-        # off crates, and it counts a multi-target hit -- Buzz's sweep, Shelly's spread, Grom's
-        # cross -- as one charge per victim, as the game counts hits against players.
-        hits = charge_hit.sum(dim=2).to(torch.int32)
+        # SUPER CHARGE, from the attacker x victim matrix because it is the only place that
+        # separates hits on PLAYERS from hits on boxes (box damage never enters `dmg_by`), so a
+        # hero cannot farm his super off crates. A swing or a blast that catches several players
+        # charges once per player, and a volley once per pellet that lands (Bull's 5 pellets
+        # into one player charge 5 of his 9).
+        hits = charge_hits.sum(dim=2).to(torch.int32)
         hero.add_super_charge(state, hits, self.params)
 
         state.time += cfg.dt
@@ -765,7 +873,7 @@ class BrawlVecEnv:
 
     # -- phase 16 --
     def _observe(self, dmg_by_total, newly_dead, newly_broken, cubes_gained, hp_healed,
-                 attacks_in_reach, gadget_hits, decision, move_reversals):
+                 attacks_in_reach, gadget_hits, attack_misses, gadget_misses, decision, move_reversals):
         """Runs ONCE per decision: `reward_fn` sees the summed deltas and latched outcomes of the
         whole decision, once per `step()` whatever `action_repeat` is. Per-tick reward terms
         integrate over `info["alive_ticks"]`/`info["in_zone_ticks"]` rather than firing once
@@ -774,7 +882,8 @@ class BrawlVecEnv:
         info = events.compute_info(
             self.state, dmg_by_total, newly_dead, newly_broken, cubes_gained, self.cfg,
             decision=decision, hp_healed=hp_healed, attacks_in_reach=attacks_in_reach,
-            gadget_hits=gadget_hits, move_reversals=move_reversals,
+            gadget_hits=gadget_hits, attack_misses=attack_misses, gadget_misses=gadget_misses,
+            move_reversals=move_reversals,
         )
         reward = self.reward_fn(obs, info, self.cfg)
         return obs, info, reward

@@ -125,8 +125,8 @@ def legal_move_bins(blocks: np.ndarray, hero_xy, *, radius: float, step: float,
 
 
 def unit_radius_tiles(env_config_path=None) -> float:
-    """`entities.unit_radius` from `configs/default.yaml`, read the way `loop.dash_reach_tiles`
-    reads it: it is a SimParams column rather than an `EnvConfig` field, and a literal here would
+    """`entities.unit_radius` from `configs/default.yaml`, the file the sim's spec merges it from:
+    it is a SimParams column rather than an `EnvConfig` field, and a literal here would
     drift the moment the sim's changed."""
     import yaml
 

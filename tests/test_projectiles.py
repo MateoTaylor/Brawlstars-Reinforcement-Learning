@@ -1,5 +1,4 @@
 import copy
-import math
 from pathlib import Path
 
 import pytest
@@ -66,7 +65,7 @@ def _grom_split_count(params) -> int:
 def _fresh_state(cfg, n_envs=1):
     state = allocate(cfg, n_envs=n_envs, device="cpu", verbose=False)
     state.ent_alive.fill_(True)
-    state.ent_kind[:, 0] = int(Kind.HERO_MORTIS)
+    state.ent_kind[:, 0] = int(Kind.HERO)
     for e in range(1, cfg.n_entities):
         state.ent_kind[:, e] = int(Kind.BOT_SNIPER)
     state.map_id.fill_(0)
@@ -1041,7 +1040,7 @@ def test_grom_shell_at_the_owners_feet_still_hits_the_owner():
 
 
 def test_charge_hit_excludes_the_spinner_but_keeps_artillery():
-    """`charge_hit` is `dmg_by > 0` minus the gadget. Two blasts in the air: the
+    """`charge_hits` is nonzero where `dmg_by > 0`, minus the gadget. Two blasts in the air: the
     spinner on bot 1 (damage yes, charge no) and a Grom shell on the hero (both yes). Bot 1 stands
     2.0 tiles from the hero on the diagonal: at the spinner's max range, outside Grom's 0.6-tile
     blast, and off the axes his 1.2-tile shards fly along, so his shell charges exactly once."""
@@ -1059,9 +1058,9 @@ def test_charge_hit_excludes_the_spinner_but_keeps_artillery():
     seen = torch.zeros(cfg.n_entities, cfg.n_entities)
     charged = torch.zeros(cfg.n_entities, cfg.n_entities, dtype=torch.bool)
     for _ in range(80):  # spinner lands on tick 4, Grom's on tick 25, his shards expire after
-        _dmg_ent, dmg_by, _, _, charge_hit = proj.step_projectiles(state, bank, params, cfg)
+        _dmg_ent, dmg_by, _, _, charge_hits = proj.step_projectiles(state, bank, params, cfg)
         seen += dmg_by[0]
-        charged |= charge_hit[0]
+        charged |= charge_hits[0] > 0
         if not bool(state.prj_alive.any()):
             break
 
@@ -1230,7 +1229,7 @@ def test_box_candidates_match_testing_every_box():
     reach wider than the map forces, over crowded states where plenty of shots hit boxes, shells
     and spheres catch them, and some slots sit on the border tiles (out-of-map neighbours)."""
     cfg, params = _cfg_and_params(n_envs=4, max_projectiles=64, max_boxes=24)
-    cells = math.ceil(params.box_reach_tiles)
+    cells = proj.box_cells(params.box_reach_tiles)
     assert (2 * cells + 1) ** 2 < cfg.max_boxes, "the grid path never runs -- this test proves nothing"
 
     gen = torch.Generator().manual_seed(1)

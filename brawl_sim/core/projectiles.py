@@ -22,6 +22,7 @@ import torch
 from ..constants import PROJ_CLASS_OF, Proj, ProjClass
 from . import geometry as geo
 from . import stats
+from . import status
 from . import terrain
 
 MAX_PROJ_PER_ENTITY = 5
@@ -561,6 +562,16 @@ def _spawn_hazards(state, died: torch.Tensor, death_pos: torch.Tensor, params, c
     )
 
 
+def box_cells(reach_tiles: float) -> int:
+    """How many tiles (per axis) around a point's tile `_box_candidates` must search to find every
+    box whose centre is within `reach_tiles` of the point. Boxes sit on tile centres
+    (`boxes.spawn_boxes`, and they never move), so a box k tiles away is at least k - 0.5 from any
+    point of the centre tile: floor(reach + 0.5) tiles. Any reach under 1.5 is a 3x3 block, which
+    keeps the default spec's 1.025 (Bull's 9 tiles/s pellet, 2026-11-01) at 9 candidates, not the
+    25 a plain ceil gives it."""
+    return math.floor(reach_tiles + 0.5)
+
+
 def _box_grid(state, cfg) -> torch.Tensor:
     """(N, H*W + 1) int16: the slot of the ALIVE box on each tile (cell `y * W + x`), B on a tile
     with none. The extra last cell is a sink: every dead box is scattered there with the value B,
@@ -590,9 +601,9 @@ def _box_candidates(state, grid, centre: torch.Tensor, cells: int, cfg):
     (N,P,C) i64, pos (N,P,C,2), alive (N,P,C)), C = (2*cells + 1)**2; a candidate with no box
     has slot B and alive False.
 
-    Exact for any box whose centre is within `cells` tiles of `centre`: a box on a tile outside
-    the block is more than `cells` away along one axis. Each in-map tile appears once, so no box
-    is ever counted twice.
+    Exact for any box whose centre is within `cells` + 0.5 tiles of `centre`: boxes sit on tile
+    centres, so a box on a tile outside the block is more than that away along one axis
+    (`box_cells`). Each in-map tile appears once, so no box is ever counted twice.
 
     `grid` None is the dense fallback -- every box is a candidate, (N,1,B) broadcasting against
     the (N,P,...) callers -- for when the block would hold at least B tiles anyway (a small test
@@ -628,15 +639,19 @@ def _earliest_only(valid_hit: torch.Tensor, hit_t: torch.Tensor) -> torch.Tensor
     return valid_hit & earliest_mask
 
 
-def step_projectiles(state, bank, params, cfg):
+def step_projectiles(state, bank, params, cfg, volleys: bool = False):
     """MUTATES: all prj_*. Returns (dmg_ent (N,E), dmg_by (N,E,E), dmg_box (N,B),
-    heal_ent (N,E), charge_hit (N,E,E)) -- the first four reported here, applied by
-    combat.apply_damage / combat.apply_heal.
+    heal_ent (N,E), charge_hits (N,E,E) int32) -- the first four reported here, applied by
+    combat.apply_damage / combat.apply_heal. `volleys=True` also settles the hero's volleys
+    (`_settle_hero_volleys`, MUTATES hero_volley_hit) and appends its (N,) int32 miss count.
 
-    `charge_hit[n,a,v]` is "attacker a landed a SUPER-CHARGING hit on victim v this tick":
-    `dmg_by > 0` with the gadget spinner's damage left out. `env._bookkeeping` counts charge from
-    it because the spinner deals damage but does not charge the super, a rule that cannot be
-    recovered from `dmg_by` once the per-projectile kinds have been summed away."""
+    `charge_hits[n,a,v]` is how many of attacker a's projectiles landed a SUPER-CHARGING hit on
+    victim v this tick: those that damaged v, by a hit or a blast, with the gadget spinner left
+    out. It is nonzero exactly where `dmg_by > 0` would be without the spinner's damage. The
+    super is charged from it (env._run_tick) because the spinner deals damage but charges
+    nothing, and because each pellet of a volley charges on its own (Bull; user decision
+    2026-10-23). Neither can be recovered from `dmg_by` once the per-projectile contributions
+    have been summed away."""
     N, P = state.prj_pos.shape[:2]
     E = state.ent_pos.shape[1]
     B = state.box_pos.shape[1]
@@ -673,17 +688,20 @@ def step_projectiles(state, bank, params, cfg):
     wall_kill = alive & non_lobbed & wall_hit & ~pierce
     pos_after_wall = torch.where(wall_kill.unsqueeze(-1), safe_wall_hit_pos, raw_new_pos)
 
-    # (3) unit collision over (N,P,E), excluding owner and dead, earliest t wins
+    # (3) unit collision over (N,P,E), excluding owner, dead and airborne, earliest t wins. An
+    # AIRBORNE unit (core/status.py) is untargetable: the shot flies on through it, and can hit
+    # whatever stands behind. The blast in (5) skips it too.
     p0 = old_pos.unsqueeze(2)              # (N,P,1,2)
     p1 = pos_after_wall.unsqueeze(2)       # (N,P,1,2)
     ent_pos_b = state.ent_pos.unsqueeze(1)  # (N,1,E,2)
     hit_r = params.unit_radius.view(-1, 1, 1) + state.prj_radius.unsqueeze(-1)  # (N,P,1)->(N,P,E)
     unit_hit, unit_hit_t = geo.segment_circle_hit(p0, p1, ent_pos_b, hit_r)  # (N,P,E)
 
+    hittable = state.ent_alive & ~status.airborne(state)  # (N,E)
     entity_idx = torch.arange(E, device=device).view(1, 1, E)
     not_owner = state.prj_owner.unsqueeze(-1) != entity_idx
     can_hit_unit = alive & non_lobbed & ~wall_kill
-    valid_unit_hit = unit_hit & state.ent_alive.unsqueeze(1) & not_owner & can_hit_unit.unsqueeze(-1)
+    valid_unit_hit = unit_hit & hittable.unsqueeze(1) & not_owner & can_hit_unit.unsqueeze(-1)
 
     # An ordinary projectile hits the FIRST thing on its path and dies. A piercing one hits
     # EVERYTHING it overlaps and flies on -- but only once per victim, which `prj_hits` remembers
@@ -701,22 +719,24 @@ def step_projectiles(state, bank, params, cfg):
     owner_exp_e = state.prj_owner.unsqueeze(-1).expand(-1, -1, E)
     dmg_by.scatter_add_(1, owner_exp_e, dmg_by_unit)
 
-    # SUPER-CHARGE EXCLUSION: a second attacker x victim matrix that receives everything `dmg_by`
-    # does EXCEPT damage dealt by a `GADGET_SPINNER` slot; `charge_hit` is `> 0` of this one. A
-    # parallel accumulator, not a subtraction afterwards, because per-projectile identity is gone
-    # once the (N,P,E) contributions are scattered into (N,E,E). Filtered by KIND, not class, so
-    # other artillery still charges. The spinner only damages through the blast below; the
-    # unit-hit term is masked too so the rule holds if it ever gets a body.
-    not_gadget = (state.prj_kind != _GADGET_SPINNER).unsqueeze(-1)  # (N,P,1)
-    dmg_by_charge = torch.zeros(N, E, E, device=device)
-    dmg_by_charge.scatter_add_(1, owner_exp_e, torch.where(not_gadget, dmg_by_unit, torch.zeros_like(dmg_by_unit)))
+    # SUPER-CHARGE COUNT: a second attacker x victim matrix, counting the projectiles behind
+    # `dmg_by`'s contributions EXCEPT a `GADGET_SPINNER` slot's. A parallel accumulator, not a
+    # reading of `dmg_by` afterwards, because per-projectile identity is gone once the (N,P,E)
+    # contributions are scattered into (N,E,E). Filtered by KIND, not class, so other artillery
+    # still charges. The spinner only damages through the blast below; the unit-hit term is
+    # masked too so the rule holds if it ever gets a body. A hit that dealt no damage is no
+    # contribution to `dmg_by`, so it counts none here either.
+    lands = ((state.prj_kind != _GADGET_SPINNER) & (state.prj_damage > 0)).unsqueeze(-1)  # (N,P,1)
+    charge_hits = torch.zeros(N, E, E, dtype=torch.int32, device=device)
+    charge_hits.scatter_add_(1, owner_exp_e, (final_unit_hit & lands).to(torch.int32))
 
     # (4) box collision, against the boxes near each slot only. Boxes never move, so a per-tile
     # lookup (`_box_grid`) finds every box a slot can touch this tick: its path's midpoint is
     # within `params.box_reach_tiles` of any box it hits, and of any box its blast in (5) reaches
-    # (config.box_reach_tiles). That is a 3x3 block at the default spec -- (N,P,9) tests instead
-    # of (N,P,B). Damage goes straight into per-box accumulators, so nothing here is (N,P,B).
-    reach_cells = math.ceil(params.box_reach_tiles)
+    # (config.box_reach_tiles). That is a 3x3 block at the default spec (`box_cells`) -- (N,P,9)
+    # tests instead of (N,P,B). Damage goes straight into per-box accumulators, so nothing here is
+    # (N,P,B).
+    reach_cells = box_cells(params.box_reach_tiles)
     grid = _box_grid(state, cfg) if (2 * reach_cells + 1) ** 2 < B else None
     cand_slot, cand_pos, cand_alive = _box_candidates(
         state, grid, 0.5 * (old_pos + pos_after_wall), reach_cells, cfg)
@@ -785,14 +805,15 @@ def step_projectiles(state, bank, params, cfg):
     # stationary target's `ent_pos` bit for bit.
     has_blast = (state.prj_aoe > 0).unsqueeze(-1)
     ent_in_aoe = (
-        (ent_dist <= state.prj_aoe.unsqueeze(-1)) & has_blast & state.ent_alive.unsqueeze(1)
+        (ent_dist <= state.prj_aoe.unsqueeze(-1)) & has_blast & hittable.unsqueeze(1)
         & blast.unsqueeze(-1) & owner_ok
     )
     dmg_by_aoe = torch.where(ent_in_aoe, state.prj_damage.unsqueeze(-1), torch.zeros_like(ent_dist))
     dmg_by.scatter_add_(1, owner_exp_e, dmg_by_aoe)
     # The blast is the spinner's only damage path, so this is the mask that keeps it from charging
-    # the super; see the parallel accumulator's note at the unit-hit scatter above.
-    dmg_by_charge.scatter_add_(1, owner_exp_e, torch.where(not_gadget, dmg_by_aoe, torch.zeros_like(dmg_by_aoe)))
+    # the super; see the parallel accumulator's note at the unit-hit scatter above. A blast counts
+    # once per player it catches, as a pellet does.
+    charge_hits.scatter_add_(1, owner_exp_e, (ent_in_aoe & lands).to(torch.int32))
 
     # Boxes in the blast: the same nearby-box lookup as (4), around the blast point.
     cand_slot, cand_pos, cand_alive = _box_candidates(state, grid, det_pos, reach_cells, cfg)
@@ -811,6 +832,9 @@ def step_projectiles(state, bank, params, cfg):
 
     final_dead = wall_kill | unit_kill | box_kill | detonate | expire | haz_expire
     new_alive = alive & ~final_dead
+    # (6b) the hero's volleys that ended without landing. Here, while every slot still holds the
+    # projectile that just flew and its old age: the spawners in (7) and (8) reuse freed slots.
+    volley_misses = _settle_hero_volleys(state, alive, final_dead, unit_kill | box_kill, cfg) if volleys else None
     final_pos = torch.where((state.prj_class == _ARTILLERY).unsqueeze(-1), det_pos, pos_after_wall)
 
     state.prj_pos.copy_(torch.where(alive.unsqueeze(-1), final_pos, state.prj_pos))
@@ -847,5 +871,38 @@ def step_projectiles(state, bank, params, cfg):
     heal_ent.scatter_add_(1, state.prj_owner, heal_amount)
 
     dmg_ent = dmg_by.sum(dim=1)
-    charge_hit = dmg_by_charge > 0
-    return dmg_ent, dmg_by, dmg_box, heal_ent, charge_hit
+    if volleys:
+        return dmg_ent, dmg_by, dmg_box, heal_ent, charge_hits, volley_misses
+    return dmg_ent, dmg_by, dmg_box, heal_ent, charge_hits
+
+
+def _settle_hero_volleys(state, alive, ended, landed, cfg) -> torch.Tensor:
+    """(N,) int32: the HERO's attack volleys whose last pellet ended this tick without any of
+    them having landed on a player or a crate -- the reward's `attack_miss` (user decision
+    2026-11-02, BULL_HERO_PLAN.md §5.8). MUTATES: hero_volley_hit.
+
+    `alive`, `ended` and `landed` (N,P) describe this tick's step: the slots that flew, those that
+    died by any cause, and those that died on a unit or a crate. A volley is the pellets one
+    attack spawned, all on one tick, so that tick names it: `step_count - age / dt`, read before
+    the step writes the new age. `hero_volley_hit` remembers per spawn tick that a pellet landed,
+    so a pellet that lands early and the one that runs out last are scored as one volley, and the
+    two volleys of a burst, in flight together, are scored apart. A volley is scored once, on the
+    tick its last pellet ends; one still flying when the episode ends is never scored.
+
+    The hero's pellets are his only ordinary projectiles: his super bolt pierces and his gadget
+    spinner lobs, and Bull's charge and Stomper spawn none. So Mortis, whose attack is a dash,
+    never has a volley to score."""
+    N = alive.shape[0]
+    ring = state.hero_volley_hit.shape[1]
+    pellet = alive & (state.prj_owner == 0) & (state.prj_class == _PROJECTILE) & ~state.prj_pierce
+    born = state.step_count.to(torch.int64).unsqueeze(1) - torch.round(state.prj_age / cfg.dt).to(torch.int64)
+    col = torch.remainder(born, ring)  # (N,P)
+
+    def per_volley(mask: torch.Tensor) -> torch.Tensor:  # (N,P) bool -> (N,ring) pellet count
+        counts = torch.zeros(N, ring, dtype=torch.int32, device=alive.device)
+        return counts.scatter_add_(1, col, mask.to(torch.int32))
+
+    hit = state.hero_volley_hit | (per_volley(pellet & landed) > 0)
+    closed = (per_volley(pellet) > 0) & (per_volley(pellet & ~ended) == 0)
+    state.hero_volley_hit.copy_(hit & ~closed)
+    return (closed & ~hit).sum(dim=1).to(torch.int32)

@@ -27,9 +27,9 @@ selected (press `g`) before trusting it.
 Re-running on a frame you have already labelled resumes it.
 
 `<clip>` is a recording name without `.mp4`, looked up in `tests/fixtures/vision/` and then
-`brawl_vision/data/training_videos/`; quote names with spaces. Recordings at 1080p (the BlueStacks
-and emulator captures) are resized to the calibrated 2002x1126 viewport first, as the deployed
-capture does. Where the same recording exists under two names (`day10_gameplay` is
+`brawl_vision/data/training_videos/`; quote names with spaces. Recordings at 1080p or 1440p (the
+BlueStacks and emulator captures) are resized to the calibrated 2002x1126 viewport first, as the
+deployed capture does. Where the same recording exists under two names (`day10_gameplay` is
 `ScreenRecording_08-29-2026 19-39-53_1`), label it under one: `--hold-out` goes by name, and a
 copy under the other name would leak the held-out map into training.
 
@@ -41,6 +41,21 @@ graveyard and seven desert. It is meant to be the whole training set on its own,
 held out for test; the older labels here are not mixed in. That file also carries the map table,
 the per-frame notes and the train/test split, because `--hold-out` cannot split a set whose labels
 all share one clip name.
+
+## Machine-made labels: Starfruit Supernova (2026-11-04)
+
+Ten files here were not drawn in the tool: the
+`bluestacks-starfruit-supernova-west-upper_f*.json` frames from 460 to 1340.
+
+- They were projected from the map label (`brawl_deployment/data/maps/starfruit_supernova.csv`).
+  Each frame was registered against the map image, and each cell given the ground-footprint class
+  under it.
+- They follow the refusals below, and their `notes` field says how each was made.
+- Their seven held-out frames are in `../labels_starfruit_test/`, a folder of its own for the same
+  reason as above: every Starfruit label shares one clip name.
+- `scripts/probes/map_label_projection/README.md` has the method.
+- Fix a wrong cell in the map label and regenerate; editing the frame instead leaves every other
+  frame that sees that ground wrong.
 
 ## How much to do
 

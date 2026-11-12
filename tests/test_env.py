@@ -131,7 +131,7 @@ def test_action_latency_delays_hero_dash_by_the_configured_ticks():
     # hardcoded. The old assertion was `disp[2] > 0.5`, which was one tick of a 5.0-tile dash;
     # hero_mortis.dash_distance is now the real game's 2.67, so a dash tick covers 0.445 tiles and
     # the test failed on a number that had nothing to do with action latency.
-    hero = int(Kind.HERO_MORTIS)
+    hero = int(Kind.HERO)
     dash_step = (
         float(env.params.dash_distance[0, hero]) / float(env.params.dash_duration[0, hero])
     ) * env.cfg.dt

@@ -11,7 +11,7 @@ weight lives in `configs/train.yaml`, so the shaping can be dialled toward spars
 touching this file.
 
 **Every weight is priced per SIM TICK, not per decision, and stays that way when `action_repeat`
-changes.** The delta terms (damage, kills, cubes, attacks in reach, gadget hits) read `info`
+changes.** The delta terms (damage, kills, cubes, attacks in reach, gadget hits, misses) read `info`
 fields `env.py` already summed over the decision's sub-ticks, and the two rate terms read
 `info["alive_ticks"]` / `info["in_zone_ticks"]`, which count sub-ticks. So the episode return is
 invariant to `action_repeat`; `gamma` is the one knob that is not, since it discounts per
@@ -43,7 +43,7 @@ _HERO = 0
 TERM_NAMES = (
     "damage_dealt", "damage_taken", "hp_healed", "kill", "cube_pickup",
     "survive_per_step", "in_zone_per_step", "win_bonus", "death_penalty", "rank_bonus",
-    "attack_in_reach", "gadget_hit", "move_reversal",
+    "attack_in_reach", "gadget_hit", "move_reversal", "attack_miss", "gadget_miss",
 )
 
 
@@ -130,11 +130,14 @@ class ShapedReward:
 
         # ---- gadget shaping (user decision, 2026-09-30; BRAWL_SIM_DESIGN.md §10) ----
         if w.gadget_hit != 0.0:
-            # A count: landings of the hero's gadget spinner that hurt at least one player
-            # (core/events.py, env.py's projectile phase). One per landing however many players
-            # it catches, and none for a spinner that lands only on crates or on nothing. Paid on
-            # top of what `damage_dealt` pays for the same blast. The 18 s cooldown bounds it: at
-            # the shipped 0.3 a match of landed spinners is worth about 3, against 10 for a win.
+            # A count: landings of the hero's gadget that caught at least one player
+            # (core/events.py). For Mortis's spinner that is a blast that hurt one (env.py's
+            # projectile phase); for Bull's Stomper, which deals no damage, a stomp that slowed or
+            # stunned one (env.py's stomp phase; user decision 2026-10-23, BULL_HERO_PLAN.md D9).
+            # One per landing however many players it catches, and none for a landing on crates or
+            # on nothing. A spinner's is paid on top of what `damage_dealt` pays for the same
+            # blast. The cooldown bounds it: at the shipped 0.3 a match of landings is worth about
+            # 3 at either cooldown (18 s spinner, 20 s stomp), against 10 for a win.
             self._add(reward, "gadget_hit", info["gadget_hit_tick"], w.gadget_hit)
 
         # ---- movement shaping (user decision, 2026-10-07; archive/SIM_ISSUES_PLAN.md §5.2) ----
@@ -146,6 +149,21 @@ class ShapedReward:
             # that saves one 1300-HP hit is worth 0.13 in `damage_taken` alone, so a real dodge
             # still pays and idle jitter stops paying.
             self._add(reward, "move_reversal", info["move_reversal_tick"], w.move_reversal)
+
+        # ---- miss shaping (user decision, 2026-11-02; BULL_HERO_PLAN.md §5.8) ----
+        if w.attack_miss != 0.0:
+            # A count: the hero's attack volleys whose last pellet ended with none of them on a
+            # player or a crate (core/projectiles._settle_hero_volleys), charged on the decision
+            # that last pellet ends, up to 12 ticks after the shot. One per volley however many
+            # pellets missed, so a volley that lands one pellet is not charged at all. Bull's alone:
+            # Mortis's attack is a dash, which fires no pellets. A cost, so negative.
+            self._add(reward, "attack_miss", info["attack_miss_tick"], w.attack_miss)
+        if w.gadget_miss != 0.0:
+            # A count: the hero's stomps that landed on nobody, the complement of `gadget_hit`'s
+            # stomps (env._stomp_phase). The spinner's misses are not scored, so a Mortis run never
+            # pays it. A cost, so negative; larger than `attack_miss` (the user's call) because a
+            # wasted stomp is a 20 s cooldown spent, a wasted volley one ammo.
+            self._add(reward, "gadget_miss", info["gadget_miss_tick"], w.gadget_miss)
 
         if w.scale != 1.0:
             reward.mul_(w.scale)

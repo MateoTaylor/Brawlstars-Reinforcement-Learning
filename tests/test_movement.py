@@ -53,7 +53,7 @@ def _cfg_and_params(n_envs=1, map_h=30, map_w=30, extra_overrides=None):
 def _fresh_state(cfg, n_envs=1):
     state = allocate(cfg, n_envs=n_envs, device="cpu", verbose=False)
     state.ent_alive.fill_(True)
-    state.ent_kind[:, 0] = int(Kind.HERO_MORTIS)
+    state.ent_kind[:, 0] = int(Kind.HERO)
     for e in range(1, cfg.n_entities):
         state.ent_kind[:, e] = int(Kind.BOT_SNIPER)
     state.map_id.fill_(0)

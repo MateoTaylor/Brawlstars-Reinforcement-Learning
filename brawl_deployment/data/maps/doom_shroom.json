@@ -1,0 +1,17 @@
+{
+ "image": "doom_shroom.png",
+ "image_size": [
+  976,
+  971
+ ],
+ "pitch_px": [
+  15.751,
+  15.723
+ ],
+ "origin_px": [
+  16.7,
+  16.05
+ ],
+ "origin_convention": "tile (0, 0)'s top-left corner; pixel i spans [i, i+1)",
+ "date": "2026-11-10"
+}

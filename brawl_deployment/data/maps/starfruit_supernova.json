@@ -1,0 +1,17 @@
+{
+ "image": "starfruit_supernova.png",
+ "image_size": [
+  976,
+  980
+ ],
+ "pitch_px": [
+  15.739,
+  15.718
+ ],
+ "origin_px": [
+  21.039,
+  20.218
+ ],
+ "origin_convention": "tile (0, 0)'s top-left corner; pixel i spans [i, i+1)",
+ "date": "2026-11-04"
+}

@@ -1,0 +1,17 @@
+{
+ "image": "truth.png",
+ "image_size": [
+  978,
+  977
+ ],
+ "pitch_px": [
+  15.747,
+  15.728
+ ],
+ "origin_px": [
+  16.7,
+  16.7
+ ],
+ "origin_convention": "tile (0, 0)'s top-left corner; pixel i spans [i, i+1)",
+ "date": "2026-11-05"
+}

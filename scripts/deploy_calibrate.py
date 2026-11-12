@@ -67,7 +67,6 @@ import json
 import math
 import sys
 import time
-from dataclasses import replace
 from pathlib import Path
 
 import numpy as np
@@ -121,7 +120,8 @@ class Rig:
             monitors = [dict(m) for m in sct.monitors]
         self.guard = WindowGuard(window, monitors,
                                  require_fullscreen=cfg.window_require_fullscreen,
-                                 check_occlusion=cfg.window_check_occlusion)
+                                 check_occlusion=cfg.window_check_occlusion,
+                                 hide_overlays=cfg.window_hide_overlays)
         self.capture = DeployCapture.from_window(window, monitors)
         self.cal = Calibration.load()
         self.match = MatchState(self.cal)
@@ -154,12 +154,9 @@ class Rig:
         return None if reading is None else reading.ammo
 
     def super_charge(self):
-        from brawl_vision.object_detection.hp_detection.hero_bars import read_super
+        from brawl_deployment.perception.super_button import read_super
 
-        det = self.hero(self.grab().image)
-        if det is None:
-            return None
-        return read_super(self.frame.image, det, self.vision.cfg)
+        return read_super(self.grab().image, self.cal.viewport_button("super"))
 
     def odometry(self):
         """One fresh frame through odometry. The camera pose alone."""
@@ -284,10 +281,10 @@ def job_super(rig, args) -> dict:
     "not charged" is not a failure of the tap. It is reported as skipped, never as a pass.
 
     **The verdict is a POLL, not one reading at a guessed offset** (2026-09-22). PASS is the first
-    frame whose track reads not-ready, and the latency it arrived at is printed, so the job
-    measures the lag instead of assuming it. Frames where the hero cannot be found decide nothing;
-    they are counted and skipped, because a dashing Mortis is exactly when the detector is least
-    sure and exactly when this job looks.
+    frame whose Super button reads not-ready, and the latency it arrived at is printed, so the job
+    measures the lag instead of assuming it. Unreadable frames decide nothing; they are counted and
+    skipped, because the button reads None while its knob is dragged off centre, which is exactly
+    when this job looks (`perception/super_button.py`).
     """
     reading = rig.super_charge()
     if reading is None or not reading.ready:
@@ -437,7 +434,9 @@ def record_gadget_trace(grab, check_window, gates, buttons, *, gate_name: str,
     to `pre_roll_ticks + record_ticks`. Returns the trace; writing it is the caller's.
 
     `gates` maps each button to a `MatchState` anchored on it; `gates[gate_name]` is the
-    production gate as `wait_for_gate` left it. Each tick runs in `loop.tick`'s order: grab,
+    production gate as `wait_for_gate` left it, with every look it has, so its score is the best
+    of them and its colour and ROI are its first look's (match_state.py, the gate's looks).
+    Each tick runs in `loop.tick`'s order: grab,
     `settle()`, the window check on its cadence, every gate's `update`, and on the tap tick
     alone the press. So the tap reaches the game exactly as the policy's does, down after that
     tick's gate read and lifted by the next tick's settle.
@@ -702,9 +701,9 @@ def probe_gadget(rig, cfg, args) -> dict:
     for name in rig.cal.buttons:
         if name == gate_name:
             continue
-        # The production gate's own class and hysteresis, anchored on another button. A floor
-        # of 0 so a button that cannot anchor the gate is recorded as such, not fatal.
-        gates[name] = MatchState(replace(rig.cal, gate_anchor=name))
+        # The production gate's own class and hysteresis, on another button alone. A floor of 0
+        # so a button that cannot anchor the gate is recorded as such, not fatal.
+        gates[name] = MatchState.on(rig.cal, name)
         refined[name] = gates[name].refine(image, min_score=0.0)
     hz = cfg.loop_tick_hz
     _log(f"scoring {', '.join(gates)} every tick at {hz:g} Hz: {PROBE_PRE_ROLL_S:g} s, one "
@@ -791,6 +790,10 @@ def main(argv=None) -> int:
 
     results, failures, probe = {}, [], None
     try:
+        # BlueStacks' keymap hints sit on the very buttons this script measures (loop.run does
+        # the same; window.py has the measurement).
+        for w in rig.guard.suppress_overlays():
+            _log(f"hid {w.title!r}, the emulator's own overlay, until calibration ends")
         with rig.capture:
             if not rig.wait_for_gate(args.wait):
                 _log("no match started -- nothing was measured and no input was sent")
@@ -816,6 +819,8 @@ def main(argv=None) -> int:
         # Same guarantee `loop.run` gives: whatever happened, no contact is left down.
         rig.controls.release_all()
         _log("released every contact")
+        for w in rig.guard.restore_overlays():
+            _log(f"showed {w.title!r} again")
 
     if "tap" in results and not results["tap"]["report"].ok:
         failures.append("tap")

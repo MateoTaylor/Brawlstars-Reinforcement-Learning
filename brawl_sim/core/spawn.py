@@ -46,8 +46,9 @@ def sample_map_ids(reset_mask: torch.Tensor, bank, cfg, gen) -> torch.Tensor:
 
 
 def sample_enemy_kinds(reset_mask: torch.Tensor, cfg, gen) -> torch.Tensor:
-    """(N,E) i64. Slot 0 is always HERO_MORTIS (0). Slots 1..E-1: a multinomial draw over the
-    bot archetypes (ARCHETYPE_SHORT_NAMES) weighted by cfg.enemy_type_weights (inverse-CDF +
+    """(N,E) i64. Slot 0 is always Kind.HERO (0), whichever brawler the run plays. Slots 1..E-1:
+    a multinomial draw over the bot archetypes (ARCHETYPE_SHORT_NAMES) weighted by
+    cfg.enemy_type_weights (inverse-CDF +
     searchsorted, the same "sort/rank plus a threshold" shape as projectiles.alloc_slots) when
     cfg.randomize_enemy_types, else cfg.fixed_enemy_types verbatim, tiled across every env.
     Computed fresh for the whole batch (see module docstring)."""
@@ -56,7 +57,7 @@ def sample_enemy_kinds(reset_mask: torch.Tensor, cfg, gen) -> torch.Tensor:
     E = cfg.n_entities
     n_enemies = cfg.n_enemies
 
-    kinds = torch.zeros((N, E), dtype=torch.int64, device=device)  # slot 0 stays HERO_MORTIS
+    kinds = torch.zeros((N, E), dtype=torch.int64, device=device)  # slot 0 stays HERO
 
     if cfg.randomize_enemy_types:
         weights = _const_tensor(cfg.enemy_type_weights, device, torch.float32)

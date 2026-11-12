@@ -65,6 +65,16 @@ move bin like the game's tap-to-fire: at the nearest enemy within the bolt's rea
 button when `ShadowHero.attack_bearing` is None, which it is for exactly that case, and the game
 picks the target. A super fired while moving keeps the drag along the move bin.
 
+**A charge super drags to the screen edge (Bull, BULL_HERO_PLAN.md §5.7b, Q6).** Mortis's bolt
+travels a fixed distance, so his drag only has to clear the aim deadzone. Bull's charge does not:
+a short drag gives a short charge, and the shadow models every charge at full length (the user's
+call, 2026-10-28). So `press(..., full=True)` drags the super along the bearing as far as the
+screen allows, 2 px short of the edge. Off-screen is not an option, because the ADB backend clamps
+an off-screen point onto the edge one axis at a time, which bends the bearing toward the nearer
+wall. Stopping on the ray keeps the direction exact, and every direction has at least
+`aim_radius_px` of room, which `require_on_screen` checks. Whether the game's super stick
+saturates before the edge in every direction is a live check (§5.7e).
+
 That button is NOT the anchor `match_state.py` watches, and never was (corrected 2026-09-22, design
 5.1). Every button name in `control_calibration.json` sat one disc off, so what this file called
 the gadget was the Super: a commanded gadget pressed the Super, and the gate sat on the Super too.
@@ -90,6 +100,10 @@ PRESS_TICKS = 3
 # `Buttons` by hand.
 AIM_RADIUS_PX = 75.0
 
+# How far short of the screen edge a full-length drag stops, in device pixels: enough that the
+# backend's rounding never lands it on the clamp.
+EDGE_MARGIN_PX = 2.0
+
 _IDLE, _DOWN, _AIMED, _TAPPED = "idle", "down", "aimed", "tapped"
 
 
@@ -100,7 +114,9 @@ class Buttons:
     tick. The origin is `attack` for a fire and `super_` for a super -- the super is a FIXED button,
     unlike the attack stick, so its drag starts on the button centre. Direction only: Mortis's
     dash and his super both travel a fixed distance, so how far the drag goes past the game's
-    aim deadzone changes nothing, and one radius serves both.
+    aim deadzone changes nothing, and one radius serves both. The exception is a charge super
+    (Bull), whose length the drag sets: `press(..., full=True)` drags it to the screen edge,
+    which needs `screen`.
 
     `gadget` is the third origin and a tap: a `down` on the button centre and an `up`, with no
     aim. It is required like the other two, so a `Buttons` that cannot press the gadget fails at
@@ -110,12 +126,14 @@ class Buttons:
     """
 
     def __init__(self, backend, attack: tuple[float, float], super_: tuple[float, float],
-                 gadget: tuple[float, float], aim_radius_px: float = AIM_RADIUS_PX):
+                 gadget: tuple[float, float], aim_radius_px: float = AIM_RADIUS_PX,
+                 screen: tuple[int, int] | None = None):
         self.backend = backend
         self.attack = attack
         self.super_ = super_
         self.gadget = gadget
         self.aim_radius_px = float(aim_radius_px)
+        self.screen = screen
         self._stage = _IDLE
         self._aim: tuple[float, float] | None = None
 
@@ -129,12 +147,15 @@ class Buttons:
             return self.gadget
         return None
 
-    def aim_point(self, action: int, bearing: float) -> tuple[float, float]:
+    def aim_point(self, action: int, bearing: float, full: bool = False) -> tuple[float, float]:
         """Where the drag for this action ends. `bearing` is radians, in the sim's frame.
 
         **No y negation**, for the reason `Joystick.contact_point` gives: `brawl_sim`'s world y and
         the screen's y both increase downward, so `(cos, sin)` maps to a screen offset unchanged.
         A minus sign here dashes every attack mirrored across the horizontal.
+
+        `full` drags a super as far along the bearing as the screen allows, `EDGE_MARGIN_PX` short
+        of the edge, for a charge whose length the drag sets (see the module docstring).
         """
         if action == ATTACK_GADGET:
             raise ValueError("the gadget is a tap on a fixed button and the game aims it, so it "
@@ -145,8 +166,23 @@ class Buttons:
         origin = self.origin(action)
         if origin is None:
             raise ValueError(f"action {action} presses nothing, so it has no aim point")
-        return (origin[0] + self.aim_radius_px * math.cos(bearing),
-                origin[1] + self.aim_radius_px * math.sin(bearing))
+        c, s = math.cos(bearing), math.sin(bearing)
+        r = self._edge_radius(origin, c, s) if full else self.aim_radius_px
+        return origin[0] + r * c, origin[1] + r * s
+
+    def _edge_radius(self, origin: tuple[float, float], c: float, s: float) -> float:
+        """How far a drag from `origin` along `(c, s)` can go and stay `EDGE_MARGIN_PX` inside
+        the screen: the nearer of the ray's two exits, an x edge and a y edge."""
+        if self.screen is None:
+            raise ValueError("a full-length drag goes to the screen edge, so Buttons needs "
+                             "`screen`")
+        w, h = self.screen
+        exits = []
+        if abs(c) > 1e-9:
+            exits.append(((w - 1) - origin[0] if c > 0 else origin[0]) / abs(c))
+        if abs(s) > 1e-9:
+            exits.append(((h - 1) - origin[1] if s > 0 else origin[1]) / abs(s))
+        return min(exits) - EDGE_MARGIN_PX
 
     def require_on_screen(self, screen: tuple[int, int]) -> None:
         """Raise unless every bearing's aim point, for both dragged buttons, lands on the
@@ -155,8 +191,9 @@ class Buttons:
 
         The ADB backend CLAMPS an off-screen point to the edge rather than rejecting it, which for
         a drag is worse than a failure: the lift lands somewhere real, in the wrong direction. The
-        super button sits low (81 px of room below it at 1920x1080), so a radius that works for
-        the attack stick can still fail here, and only for attacks aimed downward.
+        super button sits low (179 px of room below it at 1920x1080), so a radius that works for
+        the attack stick can still fail here, and only for attacks aimed downward. A full-length
+        drag (`press(..., full=True)`) needs no check: it stops on the screen by construction.
         """
         w, h = screen
         r = self.aim_radius_px
@@ -173,10 +210,12 @@ class Buttons:
                 f"the gadget button ({gx:.0f}, {gy:.0f}) is off a {w}x{h} screen. The backend "
                 f"clamps, so the tap would land on the edge, on whatever is drawn there.")
 
-    def press(self, action: int, bearing: float | None) -> bool:
+    def press(self, action: int, bearing: float | None, full: bool = False) -> bool:
         """Start one press: aimed for an attack or a super, a bare tap for the gadget, for the
         auto-aimed attack, and for a super with `bearing` None, which `ShadowHero.attack_bearing`
-        gives an idle super. Returns whether anything was pressed.
+        gives an idle super. Returns whether anything was pressed. `full` drags a super to the
+        screen edge rather than `aim_radius_px` (a charge, whose length the drag sets); the loop
+        passes the shadow's `charge_super`, and no other press reads it.
 
         Only the down goes out here; `settle()` sends the drag and then the lift, or for a tap
         the lift alone, and a tap never reads `bearing`. A press that
@@ -201,7 +240,7 @@ class Buttons:
             return True
         if bearing is None:
             raise ValueError(f"action {action} is an aimed drag and needs a bearing")
-        aim = self.aim_point(action, bearing)
+        aim = self.aim_point(action, bearing, full=full and action == ATTACK_SUPER)
         self.backend.down(SLOT_TAP, *origin)
         self._aim = aim
         self._stage = _DOWN

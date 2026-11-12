@@ -201,37 +201,91 @@ Named for the brawler because "shotgun" is already Shelly's role.
 - Health: **10000** — ties Buzz for the tankiest frame in the game
 - Attack: **5 pellets** in a **28.6° total** spread (±14.3°), each dealing **880** — **4400** if the
   whole volley lands, the largest single burst in the roster
-- Attack range: **7 tiles**, one tile shorter than Shelly
-- Projectile: `BULL_SLUG`, **speed 6.4 tiles/s** — the same pellet speed as Shelly, so his shorter
-  range also means a shorter time to target (~1.09s against her ~1.25s). Closing on Bull is worse
-  than closing on Shelly.
-- **Tighter fan than Shelly** (0.5 rad against her 0.6). At 7 tiles his outermost pellets are
-  3.46 tiles apart — 0.87 between neighbours against the 1.40 each one covers — so his volley
+- Attack range: **5.2 tiles**, 2.8 shorter than Shelly. Measured on the hero (2026-11-01,
+  BULL_HERO_PLAN.md Phase 0 b), and the user set the bot to match; it was 7, quoted as "one tile
+  shorter than Shelly".
+- Projectile: `BULL_SLUG`, **speed 9.0 tiles/s**, measured the same way (it was Shelly's 6.4). Time
+  to target is ~0.58s against her ~1.25s, so closing on Bull is worse than closing on Shelly. A
+  pellet moves its whole 0.45-tile tick, so the middle one still lands at 6.0 tiles.
+- **Tighter fan than Shelly** (0.5 rad against her 0.6). At 5.2 tiles his outermost pellets are
+  2.57 tiles apart — 0.64 between neighbours against the 1.40 each one covers — so his volley
   overlaps more heavily along its whole length. In practice: at 4 tiles and half a tile off-centre
   he still lands 3 pellets where Shelly is down to 2.
-- Move speed: **2.17 tiles/s** (Speed=650 / 300, the **SLOW** tier) — one full step below Shelly's
-  NORMAL 720, and **the slowest brawler in the roster**. This is the counterweight to everything
-  above: the biggest burst in the game on the joint-tankiest frame, on a body that cannot close the
-  distance to use it. Mortis and Edgar both move 2.73, 26% faster, so disengaging from Bull is
-  always available.
+- Move speed: **2.68 tiles/s**, measured on the hero (2026-11-01, BULL_HERO_PLAN.md Phase 0 a),
+  and the user set the bot to match (D7). It was 2.17, the SLOW 650 / 300 tier and the slowest in
+  the roster. Only Mortis and Edgar (2.73) are faster now, by 2 %, so a Bull that wants his 5.2
+  tiles mostly gets them, and disengaging from him is no longer free.
 - Ammo: 3 max, **reload 2.0s** (one ammo every 2 seconds) · Cooldown: 0.25s
 - Fire rule: **identical to Shelly's** — needs line-of-sight, holds fire past 0.9× range and on
   targets crossing faster than 2 tiles/s beyond 0.6× range, LEAD aim with 0.08 rad noise and 0.7
   lead. Keeping her thresholds means the difference between the two bots is their *stats*, not a
   second set of hand-tuned heuristics.
 - He does fight closer in, though: `desired_range_fraction` **0.6** against her 0.75, so a kiting
-  Bull holds **4.2 tiles** where Shelly holds 6.0. A 10000 HP brawler should not be hanging back at
-  the edge of a 7-tile shotgun.
+  Bull holds **3.1 tiles** (4.2 at the old 7-tile range) where Shelly holds 6.0. A 10000 HP
+  brawler should not be hanging back at the edge of his shotgun's reach.
+
+### 8b. Bull (hero) — `hero_bull`, in progress
+
+The agent can play Bull instead of Mortis: `entities.hero: bull` fills the hero's column from this
+block (BULL_HERO_PLAN.md). He has **his attack, his super, his gadget and his star power**. The attack started as
+the bot's weapon, with no bot-AI fields. One number now differs from `bot_bull`: the **reload
+1.6 s**, measured (2026-10-28; the bot keeps 2.0).
+His **walk 2.68 tiles/s** (plan Phase 0 a; the stat card's FAST tier says 2.57), **range 5.2
+tiles** and **pellet speed 9.0 tiles/s** were measured off footage, the aim indicator and the
+pellets (2026-11-01), and the user set both blocks to them. A pellet moves its whole 0.45-tile
+tick, so 12 ticks carry it 5.4 tiles, inside the 5.2-5.5 at which the game's pellets vanish. The
+0.50 rad fan is measured too, and the same for both.
+
+His volley is aimed like Mortis's dash.
+- **Attack value 1** fires along the move bin, or along facing when he stands still.
+- **Attack value 4** (auto-aim) fires at the nearest enemy or crate within **5.5 tiles** plus the
+  target's body. With nothing there it fires like value 1.
+- The reward's in-reach term pays only where most of the volley can land: **5.42 tiles** to an
+  enemy's centre, where 3 of the 5 pellets touch (user decision 2026-10-23; 5.61 at the old 7.0
+  range).
+
+His super, **Bulldozer**, is a charge (`super_type: CHARGE`, plan Phase 4), not a bolt.
+- **Meter:** 9 pellet hits on players, or two full volleys (user, 2026-10-23). The charge's own hits
+  add nothing.
+- **Wind-up:** he stands still 0.20 s.
+- **Rush:** 11.0 tiles at a fixed 6.7 tiles/s, 1.84 s in all. He cannot walk, steer, attack or
+  super until he lands. The first wall or water stops him, as it stops Mortis's dash (user,
+  2026-10-23). The game's Bull bulldozes through walls; the sim's does not.
+- **Hits:** a flat **2000**, once each, to every player whose centre comes within 1.0 tile of his.
+  The player is pushed **2.5 tiles straight away from his centre** at contact (measured 2.55,
+  2026-11-01; head-on: along the
+  charge; glancing: off at an angle; a wall stops the push) and is airborne for **0.5 s**:
+  untargetable and unable to act. Crates are passed untouched, as Mortis's bolt passes them.
+- **Landing:** everyone else within **3.0 tiles** is slowed once, 40 % for 1.5 s. Dummies can't
+  show either number, and the user kept both (2026-11-01, plan Q2).
+- **Idle aim:** tap-to-fire at the nearest enemy within 12.0 tiles (rush plus reach, on centres).
+
+His gadget, **Stomper**, is a pulse around his own body (`gadget_type: STOMP`, plan Phase 5), not a
+thrown spinner. These are the wiki's numbers (user, 2026-10-23), except the wind-up and the stun,
+measured 2026-11-01 (plan Phase 0 d, e):
+- **Tap:** a **20 s** cooldown, charged at spawn. The pulse lands **0.30 s** after the tap. He walks
+  and acts meanwhile, and it lands around wherever he stands then.
+- **Pulse:** every other player within **2.67 tiles** of his centre. One already slowed, by anything
+  (his charge's landing included), is **stunned 1.4 s** and keeps its slow. Any other is **slowed 50 %
+  for 1 s**. Airborne players are skipped. No damage, and crates are untouched.
+- **Combo:** a stomp within 1.5 s of his landing stuns every player the landing slowed who is still
+  within 2.67 tiles of him. A player the charge hit early in the rush, more than 3 tiles from the
+  landing, is not slowed by it, so a stomp can only slow that player.
+- **Mid-charge:** the charge holds the gadget closed until he lands (user, 2026-10-23).
+
+His star power is **Berserker** (user, 2026-10-23): below **60 %** of his max HP, cubes' bonus
+included, he reloads **twice as fast**. Healing back to 60 % ends it.
 
 ---
 
 ### Still unimplemented
 
-- **Star Powers and Hypercharges** — out of scope; see BRAWL_SIM_DESIGN.md §2.
-- **Gadgets for bots.** Only Mortis has one: `gadget_cooldown: 0` means "no gadget", and
-  `BotIntent` has no gadget bit yet.
-- **Supers for bots.** Only Mortis has one. Nothing about the mechanic is hero-specific — the charge
-  counter, readiness test, projectile and lifesteal are all per-entity, and `super_charge_hits: 0`
+- **Hypercharges, and every Star Power but Bull's Berserker** — out of scope; see
+  BRAWL_SIM_DESIGN.md §2.
+- **Gadgets for bots.** Only the heroes have one (Mortis's spinner, Bull's Stomper):
+  `gadget_cooldown: 0` means "no gadget", and `BotIntent` has no gadget bit yet.
+- **Supers for bots.** Only the heroes have one. Nothing about the mechanic is hero-specific — the
+  charge counter, readiness test, projectile, lifesteal and Bull's charge are all per-entity, and `super_charge_hits: 0`
   is what means "this kind has no super" — so giving a bot one is a `brawlers.yaml` block plus a
   fire decision in its combat rule.
 - **Box HP** is a constant 3000. Real loot-box HP scales 4500–8500 with the lobby's average power

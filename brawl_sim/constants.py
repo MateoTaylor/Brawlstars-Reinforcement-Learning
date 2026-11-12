@@ -23,10 +23,15 @@ class Kind(IntEnum):
     every per-kind SimParams tensor's K axis, every `kind_onehot`, and the order of
     `EnvConfig.enemy_type_weights` (config.ARCHETYPE_SHORT_NAMES).
 
-    The first five are named for the ROLE, not the brawler; each role is grounded in one real
+    HERO is whichever brawler the run plays: `entities.hero` names the `hero_<name>` block of
+    configs/brawlers.yaml that fills column 0 (config.kind_yaml_names), so a second hero costs no
+    new member and leaves every `kind_onehot` its width (BULL_HERO_PLAN.md D1).
+
+        HERO           Mortis or Bull (entities.hero)
+
+    The next four are named for the ROLE, not the brawler; each role is grounded in one real
     brawler, who can change without renaming the member:
 
-        HERO_MORTIS    Mortis        dash assassin
         BOT_SNIPER     Brock         long-range single-shot rocket
         BOT_ARTILLERY  Grom          lobbed shell that splits
         BOT_MELEE      Buzz          point-blank swept hitscan
@@ -34,14 +39,15 @@ class Kind(IntEnum):
 
     BOT_EDGAR, BOT_SPIKE and BOT_BULL are named for the BRAWLER instead (user's rule): a role label
     would invent a distinction the sim does not make (Edgar vs BOT_MELEE, Spike vs BOT_ARTILLERY,
-    Bull vs BOT_RIFLE). The name is load-bearing: `render/viewer._ENTITY_SPRITE_PATHS` derives
-    each sprite path from it (`assets/entities/bot_edgar.png`).
+    Bull vs BOT_RIFLE). The name is load-bearing: `render/viewer.entity_sprite_paths` derives
+    each bot's sprite path from it (`assets/entities/bot_edgar.png`); the hero's comes from the run
+    (`hero_bull.png`).
 
         BOT_EDGAR      Edgar         two-hit forward combo, heals off the damage it deals
         BOT_SPIKE      Spike         slow shell that splits into a 6-arm star on landing
         BOT_BULL       Bull          short-range 5-pellet shotgun on a 10000 HP frame
     """
-    HERO_MORTIS = 0
+    HERO = 0
     BOT_SNIPER = 1
     BOT_ARTILLERY = 2
     BOT_MELEE = 3
@@ -145,6 +151,45 @@ class AimModel(IntEnum):
     DIRECT = 0
     LEAD = 1
     LOB = 2
+
+
+class SuperType(IntEnum):
+    """WHAT a kind's super does when it fires: the per-kind `super_type` brawlers.yaml field. Only
+    a kind with `super_charge_hits > 0` has a super at all, so the type of every other kind is
+    never read.
+
+        BOLT    one piercing projectile along the aim (projectiles.spawn_supers): Mortis.
+        CHARGE  the body rushes along the aim for `super_range` tiles at `super_charge_speed`
+                after a standing `super_windup_seconds`, on the dash's state (hero.start_charge,
+                hero.advance_dash). It hits each player it touches once for `super_damage`,
+                knocks them back and launches them, then slows everyone near its landing: Bull
+                (BULL_HERO_PLAN.md D2).
+
+    BOLT is deliberately 0, so Mortis's block, written before there was a choice, keeps its super
+    without naming one.
+    """
+    BOLT = 0
+    CHARGE = 1
+
+
+class GadgetType(IntEnum):
+    """WHAT a kind's gadget does when it fires: the per-kind `gadget_type` brawlers.yaml field. Only
+    a kind with `gadget_cooldown > 0` has a gadget at all, so the type of every other kind is never
+    read.
+
+        SPINNER  a Proj.GADGET_SPINNER thrown at the nearest enemy its thrower can see, which lands
+                 after `gadget_flight_seconds` and blasts `gadget_radius` for `gadget_damage`
+                 (hero.gadget_target, projectiles.spawn_gadget): Mortis.
+        STOMP    a pulse around the stomper's own body `stomp_windup_seconds` after the tap
+                 (hero.start_stomp, hero.advance_stomp). It deals no damage: every other player
+                 within `stomp_radius` is slowed, or stunned if already slowed. Bull's Stomper
+                 (BULL_HERO_PLAN.md §5.5).
+
+    SPINNER is deliberately 0, so Mortis's block, written before there was a choice, keeps his
+    gadget without naming one.
+    """
+    SPINNER = 0
+    STOMP = 1
 
 
 class DeathCause(IntEnum):

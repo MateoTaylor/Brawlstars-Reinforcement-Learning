@@ -8,6 +8,7 @@ its existing circle/diamond/square fallback, so you can fill this in incremental
 
 ```
 entities/hero_mortis.png
+entities/hero_bull.png
 entities/bot_sniper.png
 entities/bot_artillery.png
 entities/bot_melee.png
@@ -19,9 +20,11 @@ items/box.png
 items/pickup.png
 ```
 
-The `entities/` filenames are `Kind.<NAME>.name.lower() + ".png"` (see `constants.Kind`) --
-if a new brawler/bot kind is ever added to that enum, its sprite slot is
-`entities/<new_name_lowercased>.png`, same pattern, still no code change.
+A bot's filename is `Kind.<NAME>.name.lower() + ".png"` (see `constants.Kind`) -- if a new bot
+kind is ever added to that enum, its sprite slot is `entities/<new_name_lowercased>.png`, same
+pattern, still no code change. The hero is the exception: `Kind.HERO` stands for whichever
+brawler the run plays (`entities.hero`), so its sprite is `entities/hero_<entities.hero>.png`
+(`render/viewer.entity_sprite_paths`).
 
 Projectiles aren't covered by this -- they stay small colored dots regardless (there can be
 dozens on screen at once, and they're too small for character art to read anyway).

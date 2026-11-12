@@ -63,6 +63,7 @@ def test_construction_builds_one_artist_set_per_entity_slot():
     assert len(viewer.hp_bg) == n
     assert len(viewer.hp_fill) == n
     assert len(viewer.ammo_text) == n
+    assert len(viewer.status_text) == n
     assert len(viewer.reveal_ring) == n
     # One scatter artist per SPAWNABLE projectile kind -- i.e. every Proj except NONE (the "this
     # archetype has no projectile" sentinel, never reaches a live slot) and SUPER_BOLT (Mortis's
@@ -99,14 +100,21 @@ def test_dead_entity_hides_all_its_artists():
     viewer, frames, cfg, bank = _viewer_from_rollout(n_enemies=2)
     viewer._entity_sprite_imgs = {}  # exercise the circle fallback regardless of local assets/
     frame0 = {k: v.copy() for k, v in frames.items()}
-    frame0["ent_alive"][0][1] = False  # kill entity 1 on frame 0
+    # Stunned, then killed, as a stomped bot often is: a death leaves its timers running
+    # (combat.resolve_deaths), so the label must hide with the body, not with the timer.
+    frame0["ent_stun_t"][0][1] = 0.6
     viewer.frames = frame0
+    viewer._draw_frame(0)
+    assert viewer.status_text[1].get_visible()
+
+    frame0["ent_alive"][0][1] = False  # kill entity 1 on frame 0
     viewer._draw_frame(0)
 
     assert not viewer.body[1].get_visible()
     assert not viewer.hp_bg[1].get_visible()
     assert not viewer.hp_fill[1].get_visible()
     assert not viewer.ammo_text[1].get_visible()
+    assert not viewer.status_text[1].get_visible()
     assert not viewer.reveal_ring[1].get_visible()
     # untouched entities are unaffected
     assert viewer.body[0].get_visible()
@@ -208,6 +216,180 @@ def test_dashing_entity_gets_the_bright_dash_ring():
     viewer.frames = {k: v[None] for k, v in frame0.items()}
     viewer._draw_frame(0)
     assert not viewer.dash_ring[0].get_visible()
+
+
+# ---- status-effect labels: stun, slow, airborne, and Bull's slow window ------------------------
+# Timers are set IN PLACE on a real recording's arrays, never added as keys, so a field name the
+# sim does not record fails here as a KeyError instead of passing on a frame only the test builds.
+
+def test_status_label_lists_each_running_timer_most_disabling_first():
+    viewer, frames, cfg, bank = _viewer_from_rollout(n_enemies=2)
+    assert not any(t.get_visible() for t in viewer.status_text)  # nothing runs at the reset
+
+    frame0 = {k: v[0].copy() for k, v in frames.items()}
+    frame0["ent_airborne_t"][1] = 0.3
+    frame0["ent_stun_t"][1] = 0.85
+    frame0["ent_slow_t"][1] = 0.35
+    frame0["ent_slow_frac"][1] = 0.4
+    frame0["ent_slow_t"][2] = 1.0
+    frame0["ent_slow_frac"][2] = 0.5
+    frame0["ent_slow_window_t"][0] = 1.35
+    viewer.frames = {k: v[None] for k, v in frame0.items()}
+    viewer._draw_frame(0)
+
+    hero, bot1, bot2 = viewer.status_text
+    assert bot1.get_visible() and bot1.get_text() == "AIR 0.30\nSTUN 0.85\nslow 40% 0.35"
+    assert bot1.get_color() == viewer_mod._AIRBORNE_COLOR
+    assert bot2.get_text() == "slow 50% 1.00"
+    assert bot2.get_color() == viewer_mod._SLOW_COLOR
+    assert hero.get_text() == "slow window 1.35"
+    assert hero.get_color() == viewer_mod._WINDOW_COLOR
+    # hung under the body (+y is down the screen), below the ammo count
+    assert bot1.get_position()[1] > viewer.ammo_text[1].get_position()[1] > float(frame0["ent_pos"][1, 1])
+
+
+def test_e_key_toggles_the_status_labels():
+    viewer, frames, cfg, bank = _viewer_from_rollout(n_enemies=1)
+    frame0 = {k: v[0].copy() for k, v in frames.items()}
+    frame0["ent_stun_t"][1] = 0.5
+    viewer.frames = {k: v[None] for k, v in frame0.items()}
+    viewer._draw_frame(0)
+    assert viewer.status_text[1].get_visible()
+
+    viewer.on_key(_FakeKeyEvent("e"))
+    assert not viewer.status_text[1].get_visible()
+    viewer.on_key(_FakeKeyEvent("e"))
+    assert viewer.status_text[1].get_visible()
+
+
+def test_a_recording_older_than_the_status_timers_plays_with_no_labels():
+    viewer, frames, cfg, bank = _viewer_from_rollout(n_enemies=2)
+    timers = ("ent_airborne_t", "ent_stun_t", "ent_slow_t", "ent_slow_frac", "ent_slow_window_t")
+    assert set(timers) <= set(frames)   # today's recordings have every one
+    old = {k: v for k, v in frames.items() if k not in timers}
+    viewer = viewer_mod.ReplayViewer(old, bank, cfg)
+    for idx in range(viewer.n_frames):
+        viewer._draw_frame(idx)
+        assert not any(t.get_visible() for t in viewer.status_text)
+
+
+def _bull_charge_and_stomp_viewer():
+    """watch.py's frames end to end: `state_snapshot` + `extra_fields` on every tick of a real charge
+    and stomp, staged as tests/test_charge_super.py stages them (one tick per step, both bots held
+    still). Bull charges east from (4, 10) and lands at (15, 10) on tick 37. Bot 1 stood on his line
+    at (13, 10): hit on tick 28, launched for 0.5 s, pushed to 14 and still in the air when he lands,
+    so the landing slows it too. Bot 2 stands 2 tiles south of the landing. The stomp is tapped
+    on tick 60, after the window read 0.40, so the pulse on tick 66 (0.30 s on) stuns both with 0.05
+    of the landing slow left. Returns the viewer over frames[t] = the state after tick t, ticks 0-67."""
+    from brawl_sim.core.state import snapshot as state_snapshot
+    over = _deep_merge(CONFIGS_TINY, {"entities": {"hero": "bull"}, "sim": {"action_repeat": 1},
+                                      "regen": {"enabled": False}})
+    cfg = load_config(CONFIGS_DEFAULT, overrides=over)
+    spec = _deep_merge({**yaml.safe_load(open("configs/default.yaml").read()),
+                        **yaml.safe_load(open("configs/brawlers.yaml").read())}, over)
+    env = BrawlVecEnv(cfg, n_envs=1, device="cpu", seed=0, spec=spec, verbose=False)
+    env.reset()
+    st = env.state
+    for slot, xy in enumerate(((4.0, 10.0), (13.0, 10.0), (15.0, 12.0))):
+        st.ent_pos[0, slot] = torch.tensor(xy)
+    st.ent_facing.zero_()
+    st.box_alive.fill_(False)
+    st.ent_super_charge[0, 0] = 9
+    override = torch.zeros(1, cfg.n_entities, 2, dtype=torch.int64)
+    override[:, 0, 0] = -1   # the hero's row takes the action; the bots' rows hold still
+
+    def frame(e):
+        snap = state_snapshot(e.state, 0)
+        snap.update(record_rollout.extra_fields(e))
+        return snap
+
+    frames = [frame(env)]   # frames[t] is the state after tick t
+    env.tick_hook = lambda e: frames.append(frame(e))
+
+    def step(move=0, attack=0):
+        env.step(torch.tensor([[move, attack]], dtype=torch.int64), override)
+
+    step(move=1, attack=2)   # tick 1: the charge, east
+    for _ in range(58):      # ticks 2-59
+        step()
+    step(attack=3)           # tick 60: the stomp
+    for _ in range(7):       # ticks 61-67
+        step()
+    stacked = {k: np.stack([f[k] for f in frames]) for k in frames[0]}
+    return viewer_mod.ReplayViewer(stacked, build_map_bank(cfg, device="cpu"), cfg)
+
+
+def test_a_real_bull_charge_and_stomp_label_the_players_they_caught():
+    viewer = _bull_charge_and_stomp_viewer()
+
+    def labels(tick):
+        viewer._draw_frame(tick)
+        return [t.get_text() if t.get_visible() else "" for t in viewer.status_text]
+
+    assert labels(27) == ["", "", ""]
+    assert labels(28) == ["", "AIR 0.50", ""]
+    assert labels(37) == ["slow window 1.50", "AIR 0.05\nslow 40% 1.50", "slow 40% 1.50"]
+    assert labels(60) == ["slow window 0.35", "slow 40% 0.35", "slow 40% 0.35"]
+    assert labels(66) == ["slow window 0.05", "STUN 1.40\nslow 40% 0.05", "STUN 1.40\nslow 40% 0.05"]
+    assert viewer.status_text[2].get_color() == viewer_mod._STUN_COLOR
+    assert labels(67) == ["", "STUN 1.35", "STUN 1.35"]
+
+
+def test_labels_that_would_cover_each_other_stack_down_instead():
+    """A charge carries the bots it hits to its landing, so the charger's label and theirs start
+    side by side on exactly the frames that show the kit: here Bull lands at (15, 10) with bot 1
+    pushed to (14, 10). Drawn for real, no two labels' dark boxes may touch on any tick; each label
+    stays centred on its own entity and only ever moves down from its spot under the ammo count."""
+    viewer = _bull_charge_and_stomp_viewer()
+    moved = set()
+    for tick in range(viewer.n_frames):
+        viewer._draw_frame(tick)
+        viewer.fig.canvas.draw()   # sizes each label's dark box (FancyBboxPatch) to its text
+        shown = [e for e, t in enumerate(viewer.status_text) if t.get_visible()]
+        boxes = {e: viewer.status_text[e].get_bbox_patch().get_window_extent() for e in shown}
+        for i in shown:
+            for j in shown:
+                assert i >= j or not boxes[i].overlaps(boxes[j]), (tick, i, j)
+        for e in shown:
+            x, y = viewer.status_text[e].get_position()
+            ammo_x, ammo_y = viewer.ammo_text[e].get_position()
+            assert x == ammo_x == pytest.approx(float(viewer.frames["ent_pos"][tick, e, 0]))
+            assert y >= ammo_y + 0.25 - 1e-9
+            if y > ammo_y + 0.25 + 1e-9:
+                moved.add(tick)
+    # the landing (tick 37) puts all three side by side; the stomp and its pulse keep them so
+    assert {37, 61, 66} <= moved
+
+
+def test_stacking_looks_again_after_each_drop_and_works_down_from_the_top():
+    """Four stunned bots, laid out in label widths `w` measured on screen (so fonts and dpi don't
+    matter) and a fraction of a pixel apart in height. Bot 4 is on top. Bot 3 sits half a label
+    right, under 4, so it drops. Bot 2 sits 1.75 labels right, clear of both, so it stays. Bot 1, at
+    1.3 labels, starts clear of the dropped 3 but under 2; dropping under 2 lands it on 3, which it
+    had already passed, so one look over the placed labels is not enough. The bots are numbered
+    bottom to top, so stacking them in entity order would leave 1 and 4 in place instead."""
+    viewer, frames, cfg, bank = _viewer_from_rollout(n_enemies=4)
+    frame0 = {k: v[0].copy() for k, v in frames.items()}
+    frame0["ent_alive"][1:5] = True
+    frame0["ent_stun_t"][1:5] = 0.5
+    viewer.frames = {k: v[None] for k, v in frame0.items()}
+    viewer._draw_frame(0)
+    (x_a, _), (x_b, _) = viewer.ax.transData.transform([(0.0, 0.0), (1.0, 0.0)])
+    w, px = viewer.status_text[4].get_window_extent().width / (x_b - x_a), 1.0 / (x_b - x_a)
+    x0, y0 = viewer.W / 2 - w, viewer.H / 2
+    frame0["ent_pos"][0] = (1.0, 1.0)   # the hero, unlabelled, out of the way
+    for e, (dx, dy) in {4: (0.0, 0.0), 3: (0.5, 0.2), 2: (1.75, 0.4), 1: (1.3, 0.6)}.items():
+        frame0["ent_pos"][e] = (x0 + dx * w, y0 + dy * px)
+    viewer._draw_frame(0)
+    viewer.fig.canvas.draw()
+
+    y = {e: viewer.status_text[e].get_position()[1] for e in range(1, 5)}
+    spot = {e: viewer.ammo_text[e].get_position()[1] + 0.25 for e in range(1, 5)}
+    assert y[4] == pytest.approx(spot[4]) and y[2] == pytest.approx(spot[2])
+    assert y[1] > y[3] > spot[3]
+    boxes = [viewer.status_text[e].get_bbox_patch().get_window_extent() for e in range(1, 5)]
+    for a, b in itertools.combinations(boxes, 2):
+        assert not a.overlaps(b)
 
 
 # ---- PNG sprites override the circle/scatter fallback iff a file was actually found -------------

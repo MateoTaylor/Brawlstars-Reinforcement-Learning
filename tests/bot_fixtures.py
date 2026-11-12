@@ -93,7 +93,7 @@ def fresh_state(cfg, params, n_envs=1, enemy_kind=Kind.BOT_SNIPER, person=Person
     """
     state = allocate(cfg, n_envs=n_envs, device="cpu", verbose=False)
     state.ent_alive.fill_(True)
-    state.ent_kind[:, 0] = int(Kind.HERO_MORTIS)
+    state.ent_kind[:, 0] = int(Kind.HERO)
     state.ent_person.fill_(int(person))
     for e in range(1, cfg.n_entities):
         state.ent_kind[:, e] = int(enemy_kind)

@@ -14,14 +14,14 @@ import time as real_time
 import numpy as np
 import pytest
 
-from brawl_vision.object_detection.hp_detection.hero_bars import SuperReading
+from brawl_deployment.perception.super_button import SuperReading
 from scripts import deploy_calibrate as dc
 
 
 def _reading(ready: bool) -> SuperReading:
-    """A charged or spent super track, with the plausible fields filled in."""
+    """A charged or spent Super button."""
     return SuperReading(charge=1.0 if ready else 0.0, ready=ready,
-                        state="ready" if ready else "empty", track_px=96, row=712)
+                        state="ready" if ready else "empty")
 
 
 class _Clock:
@@ -91,11 +91,10 @@ def test_job_super_passes_on_a_drain_that_lands_after_the_old_fixed_window(press
     assert presses == [(dc.ATTACK_SUPER, dc.AIM_BEARING)]
 
 
-def test_job_super_skips_frames_where_the_hero_cannot_be_found(presses):
-    """Mortis's super is a DASH, so the hero detector is least reliable exactly when this job
-    looks, and `super_charge` returns None for both "no player detection" and "track unreadable".
-    A None decides nothing: it is counted and the poll keeps going. The old code scored whatever
-    single frame it happened to land on, so one lost detection read as a failed super."""
+def test_job_super_skips_frames_where_the_button_cannot_be_read(presses):
+    """The Super button reads None while its knob is dragged off centre to aim, which is exactly
+    when this job looks. A None decides nothing: it is counted and the poll keeps going. The old
+    code scored whatever single frame it happened to land on, so one lost read was a failed super."""
     rig = _Rig([_reading(True), None, None, _reading(False)])
     out = dc.job_super(rig, None)
 

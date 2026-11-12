@@ -72,7 +72,7 @@ def test_sample_enemy_kinds_slot_zero_always_hero():
     mask = torch.ones(200, dtype=torch.bool)
     kinds = spawn.sample_enemy_kinds(mask, cfg, gen)
     assert kinds.shape == (200, cfg.n_entities)
-    assert torch.all(kinds[:, 0] == int(Kind.HERO_MORTIS))
+    assert torch.all(kinds[:, 0] == int(Kind.HERO))
 
 
 def test_sample_enemy_kinds_degenerate_weights_are_deterministic():
@@ -102,7 +102,7 @@ def test_sample_enemy_kinds_fixed_types_matches_config():
     mask = torch.ones(5, dtype=torch.bool)
     kinds = spawn.sample_enemy_kinds(mask, cfg, gen)
     expected = torch.tensor([
-        int(Kind.HERO_MORTIS), int(Kind.BOT_SNIPER), int(Kind.BOT_ARTILLERY),
+        int(Kind.HERO), int(Kind.BOT_SNIPER), int(Kind.BOT_ARTILLERY),
         int(Kind.BOT_MELEE), int(Kind.BOT_RIFLE), int(Kind.BOT_SNIPER), int(Kind.BOT_RIFLE),
     ])
     for row in range(5):

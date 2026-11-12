@@ -1,4 +1,5 @@
-"""Known-map labels: the loader's checks, the labeling tool's first pass, and the Dark Passage label.
+"""Known-map labels: the loader's checks, the labeling tool's first pass, and the Dark Passage,
+Starfruit Supernova and Truth labels.
 archive/KNOWN_MAP_LOCALIZATION_PLAN.md step K1.
 
 The spawn cells below were measured from the image by eye before `scripts/map_label.py` existed,
@@ -154,6 +155,115 @@ def test_the_signed_off_dark_passage_label_passes_the_checks_with_its_spawns():
     assert _cells(known.spawns) == sorted(SPAWNS)
 
 
+# Starfruit Supernova (2026-11-04). Unlike Dark Passage's, these came from `find_spawns` and were
+# then checked by eye against the image's ten rings, each centred within 0.03 of a tile centre, so
+# the two tests below pin the label and the finder rather than prove either right. Neither has been
+# signed off by the user yet (MAP_ONBOARDING.md).
+STARFRUIT_SPAWNS = [(26, 4), (44, 6), (14, 7), (51, 14), (7, 22), (56, 35), (5, 40), (55, 45),
+                    (17, 53), (37, 54)]
+
+
+def test_the_first_pass_fits_starfruit_supernova_and_finds_its_ten_spawns():
+    ml = _tool()
+    img = cv2.imread(str(MAPS_DIR / "starfruit_supernova.png"))
+    lat, clarity = ml.fit_lattice(img)
+    assert lat.pitch == pytest.approx((15.74, 15.72), abs=0.02)
+    assert clarity > 2.0
+    side = json.loads((MAPS_DIR / "starfruit_supernova.json").read_text())
+    assert side["pitch_px"] == pytest.approx(lat.pitch, abs=1e-3)
+    assert side["origin_px"] == pytest.approx(lat.origin, abs=1e-3)
+    assert ml.find_spawns(img, lat) == STARFRUIT_SPAWNS
+
+
+def test_the_starfruit_supernova_label_passes_the_checks_with_its_spawns():
+    known = KnownMap.load("starfruit_supernova")
+    assert _cells(known.spawns) == sorted(STARFRUIT_SPAWNS)
+
+
+# Truth (2026-11-05). As with Starfruit's, these came from `find_spawns`. Each ring was then centred
+# by eye within 0.06 of a tile centre (fractional parts .46-.56). One spawn has its own witness:
+# the user's clip starts on (12,26). The game draws Truth with exact half-turn symmetry, and the
+# label has it too, wall textures included, so a cell edited on one side only fails the second
+# test. Teleporter pads are `#` (the user: "recognize them as walls"). Not signed off by the user
+# yet (MAP_ONBOARDING.md).
+TRUTH_SPAWNS = [(28, 12), (38, 16), (19, 17), (46, 23), (12, 26), (47, 33), (13, 36), (40, 42),
+                (21, 43), (31, 47)]
+
+
+def test_the_first_pass_fits_truth_and_finds_its_ten_spawns():
+    ml = _tool()
+    img = cv2.imread(str(MAPS_DIR / "truth.png"))
+    lat, clarity = ml.fit_lattice(img)
+    assert lat.pitch == pytest.approx((15.747, 15.728), abs=0.02)
+    assert clarity > 2.0
+    side = json.loads((MAPS_DIR / "truth.json").read_text())
+    assert side["pitch_px"] == pytest.approx(lat.pitch, abs=1e-3)
+    assert side["origin_px"] == pytest.approx(lat.origin, abs=1e-3)
+    assert ml.find_spawns(img, lat) == TRUTH_SPAWNS
+
+
+def test_the_truth_label_passes_the_checks_with_its_spawns_and_its_half_turn_symmetry():
+    known = KnownMap.load("truth")
+    assert _cells(known.spawns) == sorted(TRUTH_SPAWNS)
+    chars = read_chars(MAPS_DIR / "truth.csv")
+    turned = chars[::-1, ::-1]
+    assert [(int(c), int(r)) for r, c in np.argwhere(chars != turned)] == []
+
+
+# Doom Shroom (2026-11-10). As with Truth's, these came from `find_spawns`, and each ring was then
+# centred by eye within 0.06 of a tile centre (fractional parts .44-.56). The user's clip starts on
+# (28,38). Unlike Truth, the map has no symmetry to check the label against. Bounce, heal and
+# teleporter pads and speed strips are `.`, and fences are `#` (both the user's rules; the fences
+# were `.` until later the same day). Not signed off by the user yet (MAP_ONBOARDING.md).
+DOOM_SHROOM_SPAWNS = [(33, 2), (12, 8), (49, 12), (8, 19), (30, 22), (49, 33), (28, 38), (6, 40),
+                      (53, 53), (26, 55)]
+
+
+def test_the_first_pass_fits_doom_shroom_and_finds_its_ten_spawns():
+    ml = _tool()
+    img = cv2.imread(str(MAPS_DIR / "doom_shroom.png"))
+    lat, clarity = ml.fit_lattice(img)
+    assert lat.pitch == pytest.approx((15.751, 15.723), abs=0.02)
+    assert clarity > 2.0
+    side = json.loads((MAPS_DIR / "doom_shroom.json").read_text())
+    assert side["pitch_px"] == pytest.approx(lat.pitch, abs=1e-3)
+    assert side["origin_px"] == pytest.approx(lat.origin, abs=1e-3)
+    assert ml.find_spawns(img, lat) == DOOM_SHROOM_SPAWNS
+
+
+def test_the_doom_shroom_label_passes_the_checks_with_its_spawns():
+    known = KnownMap.load("doom_shroom")
+    assert _cells(known.spawns) == sorted(DOOM_SHROOM_SPAWNS)
+
+
+# Rockwall Brawl (2026-11-11). As with Doom Shroom's, these came from `find_spawns`, and each ring
+# was then centred by eye within 0.05 of a tile centre (fractional parts .45-.51). The user's clip
+# starts on (37,29). The navy floor checker is faint, so the fit is less clear than the other maps'
+# (1.6 against their 2 and more); the rings agree with it. The map is only partly symmetric (its
+# bush borders differ corner to corner), so every cell was read off the image. The destructible
+# cones are `#` (the user's rule). Signed off by the user on 2026-11-11 with no changes
+# (MAP_ONBOARDING.md).
+ROCKWALL_BRAWL_SPAWNS = [(23, 2), (37, 2), (2, 22), (57, 22), (23, 29), (37, 29), (2, 36),
+                         (57, 36), (23, 57), (37, 57)]
+
+
+def test_the_first_pass_fits_rockwall_brawl_and_finds_its_ten_spawns():
+    ml = _tool()
+    img = cv2.imread(str(MAPS_DIR / "rockwall_brawl.png"))
+    lat, clarity = ml.fit_lattice(img)
+    assert lat.pitch == pytest.approx((15.746, 15.733), abs=0.02)
+    assert clarity > 1.5
+    side = json.loads((MAPS_DIR / "rockwall_brawl.json").read_text())
+    assert side["pitch_px"] == pytest.approx(lat.pitch, abs=1e-3)
+    assert side["origin_px"] == pytest.approx(lat.origin, abs=1e-3)
+    assert ml.find_spawns(img, lat) == ROCKWALL_BRAWL_SPAWNS
+
+
+def test_the_rockwall_brawl_label_passes_the_checks_with_its_spawns():
+    known = KnownMap.load("rockwall_brawl")
+    assert _cells(known.spawns) == sorted(ROCKWALL_BRAWL_SPAWNS)
+
+
 # ---------------------------------------------------------------------------
 # the tool, headless
 # ---------------------------------------------------------------------------
@@ -175,17 +285,33 @@ def _key(lab, key, cell=None):
     KeyEvent("key_press_event", lab.fig.canvas, key, x=xy[0], y=xy[1])._process()
 
 
-def _click(lab, cell):
+def _click(lab, cell, ax=None):
     from matplotlib.backend_bases import MouseEvent
-    x, y = _display(lab, cell)
+    x, y = _display(lab, cell, ax)
     MouseEvent("button_press_event", lab.fig.canvas, x, y, button=1)._process()
     MouseEvent("button_release_event", lab.fig.canvas, x, y, button=1)._process()
 
 
-def _display(lab, cell):
+def _move(lab, cell, ax=None):
+    from matplotlib.backend_bases import MouseEvent
+    x, y = _display(lab, cell, ax)
+    MouseEvent("motion_notify_event", lab.fig.canvas, x, y)._process()
+
+
+def _display(lab, cell, ax=None):
+    """Display pixels of `cell`'s centre on panel `ax` (the image panel by default)."""
     col, row = cell
     (px, py), (ox, oy) = lab.lat.pitch, lab.lat.origin
-    return lab.ax.transData.transform((ox + (col + 0.5) * px, oy + (row + 0.5) * py))
+    return (ax or lab.ax).transData.transform((ox + (col + 0.5) * px, oy + (row + 0.5) * py))
+
+
+def _pixel(lab, cell, ax) -> tuple[int, int, int]:
+    """The colour the window shows at `cell`'s centre on panel `ax`, after a full draw: what the
+    user sees, not what the tool's arrays say."""
+    lab.fig.canvas.draw()
+    rgba = np.asarray(lab.fig.canvas.buffer_rgba())
+    x, y = _display(lab, cell, ax)
+    return tuple(int(v) for v in rgba[rgba.shape[0] - 1 - int(y), int(x), :3])
 
 
 def test_a_new_map_opens_on_the_first_pass_and_saves_what_is_painted(monkeypatch, tmp_path,
@@ -194,7 +320,7 @@ def test_a_new_map_opens_on_the_first_pass_and_saves_what_is_painted(monkeypatch
     assert (tmp_path / "dp.png").read_bytes() == (MAPS_DIR / "dark_passage.png").read_bytes()
     assert int((lab.chars == "S").sum()) == 10
     assert set(np.unique(lab.chars)) == {"?", "S"}
-    assert lab.mode == "clusters"
+    assert lab.mode == "none"
 
     _key(lab, "2")
     _click(lab, (0, 8))
@@ -225,7 +351,6 @@ def test_a_new_map_opens_on_the_first_pass_and_saves_what_is_painted(monkeypatch
     assert "checks: FAIL" in capsys.readouterr().out, "an unfinished label saved as passing"
 
     again = _run_tool(monkeypatch, tmp_path, ["dp"])
-    assert again.mode == "label"
     assert (again.chars == lab.chars).all()
     assert again.lat == lab.lat.from_dict(meta)
 
@@ -245,3 +370,125 @@ def test_matplotlib_does_not_keep_the_keys_the_tool_needs():
     clashes = {name: sorted(set(v) & ml._OURS) for name, v in matplotlib.rcParams.items()
                if name.startswith("keymap.") and isinstance(v, list) and set(v) & ml._OURS}
     assert not clashes, f"matplotlib still claims {clashes}"
+
+
+def _halves(lab):
+    """Two made-up clusters, the left and right halves, so what a fill takes is known."""
+    lab.clusters = np.zeros((60, 60), np.int32)
+    lab.clusters[:, :30] = 1
+
+
+def test_the_label_panel_shows_every_change_at_once(monkeypatch, tmp_path):
+    """2026-11-03, Crystal Eye Castle: the first pass opened on the cluster colours, which no fill
+    changes, so naming 2043 cells floor looked like nothing happened. The label panel draws the
+    label itself, opaque, whatever the image panel shows; this reads the window's pixels."""
+    lab = _run_tool(monkeypatch, tmp_path, ["dp", "--image", str(MAPS_DIR / "dark_passage.png")])
+    _halves(lab)
+    # The legend's swatches as drawn: the key the user reads each cell's colour against.
+    swatch = {char: tuple(round(255 * v) for v in patch.get_facecolor()[:3])
+              for char, patch in zip(_tool().KEYS.values(), lab.legend.get_patches())}
+    assert len(set(swatch.values())) == len(swatch), "two classes share a colour"
+    cell, other = (20, 40), (45, 40)
+
+    def shows(char, at=cell):
+        got = _pixel(lab, at, lab.ax_label)
+        return max(abs(a - b) for a, b in zip(got, swatch[char])) <= 1
+
+    assert shows("?") and shows("?", other)
+    _key(lab, "1")
+    _key(lab, "c", cell)
+    assert shows("."), "a cluster fill did not show, or not in its legend colour"
+    assert shows("?", other), "the fill showed past its cluster"
+
+    _key(lab, "2")
+    _click(lab, cell, lab.ax_label)          # either panel takes paint
+    assert shows("#")
+    _key(lab, "u")
+    assert shows(".")
+
+    for mode in ("clusters", "label", "none"):
+        _key(lab, "g")
+        assert lab.mode == mode
+        assert shows("."), f"the label panel changed with the image panel's overlay ({mode})"
+
+
+def _outline_lines(lab) -> list[tuple[list[int], list[int]]]:
+    """Per outline collection (black and yellow, on each panel): the lattice columns its upright
+    edges sit on, and the rows its level edges sit on."""
+    (px, py), (ox, oy) = lab.lat.pitch, lab.lat.origin
+    out = []
+    for outline in lab.outlines:
+        segs = np.asarray(outline.get_segments()).reshape(-1, 2, 2)
+        upright = np.isclose(segs[:, 0, 0], segs[:, 1, 0])
+        cols = np.unique(np.round((segs[upright, 0, 0] - ox) / px).astype(int))
+        rows = np.unique(np.round((segs[~upright, 0, 1] - oy) / py).astype(int))
+        out.append((cols.tolist(), rows.tolist()))
+    return out
+
+
+def test_hovering_names_the_cell_and_outlines_the_cluster_c_would_fill(monkeypatch, tmp_path):
+    lab = _run_tool(monkeypatch, tmp_path, ["dp", "--image", str(MAPS_DIR / "dark_passage.png")])
+    _halves(lab)
+    (px, py), (ox, oy) = lab.lat.pitch, lab.lat.origin
+    for cell, ax, cid, edges in [((20, 40), lab.ax_label, 1, [0, 30]),
+                                 ((45, 40), lab.ax, 0, [30, 60])]:    # either panel
+        _move(lab, cell, ax)
+        assert f"(col {cell[0]}, row {cell[1]}) UNLABELLED" in lab.status.get_text()
+        assert f"cluster {cid}," in lab.status.get_text()
+        assert _outline_lines(lab) == [(edges, [0, 60])] * 4, "not that half's edge"
+        for box in lab.cursors:
+            assert box.get_visible()
+            assert np.allclose(box.get_xy(), (ox + cell[0] * px, oy + cell[1] * py))
+
+
+def test_closing_the_window_keeps_unsaved_edits(monkeypatch, tmp_path):
+    """2026-11-03: the user's first two sessions on Crystal Eye Castle ended at the window's X,
+    and nothing was written."""
+    from matplotlib.backend_bases import CloseEvent
+    lab = _run_tool(monkeypatch, tmp_path, ["dp", "--image", str(MAPS_DIR / "dark_passage.png")])
+    CloseEvent("close_event", lab.fig.canvas)._process()
+    assert not (tmp_path / "dp.csv").exists(), "closing with no edits wrote a label"
+    _key(lab, "2")
+    _click(lab, (0, 8))
+    CloseEvent("close_event", lab.fig.canvas)._process()
+    saved = read_chars(tmp_path / "dp.csv")
+    assert saved[8, 0] == "#" and (saved == lab.chars).all()
+
+    review = _run_tool(monkeypatch, tmp_path, ["dp", "--review"])
+    _key(review, "1")
+    _click(review, (0, 8))
+    CloseEvent("close_event", review.fig.canvas)._process()
+    assert (read_chars(tmp_path / "dp.csv") == saved).all(), "--review wrote"
+
+
+def test_marked_cells_are_ringed_and_n_centres_each_in_turn(monkeypatch, tmp_path):
+    lab = _run_tool(monkeypatch, tmp_path, ["dp", "--image", str(MAPS_DIR / "dark_passage.png"),
+                                            "--mark", "20,13", "(5,6)"])
+    assert lab.marks == [(20, 13), (5, 6)]
+    for want in [(20, 13), (5, 6), (20, 13)]:
+        _key(lab, "n")
+        x, y = np.mean(lab.ax.get_xlim()), np.mean(lab.ax.get_ylim())
+        assert lab.lat.cell_of(x, y) == want
+        assert lab.ax_label.get_xlim() == lab.ax.get_xlim()
+    _move(lab, (20, 13))
+    assert "[marked]" in lab.status.get_text()
+    _key(lab, "h")
+    assert (lab.ax.get_xlim(), lab.ax.get_ylim()) == lab.full
+    for bad in ("20", "20,13,1", "60,0", "a,b"):
+        with pytest.raises(SystemExit, match="--mark"):
+            _run_tool(monkeypatch, tmp_path, ["dp", "--mark", bad])
+
+
+def test_the_scroll_wheel_zooms_both_panels_about_the_cursor(monkeypatch, tmp_path):
+    from matplotlib.backend_bases import MouseEvent
+    lab = _run_tool(monkeypatch, tmp_path, ["dp", "--image", str(MAPS_DIR / "dark_passage.png")])
+    x, y = _display(lab, (20, 40), lab.ax_label)
+    under = lab.ax_label.transData.inverted().transform((x, y))
+    MouseEvent("scroll_event", lab.fig.canvas, x, y, button="up", step=1)._process()
+    assert np.diff(lab.ax.get_xlim())[0] == pytest.approx(lab.full[0][1] / 1.25)
+    assert lab.ax_label.get_xlim() == lab.ax.get_xlim()
+    lab.fig.canvas.draw()
+    assert np.allclose(lab.ax_label.transData.inverted().transform((x, y)), under, atol=1.0)
+    for _ in range(3):                       # out stops at the whole image
+        MouseEvent("scroll_event", lab.fig.canvas, x, y, button="down", step=-1)._process()
+    assert (lab.ax.get_xlim(), lab.ax.get_ylim()) == lab.full

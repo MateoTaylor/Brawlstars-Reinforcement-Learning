@@ -313,7 +313,8 @@ def test_a_directory_without_train_yaml_is_not_a_run(tmp_path):
 
 
 def _args(**kw):
-    base = {"config": "configs/deployment.yaml", "run": None, "checkpoint": None, "map": None}
+    base = {"config": "configs/deployment.yaml", "run": None, "checkpoint": None, "map": None,
+            "terrain": None}
     return SimpleNamespace(**{**base, **kw})
 
 
@@ -355,3 +356,27 @@ def test_deploy_run_turns_an_unknown_run_into_a_message_not_a_traceback(tmp_path
     monkeypatch.setattr(deploy_run, "resolve_run", lambda name: C.resolve_run(name, runs))
     with pytest.raises(SystemExit, match="no run called 'elite'"):
         deploy_run._config_from_args(_args(run="elite"))
+
+
+def test_deploy_run_takes_the_terrain_classifier_from_the_command_line(tmp_path, monkeypatch):
+    """`--terrain dark_passage` is the way back to the classifier the live Dark Passage sessions
+    ran; without it the shipped yaml keeps terrain.pt (MAP_ONBOARDING.md, Starfruit Supernova)."""
+    from scripts import deploy_run
+
+    runs = _runs(tmp_path, BASE)
+    monkeypatch.setattr(deploy_run, "resolve_run", lambda name: C.resolve_run(name, runs))
+    assert deploy_run._config_from_args(_args(run="mortis_deploy3")).terrain_model == "default"
+    cfg = deploy_run._config_from_args(_args(run="mortis_deploy3", terrain="dark_passage"))
+    assert cfg.terrain_model == "dark_passage"
+
+
+def test_deploy_run_names_a_missing_terrain_model_before_building_anything(tmp_path, monkeypatch):
+    """A fallback that went missing says so at startup, not after the window and the detectors."""
+    import brawl_vision.config as V
+    from scripts import deploy_run
+
+    runs = _runs(tmp_path, BASE)
+    monkeypatch.setattr(deploy_run, "resolve_run", lambda name: C.resolve_run(name, runs))
+    monkeypatch.setitem(V.TERRAIN_MODELS, "dark_passage", tmp_path / "gone.pt")
+    with pytest.raises(SystemExit, match="terrain model 'dark_passage': .*gone.pt is missing"):
+        deploy_run._config_from_args(_args(run="mortis_deploy3", terrain="dark_passage"))

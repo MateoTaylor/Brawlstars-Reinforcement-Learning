@@ -94,7 +94,8 @@ alike means a cell every view agrees on keeps its argmax whatever the weight, so
 change cells the views disagree on, and there it lets the views making no impossible claim win.
 `DepositResult.gap_weighted` counts the cells it touched on a frame. Votes are float32 for it.
 
-Measured with `scripts/vision_score_map.py --gap-weight ...` (same protocol as above; "gaps" is
+Measured with `scripts/vision_score_map.py --gap-weight ...` (same protocol as above; `terrain.pt`
+below is the 09-17 classifier, kept as `terrain_dark_passage.pt` since 2026-11-04; "gaps" is
 the number of one-wide passages the built maps still show over the scored cells, and the labels
 themselves show 23 / 41 / 77 in the same windows, mostly sprite overhang -- see gaps.py):
 

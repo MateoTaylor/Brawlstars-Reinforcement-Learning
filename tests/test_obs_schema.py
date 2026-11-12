@@ -168,6 +168,23 @@ def test_the_gadget_rows_are_declared_as_the_plan_specifies():
     assert (ready.privileged, ready.conditional, frac.privileged, frac.conditional) == (False, None, False, None)
 
 
+def test_the_status_rows_are_declared_as_d6_specifies():
+    """BULL_HERO_PLAN.md D6: seconds left, 0 when nothing runs. None is privileged: the window is
+    the hero's own clock, which the live shadow can keep (Phase 7b), and the three entity timers
+    are the world's state, not a bot's mind. configs/agent_obs_bull.yaml is what keeps those three
+    in the critic."""
+    rows = {name: (s.shape, s.dtype, s.units, s.range, s.privileged, s.conditional)
+            for name, s in schema.OBS_SCHEMA.items()
+            if name in ("hero.slow_window", "entities.slowed_t", "entities.stunned_t",
+                        "entities.airborne_t")}
+    assert rows == {
+        "hero.slow_window": (("N",), "float32", "seconds", (0.0, None), False, None),
+        "entities.slowed_t": (("N", "E"), "float32", "seconds", (0.0, None), False, None),
+        "entities.stunned_t": (("N", "E"), "float32", "seconds", (0.0, None), False, None),
+        "entities.airborne_t": (("N", "E"), "float32", "seconds", (0.0, None), False, None),
+    }
+
+
 def test_the_hero_rows_are_in_build_obs_order_with_the_gadget_after_the_long_dash():
     """The module docstring's promise, which dump_obs_schema.py's top-to-bottom render relies on."""
     declared = [k for k in schema.OBS_SCHEMA if k.startswith("hero.")]

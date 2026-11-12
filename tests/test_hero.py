@@ -49,7 +49,7 @@ def _cfg_and_params(n_envs=1, extra_overrides=None):
 def _fresh_state(cfg, n_envs=1):
     state = allocate(cfg, n_envs=n_envs, device="cpu", verbose=False)
     state.ent_alive.fill_(True)
-    state.ent_kind[:, 0] = int(Kind.HERO_MORTIS)
+    state.ent_kind[:, 0] = int(Kind.HERO)
     for e in range(1, cfg.n_entities):
         state.ent_kind[:, e] = int(Kind.BOT_SNIPER)
     state.map_id.fill_(0)
@@ -193,7 +193,7 @@ def test_a_kind_without_a_gadget_never_gets_the_column():
     the gate exists to prevent."""
     cfg, params = _cfg_and_params()
     state = _fresh_state(cfg)
-    assert float(params.gadget_cooldown[0, int(Kind.HERO_MORTIS)]) == 18.0
+    assert float(params.gadget_cooldown[0, int(Kind.HERO)]) == 18.0
     assert float(params.gadget_cooldown[0, int(Kind.BOT_SNIPER)]) == 0.0
 
     ready = hero.gadget_ready(state, params)
@@ -225,8 +225,8 @@ def test_ammo_regen_zero_to_full_in_max_ammo_times_reload_seconds():
     cfg, params = _cfg_and_params()
     state = _fresh_state(cfg)
     state.ent_ammo.fill_(0.0)
-    max_ammo = params.max_ammo[0, int(Kind.HERO_MORTIS)].item()
-    reload_seconds = params.reload_seconds[0, int(Kind.HERO_MORTIS)].item()
+    max_ammo = params.max_ammo[0, int(Kind.HERO)].item()
+    reload_seconds = params.reload_seconds[0, int(Kind.HERO)].item()
     total_time = max_ammo * reload_seconds
     n_ticks = int(round(total_time / cfg.dt))
 
@@ -264,7 +264,7 @@ def test_firing_pauses_the_reload_for_exactly_attack_cooldown():
     k*dt must block exactly k ticks."""
     cfg, params = _cfg_and_params()
     state = _fresh_state(cfg)
-    kind = int(Kind.HERO_MORTIS)
+    kind = int(Kind.HERO)
     cooldown = params.attack_cooldown[0, kind].item()
     reload_seconds = params.reload_seconds[0, kind].item()
     expected_frozen_ticks = int(round(cooldown / cfg.dt))
@@ -291,6 +291,27 @@ def test_firing_pauses_the_reload_for_exactly_attack_cooldown():
     assert abs((state.ent_ammo[0, 0].item() - before) - cfg.dt / reload_seconds) < 1e-6
 
 
+@pytest.mark.parametrize("cooldown, ticks", [(0.25, 5), (0.35, 7), (0.50, 10), (1.00, 20)])
+def test_every_shipped_attack_cooldown_blocks_exactly_its_whole_ticks(cooldown, ticks):
+    """Literals for every shipped `attack_cooldown`: Bull and the 0.25-s bots, Mortis, Edgar, Buzz.
+    The cooldown blocks the reload for exactly its whole ticks and reads 0 on the last of them,
+    the tick its owner may fire again (`can_attack` reads it after the decrement). A plain float32
+    clamp leaves ~1e-8 s after the fifth tick of 0.25 and held it a sixth, so the countdown snaps
+    as the status timers do (user, 2026-10-23)."""
+    cfg, params = _cfg_and_params()
+    state = _fresh_state(cfg)
+    state.ent_ammo.fill_(0.0)
+    state.ent_attack_cd[:, 0] = cooldown
+    for tick in range(1, ticks + 1):
+        before = state.ent_ammo[0, 0].item()
+        hero.tick_timers(state, params, cfg)
+        assert state.ent_ammo[0, 0].item() == before, f"reloaded on tick {tick} of {ticks}"
+        assert (state.ent_attack_cd[0, 0].item() == 0) == (tick == ticks), f"tick {tick}"
+    before = state.ent_ammo[0, 0].item()
+    hero.tick_timers(state, params, cfg)
+    assert state.ent_ammo[0, 0].item() > before
+
+
 def test_reload_is_not_paused_when_no_cooldown_is_running():
     """The other half of the gate: an idle entity reloads at the full rate; the pause covers the
     FIRING case only -- `test_ammo_regen_zero_to_full_in_max_ammo_times_reload_seconds`
@@ -300,7 +321,7 @@ def test_reload_is_not_paused_when_no_cooldown_is_running():
     state = _fresh_state(cfg)
     state.ent_ammo.fill_(0.0)
     state.ent_attack_cd.fill_(0.0)
-    reload_seconds = params.reload_seconds[0, int(Kind.HERO_MORTIS)].item()
+    reload_seconds = params.reload_seconds[0, int(Kind.HERO)].item()
 
     hero.tick_timers(state, params, cfg)
     assert abs(state.ent_ammo[0, 0].item() - cfg.dt / reload_seconds) < 1e-6
@@ -313,8 +334,8 @@ def test_ammo_refills_to_max_and_never_past_it():
     cfg, params = _cfg_and_params()
     state = _fresh_state(cfg)
     state.ent_ammo.fill_(0.0)
-    max_ammo = params.max_ammo[0, int(Kind.HERO_MORTIS)].item()
-    reload_seconds = params.reload_seconds[0, int(Kind.HERO_MORTIS)].item()
+    max_ammo = params.max_ammo[0, int(Kind.HERO)].item()
+    reload_seconds = params.reload_seconds[0, int(Kind.HERO)].item()
     for _ in range(math.ceil(1.15 * max_ammo * reload_seconds / cfg.dt)):
         hero.tick_timers(state, params, cfg)
     assert state.ent_ammo[0, 0].item() == pytest.approx(max_ammo)
@@ -359,8 +380,8 @@ def test_dash_at_wall_clips_short_of_full_distance():
     tiles[:, 5] = Tile.WALL  # wall face at x=5.0
     bank = _bank_from_grid(tiles)
 
-    dash_distance = params.dash_distance[0, int(Kind.HERO_MORTIS)].item()
-    dash_duration = params.dash_duration[0, int(Kind.HERO_MORTIS)].item()
+    dash_distance = params.dash_distance[0, int(Kind.HERO)].item()
+    dash_duration = params.dash_duration[0, int(Kind.HERO)].item()
 
     # Stand half a dash away from the wall face at x=5.0, so the wall always clips the dash to
     # roughly half its length no matter what brawlers.yaml's dash_distance happens to be. The
@@ -417,7 +438,7 @@ def test_dashing_into_a_wall_does_not_permanently_trap_the_entity():
     move_dir[0, 0] = torch.tensor([1.0, 0.0])  # dash east, straight into the wall
 
     hero.start_dash(state, fire, move_dir, bank, params, cfg)
-    n_ticks = int(round(params.dash_duration[0, int(Kind.HERO_MORTIS)].item() / cfg.dt)) + 1
+    n_ticks = int(round(params.dash_duration[0, int(Kind.HERO)].item() / cfg.dt)) + 1
     for _ in range(n_ticks):
         hero.advance_dash(state, params, cfg)
     assert state.ent_dash_t[0, 0].item() == 0.0  # dash finished, normal movement active again
@@ -449,7 +470,7 @@ def test_dash_at_water_stops_at_shoreline():
     move_dir[0, 0] = torch.tensor([1.0, 0.0])
 
     hero.start_dash(state, fire, move_dir, bank, params, cfg)
-    dash_duration = params.dash_duration[0, int(Kind.HERO_MORTIS)].item()
+    dash_duration = params.dash_duration[0, int(Kind.HERO)].item()
     traveled = state.ent_dash_speed[0, 0].item() * dash_duration
     radius = params.unit_radius[0].item()
     # water blocks bodies like a wall: the body stops at the shoreline, x = 5.0
@@ -470,8 +491,8 @@ def test_dash_open_floor_travels_full_distance():
     move_dir[0, 0] = torch.tensor([1.0, 0.0])
 
     hero.start_dash(state, fire, move_dir, bank, params, cfg)
-    dash_distance = params.dash_distance[0, int(Kind.HERO_MORTIS)].item()
-    dash_duration = params.dash_duration[0, int(Kind.HERO_MORTIS)].item()
+    dash_distance = params.dash_distance[0, int(Kind.HERO)].item()
+    dash_duration = params.dash_duration[0, int(Kind.HERO)].item()
     traveled = state.ent_dash_speed[0, 0].item() * dash_duration
     assert abs(traveled - dash_distance) < cfg.los_step_tiles + 1e-3
 
@@ -490,8 +511,8 @@ def test_start_dash_consumes_ammo_and_sets_timers():
 
     hero.start_dash(state, fire, move_dir, bank, params, cfg)
 
-    dash_duration = params.dash_duration[0, int(Kind.HERO_MORTIS)].item()
-    attack_cooldown = params.attack_cooldown[0, int(Kind.HERO_MORTIS)].item()
+    dash_duration = params.dash_duration[0, int(Kind.HERO)].item()
+    attack_cooldown = params.attack_cooldown[0, int(Kind.HERO)].item()
     assert state.ent_ammo[0, 0].item() == 2.0
     assert abs(state.ent_dash_t[0, 0].item() - dash_duration) < 1e-5
     assert state.ent_invuln_t[0, 0].item() == 0.0  # the dash grants no i-frames (2026-09-25)
@@ -561,7 +582,7 @@ def _run_full_dash(cfg, params, state, dash_dir_xy):
     move_dir[0, 0] = torch.tensor(dash_dir_xy)
     hero.start_dash(state, fire, move_dir, bank, params, cfg)
 
-    n_ticks = int(round(params.dash_duration[0, int(Kind.HERO_MORTIS)].item() / cfg.dt)) + 1
+    n_ticks = int(round(params.dash_duration[0, int(Kind.HERO)].item() / cfg.dt)) + 1
     total_dmg_ent = torch.zeros(1, cfg.n_entities)
     for _ in range(n_ticks):
         dmg_ent, dmg_by, dmg_box = hero.advance_dash(state, params, cfg)
@@ -600,9 +621,9 @@ def test_advance_dash_hits_stationary_enemy_exactly_once():
 
     total_dmg = _run_full_dash(cfg, params, state, [1.0, 0.0])
 
-    expected_hit_dmg = params.base_damage[0, int(Kind.HERO_MORTIS)].item()
-    # HERO_MORTIS has no proj/attack stats beyond dash -- its "damage" for the dash hit is
-    # effective_damage(HERO kind, cubes=0, params), i.e. base_damage unscaled.
+    expected_hit_dmg = params.base_damage[0, int(Kind.HERO)].item()
+    # Mortis (the default Kind.HERO) has no proj/attack stats beyond dash -- its "damage" for the
+    # dash hit is effective_damage(HERO kind, cubes=0, params), i.e. base_damage unscaled.
     hits = (total_dmg[0, 1] / max(expected_hit_dmg, 1e-6)).round().item()
     assert hits == 1, f"expected exactly one hit, got {total_dmg[0, 1]} (~{hits}x base damage)"
     # ...and the body it hit did not stop the dash: halting at first contact would leave the
@@ -649,7 +670,7 @@ def _dashes_through_box(extra_overrides, ahead, n_dashes=1):
     fire[0, 0] = True
     move_dir = torch.zeros(1, cfg.n_entities, 2)
     move_dir[0, 0] = torch.tensor([1.0, 0.0])
-    n_ticks = int(round(params.dash_duration[0, int(Kind.HERO_MORTIS)].item() / cfg.dt)) + 1
+    n_ticks = int(round(params.dash_duration[0, int(Kind.HERO)].item() / cfg.dt)) + 1
     total = 0.0
     for _ in range(n_dashes):
         state.ent_pos[0, 0] = torch.tensor([2.0, 10.0])
@@ -659,7 +680,7 @@ def _dashes_through_box(extra_overrides, ahead, n_dashes=1):
             _, _, dmg_box = hero.advance_dash(state, params, cfg)
             total += dmg_box[0, 0].item()
         assert not state.ent_dash_box_hits.any()  # never carried past the dash that set it
-    return total, params.base_damage[0, int(Kind.HERO_MORTIS)].item()
+    return total, params.base_damage[0, int(Kind.HERO)].item()
 
 
 def test_a_dash_hits_a_crate_once_under_dash_hits_once():
@@ -705,7 +726,7 @@ def test_long_dash_charges_only_by_not_attacking_never_reset_by_damage():
     shot at while repositioning must still build his long dash."""
     cfg, params = _cfg_and_params()
     state = _mortis_state(cfg, params)
-    threshold = params.long_dash_seconds[0, int(Kind.HERO_MORTIS)].item()
+    threshold = params.long_dash_seconds[0, int(Kind.HERO)].item()
 
     for _ in range(int(round(threshold / cfg.dt)) + 1):
         hero.tick_timers(state, params, cfg)
@@ -720,7 +741,7 @@ def test_long_dash_charges_only_by_not_attacking_never_reset_by_damage():
 def test_long_dash_charge_fraction_ramps_then_saturates():
     cfg, params = _cfg_and_params()
     state = _mortis_state(cfg, params)
-    threshold = params.long_dash_seconds[0, int(Kind.HERO_MORTIS)].item()
+    threshold = params.long_dash_seconds[0, int(Kind.HERO)].item()
 
     state.ent_attack_idle_t.fill_(0.0)
     assert abs(float(hero.long_dash_charge_frac(state, params)[0, 0])) < 1e-6
@@ -749,7 +770,7 @@ def test_charged_dash_covers_exactly_the_multiplier_times_the_distance():
     # too little room to be sure neither dash is clipped by the border wall.
     cfg, params = _cfg_and_params(extra_overrides={"world": {"map_h": 60, "map_w": 60}})
     bank = _bank_from_grid(_grid(60, 60))   # wide open, so nothing clips either dash
-    kind = int(Kind.HERO_MORTIS)
+    kind = int(Kind.HERO)
     distance = params.dash_distance[0, kind].item()
     multiplier = params.long_dash_multiplier[0, kind].item()
     duration = params.dash_duration[0, kind].item()
@@ -778,7 +799,7 @@ def test_a_charged_dash_into_a_wall_still_lands_the_body_clear_of_it():
     circle is not clear, so from inside a wall every escape attempt fails identically forever.
     Sweeps the approach distance so the clip is exercised across its whole range."""
     cfg, params = _cfg_and_params(extra_overrides={"world": {"map_h": 60, "map_w": 60}})
-    kind = int(Kind.HERO_MORTIS)
+    kind = int(Kind.HERO)
     reach = params.dash_distance[0, kind].item() * params.long_dash_multiplier[0, kind].item()
     radius = params.unit_radius[0].item()
 
@@ -854,7 +875,7 @@ def test_no_dash_approach_angle_can_leave_an_entity_stuck_against_a_wall():
     """
     k = 120
     cfg, params = _cfg_and_params(n_envs=k, extra_overrides={"world": {"map_h": 60, "map_w": 60}})
-    kind = int(Kind.HERO_MORTIS)
+    kind = int(Kind.HERO)
     radius = params.unit_radius[0].item()
     tiles = _grid(60, 60)
     tiles[:, 30] = Tile.WALL                    # the face is x = 30
@@ -918,7 +939,7 @@ def test_a_dash_alongside_a_wall_with_the_body_clear_is_not_shortened():
     start = torch.tensor([[30.0 - radius - 0.05, 20.0]])
 
     landed, _ = _dash_batch(cfg, params, bank, start, torch.tensor([0.0, 1.0]), charged=False)
-    expected = params.dash_distance[0, int(Kind.HERO_MORTIS)].item()
+    expected = params.dash_distance[0, int(Kind.HERO)].item()
     assert abs(float((landed[0] - start[0]).norm()) - expected) < 1e-3
 
 
@@ -932,7 +953,7 @@ def test_dash_travels_exactly_its_clipped_distance():
     """
     cfg, params = _cfg_and_params(extra_overrides={"world": {"map_h": 60, "map_w": 60}})
     bank = _bank_from_grid(_grid(60, 60))
-    kind = int(Kind.HERO_MORTIS)
+    kind = int(Kind.HERO)
 
     for charged in (False, True):
         expected = params.dash_distance[0, kind].item()
@@ -1066,7 +1087,7 @@ def test_auto_aim_reach_is_the_dash_reach_and_grows_with_the_long_dash():
     `unit_radius` for an enemy, the crate's radius for a crate. Just outside is no target, just
     inside is; a charged long dash multiplies the distance, and the reach grows with it."""
     cfg, params = _auto_cfg_and_params()
-    kind = int(Kind.HERO_MORTIS)
+    kind = int(Kind.HERO)
     state = _fresh_state(cfg)
     state.ent_pos[0, 0] = torch.tensor([10.0, 10.0])
     state.ent_pos[0, 1:] = torch.tensor([50.0, 50.0])

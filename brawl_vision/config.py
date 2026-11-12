@@ -39,6 +39,49 @@ EMULATOR_HUD_MASK_PATH = DATA_DIR / "hud_mask_emulator.json"      # BlueStacks +
 # (`terrain.labeling.LabelGrid.hud`). The phone's Layout B has no mask of its own yet.
 HUD_MASKS = {"phone": HUD_MASK_PATH, "emulator": EMULATOR_HUD_MASK_PATH}
 TERRAIN_WEIGHTS_PATH = DATA_DIR / "terrain.pt"
+# The shipped terrain classifiers, by the name a session picks one with (`terrain.model` in
+# configs/deployment.yaml, `--terrain` on deploy_run.py and replay_clip.py). Names, not paths, for
+# the reason above: a name can only reach weights that were validated.
+#   default       terrain.pt. Since 2026-11-04 the classifier trained with Starfruit Supernova's
+#                 projected labels (MAP_ONBOARDING.md, Starfruit Supernova).
+#   dark_passage  the one before it, which every live Dark Passage session ran. Frozen: a test pins
+#                 its hash. If the file is ever lost, it is terrain.pt's blob at commit 7db0cc0.
+#   truth         terrain_truth.pt (2026-11-05): default's labels plus Truth's projected ones, for
+#                 sessions on Truth (MAP_ONBOARDING.md, Truth). A name of its own rather than a
+#                 new terrain.pt: which classifier is the default is the user's call. A test pins
+#                 its hash too.
+#   doom_shroom   terrain_doom_shroom.pt (2026-11-11): default's labels plus Truth's and both Doom
+#                 Shroom recordings' projected ones, for sessions on Doom Shroom, where the default
+#                 never fixes (MAP_ONBOARDING.md, Doom Shroom). Its own name for the same reason; a
+#                 test pins its hash too. It is v3, trained after the user made the map's fences
+#                 walls (the doc's "Classifier v3"); v1 and v2 are deleted.
+#   rockwall_brawl  terrain_rockwall_brawl.pt (2026-11-11): doom_shroom's labels plus Rockwall
+#                 Brawl's projected ones, for sessions on Rockwall Brawl, whose blue palette the
+#                 older classifiers read with bush and wall swapped, so none of them fixes there
+#                 (MAP_ONBOARDING.md, Rockwall Brawl). Its own name for the same reason; a test
+#                 pins its hash too.
+TERRAIN_MODELS = {
+    "default": TERRAIN_WEIGHTS_PATH,
+    "dark_passage": DATA_DIR / "terrain_dark_passage.pt",
+    "truth": DATA_DIR / "terrain_truth.pt",
+    "doom_shroom": DATA_DIR / "terrain_doom_shroom.pt",
+    "rockwall_brawl": DATA_DIR / "terrain_rockwall_brawl.pt",
+}
+
+
+def terrain_weights(name: str = "default") -> Path:
+    """The weights of the shipped terrain classifier called `name` (`TERRAIN_MODELS`).
+
+    Raises for a name that was never shipped or a file that is gone, so a caller can check before
+    it builds anything: a typo, or a lost fallback, then costs a second rather than a startup.
+    """
+    if name not in TERRAIN_MODELS:
+        raise ValueError(f"no terrain model called {name!r}; shipped: {', '.join(TERRAIN_MODELS)}")
+    path = TERRAIN_MODELS[name]
+    if not path.is_file():
+        raise FileNotFoundError(f"terrain model {name!r}: {path} is missing")
+    return path
+
 
 _MISSING = object()
 _ABSENT = object()
@@ -100,6 +143,23 @@ class VisionConfig:
     # world frame mid-match, which costs Phase I far more than a noisy step. 0.75 sits between
     # the p01 of good frames and the 0.0 a real cut produces.
     odometry_min_agreement_ratio: float = 0.75
+    # The screen-static overlay rule (brawl_vision/terrain/odometry.py's docstring, 2026-11-05).
+    # A window whose shift is at most `still_tiles` reads a screen-static picture. MEASURED on
+    # the Truth, Starfruit and Dark Passage BlueStacks clips: windows on the hero, its name tag
+    # or the SHOWDOWN banner read 0.000-0.029 tiles, while the slowest walk is ~0.07 per frame at
+    # 30 fps and ~0.2 per 12 Hz tick.
+    odometry_still_tiles: float = 0.03
+    # Grey levels by which one candidate's residual must beat the other's for a pixel to decide.
+    # It keeps flat floor and compression noise out of the vote. Real splits are decided by 80k
+    # to 400k pixels at 8.
+    odometry_overlay_grey: float = 8.0
+    # Share of the deciding pixels the moving windows must explain to carry the estimate.
+    # MEASURED on the same clips with scripts/probes/odometry_overlay/vote.py, which runs the
+    # shipped rule. In a match at the deployed 12 Hz, the moving group won at 0.80-0.95 and lost
+    # at 0.04-0.26. At 30 fps its lowest win was 0.53, at the death that ends Truth's first match.
+    # Outside a match (lobby, loading, results) votes land anywhere from 0.05 to 0.89. They only
+    # move the world origin, which the localizer fixes at the gate. 1.0 turns the rule off.
+    odometry_overlay_share: float = 0.5
 
     # --- zone / gas (Phase G) ------------------------------------------------------------
     # MEASURED in Phase G on three visually different maps (configs/vision.yaml names them).
@@ -258,38 +318,6 @@ class VisionConfig:
     # and 35 as its shoulders. `AmmoReading.pip_px` reports the frame's own longest run against
     # it, so drift shows up rather than silently scaling every reading.
     hp_ammo_pip_px: int = 34
-    # --- super charge (hp_detection/hero_bars). One track below the ammo pips, same stack, and
-    # unlike ammo it is SELF-NORMALIZING: the empty remainder is painted in its own colour, so the
-    # denominator is the track's own extent rather than a calibrated constant. MEASURED on
-    # bluestacks-example-new.mp4 over 181 located frames -- 3890 filled px, 6494 ready px, 1720
-    # empty px, each sampled from a run identified by structure rather than by these thresholds.
-    #
-    # Filled: hue 26-29, sat 114-197, val 219-255. Widened at the dark/dull end for the same
-    # reason the ammo band is: the leading edge of a growing bar is drawn dimmer.
-    hp_super_hue: tuple[int, int] = (20, 35)
-    hp_super_sat_min: int = 100
-    hp_super_val_min: int = 180
-    # Ready: hue 162-166 at saturation EXACTLY 255 in every percentile, val 189-234. This is a
-    # third state, not "full yellow" -- see hero_bars.read_super for why a reader without it
-    # reports 0.0 charge at the exact moment the super is available.
-    hp_super_ready_hue: tuple[int, int] = (155, 172)
-    hp_super_ready_sat_min: int = 230
-    hp_super_ready_val_min: int = 160
-    # Empty: hue 124-133, sat 102-143, val 74-99. Narrow on purpose, and the narrowness is the
-    # whole point -- a first pass used sat >= 80, val 60-140 and the mask ate the map behind the
-    # widget, returning "tracks" of 110-225 px for a 108 px widget. Dark blue-purple is what this
-    # map is made of; only the tight val band separates the widget from it.
-    hp_super_empty_hue: tuple[int, int] = (117, 137)
-    hp_super_empty_sat: tuple[int, int] = (90, 165)
-    hp_super_empty_val: tuple[int, int] = (62, 118)
-    # The track's full width at the calibrated 2002x1126 viewport, and how far a frame's own extent
-    # may differ. A SANITY GATE, not a denominator: the reading divides by the extent this frame
-    # actually found, and this constant only decides whether that extent is credible. MEASURED as
-    # the median of 171 successful reads -- p10 113, p50 116, p90 118, sd 3.3. A first pass put it
-    # at 108 by measuring only the magenta ready-state run, which stops at the widget's rounded end
-    # where the bridged filled+empty track does not.
-    hp_super_track_px: int = 116
-    hp_super_track_tol_px: int = 22
     # --- temporal (smooth.HealthTracker). All in FRAMES, at whatever rate the caller drives it;
     # at the 4 Hz decision rate confirm_frames 2 is 500 ms of latency on a real change.
     # A changed HP must be seen this many times before it replaces the committed value, unless it
@@ -350,6 +378,9 @@ _VISION_CONFIG_FIELDS = (
     ("odometry.min_windows", "odometry_min_windows", int),
     ("odometry.max_disagreement_tiles", "odometry_max_disagreement_tiles", float),
     ("odometry.min_agreement_ratio", "odometry_min_agreement_ratio", float),
+    ("odometry.still_tiles", "odometry_still_tiles", float),
+    ("odometry.overlay_grey", "odometry_overlay_grey", float),
+    ("odometry.overlay_share", "odometry_overlay_share", float),
     ("zone.hsv_low", "zone_hsv_low", lambda v: tuple(int(x) for x in v)),
     ("zone.open_px", "zone_open_px", int),
     ("zone.min_cell_pixels", "zone_min_cell_pixels", float),
@@ -386,17 +417,6 @@ _VISION_CONFIG_FIELDS = (
     ("hp.ammo_sat_min", "hp_ammo_sat_min", int),
     ("hp.ammo_val_min", "hp_ammo_val_min", int),
     ("hp.ammo_pip_px", "hp_ammo_pip_px", int),
-    ("hp.super_hue", "hp_super_hue", lambda v: tuple(int(x) for x in v)),
-    ("hp.super_sat_min", "hp_super_sat_min", int),
-    ("hp.super_val_min", "hp_super_val_min", int),
-    ("hp.super_ready_hue", "hp_super_ready_hue", lambda v: tuple(int(x) for x in v)),
-    ("hp.super_ready_sat_min", "hp_super_ready_sat_min", int),
-    ("hp.super_ready_val_min", "hp_super_ready_val_min", int),
-    ("hp.super_empty_hue", "hp_super_empty_hue", lambda v: tuple(int(x) for x in v)),
-    ("hp.super_empty_sat", "hp_super_empty_sat", lambda v: tuple(int(x) for x in v)),
-    ("hp.super_empty_val", "hp_super_empty_val", lambda v: tuple(int(x) for x in v)),
-    ("hp.super_track_px", "hp_super_track_px", int),
-    ("hp.super_track_tol_px", "hp_super_track_tol_px", int),
     ("hp.confirm_frames", "hp_confirm_frames", int),
     ("hp.max_misses", "hp_max_misses", int),
     ("hp.instant_confidence", "hp_instant_confidence", float),
@@ -491,6 +511,20 @@ def validate(cfg: VisionConfig) -> None:
     if cfg.odometry_max_shift_tiles <= 0:
         raise ValueError(
             f"odometry.max_shift_tiles must be > 0, got {cfg.odometry_max_shift_tiles}"
+        )
+    if not 0.0 < cfg.odometry_still_tiles < cfg.odometry_max_disagreement_tiles:
+        raise ValueError(
+            "odometry.still_tiles must be > 0 and below max_disagreement_tiles: a window that "
+            "still counts as agreeing with the motion cannot also be screen-static. Got "
+            f"{cfg.odometry_still_tiles}"
+        )
+    if cfg.odometry_overlay_grey <= 0:
+        raise ValueError(f"odometry.overlay_grey must be > 0, got {cfg.odometry_overlay_grey}")
+    if not 0.5 <= cfg.odometry_overlay_share <= 1.0:
+        raise ValueError(
+            "odometry.overlay_share is a majority in [0.5, 1.0] (1.0 turns the rule off): below "
+            "half, the moving windows would win while explaining less of the view than the "
+            f"still ones. Got {cfg.odometry_overlay_share}"
         )
 
     for name, value in (("hsv_low", cfg.zone_hsv_low), ("hsv_high", cfg.zone_hsv_high)):
@@ -610,22 +644,6 @@ def validate(cfg: VisionConfig) -> None:
         )
     if cfg.hp_ammo_pip_px <= 0:
         raise ValueError(f"hp.ammo_pip_px is a pixel width, got {cfg.hp_ammo_pip_px}")
-    if cfg.hp_super_track_px <= 0:
-        raise ValueError(f"hp.super_track_px is a pixel width, got {cfg.hp_super_track_px}")
-    if not 0 < cfg.hp_super_track_tol_px < cfg.hp_super_track_px:
-        raise ValueError(
-            f"hp.super_track_tol_px ({cfg.hp_super_track_tol_px}) must be positive and below "
-            f"hp.super_track_px ({cfg.hp_super_track_px}) -- a tolerance as wide as the track "
-            f"accepts any run at all, which is the gate's only job to refuse"
-        )
-    # The empty remainder's mask is the one that decides the DENOMINATOR, so a band wide enough to
-    # admit the map behind the widget silently inflates the track and deflates every reading. A
-    # first pass at these numbers did exactly that; see the comment on hp_super_empty_val.
-    for name in ("hp_super_empty_hue", "hp_super_empty_sat", "hp_super_empty_val"):
-        lo, hi = getattr(cfg, name)
-        if lo >= hi:
-            raise ValueError(f"{name.replace('_', '.', 1)} must be (low, high) with low < high, "
-                             f"got {(lo, hi)!r}")
     if not 0 <= cfg.hp_white_max_sat <= 255:
         raise ValueError(f"hp.white_max_sat must be in [0, 255], got {cfg.hp_white_max_sat}")
     if not 0 <= cfg.hp_white_min_val <= 255:
@@ -652,8 +670,7 @@ def validate(cfg: VisionConfig) -> None:
         value = getattr(cfg, name)
         if not 0.0 <= value <= 1.0:
             raise ValueError(f"{name.replace('_', '.', 1)} must be in [0, 1], got {value}")
-    for name in ("hp_bar_hue_player", "hp_bar_hue_enemy", "hp_ammo_hue",
-                 "hp_super_hue", "hp_super_ready_hue"):
+    for name in ("hp_bar_hue_player", "hp_bar_hue_enemy", "hp_ammo_hue"):
         value = getattr(cfg, name)
         if len(value) != 2:
             raise ValueError(f"{name.replace('_', '.', 1)} must be (low, high), got {value!r}")

@@ -363,7 +363,7 @@ def test_the_real_checkpoint_loads_and_decides_from_an_assembled_observation(run
                   "can_attack": True, "dashing": False, "dash_t": 0.0, "dash_dir": (0.0, 0.0),
                   "invuln": False, "long_dash_ready": True, "long_dash_frac": 1.0,
                   "super_ready": False, "super_charge_frac": 0.4,
-                  "gadget_ready": False, "gadget_charge_frac": 0.5}
+                  "gadget_ready": False, "gadget_charge_frac": 0.5, "slow_window": 0.0}
     rng = np.random.default_rng(0)
     # Super and gadget masked off throughout; everything else the run has stays legal.
     legal = (True, True, False, False) + (True,) * (int(pol.cfg.action_nvec[1]) - 4)

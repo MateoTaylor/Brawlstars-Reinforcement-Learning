@@ -72,10 +72,13 @@ from collections import deque
 from dataclasses import dataclass
 from enum import Enum
 from pathlib import Path
+from types import SimpleNamespace
 
 import numpy as np
 
+from brawl_sim.config import DEFAULT_HERO, kind_yaml_names
 from brawl_sim.constants import Tile
+from brawl_sim.core import hero as sim_hero
 from brawl_sim.core.projectiles import BOX_RADIUS
 from brawl_vision.config import EMULATOR_HUD_MASK_PATH
 
@@ -109,20 +112,34 @@ HUD_MASK_PATH = EMULATOR_HUD_MASK_PATH
 # rationale is a duration should not silently become 3.3 s when the perception rate moves (§6.13).
 ODOMETRY_LOST_SECONDS = 2.0
 
+# While the loop waits, how often it logs the peak of each match-gate look (`_note_waiting`). A
+# gate that never opened used to leave one line, "waiting for the match gate", and nothing after:
+# on 2026-11-04 the real app drew no hypercharge, the gate peaked at 0.32 for a whole match, and
+# the run gave no sign of why (§5.2).
+WAIT_LOG_SECONDS = 10.0
+
+# How long after the gate opens the loop looks for the gadget's disc before deciding this match's
+# brawler has none (`_look_for_gadget`, §5.2). Not one look on the gate's own tick: the disc comes
+# up with the other controls and then flashes white for ~0.2 s, a shine sweeping its face, reading
+# 0.19-0.27 at the brightest on both Nulls clips frame by frame. A look that lands in the flash
+# reads a drawn gadget as absent. The live gate opens ~0.42 s in, after it. The real app's empty
+# spot never passed 0.17 in a match's first 2 s, against the 0.45 a sighting needs.
+GADGET_LOOK_SECONDS = 1.0
+
 # Telemetry ring depth: 4000 rows is >5 minutes at any admitted tick rate (333 s at 12 Hz), one
 # match plus margin, and ~1 MB of scalars. Fixed-size on purpose (§7) -- the resource risk in this
 # package is unbounded growth, not size.
 TELEMETRY_ROWS = 4000
 
-# The repo's configs, for `dash_reach_tiles`: the same directory `perception/shadow.py` and
+# The repo's configs, for `attack_reach_tiles`: the same directory `perception/shadow.py` and
 # `perception/grid.py` resolve for the kit constants and the view.
 _CONFIGS_DIR = Path(__file__).resolve().parents[1] / "configs"
 
-# The brawler the loop deploys: the `configs/brawlers.yaml` block the shadow dead-reckons from
-# and `dash_reach_tiles` takes `dash_radius` from. One name, so the two cannot default apart
-# (`ShadowParams` carries no `kind`, and shadow.py is not this package's to change for that).
-# Only Mortis deploys today; a second kind would make this a `DeploymentConfig` field.
-HERO_KIND = "hero_mortis"
+# The heroes `ShadowHero` can dead-reckon. The hero itself comes from the run (`policy.cfg.hero`,
+# BULL_HERO_PLAN.md D8), and the shadow loads that hero's kit by name, but it models only the kits
+# written into it: Mortis's dash and Bull's volley, charge and Berserker (§5.7b). Any other hero
+# is refused at startup rather than played with timers the shadow does not have.
+SHADOW_KINDS = ("hero_mortis", "hero_bull")
 
 # The longest coast, in decisions, after which an enemy track still counts as where the enemy is:
 # for the auto-aimed attack's target (`_auto_aim`) and the `enemy_in_reach` telemetry. It is the
@@ -204,7 +221,7 @@ class TickRow:
     # so a fresh match's first row reads 0b1011. `attack_cd_shadow` / `attack_idle_t_shadow`
     # are the shadow's two timers the audit reads (phasing loss and long-dash waiting).
     # `enemy_in_reach` is the audit's own criterion applied to the tracks the assembler was given:
-    # any enemy within `dash_distance + dash_radius + unit_radius` tiles of the hero
+    # any enemy within the sim's `hero.in_reach_radius` of the hero, 3.77 tiles for Mortis
     # (`DeployLoop.reach_tiles`, from the configs -- not a literal).
     attack_legal: int = -1
     attack_cd_shadow: float = -1.0
@@ -308,50 +325,46 @@ def read_telemetry_csv(path) -> list[TickRow]:
         return [TickRow.from_record(record) for record in csv.DictReader(fh)]
 
 
-def dash_reach_tiles(params: ShadowParams, *, kind: str = HERO_KIND,
-                     brawlers_path=None, env_config_path=None) -> float:
-    """`dash_distance + dash_radius + unit_radius` in tiles: the uncharged dash's "certainly could
-    have hit" radius, which is `scripts/audit_attack_cadence.py`'s `enemy_in_reach` criterion
-    restated from the deployment's own sources. `dash_distance` is the shadow's
-    (`ShadowParams`, from `configs/brawlers.yaml`); `dash_radius` is read from the same brawler
-    block, and `unit_radius` from `entities.unit_radius` in `configs/default.yaml`, the way
-    `GridSpec.load` reads that file for the view -- neither is a field the shadow needs, so
-    neither is on `ShadowParams`, and a literal here would drift the moment the sim's changed.
-    A randomized range for either raises for the reason `ShadowParams.load` gives."""
-    dash_radius, unit_radius = _reach_radii(kind, brawlers_path, env_config_path)
-    return float(params.dash_distance) + dash_radius + unit_radius
+def attack_reach_tiles(hero: str = DEFAULT_HERO) -> float:
+    """`scripts/audit_attack_cadence.py`'s `enemy_in_reach` radius for `hero`, in tiles: the sim's
+    own `hero.in_reach_radius`, so the deployment's criterion is the reward's float rather than a
+    restatement of it. Mortis: his uncharged dash plus an enemy's body, 3.77. Bull: the farthest
+    an enemy still takes most of his volley, 5.42."""
+    state, params = _hero_alone(hero, long_dash=False)
+    return float(sim_hero.in_reach_radius(state, params)[0])
 
 
-def auto_aim_reach_tiles(params: ShadowParams, *, long_dash: bool = False, kind: str = HERO_KIND,
-                         brawlers_path=None, env_config_path=None) -> tuple[float, float]:
+def auto_aim_reach_tiles(hero: str = DEFAULT_HERO, *, long_dash: bool = False) -> tuple[float, float]:
     """`(enemy reach, crate reach)` in tiles for the auto-aimed attack (attack value 4), the
-    radii `hero.auto_aim_target` uses: the dash's distance (times `long_dash_multiplier` when
-    `long_dash` is charged) plus `dash_radius`, plus the target's body, `unit_radius` for an
-    enemy and `projectiles.BOX_RADIUS` for a crate. From the same files as `dash_reach_tiles`."""
-    dash_radius, unit_radius = _reach_radii(kind, brawlers_path, env_config_path)
-    distance = float(params.dash_distance)
-    if long_dash:
-        distance *= max(1.0, float(params.long_dash_multiplier))
-    base = distance + dash_radius
-    return base + unit_radius, base + float(BOX_RADIUS)
+    radii `hero.auto_aim_target` uses: the sim's `weapon_reach` (Mortis's dash, long dash included
+    when `long_dash` is charged; Bull's range plus a pellet) plus the target's body,
+    `unit_radius` for an enemy and `projectiles.BOX_RADIUS` for a crate."""
+    state, params = _hero_alone(hero, long_dash=long_dash)
+    base = sim_hero.weapon_reach(state, params, charged=True)
+    return float((base + params.unit_radius)[0]), float((base + BOX_RADIUS)[0])
 
 
-def _reach_radii(kind: str, brawlers_path, env_config_path) -> tuple[float, float]:
-    """`(dash_radius, unit_radius)` for `kind`, read from `configs/brawlers.yaml` and
-    `entities.unit_radius` in `configs/default.yaml`."""
+def _hero_alone(hero: str, *, long_dash: bool):
+    """`(state, params)` for the reach functions above: the sim's params for `hero`, built from
+    `configs/default.yaml` + `configs/brawlers.yaml` the way `env._load_base_spec` merges them
+    (neither deployed run overrides a hero block or `unit_radius`; the base files hold no
+    randomized ranges), and a one-env, one-entity state holding only what those functions read:
+    the hero's kind, and an attack idle timer past any long-dash threshold when `long_dash`."""
+    import torch
     import yaml
 
-    brawlers = yaml.safe_load(Path(brawlers_path or _CONFIGS_DIR / "brawlers.yaml").read_text())
-    env = yaml.safe_load(Path(env_config_path or _CONFIGS_DIR / "default.yaml").read_text())
-    try:
-        dash_radius = brawlers[kind]["dash_radius"]
-        unit_radius = env["entities"]["unit_radius"]
-    except KeyError as exc:
-        raise KeyError(f"dash reach needs {kind}.dash_radius and entities.unit_radius: {exc}") from exc
-    for name, raw in (("dash_radius", dash_radius), ("unit_radius", unit_radius)):
-        if isinstance(raw, (list, tuple, dict)):
-            raise ValueError(f"{name} is a randomized range {raw!r}; deployment needs one value")
-    return float(dash_radius), float(unit_radius)
+    from brawl_sim.config import build_params, load_config
+
+    spec = {**yaml.safe_load((_CONFIGS_DIR / "default.yaml").read_text()),
+            **yaml.safe_load((_CONFIGS_DIR / "brawlers.yaml").read_text())}
+    spec["entities"] = {**spec.get("entities", {}), "hero": hero}
+    cfg = load_config(_CONFIGS_DIR / "default.yaml", overrides={"entities": {"hero": hero}})
+    params = build_params(cfg, n_envs=1, device="cpu", gen=torch.Generator().manual_seed(0),
+                          spec=spec)
+    state = SimpleNamespace(
+        ent_kind=torch.zeros((1, 1), dtype=torch.int64),
+        ent_attack_idle_t=torch.full((1, 1), math.inf if long_dash else 0.0))
+    return state, params
 
 
 def _map_thresholds(cfg: DeploymentConfig) -> dict:
@@ -404,15 +417,19 @@ class VisionStack:
 
     @classmethod
     def build(cls, vision_cfg=None, *, detector_threads: int | None = None,
-              detector_spin: bool = True) -> "VisionStack":
+              detector_spin: bool = True, terrain: str = "default") -> "VisionStack":
         """The real stack, loaded from `configs/vision.yaml` and the shipped weights.
 
         `detector_threads` / `detector_spin` are the ORT CPU-pool settings for both sessions, from
         `DeploymentConfig.compute_*` when the live builders call this (`pin_thread_pools`). The
         defaults are the library's, which is right for a script that runs alone.
+
+        `terrain` names the shipped terrain classifier (`brawl_vision.config.TERRAIN_MODELS`), from
+        `DeploymentConfig.terrain_model`. It is resolved before anything loads, so a bad name or a
+        missing file fails in a second.
         """
         from brawl_vision.camera import build_rectify_plan, load_camera_model, load_hud_mask
-        from brawl_vision.config import load_vision_config
+        from brawl_vision.config import load_vision_config, terrain_weights
         from brawl_vision.hud import HudReader
         from brawl_vision.object_detection.detector import ObjectDetector
         from brawl_vision.object_detection.hp_detection.smooth import HealthTracker
@@ -423,6 +440,7 @@ class VisionStack:
 
         from .perception.projectiles import require_projectile_class
 
+        terrain_path = terrain_weights(terrain)
         cfg = vision_cfg or load_vision_config()
         plan = build_rectify_plan(load_camera_model(), load_hud_mask(HUD_MASK_PATH))
         # Checked here, on the real model, because the tracker filters by label: a promoted model
@@ -434,7 +452,7 @@ class VisionStack:
             plan=plan,
             odometry=Odometry(plan, cfg),
             occupancy=OccupancyMap.from_config(cfg),
-            classifier=TerrainClassifier.from_config(cfg),
+            classifier=TerrainClassifier.from_config(cfg, path=terrain_path),
             entities=ObjectDetector.from_config(cfg, **pool),
             projectiles=projectiles,
             health=HealthTracker.from_config(cfg),
@@ -488,7 +506,8 @@ class Controls:
                           attack=(dcfg.control_attack_tap[0] * w, dcfg.control_attack_tap[1] * h),
                           super_=cal.button("super"),
                           gadget=cal.button("gadget"),
-                          aim_radius_px=dcfg.control_aim_radius_px)
+                          aim_radius_px=dcfg.control_aim_radius_px,
+                          screen=cal.screen)
         try:
             buttons.require_on_screen(cal.screen)
         except ValueError:
@@ -516,7 +535,7 @@ class Controls:
             backend=backend,
             joystick=type(j)(backend, j.anchor, j.radius_px, n_bins=j.n_bins),
             buttons=type(b)(backend, attack=b.attack, super_=b.super_, gadget=b.gadget,
-                            aim_radius_px=b.aim_radius_px),
+                            aim_radius_px=b.aim_radius_px, screen=b.screen),
         )
 
     def release_all(self) -> None:
@@ -559,21 +578,35 @@ class DeployLoop:
         self.decision_every = self.rates.decision_every
         # A duration, not a tick count: see ODOMETRY_LOST_SECONDS.
         self.odometry_lost_ticks = max(1, round(ODOMETRY_LOST_SECONDS / self.tick_seconds))
+        self.wait_log_ticks = max(1, round(WAIT_LOG_SECONDS / self.tick_seconds))
+        self.gadget_look_ticks = max(1, round(GADGET_LOOK_SECONDS / self.tick_seconds))
         self._grab_total = 0.0      # last read of the capture's CUMULATIVE grab_seconds
 
         self.assembler = policy.make_assembler()
-        self.shadow = ShadowHero(ShadowParams.load(HERO_KIND), dt=self.sim.dt,
+        # The hero is the run's (`entities.hero`, BULL_HERO_PLAN.md D8), never a deployment
+        # setting: a checkpoint plays the hero it trained as. The shadow's block, the reach and
+        # the aim radii below all follow this one name.
+        self.hero_kind = kind_yaml_names(self.sim.hero)[0]
+        if self.hero_kind not in SHADOW_KINDS:
+            raise ValueError(
+                f"the run plays {self.hero_kind}, but the shadow models only {SHADOW_KINDS}: its "
+                f"timers would be another hero's (BULL_HERO_PLAN.md §5.7b)")
+        # The run's kit whole, and the shadow's copy of it as the account plays it (design §5.2):
+        # no disc shows a star power, so `loadout.star_power` says whether the account's brawler
+        # has the kit's. Without it the shadow's reload is the game's base rate at every HP; the
+        # policy still trained with the boost. `loadout_note` is the startup line saying which.
+        self.hero_kit = ShadowParams.load(self.hero_kind)
+        kit = self.hero_kit if cfg.loadout_star_power else self.hero_kit.without_star_power()
+        self.shadow = ShadowHero(kit, dt=self.sim.dt,
                                  n_move_bins=int(self.sim.n_move_bins),
                                  desync_strikes=cfg.shadow_ammo_strikes,
                                  auto_aim=bool(self.sim.auto_aim))
         # Telemetry only (`TickRow.enemy_in_reach`): the cadence audit's "certainly
-        # could have hit" radius, from the same configs the shadow and the sim read. The SAME
-        # kind as the shadow's block: `ShadowParams` does not record which brawler it was loaded
-        # for, so this is the one place both defaults are set.
-        self.reach_tiles = dash_reach_tiles(self.shadow.p, kind=HERO_KIND)
+        # could have hit" radius, the sim's own.
+        self.reach_tiles = attack_reach_tiles(self.sim.hero)
         # The auto-aimed attack's target radii (`_auto_aim`), uncharged and with the long dash
         # charged, so the per-decision estimate reads no file.
-        self._aim_reach = {long: auto_aim_reach_tiles(self.shadow.p, long_dash=long, kind=HERO_KIND)
+        self._aim_reach = {long: auto_aim_reach_tiles(self.sim.hero, long_dash=long)
                            for long in (False, True)}
         # The slot rule is the run's (`slots.*`, counted in decisions, as this tracker updates):
         # the sim's `core/slots.py` trained the policy on those two numbers, and the tracker's own
@@ -650,6 +683,12 @@ class DeployLoop:
         self._last_decision = None
         self._warmed = False
         self._warm_seconds = 0.0
+        # Each gate look's peak since the last waiting line, and the ticks it spans.
+        self._wait_peaks: tuple[float, ...] | None = None
+        self._wait_ticks = 0
+        # Ticks left to look for the gadget's disc this match, and its best ring so far.
+        self._gadget_look = 0
+        self._gadget_peak = 0.0
 
     # -- construction ---------------------------------------------------------
 
@@ -671,18 +710,33 @@ class DeployLoop:
 
         guard = WindowGuard(window, monitors,
                             require_fullscreen=cfg.window_require_fullscreen,
-                            check_occlusion=cfg.window_check_occlusion)
+                            check_occlusion=cfg.window_check_occlusion,
+                            hide_overlays=cfg.window_hide_overlays)
         capture = DeployCapture.from_window(window, monitors)
         policy = DeployedPolicy.from_run(cfg.run_dir, checkpoint=cfg.run_checkpoint,
                                          device=cfg.policy_device,
                                          deterministic=cfg.policy_deterministic)
         cal = Calibration.load()
         vision = VisionStack.build(detector_threads=cfg.compute_detector_threads,
-                                   detector_spin=cfg.compute_detector_spin)
+                                   detector_spin=cfg.compute_detector_spin,
+                                   terrain=cfg.terrain_model)
         return cls(capture=capture, guard=guard, match=MatchState(cal),
                    vision=vision, policy=policy,
                    controls=Controls.build(cal, cfg, int(policy.cfg.n_move_bins)),
                    cfg=cfg, log=log)
+
+    @property
+    def loadout_note(self) -> str | None:
+        """The startup line for the account's star power (design §5.2), or None when the run's
+        kit has none to drop (Mortis). Read off the shadow actually built, not the config, so it
+        reports what the loop will do. A property for the caller to log, never a log call in
+        `__init__`: a caller's log may read state it builds after the loop (replay_clip's does)."""
+        if not self.hero_kit.star_power:
+            return None
+        if self.shadow.p.star_power:
+            return f"loadout {self.hero_kind}: star power on, the run's kit whole"
+        return (f"loadout {self.hero_kind}: NO star power (loadout.star_power: false), so the "
+                f"shadow reloads at the base rate at every HP; the policy trained with the boost")
 
     # -- the run --------------------------------------------------------------
 
@@ -699,6 +753,7 @@ class DeployLoop:
         t0 = time.perf_counter()
         deadline = t0
         try:
+            self._hide_overlays()
             with self.capture:
                 while self.phase is not Phase.STOPPED:
                     was_playing = self.phase is Phase.PLAYING
@@ -717,7 +772,28 @@ class DeployLoop:
             # must not overwrite a stop reason that already explains what happened.
             self.controls.release_all()
             self.phase = Phase.STOPPED
+            self._show_overlays()
         return self.stop_reason or "stopped"
+
+    def _hide_overlays(self) -> None:
+        """Hide the emulator's own overlays before the first frame (`WindowGuard.suppress_overlays`).
+
+        For the real Brawl Stars app, BlueStacks draws its keymap hints on top of the HUD buttons,
+        and the screen grab includes them (`window.py`, 2026-11-04). `check()` keeps them hidden;
+        `run`'s `finally` shows them again.
+        """
+        for w in self.guard.suppress_overlays():
+            self.log(f"hid {w.title!r}, the emulator's own overlay, until the run ends")
+
+    def _show_overlays(self) -> None:
+        """Show what `_hide_overlays` hid. It runs in `run`'s `finally`, after the contacts are
+        released, so an error here is logged and not raised: raising would replace the exception
+        that explains the stop."""
+        try:
+            for w in self.guard.restore_overlays():
+                self.log(f"showed {w.title!r} again")
+        except Exception as exc:
+            self.log(f"could not show the emulator's overlay again: {type(exc).__name__}: {exc}")
 
     def _pace(self, deadline: float) -> float:
         """Hold the tick rate without accumulating drift, and without bursting to catch up.
@@ -772,6 +848,8 @@ class DeployLoop:
             odo = self.vision.odometry.update(rect)
             row.odometry = odo.status
             gate = self.match.update(frame.image)
+            if self.phase is Phase.WAITING:
+                self._note_waiting()
 
             if self.phase is Phase.PLAYING:
                 # Real seconds, spent as whole sub-ticks. Before the gate check, so the sub-ticks
@@ -783,6 +861,8 @@ class DeployLoop:
                 return
             if not self._gate_transition(gate, frame):
                 return
+            # Before the decision, so one made on the tick the disc is seen may throw.
+            self._look_for_gadget(frame)
             detections, world = self._perceive(frame, rect, odo, row)
             if self._is_decision_tick():
                 self._decide(frame, world, row, detections)
@@ -920,6 +1000,8 @@ class DeployLoop:
         if hero_hp is None:
             row.note = "no hero hp"
             return
+        # Berserker's threshold (Bull) reads this; a kit without one ignores it.
+        self.shadow.set_hp(hero_hp)
 
         self._read_own_bars(image, detections, row)
         self._update_enemy_hp(tracked, readings, odo)
@@ -952,7 +1034,7 @@ class DeployLoop:
             shadow=shadow_obs,
             hero_hp=hero_hp,
             n_enemies_alive=n_enemies,
-            elapsed_s=time.perf_counter() - self._match_t0,
+            elapsed_s=self._match_clock() - self._match_t0,
             hero_in_bush=self._in_bush(hero_pos),
             hero_in_zone=self._in_gas(hero_pos),
             enemies=tracked.enemies,
@@ -1004,7 +1086,9 @@ class DeployLoop:
         aim = self._auto_aim(hero_pos, tracked.enemies) if self.shadow.auto_aim else None
         modelled = self.shadow.act(decision.move_bin, decision.attack, aim=aim)
         self.controls.joystick.apply(decision.move_bin)
-        self.controls.buttons.press(modelled, self.shadow.attack_bearing)
+        # A charge super's length is the drag's, and the shadow models it at full length (Q6).
+        self.controls.buttons.press(modelled, self.shadow.attack_bearing,
+                                    full=self.shadow.p.charge_super)
         self._last_decision = decision
         # This decision as the next ones read it back, after `shadow.act` so the attack is the
         # modelled one. Everything else is what this observation was built from.
@@ -1065,8 +1149,9 @@ class DeployLoop:
         return False
 
     def _read_own_bars(self, image, detections, row: "TickRow | None" = None) -> None:
-        """Ammo and super off the hero's own box. Ammo is the desync canary (§6.3)."""
-        from brawl_vision.object_detection.hp_detection.hero_bars import read_ammo, read_super
+        """Ammo off the hero's own box, the super off its button. Ammo is the desync canary (§6.3)."""
+        from brawl_deployment.perception.super_button import read_super
+        from brawl_vision.object_detection.hp_detection.hero_bars import read_ammo
 
         # The shadow's clip is recorded FIRST, whether or not this frame has a hero box: it exists
         # regardless of the box, and `scripts/audit_attack_cadence.py --telemetry` reads it as the
@@ -1078,10 +1163,11 @@ class DeployLoop:
         # audit statistic ever reads that row's ammo).
         if row is not None:
             row.ammo_shadow = float(self.shadow.ammo)
+        # The super is read off its button (perception/super_button.py), which needs no hero box.
+        self.shadow.set_super(read_super(image, self.match.cal.viewport_button("super")))
         hero_det = next((d for d in detections if d.label == "player"), None)
         if hero_det is None:
             return
-        self.shadow.set_super(read_super(image, hero_det, self.vision.cfg))
         reading = read_ammo(image, hero_det, self.vision.cfg)
         if row is not None and reading is not None:
             row.ammo_cv = float(reading.ammo)
@@ -1209,13 +1295,55 @@ class DeployLoop:
 
     # -- phase and the interlock ----------------------------------------------
 
+    def _note_waiting(self) -> None:
+        """While waiting, log each gate look's peak every `WAIT_LOG_SECONDS`, so a gate that never
+        opens says which disc it is missing. Peaks, not this tick's scores: what a silent run needs
+        to know is whether anything came close in between, and a lobby tick cannot say."""
+        scores = self.match.last_scores
+        self._wait_peaks = (scores if self._wait_peaks is None
+                            else tuple(map(max, self._wait_peaks, scores)))
+        self._wait_ticks += 1
+        if self._wait_ticks < self.wait_log_ticks:
+            return
+        cal = self.match.cal
+        peaks = ", ".join(f"{look[0]} {peak:.2f}"
+                          for look, peak in zip(self.match.looks, self._wait_peaks))
+        self.log(f"waiting: gate peaks over {self._wait_ticks * self.tick_seconds:.0f} s: {peaks} "
+                 f"(opens at {cal.threshold:.2f} held for {cal.enter_samples} ticks)")
+        self._wait_peaks, self._wait_ticks = None, 0
+
+    def _look_for_gadget(self, frame) -> None:
+        """For `GADGET_LOOK_SECONDS` after the gate opens, look for the gadget's disc. The first
+        sighting equips it; a window that ends without one leaves it masked for the match.
+
+        The game unlocks a gadget at power 7, so the account's brawler can lack one the policy's
+        kit has (§5.2), and a throw would tap an empty patch of the HUD. Masked until seen, so a
+        miss fails closed: the cost is a gadget held back, never a tap on nothing."""
+        if self._gadget_look <= 0:
+            return
+        if self.shadow.p.gadget_cooldown <= 0:      # the kit has none: nothing to look for
+            self._gadget_look = 0
+            return
+        drawn, score = self.match.button_drawn(frame.image, "gadget")
+        self._gadget_peak = max(self._gadget_peak, score)
+        self._gadget_look -= 1
+        if drawn:
+            self.shadow.equip_gadget(True)
+            self._gadget_look = 0
+            if self._ticks_in_match:
+                self.log(f"gadget disc seen {self._ticks_in_match * self.tick_seconds:.2f} s "
+                         f"after the gate (ring {score:.2f})")
+        elif self._gadget_look == 0:
+            self.log(f"no gadget disc in the first {GADGET_LOOK_SECONDS:g} s of the match (best "
+                     f"ring {self._gadget_peak:.2f}): the policy's gadget stays masked")
+
     def _gate_transition(self, gate: bool, frame) -> bool:
         """Apply the match gate. Returns whether the tick should continue into perception."""
         if self.phase is Phase.PLAYING:
             if not gate:
                 self._end_match("match gate closed")
                 return False
-            if time.perf_counter() - self._match_t0 > self.cfg.safety_max_match_seconds:
+            if self._match_clock() - self._match_t0 > self.cfg.safety_max_match_seconds:
                 self._end_match("match watchdog expired")
                 self._stop("match ran past safety_max_match_seconds")
                 return False
@@ -1241,8 +1369,12 @@ class DeployLoop:
             self.log(f"gate opened but refine failed, staying out: {exc}")
             return False
 
-        self.log(f"match started (gate refined to {score:.3f})")
+        self.log(f"match started (gate refined to {score:.3f} on {', '.join(self.match.drawn)})")
         self.shadow.reset()
+        # The loadout (§5.2): the gadget stays masked until its disc is seen, `_look_for_gadget`.
+        self.shadow.equip_gadget(False)
+        self._gadget_look, self._gadget_peak = self.gadget_look_ticks, 0.0
+        self._wait_peaks, self._wait_ticks = None, 0
         # A new match is a new world frame even if odometry never cut: a new epoch at phase 0, and
         # every consumer adopts it. The occupancy map, which has no reset here, sees the new epoch
         # on its next deposit and drops the last match's votes.
@@ -1264,7 +1396,7 @@ class DeployLoop:
         self._dry_desync_noted = False
         self._odometry_lost = 0
         self._ticks_in_match = 0
-        self._match_t0 = time.perf_counter()
+        self._match_t0 = self._match_clock()
         self.phase = Phase.PLAYING
         self.controls.joystick.acquire()
         return True
@@ -1347,6 +1479,17 @@ class DeployLoop:
         slower than the thing it is shadowing.
         """
         return self.tick_seconds if not self._last_grab_t else now - self._last_grab_t
+
+    def _match_clock(self) -> float:
+        """Seconds on the clock the match is timed by: `meta.time_frac` and the match watchdog.
+
+        Wall clock, because a live match runs on it. It's a method rather than an inline
+        `time.perf_counter()` for the same reason `_elapsed_since_last_tick` is: a replay swaps
+        both for the clip's clock (`scripts/probes/replay_clip.py`). When a replay's time_frac read
+        the wall clock, it measured how fast the CPU got through the clip, and one Starfruit
+        decision came out differently from run to run (MAP_ONBOARDING.md, Starfruit Supernova).
+        """
+        return time.perf_counter()
 
     def _pause(self, reason: str) -> None:
         self.controls.release_all()

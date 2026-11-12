@@ -13,6 +13,7 @@ from ..constants import DeathCause
 from . import geometry as geo
 from . import projectiles as proj
 from . import stats
+from . import status
 from . import terrain
 
 _NO_ATTACKER = -1
@@ -100,10 +101,15 @@ def melee_hitscan(state, fire_mask: torch.Tensor, bank, params, cfg, cone_dir: t
     """Returns (dmg_ent (N,E), dmg_by (N,E,E), dmg_box (N,B)). All live entities/boxes within
     attack_range, inside attack_arc_rad of the cone centre, with a clear physical path
     (terrain.line_of_sight via blocks_proj -- walls only). No single-target restriction: unlike
-    a projectile, a wide arc can hit several entities (and boxes) in the same swing.
+    a projectile, a wide arc can hit several entities (and boxes) in the same swing. An airborne
+    entity (core/status.py) is untargetable and skipped.
 
     `cone_dir` (N,E) is the angle the cone is centred on; `None` means `state.ent_facing`, a
     single-swing melee. Swept melee passes each sub-swing's angle (core/melee_sweep.py).
+
+    Fire it for cone kinds only (`attack_arc_rad > 0`), as env._attack_phase does: a zero arc
+    still passes a body EXACTLY on the cone's centre line, and the LOS budget below covers only
+    cone kinds' reach.
     """
     E = state.ent_pos.shape[1]
     B = state.box_pos.shape[1]
@@ -128,7 +134,8 @@ def melee_hitscan(state, fire_mask: torch.Tensor, bank, params, cfg, cone_dir: t
     # instead of the full cfg.ray_steps budget. That makes `los` WRONG for pairs further apart
     # than the budget (a far wall is never sampled), which is sound only because `los` is used
     # once, ANDed with `in_cone`, and `point_in_cone` already requires the victim within
-    # `attack_range` <= cone_ray_tiles, so `can_hit` is bit-identical.
+    # `attack_range`, which is <= cone_ray_tiles for every kind that fires this (a cone kind: see
+    # the docstring), so `can_hit` is bit-identical.
     # tests/test_combat.py::test_melee_los_budget_matches_full_budget_ray pins that equality.
     origin_b = state.ent_pos.unsqueeze(2).expand(-1, -1, E, -1)
     victim_b = state.ent_pos.unsqueeze(1).expand(-1, E, -1, -1)
@@ -136,10 +143,10 @@ def melee_hitscan(state, fire_mask: torch.Tensor, bank, params, cfg, cone_dir: t
                                 max_tiles=params.cone_ray_tiles)
 
     not_self = ~torch.eye(E, dtype=torch.bool, device=device).unsqueeze(0)
-    victim_alive = state.ent_alive.unsqueeze(1)
+    victim_ok = (state.ent_alive & ~status.airborne(state)).unsqueeze(1)  # (N,1,E)
     attacker_ok = fire_mask.unsqueeze(2) & state.ent_alive.unsqueeze(2)  # (N,E,1)
 
-    can_hit = in_cone & los & not_self & victim_alive & attacker_ok
+    can_hit = in_cone & los & not_self & victim_ok & attacker_ok
     dmg_by = torch.where(can_hit, damage.unsqueeze(2), torch.zeros_like(in_cone, dtype=damage.dtype))
     dmg_ent = dmg_by.sum(dim=1)
 

@@ -90,6 +90,11 @@ auto-aims at the nearest enemy; the sim dashes along the move bin, or `facing` w
 step per tick. Do not "simplify" it back to a tap: that silently changes where every dash goes. The tap exists as
 its own action, value 4 below, chosen by the policy, never substituted for value 1.
 
+**A charge super (Bull) drags to the screen edge, not `aim_radius_px`** (2026-10-28,
+BULL_HERO_PLAN.md Q6). Its length is the drag's, and the shadow models every charge at full
+length, so the loop presses with `full=shadow.p.charge_super` and `Buttons` stops 2 px inside the
+edge ON the bearing. Never off-screen: the ADB backend clamps per axis, which bends the direction.
+
 **The one super exception: an idle super is a bare tap** (2026-10-06). The sim aims a super on
 move bin 0 like the game's tap-to-fire (`hero.super_aim_target`: nearest enemy in 11.1 tiles, else
 `facing`), so `ShadowHero.attack_bearing` is None for it and `Buttons.press` taps the super
@@ -105,11 +110,25 @@ as the sim's `hero.gadget_target` does. Its mask bit is the shadow's own 18 s ti
 dash, cooldown or ammo term, and a throw is not an attack. **The gadget is NOT the match gate's
 anchor** (corrected 2026-09-22, design §5.1). It was believed to be for two weeks, because all three
 button names in `control_calibration.json` sat one disc off and a commanded gadget actually pressed
-the Super. The gate is now on `hypercharge`, the one disc in the cluster nothing presses. Keep it
-there: the alternative was measured live, and one throw drops the gadget's own ring score under
-threshold for 5.0 s, so an agent gated on its own gadget stops dead after every throw.
+the Super. The gate's first look is `hypercharge`, the one disc in the cluster nothing presses.
+Never make the gadget a look: that was measured live, and one throw drops the gadget's own ring
+score under threshold for 5.0 s, so an agent gated on its own gadget stops dead after every throw.
 Its trace comes from `scripts/deploy_calibrate.py --probe-gadget`, in a real match,
 never Training Grounds.
+
+**And the gadget may not exist** (design §5.2, 2026-11-04). The game unlocks it at power 7, and
+the real account's Shelly at power 3 draws no gadget disc. So every match starts with the gadget
+masked (`ShadowHero.equip_gadget(False)`, the sim's own zero-cooldown "no gadget"), and
+`DeployLoop._look_for_gadget` equips it on the first sighting of the disc within
+`GADGET_LOOK_SECONDS` (1.0 s) of the gate, or logs that it stays masked for the match. Never read
+it once on the gate's own tick: the disc flashes white for about 0.2 s as the match starts.
+
+**The star power draws nothing, so it is a setting** (design §5.2, 2026-11-04).
+`loadout.star_power: false` (shipped: the user's Bull has Stomper and no Berserker) builds the
+shadow from `ShadowParams.without_star_power()`, which reloads at the base rate at every HP. The
+policy still trained with Berserker. `DeployLoop.loadout_note` is the startup line, and the
+constructor logs nothing: replay_clip's log reads the capture it builds after the loop. Replay
+the Nulls clips, whose Bull has Berserker, with `replay_clip.py --star-power on`.
 
 **The auto-aimed attack (`attack == 4`) is the other bare tap** (design §4.4 and §9 entry 23,
 2026-09-26). Down on the attack point, up on the next tick, no drag: the game aims it, which is
@@ -140,6 +159,17 @@ Live adaptation is only two changes:
 - Replace `longest_span` (which needs future frames) with **asymmetric hysteresis**. Exit must not
   be instant: `gameplay.py` documents that a Super detonating over the button drops the score for
   a few mid-match frames, and those frames are gameplay.
+
+**The gate is the best of several LOOKS** (`match_gate.looks`, design §5.2, 2026-11-04): the
+hypercharge, then the Super's uncharged face, then its charged face at a wider radius. The first
+real-app run pressed nothing for a whole match because the gate's one anchor was the hypercharge,
+and a brawler without one draws no disc. Rules that came out of it:
+- **A face that changes needs one look per face**, each refined within half the gap between the
+  two radii. A single look refined at ±12 px jumps from one face onto the other.
+- **A disc missing from the account is a closed gate, silently.** So a waiting loop logs each
+  look's peak every 10 s (`waiting: gate peaks over 10 s: ...`). Read that line before
+  re-measuring anything.
+- Never trim `exit_samples` 4: the Super looks dip for 1-3 ticks while a player holds a drag.
 
 ## Calibration is measured, never hardcoded
 
@@ -301,6 +331,11 @@ deployed value is seconds since the match gate went true, over 150.
 top of the range, exactly as when a sim episode ends early. Running LONG is out-of-distribution —
 the sim truncates at `time_frac == 1`, so the column's entire training range is bounded by 1 and a
 200-second match would feed it 1.33.
+
+**Read match time through `DeployLoop._match_clock`, never an inline `time.perf_counter()`**
+(2026-11-04). `scripts/probes/replay_clip.py` swaps that method, and `_elapsed_since_last_tick`, for
+the clip's clock. When `time_frac` read the wall clock, a replay's decisions depended on how fast
+the CPU ran, and one Starfruit decision came out differently from run to run.
 
 ## The `self` group is proprioception, not perception
 

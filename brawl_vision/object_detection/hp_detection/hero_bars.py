@@ -1,23 +1,24 @@
-"""The ammo and super bars under the HERO's own HP bar. See BRAWL_DEPLOYMENT_DESIGN.md 6.4.
+"""The ammo bar under the HERO's own HP bar. See BRAWL_DEPLOYMENT_DESIGN.md 6.4.
 
 **Why this lives in `hp_detection` and not somewhere named after it.** `locate.py` records the
 layout it measured: *"Brawl Stars stacks a brawler's readout in a fixed order, top to bottom: a
 power-level pip, the player's NAME, the HP number, the HP bar, and -- for your own brawler only --
-an ammo bar and a super-charge bar."* These are the last two rows of that same stack. They are
-box-relative, they cannot run without a detection, and they anchor on the digit row and HP bar
-this package already finds. The package name is now a little narrow for what it holds; renaming it
+an ammo bar and a super-charge bar."* The ammo bar is the next row of that same stack. It is
+box-relative, it cannot run without a detection, and it anchors on the digit row and HP bar this
+package already finds. The package name is now a little narrow for what it holds; renaming it
 would touch every importer for no behavioural gain, so this docstring says so instead.
+
+**There is no super reader here any more** (2026-11-02). The bar under the pips that one was built
+on is Mortis's LONG-DASH meter, not his super, and Bull has no such bar; the super is read off the
+Super button instead, in `brawl_deployment/perception/super_button.py`.
 
 #### The denominator problem, and why it does not apply here
 
 `read.py` explains at length why it ships no HP fill ratio: the depleted remainder of the HP bar
 is a pale wash that does not separate from white text or a pale sprite, so *"a ratio computed
 against the filled run alone would be the constant 1.0 dressed up as a measurement."* That is
-still true of HP. It is not true here, and the reason is different for each bar:
-
-  ammo    the track is exactly THREE IDENTICAL SEGMENTS. Their common width is the denominator,
-          and it is visible in any frame where a single pip is full.
-  super   the empty portion is a strongly saturated dark purple, not a wash.
+still true of HP. It is not true of ammo: the track is exactly THREE IDENTICAL SEGMENTS, their
+common width is the denominator, and it is visible in any frame where a single pip is full.
 
 #### What measurement changed about the obvious design
 
@@ -133,16 +134,14 @@ MIN_RUN_PX = 4
 # came from `bluestacks-example-new.mp4`, which `ClipReader` normalizes to **1920x1080** -- not to
 # the 2002x1126 the rest of the vision stack is calibrated at, because `normalize_viewport` trims
 # to 16:9 and never resizes, and that clip is natively 16:9 already. This readout stack scales
-# with viewport height exactly as `hud.py` measured the top-left HUD to: the super track runs 116
-# px at 1080 and a measured 120 at 1126, and the pip runs a median 33 at 1080 and 34 at 1126.
+# with viewport height exactly as `hud.py` measured the top-left HUD to: the pip runs a median 33
+# at 1080 and 34 at 1126.
 #
 # So this constant is quoted at 1126, which is what DEPLOYMENT resizes to
 # (BRAWL_DEPLOYMENT_DESIGN.md 9.4 item 4) -- and the fixture clips are 1080, which is why the
 # 33-35 spread straddles both and why nothing looked wrong for a long time. `read_ammo` now
 # applies the `REF_H` treatment `hud.py` gives its own constants; see `REF_VIEWPORT_H` for what
-# it cost not to. **`read_super` below still does not scale** -- its own measurement (116 px at
-# 1080 against 120 at 1126) says it has the same dependence, and it is a fraction of a measured
-# extent rather than a lattice, so the error is a few percent instead of a lost pip.
+# it cost not to.
 PIP_WIDTH_PX = 34
 
 # The viewport height `PIP_PITCH_PX` and `PIP_WIDTH_PX` are quoted at. The widget scales with
@@ -362,148 +361,3 @@ def read_ammo(frame: np.ndarray, det, cfg=None) -> AmmoReading | None:
     ammo = float(sum(fills))
     return AmmoReading(ammo=ammo, frac=ammo / MAX_AMMO_SLOTS, whole=int(ammo),
                        slots=fills, row=best_row + y0, pip_px=longest)
-
-
-# ---------------------------------------------------------------------------------------------
-# Super charge. Same stack, one track below the ammo pips, and a structurally different problem.
-# ---------------------------------------------------------------------------------------------
-
-# Rows below the HP bar's own row to search for the super track. MEASURED over 181 located frames
-# of bluestacks-example-new.mp4: the row carrying the most filled paint was dy 33-39 (mode 36) and
-# the row carrying the most ready-magenta was dy 33-38 (mode 34). Widened by a row at each end for
-# the same sub-pixel drift AMMO_BAND allows for.
-SUPER_BAND = (31, 42)
-
-# Runs separated by at most this many pixels are one run. The boundary between the filled part and
-# the empty remainder is anti-aliased across a few pixels belonging to neither mask, and treating
-# that seam as the end of the track would halve the denominator. MEASURED gaps: 0-4 px.
-SUPER_BRIDGE_PX = 6
-
-# Below this, a "run" is a map edge that happens to pass the colour test.
-SUPER_MIN_RUN_PX = 6
-
-# Magenta covering at least this share of the track means READY. Not 1.0: the widget's ends are
-# rounded and anti-aliased, so a fully magenta track still reports a few percent of neither colour.
-SUPER_READY_COVERAGE = 0.6
-
-
-@dataclass(frozen=True)
-class SuperReading:
-    """One frame's super charge, in the units `brawl_sim`'s obs schema asks for.
-
-    `track_px` is the extent this frame actually measured, and it is the DENOMINATOR rather than a
-    diagnostic -- unlike `AmmoReading.pip_px`, which reports a cross-check against a constant. The
-    difference between the two is that this track's empty remainder is painted and ammo's is not.
-    """
-    charge: float                # 0..1 -- obs_schema hero.super_charge_frac
-    ready: bool                  # obs_schema hero.super_ready -- the MAGENTA test, not charge >= 1
-    state: str                   # "charging" | "ready" | "empty"
-    track_px: int                # this frame's own track extent, the denominator that was used
-    row: int                     # the frame row it was read from
-
-
-def _band_mask(row_hsv: np.ndarray, hue: tuple[int, int], sat: tuple[int, int],
-               val: tuple[int, int]) -> np.ndarray:
-    """Pixels inside a closed HSV box, with `hue` allowed to wrap past 179 as `pip_mask` does."""
-    h = row_hsv[:, 0].astype(int)
-    s = row_hsv[:, 1].astype(int)
-    v = row_hsv[:, 2].astype(int)
-    lo, hi = hue
-    hue_ok = (h >= lo) & (h <= hi) if lo <= hi else ((h >= lo) | (h <= hi))
-    return hue_ok & (s >= sat[0]) & (s <= sat[1]) & (v >= val[0]) & (v <= val[1])
-
-
-def _bridged_runs(mask: np.ndarray, bridge: int) -> list[tuple[int, int]]:
-    """`[(start, length)]` of True runs, merging any two separated by at most `bridge` False."""
-    out: list[tuple[int, int]] = []
-    for start, length in _runs(mask):
-        if out and start - (out[-1][0] + out[-1][1]) <= bridge:
-            out[-1] = (out[-1][0], start + length - out[-1][0])
-        else:
-            out.append((start, length))
-    return out
-
-
-def read_super(frame: np.ndarray, det, cfg=None) -> SuperReading | None:
-    """Super charge from the hero's own readout stack, or None if it could not be read.
-
-    `det` must be the `player` detection: like the ammo pips, this track is drawn for your own
-    brawler only. `None` means "could not read" and never a guess, for BRAWL_DEPLOYMENT_DESIGN.md
-    6.4's reason -- 6.3's shadow state dead-reckons this field and treats CV as the check, so a
-    missing read costs one tick of confirmation while a fabricated one is silent.
-
-    **The magenta test comes first, and a reader without it would fail in the worst way this field
-    allows.** At full charge the track does not fill with yellow: the whole widget turns magenta,
-    MEASURED at hue 162-166 with saturation exactly 255 at every percentile from p5 to p95. So a
-    reader that counts yellow and divides reports **0.0 charge at the exact moment the super became
-    available** -- silently, and into the field that gates whether the action mask offers bin 2 to
-    the policy at all.
-
-    **The denominator is this frame's own track, not a calibrated constant, and that is the one
-    structural difference from `read_ammo`.** Ammo could not work this way: its empty remainder is
-    dark slate against a dark blue-purple map, a mask for it returned 35-236 px for a ~115 px
-    track, and so ammo counts painted pixels against a fixed pip width instead. The super track's
-    empty remainder is a distinct colour -- MEASURED hue 124-133, sat 102-143, val 74-99 -- so
-    filled and empty together recover the extent and the reading normalizes itself.
-
-    That separation is narrow, and the narrowness is load-bearing rather than incidental. A first
-    pass used sat >= 80 with val 60-140, which reads as a reasonable band and is in fact wide
-    enough to admit the map behind the widget: merged tracks came out 110-225 px for a 108 px
-    widget, and every charge reading was deflated in proportion. `hp.super_track_px` exists to
-    catch precisely that -- it decides whether the extent found is credible, and it is never
-    divided by.
-    """
-    from ...config import VisionConfig
-    cfg = cfg or VisionConfig()
-
-    x0, y0, x1, y1, box_cx = locate.crop_for(det, frame.shape, cfg.hp_ammo_crop_height_frac,
-                                             cfg.hp_crop_pad_frac)
-    hsv = cv2.cvtColor(frame[y0:y1, x0:x1], cv2.COLOR_BGR2HSV)
-
-    # The HP bar's ROW, never its width -- see read_ammo. The tracks below it stay full width while
-    # the bar itself shrinks with damage, and keying to that width is what once clipped a full pip.
-    row = locate.find_digit_row(hsv, box_cx, max_sat=cfg.hp_white_max_sat,
-                                min_val=cfg.hp_white_min_val, min_h=cfg.hp_glyph_min_height,
-                                max_h=cfg.hp_glyph_max_height)
-    if row is None:
-        return None
-    bar = locate.find_bar(hsv, cfg.hp_bar_hue_player, row.bottom)
-    if bar is None:
-        return None
-
-    lo = cfg.hp_super_track_px - cfg.hp_super_track_tol_px
-    hi = cfg.hp_super_track_px + cfg.hp_super_track_tol_px
-    best: SuperReading | None = None
-
-    for dy in range(*SUPER_BAND):
-        yy = bar.xyxy[1] + dy
-        if yy >= hsv.shape[0]:
-            break
-        r = hsv[yy]
-        filled = pip_mask(r, cfg.hp_super_hue, cfg.hp_super_sat_min, cfg.hp_super_val_min)
-        ready = pip_mask(r, cfg.hp_super_ready_hue, cfg.hp_super_ready_sat_min,
-                         cfg.hp_super_ready_val_min)
-        empty = _band_mask(r, cfg.hp_super_empty_hue, cfg.hp_super_empty_sat,
-                           cfg.hp_super_empty_val)
-
-        for start, length in _bridged_runs(filled | ready | empty, SUPER_BRIDGE_PX):
-            if length < SUPER_MIN_RUN_PX or not lo <= length <= hi:
-                continue
-            seg = slice(start, start + length)
-            n_ready = int(ready[seg].sum())
-            n_filled = int(filled[seg].sum())
-            if n_ready >= SUPER_READY_COVERAGE * length:
-                cand = SuperReading(1.0, True, "ready", length, yy + y0)
-            else:
-                # Capped rather than trusted: `filled` and `empty` can each claim a pixel of the
-                # anti-aliased seam, so a nearly-charged track can total slightly more than its own
-                # extent. A charge above 1 is not a state this field has.
-                charge = min(1.0, n_filled / length)
-                cand = SuperReading(charge, False, "charging" if n_filled else "empty",
-                                    length, yy + y0)
-            # Longest credible track wins. A partly occluded row yields a shorter one that can
-            # still clear the gate, and it is a worse view of the same widget.
-            if best is None or cand.track_px > best.track_px:
-                best = cand
-
-    return best

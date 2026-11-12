@@ -61,11 +61,11 @@ read, offered because suppressing it would throw away information the caller may
 """
 from .glyphs import Glyph, GlyphBank
 from .locate import Bar, DigitRow
-from .hero_bars import AmmoReading, SuperReading, read_ammo, read_super
+from .hero_bars import AmmoReading, read_ammo
 from .read import HealthReader, HealthReading
 from .smooth import HealthTracker, SmoothedReading, Track
 from .draw import draw_health
 
 __all__ = ["AmmoReading", "Bar", "DigitRow", "Glyph", "GlyphBank", "HealthReader",
-           "HealthReading", "HealthTracker", "SmoothedReading", "SuperReading", "Track",
-           "draw_health", "read_ammo", "read_super"]
+           "HealthReading", "HealthTracker", "SmoothedReading", "Track", "draw_health",
+           "read_ammo"]

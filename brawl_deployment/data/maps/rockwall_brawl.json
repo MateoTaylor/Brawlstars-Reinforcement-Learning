@@ -1,0 +1,17 @@
+{
+ "image": "rockwall_brawl.png",
+ "image_size": [
+  978,
+  977
+ ],
+ "pitch_px": [
+  15.746,
+  15.733
+ ],
+ "origin_px": [
+  16.7,
+  16.6
+ ],
+ "origin_convention": "tile (0, 0)'s top-left corner; pixel i spans [i, i+1)",
+ "date": "2026-11-11"
+}

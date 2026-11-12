@@ -90,6 +90,9 @@ class DeploymentConfig:
     window_exe: str = "HD-Player.exe"
     window_require_fullscreen: bool = True
     window_check_occlusion: bool = True
+    # Hide the emulator's own click-through overlays (BlueStacks' keymap hints) during a run, and
+    # show them again afterwards. See `window.py`'s module docstring.
+    window_hide_overlays: bool = True
     # Ticks between occlusion probes: about once a second, which at `loop.tick_hz` = 12 is 12.
     # Five `WindowFromPoint` calls are microseconds, so this is not a cost tuning -- it is how long
     # the agent may keep playing into a covered screen, and a second of that is recoverable. It is
@@ -167,6 +170,14 @@ class DeploymentConfig:
     # are not landing, and an agent whose model of itself is wrong is worse than a stopped one.
     shadow_max_resyncs: int = 5
 
+    # --- the account's loadout (design §5.2) -----------------------------------------------
+    # The gadget and the hypercharge are read off their discs every match. A star power draws
+    # nothing on screen, so this says whether the account's brawler has the one the run's kit
+    # models (Bull: Berserker). False hands the shadow `ShadowParams.without_star_power()`: the
+    # reload runs at the base rate at every HP, as the game's does, while the policy still trained
+    # with the boost. The default is the run's kit whole. A kit with no star power ignores it.
+    loadout_star_power: bool = True
+
     # --- safety backstops ------------------------------------------------------------------
     # The match gate is the primary interlock; this is the backstop for the gate itself being
     # wrong. Generous on purpose -- a Showdown match runs ~150 s and this should never be what
@@ -199,6 +210,15 @@ class DeploymentConfig:
     map_search_tiles: int = 4
     map_search_seconds: float = 5.0
 
+    # --- which terrain classifier reads the screen (MAP_ONBOARDING.md, Starfruit Supernova) ------
+    # A name from `brawl_vision.config.TERRAIN_MODELS`, never a path. `default` is the shipped
+    # terrain.pt; `dark_passage` is the classifier every live Dark Passage session ran before
+    # 2026-11-04, kept so a session can go back to it; `truth` is the one trained with Truth's
+    # labels as well, for sessions on Truth; `doom_shroom` adds Doom Shroom's, for sessions on
+    # Doom Shroom. Not `map.*`: the loop hands every `map_` field but map_name to `MapLocalizer`
+    # as a keyword.
+    terrain_model: str = "default"
+
 
 # (dotted YAML path, DeploymentConfig field name, type coercion)
 _DEPLOYMENT_CONFIG_FIELDS = (
@@ -214,6 +234,7 @@ _DEPLOYMENT_CONFIG_FIELDS = (
     ("window.exe", "window_exe", str),
     ("window.require_fullscreen", "window_require_fullscreen", bool),
     ("window.check_occlusion", "window_check_occlusion", bool),
+    ("window.hide_overlays", "window_hide_overlays", bool),
     ("window.check_every_n_ticks", "window_check_every_n_ticks", int),
     ("capture.monitor", "capture_monitor", lambda v: None if v is None else int(v)),
     ("control.backend", "control_backend", str),
@@ -223,6 +244,7 @@ _DEPLOYMENT_CONFIG_FIELDS = (
     ("loop.tick_hz", "loop_tick_hz", float),
     ("shadow.ammo_strikes", "shadow_ammo_strikes", int),
     ("shadow.max_resyncs", "shadow_max_resyncs", int),
+    ("loadout.star_power", "loadout_star_power", bool),
     ("safety.max_match_seconds", "safety_max_match_seconds", float),
     ("safety.capture_stall_seconds", "safety_capture_stall_seconds", float),
     ("telemetry.dir", "telemetry_dir", str),
@@ -236,6 +258,7 @@ _DEPLOYMENT_CONFIG_FIELDS = (
     ("map.wrong_map_agreement", "map_wrong_map_agreement", float),
     ("map.search_tiles", "map_search_tiles", int),
     ("map.search_seconds", "map_search_seconds", float),
+    ("terrain.model", "terrain_model", str),
 )
 
 

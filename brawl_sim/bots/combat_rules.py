@@ -14,9 +14,9 @@ The fields, and the reason behind each:
     lateral mover misses either side of it, while close in it lands anyway. A box never triggers
     it, since its `tgt.vel` is zero (bots/policy.targeting).
   - **The cone gate.** No separate field: "swings a cone" is `attack_arc_rad > 0`, as in
-    `config.cone_ray_tiles` and `combat.melee_hitscan`, so the gate MUST be conditional on it
-    (a zero arc never satisfies `geo.point_in_cone`; an unconditional test would stop every
-    ranged kind firing). `fire` is True only when this tick's swing would land, tested with
+    `config.cone_ray_tiles` and env._attack_phase's `melee_fire`, so the gate MUST be
+    conditional on it (a zero arc passes `geo.point_in_cone` only for a target EXACTLY on the
+    facing ray, so an unconditional test would all but stop every ranged kind firing). `fire` is True only when this tick's swing would land, tested with
     `geo.point_in_cone` against `ent_facing` before this tick's movement (this runs in phase 4,
     attacks resolve in phase 6, movement is phase 7), so turning to face costs a tick or two.
     The half-angle is `(hitscan_sweep_rad + attack_arc_rad) / 2`, the arc the WHOLE swept attack

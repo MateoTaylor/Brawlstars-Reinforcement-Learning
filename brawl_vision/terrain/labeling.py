@@ -44,7 +44,8 @@ UNLABELLED = "?"
 
 # Recordings captured on the emulator (BlueStacks + Nulls Brawl), by name prefix. Their buttons sit
 # where `config.EMULATOR_HUD_MASK_PATH` says; every other recording is a phone's. All of them, and
-# only they, are 1920x1080, which `test_vision_classifier` checks against the recordings on disk.
+# only they, are 16:9 at 1920x1080 or, recorded by OBS on the 1440p monitor (Starfruit Supernova,
+# 2026-11-04), 2560x1440, which `test_vision_classifier` checks against the recordings on disk.
 EMULATOR_CLIP_PREFIXES = ("bluestacks-", "9-10_new", "edited_day14_broll", "2maps_dataset")
 
 # Share of a cell that must be real world, clear of the HUD, before it can be labelled. The same
@@ -222,9 +223,9 @@ def read_label_frames(clip: str, indices, viewport: tuple[int, int] | None = Non
 
     Indices past the clip's usable range are left out, as `ClipReader` would never yield them.
 
-    `viewport` resizes frames of another size to it. That is for 1080p recordings (the BlueStacks
-    and emulator captures), which normalize to 1920x1080 against a camera model calibrated at
-    2002x1126. The deployed capture resizes the same way (`brawl_deployment.capture.to_viewport`),
+    `viewport` resizes frames of another size to it. That is for the BlueStacks and emulator
+    captures, 1080p and (from 2026-11-04) 1440p, which normalize to 1920x1080 or 2560x1440 against
+    a camera model calibrated at 2002x1126. The deployed capture resizes the same way (`brawl_deployment.capture.to_viewport`),
     so a label drawn here sits on the geometry the bot actually sees.
     """
     path = find_clip(clip)

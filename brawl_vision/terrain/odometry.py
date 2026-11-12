@@ -38,6 +38,39 @@ deposit votes), and `lost` (a genuine discontinuity: stop, and open a new segmen
 respawn, the match-start fly-in) corrupts the whole accumulated map in one frame, so a cut instead
 bumps `segment`. Phase I must treat votes from different segments as belonging to different world
 frames -- there is no defined offset between them until loop closure exists.
+
+**Screen-static windows can take the median, and the inlier gate cannot see it** (2026-11-05,
+MAP_ONBOARDING.md's Truth section). The camera follows the hero, so whatever is drawn in screen
+space reads exactly zero shift: the hero, its name tag, the "SHOWDOWN!" text at two brawlers
+left, a "Defeated" popup, a recording's mouse cursor. A slow walk moves under 0.25 tiles per
+12 Hz tick, which keeps zero inside `max_disagreement_tiles` of the true motion. So when half the
+windows or more land on such content, the median is their zero, or the average of the two groups
+when they tie. With three of eight, the per-axis median can still land halfway. Every window
+still "agrees", and the frame comes back `ok` with the camera frozen or slowed. On
+bluestacks-truth-west-upper's banner, 5 of 8 windows read zero for 3 s, and the odometry stood
+still and fell 7.5 tiles behind the camera. On the same clip, the halfway median drifted it
+1.6 tiles once and 1.0 tile once more. Window statistics alone cannot tell this from the moving
+sprite above. It is the same pattern, a still majority and a coherent moving minority, with the
+opposite answer.
+
+The same windows cost trust when they are a minority. A brisk walk passes
+`max_disagreement_tiles` per tick, so the hero and its name tag count against a correct median.
+On the Truth replay, 17% of in-match ticks came back `uncertain` for that reason and held their
+action.
+
+So when the windows split into still ones and a coherent moving group, and the still ones change
+the answer, the PIXELS decide. Every pixel of the core is compared under both candidate shifts. A
+pixel whose two residuals differ by more than `overlay_grey` votes for the shift that explains it
+better. The world fills most of the view, and an overlay or a sprite covers only part of it. So
+the moving windows win only when they explain a share above `overlay_share` of the deciding
+pixels. They then carry the estimate, and the still windows are set aside from the inlier ratio
+as screen furniture rather than counted against it. Measured against image registration at 12 Hz,
+this cut the Truth clip's error from 20.7 to 4.9 tiles, summed over the registered 100-frame spans
+that hold no cut. It made no span worse. Replayed through the deploy loop, the clip's in-match
+`uncertain` ticks fell from 160 to 33 of 932, and the localizer's three corrections (the two
+drifts and the banner refix) did not happen. A frame whose still windows win the vote, or never
+come into question, is estimated and gated exactly as before.
+`scripts/probes/odometry_overlay/` runs the shipped rule over recorded frame pairs.
 """
 from dataclasses import dataclass
 
@@ -52,6 +85,17 @@ from ..config import VisionConfig
 # window straddling it locks to zero motion.
 _CORE_ERODE_PX = 9
 
+# The overlay vote (module docstring). It needs at least this many moving windows agreeing with
+# each other: one window alone is a sprite as often as not, and the vote would only overrule it.
+_MIN_MOVERS = 2
+# A moving window belongs to the moving group within `odometry_still_tiles` plus this share of the
+# group's own speed. A fast dash spreads the windows' estimates more than a walk does.
+_GROUP_SLACK_FRAC = 0.1
+# A vote decided by fewer pixels than this share of the core is no vote. The frame is then
+# estimated as if the windows had not split. Real splits are decided by 80k-400k pixels, 10-45%
+# of the core.
+_MIN_DECISIVE_FRAC = 0.01
+
 
 @dataclass(frozen=True)
 class OdometryResult:
@@ -60,11 +104,17 @@ class OdometryResult:
     delta_tiles: tuple[float, float]
     position_tiles: tuple[float, float]
     response: float                # median per-window correlation response
-    agreement_tiles: float         # median distance from the median, for diagnostics
-    inlier_ratio: float            # share of windows within max_disagreement_tiles of the median
+    agreement_tiles: float         # median distance from the estimate, for diagnostics
+    inlier_ratio: float            # share of windows within max_disagreement_tiles of the estimate
     n_windows: int                 # windows that cleared the response floor
     status: str                    # "init" | "ok" | "uncertain" | "lost"
     segment: int
+    # Set when the windows split into still ones and a moving group, and the still ones would
+    # change the answer (`Odometry._split`). It is the share of the deciding pixels the moving
+    # group explained better. Above `odometry_overlay_share` the moving group carried the
+    # estimate, and the still windows were left out of `agreement_tiles` and `inlier_ratio`.
+    # None when the windows did not split, or too few pixels decided.
+    overlay_vote: float | None = None
 
     @property
     def ok(self) -> bool:
@@ -108,6 +158,9 @@ class Odometry:
             )
         self._win = win
         self._hann = cv2.createHanningWindow((win, win), cv2.CV_32F)
+        self._core = core
+        self._core_u8 = core.astype(np.uint8)
+        self._core_px = int(core.sum())
 
     # -- the estimator -------------------------------------------------------
 
@@ -123,6 +176,60 @@ class Odometry:
                 out.append((dx, dy))
                 resp.append(r)
         return np.array(out, np.float64).reshape(-1, 2), np.array(resp, np.float64)
+
+    def _split(self, shifts: np.ndarray, median: np.ndarray):
+        """`(still, c0, c1)` when the windows split into still ones and a coherent moving group,
+        and the still ones change the answer, else None.
+
+        They change it in two ways. The median may not sit with the moving group: the banner
+        freeze. Or the median does sit there, but the still windows alone make the frame
+        `uncertain`. At 12 Hz a walk can pass `max_disagreement_tiles` per tick, and the hero and
+        its name tag are then outliers on every tick. `still` masks the windows reading at most
+        `odometry_still_tiles`; `c0` is their median shift and `c1` the moving group's."""
+        ppt = self.plan.pixels_per_tile
+        eps = self.cfg.odometry_still_tiles
+        still = np.linalg.norm(shifts, axis=1) / ppt <= eps
+        moving = ~still
+        if not still.any() or moving.sum() < _MIN_MOVERS:
+            return None
+        v = np.median(shifts[moving], axis=0)
+        slack = eps + _GROUP_SLACK_FRAC * np.linalg.norm(v) / ppt
+        group = moving & (np.linalg.norm(shifts - v, axis=1) / ppt <= slack)
+        if group.sum() < _MIN_MOVERS:
+            return None
+        if np.linalg.norm(median - v) / ppt <= slack:
+            dev = np.linalg.norm(shifts - median, axis=1) / ppt
+            agree = dev <= self.cfg.odometry_max_disagreement_tiles
+            gate = self.cfg.odometry_min_agreement_ratio
+            if agree.mean() >= gate or agree[moving].mean() < gate:
+                return None            # trusted already, or doubtful whatever the still ones are
+        return still, np.median(shifts[still], axis=0), np.median(shifts[group], axis=0)
+
+    def _vote(self, a: np.ndarray, b: np.ndarray, c0: np.ndarray, c1: np.ndarray) -> float | None:
+        """Share of the core's deciding pixels that image shift `c1` explains better than `c0`.
+
+        A candidate d explains pixel x when b(x + d) matches a(x), the convention
+        `cv2.phaseCorrelate(a, b)` reports d in. A pixel decides only where the two residuals
+        differ by more than `odometry_overlay_grey`, i.e. where it has texture along c1 - c0, and
+        only where both shifted positions fall back inside the core. None below
+        `_MIN_DECISIVE_FRAC` of the core."""
+        h, w = a.shape
+        valid = self._core.copy()
+        residual = []
+        for d in (c0, c1):
+            m = np.float32([[1, 0, d[0]], [0, 1, d[1]]])
+            back = cv2.warpAffine(b, m, (w, h), flags=cv2.INTER_LINEAR | cv2.WARP_INVERSE_MAP,
+                                  borderMode=cv2.BORDER_REPLICATE)
+            residual.append(np.abs(a - back))
+            valid &= cv2.warpAffine(self._core_u8, m, (w, h),
+                                    flags=cv2.INTER_NEAREST | cv2.WARP_INVERSE_MAP,
+                                    borderMode=cv2.BORDER_CONSTANT, borderValue=0).astype(bool)
+        r0, r1 = residual
+        deciding = valid & (np.abs(r0 - r1) > self.cfg.odometry_overlay_grey)
+        n = int(np.count_nonzero(deciding))
+        if n < _MIN_DECISIVE_FRAC * self._core_px:
+            return None
+        return float(np.count_nonzero(deciding & (r1 < r0))) / n
 
     def update(self, frame: np.ndarray) -> OdometryResult:
         """Feed one RECTIFIED frame (BGR or grayscale) and get the camera's motion since the last.
@@ -148,8 +255,8 @@ class Odometry:
             self._prev = gray
             return self._result((0.0, 0.0), 0.0, 0.0, 0.0, 0, "init")
 
-        shifts, resp = self._shifts(self._prev, gray)
-        self._prev = gray
+        prev, self._prev = self._prev, gray
+        shifts, resp = self._shifts(prev, gray)
 
         if len(shifts) < self.cfg.odometry_min_windows:
             return self._cut(float(np.median(resp)) if len(resp) else 0.0, 0.0, 0.0,
@@ -157,33 +264,41 @@ class Odometry:
 
         ppt = self.plan.pixels_per_tile
         median = np.median(shifts, axis=0)
-        dev = np.linalg.norm(shifts - median, axis=1) / ppt
+        estimate, used, vote = median, shifts, None
+        split = self._split(shifts, median) if self.cfg.odometry_overlay_share < 1.0 else None
+        if split is not None:
+            still, c0, c1 = split
+            vote = self._vote(prev, gray, c0, c1)
+            if vote is not None and vote > self.cfg.odometry_overlay_share:
+                # The still windows sit on screen furniture: they say nothing about the camera.
+                estimate, used = c1, shifts[~still]
+        dev = np.linalg.norm(used - estimate, axis=1) / ppt
         agreement = float(np.median(dev))
         inliers = float(np.mean(dev <= self.cfg.odometry_max_disagreement_tiles))
-        delta = -median / ppt                            # image shift -> camera motion
+        delta = -estimate / ppt                          # image shift -> camera motion
         r = float(np.median(resp))
 
         # Order matters: an implausible shift is a discontinuity whatever the windows agreed on,
         # while mere disagreement is a confidence statement about an otherwise usable estimate.
         if np.hypot(*delta) > self.cfg.odometry_max_shift_tiles:
-            return self._cut(r, agreement, inliers, len(shifts))
+            return self._cut(r, agreement, inliers, len(shifts), vote)
 
         self.position = self.position + delta
         status = "ok" if inliers >= self.cfg.odometry_min_agreement_ratio else "uncertain"
-        return self._result(tuple(delta), r, agreement, inliers, len(shifts), status)
+        return self._result(tuple(delta), r, agreement, inliers, len(shifts), status, vote)
 
     # -- bookkeeping ---------------------------------------------------------
 
-    def _cut(self, response, agreement, inliers, n) -> OdometryResult:
+    def _cut(self, response, agreement, inliers, n, vote=None) -> OdometryResult:
         self.segment += 1
-        return self._result((0.0, 0.0), response, agreement, inliers, n, "lost")
+        return self._result((0.0, 0.0), response, agreement, inliers, n, "lost", vote)
 
-    def _result(self, delta, response, agreement, inliers, n, status) -> OdometryResult:
+    def _result(self, delta, response, agreement, inliers, n, status, vote=None) -> OdometryResult:
         return OdometryResult(
             delta_tiles=(float(delta[0]), float(delta[1])),
             position_tiles=(float(self.position[0]), float(self.position[1])),
             response=response, agreement_tiles=agreement, inlier_ratio=inliers,
-            n_windows=n, status=status, segment=self.segment,
+            n_windows=n, status=status, segment=self.segment, overlay_vote=vote,
         )
 
     def reset(self) -> None:

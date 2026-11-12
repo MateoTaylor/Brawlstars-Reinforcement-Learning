@@ -118,6 +118,10 @@ def test_defaults_validate():
     ("odometry_min_response", -0.1),
     ("odometry_min_response", 1.5),
     ("odometry_max_shift_tiles", 0.0),
+    ("odometry_still_tiles", 0.0),
+    ("odometry_still_tiles", 0.25),        # = max_disagreement_tiles: still would also agree
+    ("odometry_overlay_grey", 0.0),
+    ("odometry_overlay_share", 1.2),
     ("zone_min_cell_fraction", 0.0),
     ("zone_min_cell_fraction", 1.5),
     ("occupancy_grid_h", 0),
@@ -154,6 +158,14 @@ def test_validate_rejects_a_lock_ratio_an_even_split_would_clear():
     cell to reach min_votes would lock whatever it happened to see, permanently."""
     with pytest.raises(ValueError, match="five terrain"):
         validate(_cfg(occupancy_lock_ratio=0.2))
+
+
+def test_validate_holds_the_overlay_share_to_a_majority():
+    """Below half, the moving windows would carry the odometry while explaining less of the view
+    than the still ones, which hands a sprite's motion to the camera. 1.0 (the rule off) is fine."""
+    with pytest.raises(ValueError, match="overlay_share"):
+        validate(_cfg(odometry_overlay_share=0.4))
+    validate(_cfg(odometry_overlay_share=1.0))
 
 
 def test_validate_rejects_a_gap_rule_weight_that_withholds_the_vote():

@@ -6,12 +6,20 @@
     python scripts/deploy_run.py --run mortis_deploy3 # a different run, by the name it trained as
     python scripts/deploy_run.py --run mortis_deploy3_elite --checkpoint final
     python scripts/deploy_run.py --map dark_passage   # on a labelled map: localize, label terrain
+    python scripts/deploy_run.py --map dark_passage --terrain dark_passage
 
 **`--run` swaps the checkpoint for one invocation** without editing `configs/deployment.yaml`,
 which stays the default. It takes the `run.name` a run was trained under, a directory under
 `runs/`, or a path. The name match is exact (`mortis_deploy3` never means `mortis_deploy3_elite`),
 and a name trained more than once is refused with the candidates listed. `--checkpoint` takes
 `best`, `final`, or a file name in the run.
+
+**`--terrain dark_passage` goes back to the old terrain classifier** for one invocation: the one
+every live Dark Passage session ran, kept as `brawl_vision/data/terrain_dark_passage.pt` when
+`terrain.pt` became the classifier trained with Starfruit Supernova's labels (2026-11-04,
+`MAP_ONBOARDING.md`). `default` is `terrain.pt`; `terrain.model` in the config stays the default.
+**`--terrain truth`** is the classifier trained with Truth's labels as well (2026-11-05): play Truth
+with `--map truth --terrain truth`.
 
 **Start it before you queue the battle.** It waits on the match gate, emits nothing in the menus,
 and takes the movement contact the moment the gate opens -- so there is nothing to time. The gate's
@@ -45,6 +53,7 @@ if str(REPO) not in sys.path:
 from brawl_deployment.config import load_deployment_config, resolve_run, validate  # noqa: E402
 from brawl_deployment.loop import DeployLoop, Phase                            # noqa: E402
 from brawl_deployment.perception.known_map import MAPS_DIR, KnownMap          # noqa: E402
+from brawl_vision.config import TERRAIN_MODELS, terrain_weights               # noqa: E402
 
 # `--checkpoint` shorthands: the two files every run's `scripts/train.py` writes.
 CHECKPOINTS = {"best": "best_model.zip", "final": "final_model.zip"}
@@ -55,12 +64,13 @@ def _log(message: str) -> None:
 
 
 def _config_from_args(args):
-    """`configs/deployment.yaml` with `--run` / `--checkpoint` / `--map` applied, validated.
+    """`configs/deployment.yaml` with `--run` / `--checkpoint` / `--map` / `--terrain` applied,
+    validated.
 
     Through the loader's `overrides` rather than a `dataclasses.replace` afterwards, so a run picked
-    on the command line takes exactly the path a run picked in the YAML does. The checkpoint and
-    the map label are checked here, before the window is located or a detector is built: a typo
-    should cost a second, not a startup.
+    on the command line takes exactly the path a run picked in the YAML does. The checkpoint, the
+    map label and the terrain weights are checked here, before the window is located or a detector
+    is built: a typo should cost a second, not a startup.
     """
     run = {}
     if args.run is not None:
@@ -73,6 +83,8 @@ def _config_from_args(args):
     overrides = {"run": run} if run else {}
     if args.map is not None:
         overrides["map"] = {"name": args.map}
+    if args.terrain is not None:
+        overrides["terrain"] = {"model": args.terrain}
     cfg = load_deployment_config(args.config, overrides=overrides or None)
     validate(cfg)
 
@@ -86,6 +98,10 @@ def _config_from_args(args):
         except (OSError, ValueError) as exc:
             have = sorted(p.stem for p in MAPS_DIR.glob("*.csv"))
             raise SystemExit(f"map {cfg.map_name!r}: {exc}\nlabelled maps: {have}") from None
+    try:
+        terrain_weights(cfg.terrain_model)
+    except (OSError, ValueError) as exc:
+        raise SystemExit(str(exc)) from None
     return cfg
 
 
@@ -144,6 +160,11 @@ def main(argv=None) -> int:
     ap.add_argument("--map", default=None,
                     help="the labelled map this session is played on (dark_passage), instead of "
                          "the config's map.name; the loop then localizes on it")
+    ap.add_argument("--terrain", default=None, choices=sorted(TERRAIN_MODELS),
+                    help="the shipped terrain classifier, instead of the config's terrain.model: "
+                         "default (terrain.pt), dark_passage (the one before Starfruit "
+                         "Supernova's labels, which the live Dark Passage sessions ran) or truth "
+                         "(trained with Truth's labels as well; for Truth)")
     ap.add_argument("--dry-run", action="store_true",
                     help="build everything and decide for real, but send no touches")
     ap.add_argument("--matches", type=int, default=1,
@@ -157,8 +178,11 @@ def main(argv=None) -> int:
     _log(f"config {args.config}{' (run from --run)' if args.run else ''}")
     _log(f"run    {cfg.run_dir} ({cfg.run_checkpoint}) on {cfg.policy_device}")
     _log(f"map    {cfg.map_name or 'none (terrain from the occupancy map)'}")
+    _log(f"terrain {cfg.terrain_model} ({terrain_weights(cfg.terrain_model).name})")
 
     loop = DeployLoop.from_config(cfg, log=_log)
+    if loop.loadout_note:
+        _log(loop.loadout_note)
     if args.dry_run:
         # Swap the backend rather than adding a flag the loop has to remember to check. There is
         # then no code path in which a dry run can touch the device, which a boolean cannot promise.
@@ -168,7 +192,8 @@ def main(argv=None) -> int:
         _log("DRY RUN -- decisions are real, touches go nowhere")
 
     _log(f"capture {loop.capture.viewport[0]}x{loop.capture.viewport[1]} from monitor "
-         f"{loop.guard.monitor_index}; waiting for the match gate")
+         f"{loop.guard.monitor_index}; waiting for the match gate "
+         f"({', '.join(look[0] for look in loop.match.looks)})")
     _log(f"rates: {1.0 / loop.tick_seconds:.0f} Hz perception, "
          f"{1.0 / (loop.tick_seconds * loop.decision_every):.0f} Hz decisions")
 

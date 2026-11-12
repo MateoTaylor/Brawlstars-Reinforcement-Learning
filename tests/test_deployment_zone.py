@@ -195,7 +195,8 @@ def _zone_fields(spec_path) -> set[str]:
 # is how agent_obs_deploy2/3 went unchecked here: the first live run on deploy3 raised
 # "no value supplied for 'zone.hero_margin_local'" on its first decision.
 DEPLOY_SPECS = sorted(str(p).replace("\\", "/")
-                      for p in Path("configs").glob("agent_obs_deploy*.yaml"))
+                      for p in [*Path("configs").glob("agent_obs_deploy*.yaml"),
+                                Path("configs/agent_obs_bull.yaml")])
 
 
 def test_every_deploy_spec_is_covered_here():

@@ -70,6 +70,13 @@ POPUP_MIN_AREA = 150
 MIN_GLYPH_AREA = 20
 # Width band for a glyph at this scale. 4 is a `1`, 16 is a wide `0` with its outline.
 MIN_GLYPH_W, MAX_GLYPH_W = 4, 16
+# Two neighbouring glyphs can touch: the `4`'s arm leans far enough left to reach a `0` before it,
+# so `10400` (Bull's full HP with one cube) segments as `1`, a 25 px `04`, `0`, `0`. Dropped for
+# being wider than any glyph, that pair left a hole the gap test rejects, and the hero's HP went
+# unread for as long as he sat at full -- 14 s of skipped decisions on
+# bluestacks-bull-hypercharge.mp4 (2026-11-02). A component of glyph height and up to two glyphs'
+# width is cut at its thinnest column instead (`_split_pair`).
+MAX_PAIR_W = 2 * MAX_GLYPH_W
 
 # Widest bare gap allowed between consecutive glyphs of one number, in pixels. MEASURED over 893
 # consecutive-glyph pairs on intact rows: 1-4 px, median 2, max 4. The narrowest glyph measured 6
@@ -210,6 +217,17 @@ def white_mask(crop_hsv: np.ndarray, max_sat: int, min_val: int) -> np.ndarray:
     return ((crop_hsv[:, :, 1] < max_sat) & (crop_hsv[:, :, 2] > min_val)).astype(np.uint8)
 
 
+def _split_pair(mask: np.ndarray, x: int, y: int, h: int, label: int) -> list:
+    """Two touching glyphs as two candidates, cut at the thinnest column, or none if either half
+    would not be a glyph's width. The cut column goes to neither half: it is the bridge, a pixel
+    or two of anti-aliased edge, and leaving it off keeps each mask the shape the templates were
+    cut from."""
+    w = mask.shape[1]
+    cut = MIN_GLYPH_W + int(np.argmin(mask.sum(axis=0)[MIN_GLYPH_W:w - MIN_GLYPH_W]))
+    halves = [(x, y, cut, h, label), (x + cut + 1, y, w - cut - 1, h, label)]
+    return halves if all(MIN_GLYPH_W <= c[2] <= MAX_GLYPH_W for c in halves) else []
+
+
 def find_digit_row(crop_hsv: np.ndarray, box_centre_x: float, *, max_sat: int, min_val: int,
                    min_h: int, max_h: int) -> DigitRow | None:
     """The most plausible run of HP digits in `crop_hsv`, or None if there is no such run.
@@ -230,6 +248,8 @@ def find_digit_row(crop_hsv: np.ndarray, box_centre_x: float, *, max_sat: int, m
             continue
         if min_h <= h <= max_h and MIN_GLYPH_W <= w <= MAX_GLYPH_W:
             candidates.append((x, y, w, h, i))
+        elif min_h <= h <= max_h and MAX_GLYPH_W < w <= MAX_PAIR_W:
+            candidates.extend(_split_pair(labels[y:y + h, x:x + w] == i, x, y, h, i))
         elif h >= POPUP_MIN_H and area >= POPUP_MIN_AREA:
             popups.append((x, y, x + w, y + h))
 

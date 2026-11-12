@@ -131,12 +131,16 @@ class RewardConfig:
     # x attacks/supers made with a visible enemy in dash reach (see reward.py). Off by default so
     # a hand-built RewardConfig keeps its meaning; configs/train.yaml turns it on.
     attack_in_reach: float = 0.0
-    # x gadget spinners that landed on at least one player (see reward.py). Off by default for
-    # the same reason.
+    # x gadget landings that caught at least one player: a spinner that hurt one, or a stomp that
+    # slowed or stunned one (see reward.py). Off by default for the same reason.
     gadget_hit: float = 0.0
     # x decisions whose move bin reversed the last one's (see reward.py); a cost, so negative.
     # Off by default for the same reason.
     move_reversal: float = 0.0
+    # x the hero's attack volleys that landed no pellet on a player or crate, and x his stomps
+    # that landed on nobody (see reward.py); costs, so negative. Off by default for the same reason.
+    attack_miss: float = 0.0
+    gadget_miss: float = 0.0
     scale: float = 1.0
 
 

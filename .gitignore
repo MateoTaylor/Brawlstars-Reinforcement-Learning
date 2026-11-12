@@ -76,3 +76,8 @@ BRAWL_SIM_BUILD_PLAN.md
 CONVENTIONS.md
 bot_overhaul.md
 EDGAR_HERO_PLAN.md
+
+# Null's Brawl state reader (nulls_reader/): probes, a map dump and their offline checks for
+# Null's scripting API. Shelved 2026-11-11: scripting is a closed beta, so none of it can run in
+# the game yet. Nothing imports it. Stays local until scripting opens; its README has the status.
+nulls_reader/

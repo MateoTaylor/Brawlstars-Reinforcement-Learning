@@ -5,7 +5,7 @@ import torch
 
 from ..constants import Kind
 
-_HERO_KIND = int(Kind.HERO_MORTIS)
+_HERO_KIND = int(Kind.HERO)
 
 
 def gather_kind(param_nk: torch.Tensor, kind_ne: torch.Tensor) -> torch.Tensor:

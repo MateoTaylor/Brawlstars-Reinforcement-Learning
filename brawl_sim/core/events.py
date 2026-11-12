@@ -13,9 +13,14 @@ nowhere and must be handed in by the caller (env.py, accumulated over the decisi
   leaves no matrix and no counter to diff, so only the caller knows it.
 - `attacks_in_reach`: the hero's attacks and supers made with a visible enemy in reach, known
   only inside env.py's attack phase; training/reward.py's `attack_in_reach` term reads it.
-- `gadget_hits`: landings of the hero's gadget spinner that hurt at least one player (crates
-  never count), known only inside env.py's projectile phase; training/reward.py's `gadget_hit`
+- `gadget_hits`: landings of the hero's gadget that caught at least one player (crates never
+  count): a spinner that hurt one, known only inside env.py's projectile phase, or a stomp that
+  slowed or stunned one, known only inside its stomp phase; training/reward.py's `gadget_hit`
   term reads it.
+- `attack_misses`: the hero's attack volleys whose last pellet ended with none of them on a player
+  or a crate (projectiles._settle_hero_volleys), and `gadget_misses`: the hero's stomps that landed
+  on nobody, known only inside env.py's projectile and stomp phases; training/reward.py's
+  `attack_miss` and `gadget_miss` terms read them (user decision 2026-11-02).
 - `move_reversals`: whether this decision's move reversed the last one's (`move_reversals`
   below), readable only before `history.push` overwrites the last one; training/reward.py's
   `move_reversal` term reads it.
@@ -129,7 +134,8 @@ def compute_info(
     state, dmg_by: torch.Tensor, newly_dead: torch.Tensor, newly_broken: torch.Tensor,
     cubes_gained: torch.Tensor, cfg, decision: dict | None = None,
     hp_healed: torch.Tensor | None = None, attacks_in_reach: torch.Tensor | None = None,
-    gadget_hits: torch.Tensor | None = None, move_reversals: torch.Tensor | None = None,
+    gadget_hits: torch.Tensor | None = None, attack_misses: torch.Tensor | None = None,
+    gadget_misses: torch.Tensor | None = None, move_reversals: torch.Tensor | None = None,
 ) -> dict:
     """(N,)/(N,E)/(N,E,E) device tensors, one dict of THIS DECISION's events; the module
     docstring gives the contracts of the caller-supplied inputs.
@@ -145,8 +151,13 @@ def compute_info(
     enemy inside its uncharged dash reach over the same sub-ticks (env.py's attack phase). None
     is zeros.
 
-    `gadget_hits`: (N,) int32 count of the hero's gadget-spinner landings that hurt at least one
-    player over the same sub-ticks (env.py's projectile phase). None is zeros.
+    `gadget_hits`: (N,) int32 count of the hero's gadget landings that caught at least one player
+    over the same sub-ticks: spinners that hurt one and stomps that slowed or stunned one
+    (env.py's projectile and stomp phases). None is zeros.
+
+    `attack_misses`: (N,) int32 count of the hero's attack volleys that ended over the same
+    sub-ticks with no pellet on a player or a crate; `gadget_misses`: (N,) int32 count of his
+    stomps that landed on nobody (env.py's projectile and stomp phases). None is zeros.
 
     `move_reversals`: (N,) int32, 1 where this decision's move reversed the last one's
     (`move_reversals` above, taken before env.step's `history.push`). None is zeros."""
@@ -158,6 +169,10 @@ def compute_info(
         attacks_in_reach = torch.zeros_like(decision["n_ticks"])
     if gadget_hits is None:
         gadget_hits = torch.zeros_like(decision["n_ticks"])
+    if attack_misses is None:
+        attack_misses = torch.zeros_like(decision["n_ticks"])
+    if gadget_misses is None:
+        gadget_misses = torch.zeros_like(decision["n_ticks"])
     if move_reversals is None:
         move_reversals = torch.zeros_like(decision["n_ticks"])
     terminated, truncated = decision["terminated"], decision["truncated"]
@@ -210,6 +225,10 @@ def compute_info(
         "attack_in_reach_tick": attacks_in_reach,
         # (N,) int32, the HERO's alone -- what training/reward.py's `gadget_hit` term pays.
         "gadget_hit_tick": gadget_hits,
+        # (N,) int32, the HERO's alone -- what training/reward.py's `attack_miss` and `gadget_miss`
+        # terms charge.
+        "attack_miss_tick": attack_misses,
+        "gadget_miss_tick": gadget_misses,
         # (N,) int32, 0 or 1 per DECISION -- what training/reward.py's `move_reversal` term pays.
         "move_reversal_tick": move_reversals,
         "hero_rank": decision["hero_rank"],

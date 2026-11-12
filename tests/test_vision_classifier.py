@@ -14,6 +14,7 @@ import pytest
 
 from brawl_sim.constants import TILE_TO_CHAR, Tile
 from brawl_vision.camera import build_rectify_plan, load_camera_model, load_hud_mask
+from brawl_vision.config import TERRAIN_WEIGHTS_PATH, terrain_weights
 from brawl_vision.terrain import labeling
 from brawl_vision.terrain.classifier import (
     IGNORE_INDEX, Example, TerrainClassifier, TerrainNet, augment, build_examples, evaluate,
@@ -113,6 +114,11 @@ def test_load_label_dir_reads_every_file(plan, tmp_path):
 # ---------------------------------------------------------------------------
 
 LABELS = Path(__file__).parent / "fixtures" / "vision" / "labels"
+# Scoring-only sets, kept out of LABELS so training never reads them (load_label_dir does not
+# recurse). Each holds one map's held-out ground; its README says how it was split.
+HELD_OUT_LABELS = [Path(__file__).parent / "fixtures" / "vision" / name
+                   for name in ("labels_starfruit_test", "labels_truth_test", "labels_doom_shroom_test",
+                                "labels_doom_shroom_east_test", "labels_rockwall_brawl_test")]
 
 
 @pytest.fixture(scope="module")
@@ -159,9 +165,13 @@ def test_emulator_recordings_default_to_the_emulator_mask():
     assert labeling.default_hud("bluestacks-dump/counted_walking.mp4") == "phone"
 
 
+EMULATOR_CAPTURE_SIZES = {(1920, 1080), (2560, 1440)}
+
+
 @pytest.mark.vision
 def test_the_name_rule_agrees_with_every_recordings_capture_size():
-    """Every emulator capture is 1920x1080 and every phone recording is not, so a recording whose
+    """Every emulator capture is 1920x1080 or 2560x1440 (OBS on the 1440p monitor since the
+    Starfruit Supernova clip, 2026-11-04) and no phone recording is either, so a recording whose
     size and name disagree is one the rule misfiles: `edited_day14_broll`, an emulator capture,
     defaulted to the phone mask until 2026-09-15. A new emulator recording under a new name fails
     here until `EMULATOR_CLIP_PREFIXES` learns it."""
@@ -174,7 +184,7 @@ def test_the_name_rule_agrees_with_every_recordings_capture_size():
         cap = cv2.VideoCapture(str(p))
         size = (int(cap.get(cv2.CAP_PROP_FRAME_WIDTH)), int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT)))
         cap.release()
-        if (size == (1920, 1080)) != (labeling.default_hud(p) == "emulator"):
+        if (size in EMULATOR_CAPTURE_SIZES) != (labeling.default_hud(p) == "emulator"):
             misfiled.append(f"{p.name} {size} -> {labeling.default_hud(p)}")
     assert not misfiled, misfiled
 
@@ -217,6 +227,10 @@ def test_every_shipped_label_records_the_mask_its_recording_was_captured_under(p
     2026-09-15)."""
     grids = labeling.load_label_dir(LABELS, plans["phone"])
     assert len(grids) >= 54
+    for held_out in HELD_OUT_LABELS:
+        extra = labeling.load_label_dir(held_out, plans["phone"])
+        assert extra, f"{held_out} holds no labels"
+        grids += extra
     for g in grids:
         assert g.hud == labeling.default_hud(g.clip), f"{g.clip} f{g.frame} is under {g.hud}"
         outside = g.labelled & ~labeling.observed_cells(plans[g.hud])
@@ -421,6 +435,98 @@ def test_a_checkpoint_round_trips_and_pins_its_class_order(plan, trained, tmp_pa
     torch.save(blob, str(path))
     with pytest.raises(ValueError, match="channel order"):
         TerrainClassifier.load(path)
+
+
+# The classifier every live Dark Passage session ran, kept by name when terrain.pt became the one
+# trained with Starfruit Supernova's labels (2026-11-04). A literal, never a hash computed from
+# anything the repo ships: it is the fallback `--terrain dark_passage` promises.
+DARK_PASSAGE_SHA256 = "f7a788b25eadd1d0d3e310b21c6b56bbe3ba44d30903779d9447022e4af4fee0"
+
+
+def test_the_dark_passage_classifier_is_kept_byte_for_byte_and_runs(plan):
+    """`--terrain dark_passage` is the way back to the classifier the live Dark Passage sessions
+    ran (MAP_ONBOARDING.md, Starfruit Supernova). A retrain written to the wrong `--out`, or a copy
+    made in the wrong direction, would replace it without a word; this is the word."""
+    import hashlib
+
+    path = terrain_weights("dark_passage")
+    assert hashlib.sha256(path.read_bytes()).hexdigest() == DARK_PASSAGE_SHA256, (
+        f"{path.name} is no longer the Dark Passage classifier; its weights are terrain.pt's blob "
+        "at commit 7db0cc0")
+    img, _ = _synthetic(plan, 3)
+    cells, conf = TerrainClassifier.load(path, device="cpu").predict(img, plan)
+    cols, rows = plan.size_tiles
+    assert cells.shape == (rows, cols) and conf.shape == (rows, cols)
+
+
+# The classifier trained with Truth's labels as well (2026-11-05, MAP_ONBOARDING.md, Truth): the
+# candidate that passed every gate, copied from runs/terrain_truth/candidate.pt. A literal for the
+# same reason as the one above.
+TRUTH_SHA256 = "f897391f994d078c12219aac62cf5429a7de9072d2404d52ca16269679e1cb83"
+
+
+def test_the_truth_classifier_is_kept_byte_for_byte_and_runs(plan):
+    """`--terrain truth` names the weights that were scored and replayed on 2026-11-05. A retrain
+    written over them would keep the name and lose every number MAP_ONBOARDING.md quotes for it."""
+    import hashlib
+
+    path = terrain_weights("truth")
+    assert hashlib.sha256(path.read_bytes()).hexdigest() == TRUTH_SHA256, (
+        f"{path.name} is no longer the classifier MAP_ONBOARDING.md's Truth section scored")
+    img, _ = _synthetic(plan, 3)
+    cells, conf = TerrainClassifier.load(path, device="cpu").predict(img, plan)
+    cols, rows = plan.size_tiles
+    assert cells.shape == (rows, cols) and conf.shape == (rows, cols)
+
+
+# The classifier trained with both Doom Shroom recordings' labels after the user made the map's
+# fences walls (2026-11-10, MAP_ONBOARDING.md, Doom Shroom, "Classifier v3"), copied from
+# runs/terrain_doom_shroom3/candidate.pt. It replaced v2 (a4cd95f7...), which had replaced v1
+# (ae22f6be...); both were deleted. A literal for the same reason again.
+DOOM_SHROOM_SHA256 = "0353bfa7235c16f26675b5002ea2ea0d7c03a9783373ea0ea91d4aea95585e7f"
+
+
+def test_the_doom_shroom_classifier_is_kept_byte_for_byte_and_runs(plan):
+    """`--terrain doom_shroom` names the weights that were scored and replayed on 2026-11-10. A
+    retrain written over them would keep the name and lose every number MAP_ONBOARDING.md quotes."""
+    import hashlib
+
+    path = terrain_weights("doom_shroom")
+    assert hashlib.sha256(path.read_bytes()).hexdigest() == DOOM_SHROOM_SHA256, (
+        f"{path.name} is no longer the classifier MAP_ONBOARDING.md's Doom Shroom section scored")
+    img, _ = _synthetic(plan, 3)
+    cells, conf = TerrainClassifier.load(path, device="cpu").predict(img, plan)
+    cols, rows = plan.size_tiles
+    assert cells.shape == (rows, cols) and conf.shape == (rows, cols)
+
+
+# The classifier trained with Rockwall Brawl's labels as well (2026-11-11, MAP_ONBOARDING.md,
+# Rockwall Brawl), copied from runs/terrain_rockwall_brawl/candidate.pt. A literal for the same
+# reason again.
+ROCKWALL_BRAWL_SHA256 = "9c95be49bbdaa149424c70e2aaf8bba60d471599220365087ae451b390145238"
+
+
+def test_the_rockwall_brawl_classifier_is_kept_byte_for_byte_and_runs(plan):
+    """`--terrain rockwall_brawl` names the weights that were scored and replayed on 2026-11-11. A
+    retrain written over them would keep the name and lose every number MAP_ONBOARDING.md quotes."""
+    import hashlib
+
+    path = terrain_weights("rockwall_brawl")
+    assert hashlib.sha256(path.read_bytes()).hexdigest() == ROCKWALL_BRAWL_SHA256, (
+        f"{path.name} is no longer the classifier MAP_ONBOARDING.md's Rockwall Brawl section scored")
+    img, _ = _synthetic(plan, 3)
+    cells, conf = TerrainClassifier.load(path, device="cpu").predict(img, plan)
+    cols, rows = plan.size_tiles
+    assert cells.shape == (rows, cols) and conf.shape == (rows, cols)
+
+
+def test_terrain_models_are_picked_by_name():
+    """`default` is whatever terrain.pt holds; a name that was never shipped fails before anything
+    loads, listing the ones that were."""
+    assert terrain_weights() == TERRAIN_WEIGHTS_PATH
+    with pytest.raises(ValueError, match="no terrain model called 'dark-passage'; shipped: "
+                                         "default, dark_passage, truth, doom_shroom, rockwall_brawl"):
+        terrain_weights("dark-passage")
 
 
 def test_predict_rejects_a_grid_that_stopped_matching_the_plan(plan, trained):

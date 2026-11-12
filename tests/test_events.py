@@ -31,7 +31,7 @@ def _cfg_and_params(n_envs=1, n_enemies=3, max_episode_steps=300):
 def _fresh_state(cfg, params, n_envs=1):
     state = allocate(cfg, n_envs=n_envs, device="cpu", verbose=False)
     state.ent_alive.fill_(True)
-    state.ent_kind[:, 0] = int(Kind.HERO_MORTIS)
+    state.ent_kind[:, 0] = int(Kind.HERO)
     for e in range(1, cfg.n_entities):
         state.ent_kind[:, e] = int(Kind.BOT_MELEE)
     state.map_id.fill_(0)

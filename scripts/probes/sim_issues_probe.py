@@ -424,14 +424,14 @@ def scripted_dash_vs_crate(hits_once):
             move = torch.zeros(1, cfg.n_entities, 2)
             move[0, 0] = torch.tensor([1.0, 0.0])
             hero.start_dash(state, fire, move, bank, params, cfg)
-            n = int(round(params.dash_duration[0, int(Kind.HERO_MORTIS)].item() / cfg.dt)) + 1
+            n = int(round(params.dash_duration[0, int(Kind.HERO)].item() / cfg.dt)) + 1
             hits, total = 0, 0.0
             for _ in range(n):
                 _, _, dmg_box = hero.advance_dash(state, params, cfg)
                 hits += int(dmg_box[0, 0] > 0)
                 total += float(dmg_box[0, 0])
             rows.append((ahead, side, hits, total))
-    return rows, float(params.base_damage[0, int(Kind.HERO_MORTIS)])
+    return rows, float(params.base_damage[0, int(Kind.HERO)])
 
 
 def rollout_dashes(ep, decs, crate_hp):

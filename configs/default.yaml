@@ -116,6 +116,10 @@ observation:
   history_radius_tiles: 4
 
 entities:
+  # The brawler the agent plays: the `hero_<name>` block of brawlers.yaml that fills Kind.HERO's
+  # column (config.kind_yaml_names). mortis | bull. A run trains one hero; a policy trained on one
+  # cannot play the other, since the same action values mean different moves.
+  hero: mortis
   n_enemies: 9                  # 10 players total: 1 hero + 9 enemies
   randomize_enemy_types: true
   enemy_type_weights: {sniper: 0.22, artillery: 0.15, melee: 0.09, rifle: 0.16,

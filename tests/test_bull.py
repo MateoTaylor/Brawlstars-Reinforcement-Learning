@@ -143,21 +143,23 @@ def test_the_fan_is_a_total_span_of_half_a_radian():
 def test_bull_hits_harder_than_shelly_at_every_range_he_can_reach():
     """Same pellet count, more damage each: 4400 against 3000 point-blank. This is the trade for
     the shorter range, and it should hold at every distance where both connect."""
-    for dist in (1.0, 2.0, 4.0, 6.0):
+    for dist in (1.0, 2.0, 4.0, 5.0):
         bull, shelly = _damage_at(Kind.BOT_BULL, dist), _damage_at(Kind.BOT_RIFLE, dist)
         assert shelly > 0, f"Shelly whiffed at {dist} -- the comparison is meaningless"
         assert bull > shelly, f"at {dist} tiles Bull dealt {bull} against Shelly's {shelly}"
 
 
-def test_bulls_reach_is_exactly_one_tile_shorter():
-    """"1 tile shorter range." Asserted as a REACH, at the distance where each stops connecting --
-    the pellet dies after `attack_range` of travel but still damages within its hit radius, so the
-    observable cutoff sits about 0.7 tiles past the configured range for both of them."""
-    assert float(params_of(BULL, "attack_range")) == float(params_of(SHELLY, "attack_range")) - 1.0
+def test_bulls_reach_is_his_measured_5_2_tiles_well_short_of_shellys():
+    """Range 5.2, measured on the hero (BULL_HERO_PLAN.md Phase 0 b) and set on the bot by the
+    user 2026-11-01; it was 7.0, quoted as "1 tile shorter" than Shelly's 8.0. Asserted as a REACH,
+    at the distance where he stops connecting: a pellet moves a whole tick (0.45 tiles at 9
+    tiles/s) and hits anything on that path, so the middle pellet still lands at 6.0 and none does
+    at 6.1."""
+    assert abs(float(params_of(BULL, "attack_range")) - 5.2) < 1e-6  # float32: 5.2 is not exact
 
-    assert _damage_at(Kind.BOT_BULL, 7.5) > 0        # inside Bull's reach
-    assert _damage_at(Kind.BOT_BULL, 8.5) == 0       # past it
-    assert _damage_at(Kind.BOT_RIFLE, 8.5) > 0       # Shelly still connects a full tile further
+    assert _damage_at(Kind.BOT_BULL, 5.3) == 3 * PELLET_DAMAGE  # inside Bull's reach
+    assert _damage_at(Kind.BOT_BULL, 6.2) == 0                  # past it
+    assert _damage_at(Kind.BOT_RIFLE, 6.2) > 0                  # Shelly still connects there
 
 
 def test_bulls_fan_is_tighter_than_shellys():
@@ -171,9 +173,13 @@ def test_bulls_fan_is_tighter_than_shellys():
     assert _damage_at(Kind.BOT_RIFLE, 4.0, lateral=0.5) < _damage_at(Kind.BOT_RIFLE, 4.0)
 
 
-def test_bull_is_slower_and_tankier_than_shelly():
+def test_bull_outwalks_shelly_but_not_mortis_and_is_tankier():
+    """2.68 tiles/s, measured 2026-11-01 (BULL_HERO_PLAN.md Phase 0 a): only the 2.73 kinds
+    (Mortis, Edgar) are faster."""
     cfg, params, _, _ = _setup()
-    assert float(params.move_speed[0, BULL]) < float(params.move_speed[0, SHELLY])
+    assert abs(float(params.move_speed[0, BULL]) - 2.68) < 1e-6
+    assert float(params.move_speed[0, SHELLY]) < float(params.move_speed[0, BULL])
+    assert float(params.move_speed[0, BULL]) < float(params.move_speed[0, int(Kind.BOT_EDGAR)])
     assert float(params.base_hp[0, BULL]) == 10000.0
     assert float(params.base_hp[0, BULL]) > float(params.base_hp[0, SHELLY])
     # 2.0 s per ammo point, and the cooldown freezes reload, so sustained is 0.25 + 2.0.

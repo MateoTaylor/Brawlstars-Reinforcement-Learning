@@ -71,6 +71,27 @@ odometry:                 # Phase F
   # to 0.0. Median deviation alone would not work here, because a coherent split (half the patch
   # sliding one way, half the other) puts the median inside one group and drives it to zero.
   min_agreement_ratio: 0.75
+  # The screen-static overlay rule (2026-11-05; brawl_vision/terrain/odometry.py's docstring).
+  # The camera follows the hero, so the hero, its name tag and the "SHOWDOWN!" banner read zero
+  # shift. When half the windows sit on them the median freezes while every window still
+  # "agrees" -- on Truth's banner the odometry stood still for 3 s and fell 7.5 tiles behind.
+  # As a minority on a brisk walk they disagree with a correct median and cost the frame its
+  # `ok`: 17% of Truth's in-match ticks, each a held action. When the windows split into still
+  # ones and a moving group, and either case applies, every pixel votes for the shift that
+  # explains it better. The moving group carries the estimate, and the still windows leave the
+  # agreement count, only if it explains more than overlay_share of the deciding pixels.
+  #
+  # MEASURED: windows on screen-static content read 0.000-0.029 tiles, and a walk is >= ~0.07
+  # per 30 fps frame.
+  still_tiles: 0.03
+  # A pixel decides only where its two residuals differ by more than this many grey levels.
+  overlay_grey: 8.0
+  # MEASURED on the Truth, Starfruit and Dark Passage BlueStacks clips with
+  # scripts/probes/odometry_overlay/vote.py. In a match at the deployed 12 Hz, the moving group
+  # won at 0.80-0.95 and lost at 0.04-0.26; at 30 fps its lowest win was 0.53, at a death. The
+  # phone clips never pass 0.20. Outside a match, votes land anywhere from 0.05 to 0.89, and only
+  # move the world origin the localizer fixes at the gate. 1.0 turns the rule off.
+  overlay_share: 0.5
 
 zone:                     # Phase G
   # MEASURED (Phase G) on three visually different maps: zone_grows_from_east,
@@ -348,14 +369,15 @@ hp:                       # object_detection/hp_detection -- the HP number insid
   # MEASURED on bluestacks-example-new.mp4, NOT on day10_gameplay.mp4 like the rest of this
   # section -- and at that clip's own **1920x1080**, not at the 2002x1126 this file says
   # elsewhere. ClipReader trims to 16:9 and never resizes, and that clip is natively 16:9. The
-  # stack scales with viewport height (measured: super track 116 px at 1080, 120 at 1126), so
-  # these are 1080 numbers that happen to be right at the 1126 deployment viewport. See
-  # hero_bars.py:PIP_WIDTH_PX.
+  # stack scales with viewport height (measured: the track under the pips, 116 px at 1080 and 120
+  # at 1126), so these are 1080 numbers that happen to be right at the 1126 deployment viewport.
+  # See hero_bars.py:PIP_WIDTH_PX.
   #
-  # The ammo and super tracks sit BELOW the HP bar, so this stage needs a taller slice than
-  # crop_height_frac gives it: the super track's last row was at 0.68 of box height in the
-  # sampled crops. Separate from crop_height_frac rather than raising it, because a taller crop
-  # for the DIGIT search means more chances to pull in a neighbour's readout.
+  # The ammo track sits BELOW the HP bar, so this stage needs a taller slice than
+  # crop_height_frac gives it: the last row of the stack (Mortis's long-dash meter, under the
+  # pips) was at 0.68 of box height in the sampled crops. Separate from crop_height_frac rather
+  # than raising it, because a taller crop for the DIGIT search means more chances to pull in a
+  # neighbour's readout.
   ammo_crop_height_frac: 0.75
   # A filled pip's orange. Narrow on purpose -- the map's crate borders are also orange, and this
   # band is not what rejects them; the pitch lattice in slot_fills is. See that docstring.
@@ -368,35 +390,6 @@ hp:                       # object_detection/hp_detection -- the HP number insid
   # A full pip therefore reads 0.94-1.03 and that residual is reported, not snapped away.
   # Re-measure at a new capture resolution: this is screen pixels, like the glyph heights above.
   ammo_pip_px: 34
-
-  # --- super charge (hp_detection/hero_bars.read_super). One track below the ammo pips, and
-  # unlike ammo it is SELF-NORMALIZING: the empty remainder is painted in its own colour, so the
-  # denominator is the track's own extent rather than a calibrated constant.
-  #
-  # MEASURED on bluestacks-example-new.mp4 over 181 located frames, each colour sampled from a run
-  # identified by structure rather than by these thresholds: 3890 filled px, 6494 ready px, 1720
-  # empty px. Filled hue 26-29 / sat 114-197 / val 219-255.
-  super_hue: [20, 35]
-  super_sat_min: 100
-  super_val_min: 180
-  # Ready: hue 162-166 at saturation EXACTLY 255 in every percentile p5..p95, val 189-234. A THIRD
-  # STATE, not "all yellow" -- at full charge the whole widget turns magenta, so a reader that
-  # counts yellow and divides reports 0.0 charge at the moment the super becomes available.
-  super_ready_hue: [155, 172]
-  super_ready_sat_min: 230
-  super_ready_val_min: 160
-  # Empty: hue 124-133, sat 102-143, val 74-99. Narrow deliberately. A first pass used sat >= 80
-  # with val 60-140 and that mask ate the map behind the widget, returning tracks of 110-225 px
-  # for a 116 px widget and deflating every charge reading in proportion. This map is made of dark
-  # blue-purple; only the tight value band separates the widget from it.
-  super_empty_hue: [117, 137]
-  super_empty_sat: [90, 165]
-  super_empty_val: [62, 118]
-  # The track's full width at the calibrated viewport and the tolerance around it. A SANITY GATE,
-  # never a denominator -- the reading divides by the extent the frame itself found. Measured as
-  # the median of 171 successful reads: p10 114, p50 116, p90 118, min 104, max 128, sd 2.6.
-  super_track_px: 116
-  super_track_tol_px: 22
 
 hud:                      # hud.py -- screen-anchored readouts. "Brawlers left: N", so far.
   # This section has three keys because everything else about the widget is GEOMETRY, and

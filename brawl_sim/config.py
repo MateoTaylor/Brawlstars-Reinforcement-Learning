@@ -13,7 +13,7 @@ from pathlib import Path
 import torch
 import yaml
 
-from .constants import HUNT_WAYPOINT_BITS, AimModel, Kind, Proj
+from .constants import HUNT_WAYPOINT_BITS, AimModel, GadgetType, Kind, Proj, SuperType
 # No import cycle: core.projectiles imports only torch, ..constants and sibling core modules
 # (geometry/stats/terrain), none of which import config.
 from .core.projectiles import BOX_RADIUS, MAX_SPLITS
@@ -24,10 +24,13 @@ _MISSING = object()
 # EnvConfig default for a field the file omits.
 _ABSENT = object()
 
-# Kind 0 is always the hero; this order matches brawl_sim.constants.Kind's values 0..7 and
-# is also the order used for the leading dim of every per-kind SimParams tensor's K axis.
-KIND_YAML_NAMES = ("hero_mortis", "bot_sniper", "bot_artillery", "bot_melee", "bot_rifle",
-                   "bot_edgar", "bot_spike", "bot_bull")
+# The bot kinds' brawlers.yaml blocks in Kind-value order (1..7). Column 0 of every per-kind
+# SimParams tensor is the hero, whose block the run picks: see kind_yaml_names.
+BOT_YAML_NAMES = ("bot_sniper", "bot_artillery", "bot_melee", "bot_rifle", "bot_edgar", "bot_spike",
+                  "bot_bull")
+# The heroes a run can play (`entities.hero`), each a `hero_<name>` block in brawlers.yaml.
+HERO_NAMES = ("mortis", "bull")
+DEFAULT_HERO = "mortis"
 # Bot kinds in Kind-value order (1..7), used for entities.enemy_type_weights / fixed_enemy_types.
 # "edgar", "spike" and "bull" are brawler names where the other four are role names -- see
 # constants.Kind.
@@ -56,6 +59,29 @@ _KNOWN_MAP_NAMES = (
 RandomizationSpec = dict
 
 
+def kind_yaml_names(hero: str = DEFAULT_HERO) -> tuple[str, ...]:
+    """The brawlers.yaml block behind each column of the per-kind SimParams tensors, in Kind-value
+    order: `hero_<hero>` for column 0 (Kind.HERO), then the seven bots.
+
+    The hero is a ROW SWAP, not a new Kind (BULL_HERO_PLAN.md D1): Bull fills the same column 0
+    Mortis does, so N_KINDS, every `kind_onehot` and the slot-0-is-the-hero code (stats.is_hero,
+    spawn, the curriculum's column 0) are the same for either. One hero per run."""
+    if hero not in HERO_NAMES:
+        raise ValueError(f"entities.hero must be one of {', '.join(HERO_NAMES)}, got {hero!r}")
+    return (f"hero_{hero}",) + BOT_YAML_NAMES
+
+
+def spec_hero(spec: dict) -> str:
+    """The hero a spec plays: `entities.hero`, or Mortis when the spec does not say (every
+    hand-built partial spec in the tests, and every run that predates the key)."""
+    return str(_dget(spec, "entities.hero", default=DEFAULT_HERO))
+
+
+def spec_kind_names(spec: dict) -> tuple[str, ...]:
+    """`kind_yaml_names` for the hero `spec` names."""
+    return kind_yaml_names(spec_hero(spec))
+
+
 @dataclass(frozen=True)
 class EnvConfig:
     map_h: int = 60
@@ -80,6 +106,9 @@ class EnvConfig:
     # granted, unseen decisions before it is released (core/slots.py).
     slots_promote_hits: int = 2
     slots_max_misses: int = 3
+    # Which `hero_<name>` block of brawlers.yaml fills Kind.HERO's column (kind_yaml_names). The
+    # spec carries the same key for build_params; BrawlVecEnv refuses the two disagreeing.
+    hero: str = DEFAULT_HERO
     n_enemies: int = 6
     randomize_enemy_types: bool = True
     enemy_type_weights: tuple[float, ...] = (1 / 7,) * 7
@@ -310,6 +339,7 @@ _ENV_CONFIG_FIELDS = (
     ("camera.edge_flag_tiles", "camera_edge_flag_tiles", float),
     ("slots.promote_hits", "slots_promote_hits", int),
     ("slots.max_misses", "slots_max_misses", int),
+    ("entities.hero", "hero", str),
     ("entities.n_enemies", "n_enemies", int),
     ("entities.randomize_enemy_types", "randomize_enemy_types", bool),
     ("entities.enemy_type_weights", "enemy_type_weights", _weights_transform),
@@ -445,7 +475,7 @@ def apply_randomization(spec: dict, randomization: RandomizationSpec) -> dict:
 _F32 = torch.float32
 _I64 = torch.int64
 
-# (SimParams attribute, brawlers.yaml leaf key, dtype) -- one column per KIND_YAML_NAMES entry.
+# (SimParams attribute, brawlers.yaml leaf key, dtype) -- one column per kind_yaml_names entry.
 # Enum-valued fields live in PER_KIND_ENUM_FIELDS below: they're name strings, not scalar-or-range
 # numbers, so they can't ride _resolve_value.
 PER_KIND_FIELDS = (
@@ -520,6 +550,23 @@ PER_KIND_FIELDS = (
     ("super_heal", "super_heal", _F32),
     ("super_proj_speed", "super_proj_speed", _F32),
     ("super_radius", "super_radius", _F32),
+    # A CHARGE super (`super_type: CHARGE` below; Bull, BULL_HERO_PLAN.md D2) reuses three of the
+    # fields above: `super_range` is how far the body rushes, `super_radius` the half-width of the
+    # path it hits (on centres, as `dash_radius` is) and `super_damage` the flat damage per player.
+    # These are its own. All are 0 on a BOLT kind, and only a charge's rows read them
+    # (hero.start_charge, hero.advance_dash); validate() rejects a CHARGE with no speed.
+    ("super_charge_speed", "super_charge_speed", _F32),
+    # Seconds the charger stands still before the rush, counted inside `ent_dash_t`.
+    ("super_windup_seconds", "super_windup_seconds", _F32),
+    # Each player the charge hits is pushed this far away from the charger and launched (status
+    # airborne) for this long.
+    ("super_knockback_tiles", "super_knockback_tiles", _F32),
+    ("super_airborne_seconds", "super_airborne_seconds", _F32),
+    # The landing pulse: everyone within `super_slow_radius` of where the charge ends is slowed by
+    # `super_slow_frac` for `super_slow_seconds` (status.apply_slow).
+    ("super_slow_radius", "super_slow_radius", _F32),
+    ("super_slow_frac", "super_slow_frac", _F32),
+    ("super_slow_seconds", "super_slow_seconds", _F32),
     # GADGET. Per-kind like the super: `gadget_cooldown: 0` means "this kind has no gadget", which
     # is what every bot resolves to. The five numbers are the whole mechanic: a Proj.GADGET_SPINNER
     # (ARTILLERY-class) flies up to `gadget_range` tiles toward the nearest enemy its thrower can
@@ -532,6 +579,23 @@ PER_KIND_FIELDS = (
     ("gadget_flight_seconds", "gadget_flight_seconds", _F32),
     ("gadget_damage", "gadget_damage", _F32),
     ("gadget_radius", "gadget_radius", _F32),
+    # A STOMP gadget (`gadget_type: STOMP` below; Bull's Stomper, BULL_HERO_PLAN.md §5.5) uses
+    # `gadget_cooldown` and none of the spinner's four numbers. These are its own, all 0 on a
+    # SPINNER kind, and only a stomp's rows read them (hero.start_stomp, hero.advance_stomp):
+    # `stomp_windup_seconds` after the tap, every other player within `stomp_radius` of the
+    # stomper's centre is slowed by `stomp_slow_frac` for `stomp_slow_seconds`, or, if already
+    # slowed, stunned for `stomp_stun_seconds`. validate() rejects a stomp with no radius or
+    # wind-up.
+    ("stomp_radius", "stomp_radius", _F32),
+    ("stomp_windup_seconds", "stomp_windup_seconds", _F32),
+    ("stomp_slow_frac", "stomp_slow_frac", _F32),
+    ("stomp_slow_seconds", "stomp_slow_seconds", _F32),
+    ("stomp_stun_seconds", "stomp_stun_seconds", _F32),
+    # STAR POWER, Bull's Berserker: while HP is below `reload_boost_below_hp_frac` of max HP, the
+    # reload runs `reload_boost_mult` times as fast (hero.tick_timers). A threshold of 0, what
+    # every other kind resolves to, never boosts.
+    ("reload_boost_below_hp_frac", "reload_boost_below_hp_frac", _F32),
+    ("reload_boost_mult", "reload_boost_mult", _F32),
     # --- FIRE RULE. These four numbers plus `aim_model` below are a kind's whole fire rule, read
     # by bots/combat_rules.py, so a new brawler is a brawlers.yaml block, not a Python module.
     #
@@ -576,7 +640,7 @@ PER_KIND_FIELDS = (
 )
 
 # (SimParams attribute, brawlers.yaml leaf key, enum class, default member name) -- one column per
-# KIND_YAML_NAMES entry, same (N,K) i64 shape as PER_KIND_FIELDS produces. These are enum NAME
+# kind_yaml_names entry, same (N,K) i64 shape as PER_KIND_FIELDS produces. These are enum NAME
 # STRINGS in the config ("SNIPER_BOLT", "LEAD"), so they resolve to a constant column of that
 # member's value rather than through _resolve_value's scalar-or-range sampling -- an enum has no
 # meaningful midpoint to randomize between.
@@ -587,6 +651,10 @@ PER_KIND_FIELDS = (
 PER_KIND_ENUM_FIELDS = (
     ("proj_kind", "proj_kind", Proj, "NONE"),
     ("aim_model", "aim_model", AimModel, "DIRECT"),
+    # What the super does when it fires (constants.SuperType). BOLT, the default, is Mortis's.
+    ("super_type", "super_type", SuperType, "BOLT"),
+    # What the gadget does when it fires (constants.GadgetType). SPINNER, the default, is Mortis's.
+    ("gadget_type", "gadget_type", GadgetType, "SPINNER"),
 )
 
 # (SimParams attribute, dotted spec path, dtype). zone_start_time is handled separately: it's
@@ -648,13 +716,14 @@ def cone_ray_tiles(spec: dict) -> float:
     moment to take one. Reading `high` off the spec instead gives a bound that is valid for every
     reset this env will ever do, computed once in pure Python.
 
-    **Only kinds that can actually swing a cone count.** A kind with `attack_arc_rad == 0` can
-    never satisfy `geo.point_in_cone`, so `melee_hitscan` discards its rows regardless of what
-    the LOS check says; counting it would raise the bound to the longest RANGED range for
-    nothing.
+    **Only kinds that can actually swing a cone count.** A kind with `attack_arc_rad == 0` never
+    fires the hitscan: env._attack_phase gates `melee_fire` on `attack_arc_rad > 0`. (Until
+    2026-10-23 it did, and `geo.point_in_cone` passed a body EXACTLY on its facing ray at any
+    range up to its attack_range, past this bound.) Counting it would raise the bound to the
+    longest RANGED range for nothing.
     """
     best = 0.0
-    for kind in KIND_YAML_NAMES:
+    for kind in spec_kind_names(spec):
         blob = spec.get(kind, {})
         if _spec_upper(blob.get("attack_arc_rad", 0)) > 0:
             best = max(best, _spec_upper(blob.get("attack_range", 0)))
@@ -673,7 +742,7 @@ def attack_ray_tiles(spec: dict) -> float:
     box.
     """
     return max(
-        (_spec_upper(spec.get(kind, {}).get("attack_range", 0)) for kind in KIND_YAML_NAMES),
+        (_spec_upper(spec.get(kind, {}).get("attack_range", 0)) for kind in spec_kind_names(spec)),
         default=0.0,
     )
 
@@ -689,7 +758,54 @@ def dash_ray_tiles(spec: dict) -> float:
     return max(
         (_spec_upper(spec.get(kind, {}).get("dash_distance", 0))
          * max(1.0, _spec_upper(spec.get(kind, {}).get("long_dash_multiplier", 1.0)))
-         for kind in KIND_YAML_NAMES),
+         for kind in spec_kind_names(spec)),
+        default=0.0,
+    )
+
+
+def _charge_upper(spec: dict, field: str) -> float:
+    """The largest value `field` can roll on any `super_type: CHARGE` kind, 0 with none. A
+    misspelled `super_type` raises KeyError, as `_resolve_all` would."""
+    return max(
+        (_spec_upper(spec.get(kind, {}).get(field, 0)) for kind in spec_kind_names(spec)
+         if SuperType[spec.get(kind, {}).get("super_type", "BOLT")] == SuperType.CHARGE),
+        default=0.0,
+    )
+
+
+def charge_ray_tiles(spec: dict) -> float:
+    """A STATIC upper bound (in tiles) on how far a CHARGE super can rush: the longest
+    `super_range` any CHARGE kind can roll. Budgets `hero.start_charge`'s body march, as
+    `dash_ray_tiles` budgets the dash's. Same spec-derived, host-sync-free construction as
+    `cone_ray_tiles`.
+
+    It is also the switch for the whole charge. A spec with no CHARGE kind (every Mortis run)
+    gets 0, and env._attack_phase and hero.advance_dash then skip the charge in Python, so those
+    runs execute exactly the code they ran before it existed. validate() keeps a CHARGE kind's
+    `super_range` above 0, so a 0 here never hides one.
+    """
+    return _charge_upper(spec, "super_range")
+
+
+def knockback_ray_tiles(spec: dict) -> float:
+    """A STATIC upper bound (in tiles) on a charge's knockback: the longest
+    `super_knockback_tiles` any CHARGE kind can roll. Budgets the push's body march in
+    `hero.advance_dash`, which runs every tick of a Bull run, so it is kept apart from
+    `charge_ray_tiles`: a 1-tile push marched over an 11-tile budget would pay for 11."""
+    return _charge_upper(spec, "super_knockback_tiles")
+
+
+def stomp_radius_tiles(spec: dict) -> float:
+    """The widest `stomp_radius` any `gadget_type: STOMP` kind can roll, 0 with none. A
+    misspelled `gadget_type` raises KeyError, as `_resolve_all` would.
+
+    It is the switch for the whole stomp, as `charge_ray_tiles` is for the charge. A spec with no
+    STOMP kind (every Mortis run) gets 0, and env._attack_phase and env._stomp_phase then skip the
+    stomp in Python, so those runs execute exactly the code they ran before it existed. validate()
+    keeps the radius of a STOMP kind that has a gadget above 0, so a 0 here never hides one."""
+    return max(
+        (_spec_upper(spec.get(kind, {}).get("stomp_radius", 0)) for kind in spec_kind_names(spec)
+         if GadgetType[spec.get(kind, {}).get("gadget_type", "SPINNER")] == GadgetType.STOMP),
         default=0.0,
     )
 
@@ -722,7 +838,7 @@ def shot_step_tiles(spec: dict, dt: float) -> float:
     or boxes in flight. The curriculum's tier multipliers never touch any of these stats.
     """
     fastest = 0.0
-    for kind in KIND_YAML_NAMES:
+    for kind in spec_kind_names(spec):
         blob = spec.get(kind, {})
         fastest = max(fastest, _spec_upper(blob.get("proj_speed", 0)))
         if _spec_upper(blob.get("split_distance", 0)) > 0 and _spec_upper(blob.get("split_seconds", 0)) > 0:
@@ -743,11 +859,13 @@ def box_reach_tiles(spec: dict, shot_step: float) -> float:
       (the spinner) or `on_hit_area_radius` (a hazard) any kind can roll.
     Supers stay out for the reason `shot_step_tiles` gives: a piercing bolt never hits a box.
     """
-    widest_shot = max((_spec_upper(spec.get(kind, {}).get("proj_radius", 0)) for kind in KIND_YAML_NAMES),
-                      default=0.0)
+    widest_shot = max(
+        (_spec_upper(spec.get(kind, {}).get("proj_radius", 0)) for kind in spec_kind_names(spec)),
+        default=0.0,
+    )
     widest_blast = max(
         (_spec_upper(spec.get(kind, {}).get(field, 0))
-         for kind in KIND_YAML_NAMES for field in ("aoe_radius", "gadget_radius", "on_hit_area_radius")),
+         for kind in spec_kind_names(spec) for field in ("aoe_radius", "gadget_radius", "on_hit_area_radius")),
         default=0.0,
     )
     return max(widest_shot + BOX_RADIUS + shot_step / 2.0, widest_blast)
@@ -771,7 +889,8 @@ class SimParams:
     lifetime; `resample_params` does not touch them.
     """
 
-    SCALAR_FIELDS = ("cone_ray_tiles", "attack_ray_tiles", "dash_ray_tiles", "shot_step_tiles", "box_reach_tiles")
+    SCALAR_FIELDS = ("cone_ray_tiles", "attack_ray_tiles", "dash_ray_tiles", "charge_ray_tiles",
+                     "knockback_ray_tiles", "stomp_radius_tiles", "shot_step_tiles", "box_reach_tiles")
 
     __slots__ = (
         tuple(attr for attr, _, _ in PER_KIND_FIELDS)
@@ -801,7 +920,7 @@ def _resolve_all(cfg: EnvConfig, n_envs: int, device, gen: torch.Generator, spec
     for attr, yaml_key, dtype in PER_KIND_FIELDS:
         cols = [
             _resolve_value(spec.get(kind, {}).get(yaml_key, 0), gen, device, n_envs, dtype)
-            for kind in KIND_YAML_NAMES
+            for kind in spec_kind_names(spec)
         ]
         setattr(params, attr, torch.stack(cols, dim=1))
 
@@ -811,7 +930,7 @@ def _resolve_all(cfg: EnvConfig, n_envs: int, device, gen: torch.Generator, spec
                 (n_envs,), int(enum_cls[spec.get(kind, {}).get(yaml_key, default_name)]),
                 device=device, dtype=torch.int64,
             )
-            for kind in KIND_YAML_NAMES
+            for kind in spec_kind_names(spec)
         ]
         setattr(params, attr, torch.stack(cols, dim=1))
 
@@ -829,6 +948,9 @@ def _resolve_all(cfg: EnvConfig, n_envs: int, device, gen: torch.Generator, spec
     params.cone_ray_tiles = cone_ray_tiles(spec)
     params.attack_ray_tiles = attack_ray_tiles(spec)
     params.dash_ray_tiles = dash_ray_tiles(spec)
+    params.charge_ray_tiles = charge_ray_tiles(spec)
+    params.knockback_ray_tiles = knockback_ray_tiles(spec)
+    params.stomp_radius_tiles = stomp_radius_tiles(spec)
     # Capped at the full ray: a march never takes more than cfg.ray_steps samples, and an
     # unbounded shard speed (see shot_step_tiles) lands exactly there.
     params.shot_step_tiles = min(shot_step_tiles(spec, cfg.dt), cfg.max_ray_tiles)
@@ -873,8 +995,21 @@ def check_removed_keys(spec: dict) -> None:
         )
 
 
+def check_hero_block(spec: dict) -> None:
+    """Raises if the spec names a hero whose `hero_<name>` block is missing. A missing block reads
+    as all zeros (`spec.get(kind, {})`), a 0-HP hero with no attack that loads without complaint.
+    A spec that names no hero is left alone: hand-built partial specs in the tests omit blocks on
+    purpose, and the shipped brawlers.yaml always has Mortis's."""
+    if _dget(spec, "entities.hero", default=_ABSENT) is _ABSENT:
+        return
+    block = spec_kind_names(spec)[0]
+    if not isinstance(spec.get(block), dict):
+        raise ValueError(f"entities.hero is {spec_hero(spec)!r} but the spec has no {block!r} block")
+
+
 def build_params(cfg: EnvConfig, n_envs: int, device, gen: torch.Generator, spec: dict) -> SimParams:
     check_removed_keys(spec)
+    check_hero_block(spec)
     return _resolve_all(cfg, n_envs, device, gen, spec)
 
 
@@ -1120,7 +1255,7 @@ def validate(cfg: EnvConfig, params: SimParams) -> None:
     # --- per-kind mechanic sanity. Each of these is a config that raises NO error and produces
     # subtly wrong behavior for an entire training run, visible only much later as "the agent
     # learned something strange".
-    for k, kind_name in enumerate(KIND_YAML_NAMES):
+    for k, kind_name in enumerate(kind_yaml_names(cfg.hero)):
         # Swept melee: the sub-swing schedule is a floor() crossing on elapsed time, so it can fire
         # at most ONE sub-swing per tick. An interval below dt silently DROPS swings -- a Buzz
         # configured for 5 hitscans would land 4, with nothing anywhere saying so.
@@ -1200,7 +1335,7 @@ def validate(cfg: EnvConfig, params: SimParams) -> None:
         # fire-rule field with no usable default, so a new brawler block MUST name it. Gated on
         # attack_range, of which it is a FRACTION: a kind with no range can never pass fire_gate,
         # so demanding one would only reject hand-built partial specs.
-        if (k != int(Kind.HERO_MORTIS) and desired <= 0
+        if (k != int(Kind.HERO) and desired <= 0
                 and float(params.attack_range[:, k].max()) > 0):
             raise ValueError(
                 f"{kind_name}: attack_range is set but desired_range_fraction is 0, so a KITE bot "
@@ -1232,17 +1367,99 @@ def validate(cfg: EnvConfig, params: SimParams) -> None:
         # (core/hero.gadget_ready), so a block that sets it and leaves the geometry at 0 loads fine
         # and ships a spinner that reaches nowhere, lands never and hurts nothing. Damage is not
         # checked: 0 is a legitimate "utility" gadget, the geometry is not.
+        #
+        # A STOMP is the body's own pulse (hero.advance_stomp): with no radius it catches nobody,
+        # with no wind-up it never lands (the pulse fires as the wind-up runs out), and with
+        # neither a slow nor a stun it changes nothing. A STOMP kind whose cooldown is 0 has no
+        # gadget, so its numbers may stay (the M1 run sets only the cooldown). The reverse mistake
+        # is a SPINNER kind with stomp numbers, a block that forgot `gadget_type: STOMP`.
         if float(params.gadget_cooldown[:, k].min()) < 0:
             raise ValueError(f"{kind_name}: gadget_cooldown must be >= 0 (0 = no gadget).")
-        if float(params.gadget_cooldown[:, k].max()) > 0:
-            for field in ("gadget_range", "gadget_flight_seconds", "gadget_radius"):
+        has_gadget = float(params.gadget_cooldown[:, k].max()) > 0
+        if int(params.gadget_type[:, k].max()) == int(GadgetType.STOMP):
+            if has_gadget:
+                for field in ("stomp_radius", "stomp_windup_seconds"):
+                    if float(getattr(params, field)[:, k].min()) <= 0:
+                        raise ValueError(
+                            f"{kind_name}: gadget_type is STOMP but {field} is 0, so the stomp "
+                            f"would never land or never catch anyone. Set stomp_radius and "
+                            f"stomp_windup_seconds, or drop the cooldown."
+                        )
+                if (float(params.stomp_slow_seconds[:, k].max()) <= 0
+                        and float(params.stomp_stun_seconds[:, k].max()) <= 0):
+                    raise ValueError(
+                        f"{kind_name}: gadget_type is STOMP but stomp_slow_seconds and "
+                        f"stomp_stun_seconds are both 0, so the stomp would change nothing."
+                    )
+            for field in ("stomp_slow_seconds", "stomp_stun_seconds"):
+                if float(getattr(params, field)[:, k].min()) < 0:
+                    raise ValueError(f"{kind_name}: {field} must be >= 0 (0 = none).")
+            if (float(params.stomp_slow_frac[:, k].min()) < 0
+                    or float(params.stomp_slow_frac[:, k].max()) > 1.0):
+                raise ValueError(
+                    f"{kind_name}: stomp_slow_frac must be in [0, 1] -- it is the fraction of "
+                    f"walking speed the stomp's slow takes away."
+                )
+        else:
+            if has_gadget:
+                for field in ("gadget_range", "gadget_flight_seconds", "gadget_radius"):
+                    if float(getattr(params, field)[:, k].min()) <= 0:
+                        raise ValueError(
+                            f"{kind_name}: gadget_cooldown is set but {field} is 0, so the gadget "
+                            f"would fire a spinner that cannot reach, land or hit anything. Set "
+                            f"all three of gadget_range, gadget_flight_seconds and gadget_radius, "
+                            f"or drop the cooldown."
+                        )
+            if float(params.stomp_radius[:, k].max()) > 0:
+                raise ValueError(
+                    f"{kind_name}: stomp_radius is set but gadget_type is SPINNER, so the gadget "
+                    f"would throw a spinner and never stomp. Add `gadget_type: STOMP`."
+                )
+
+        # --- star power (Berserker). The threshold is a FRACTION of max HP, and below it the
+        # reload gain is multiplied by `reload_boost_mult`: a multiplier left at 0 would stop the
+        # reload outright just when the boost should start.
+        boost_frac = params.reload_boost_below_hp_frac[:, k]
+        if float(boost_frac.min()) < 0 or float(boost_frac.max()) > 1.0:
+            raise ValueError(
+                f"{kind_name}: reload_boost_below_hp_frac must be in [0, 1] -- it is a fraction "
+                f"of max HP (0 = no boost). Got {float(boost_frac.min())}..{float(boost_frac.max())}."
+            )
+        if float(boost_frac.max()) > 0 and float(params.reload_boost_mult[:, k].min()) <= 0:
+            raise ValueError(
+                f"{kind_name}: reload_boost_below_hp_frac is set but reload_boost_mult is 0, so "
+                f"the reload would stop below the threshold instead of speeding up."
+            )
+
+        # --- super type. A CHARGE is the body's own rush (hero.start_charge): with no speed it
+        # would never move or end, and with no range it would also hide from charge_ray_tiles,
+        # the switch that runs the charge at all. The reverse mistake is a BOLT kind with charge
+        # numbers, a block that forgot `super_type: CHARGE`: its super would fire a bolt with a
+        # charge's range and damage.
+        is_charge = int(params.super_type[:, k].max()) == int(SuperType.CHARGE)
+        if is_charge:
+            for field in ("super_charge_speed", "super_range", "super_radius"):
                 if float(getattr(params, field)[:, k].min()) <= 0:
                     raise ValueError(
-                        f"{kind_name}: gadget_cooldown is set but {field} is 0, so the gadget "
-                        f"would fire a spinner that cannot reach, land or hit anything. Set all "
-                        f"three of gadget_range, gadget_flight_seconds and gadget_radius, or "
-                        f"drop the cooldown."
+                        f"{kind_name}: super_type is CHARGE but {field} is 0, so the charge "
+                        f"could not move, end or hit anything. Set super_charge_speed, "
+                        f"super_range and super_radius."
                     )
+            for field in ("super_windup_seconds", "super_knockback_tiles", "super_airborne_seconds",
+                          "super_slow_radius", "super_slow_seconds"):
+                if float(getattr(params, field)[:, k].min()) < 0:
+                    raise ValueError(f"{kind_name}: {field} must be >= 0 (0 = none).")
+            if (float(params.super_slow_frac[:, k].min()) < 0
+                    or float(params.super_slow_frac[:, k].max()) > 1.0):
+                raise ValueError(
+                    f"{kind_name}: super_slow_frac must be in [0, 1] -- it is the fraction of "
+                    f"walking speed the landing slow takes away."
+                )
+        elif float(params.super_charge_speed[:, k].max()) > 0:
+            raise ValueError(
+                f"{kind_name}: super_charge_speed is set but super_type is BOLT, so the super "
+                f"would fire a bolt and never charge. Add `super_type: CHARGE`."
+            )
 
         # A projectile with no speed and no fixed flight time never moves and never expires by
         # distance -- it would sit on the shooter forever, holding a slot.

@@ -11,6 +11,7 @@ The rest pin failure modes the sim cannot reach because they do not exist there:
 disagrees, a reader that returns None, a super spend the next frame has not caught up with yet.
 """
 import math
+from dataclasses import fields
 from pathlib import Path
 from random import Random
 
@@ -26,18 +27,19 @@ from brawl_deployment.perception.shadow import (
     AMMO_TOLERANCE, AMMO_TOLERANCE_UNPAINTED, DESYNC, DESYNC_GRACE_SECONDS, GRACE, NO_READ,
     OK, SUSPECT, ShadowHero, ShadowParams,
 )
-from brawl_vision.object_detection.hp_detection.hero_bars import AmmoReading, SuperReading
+from brawl_deployment.perception.super_button import SuperReading
+from brawl_vision.object_detection.hp_detection.hero_bars import AmmoReading
 
 CONFIGS = Path(__file__).resolve().parent.parent / "configs"
 TINY = yaml.safe_load((CONFIGS / "presets" / "debug_tiny.yaml").read_text())
 
 
-def _params():
-    return ShadowParams.load()
+def _params(kind="hero_mortis"):
+    return ShadowParams.load(kind)
 
 
-def _shadow(**kw):
-    return ShadowHero(_params(), **kw)
+def _shadow(kind="hero_mortis", **kw):
+    return ShadowHero(_params(kind), **kw)
 
 
 def _ammo(value, whole=None):
@@ -49,8 +51,7 @@ def _ammo(value, whole=None):
 
 def _super(charge, ready):
     return SuperReading(charge=charge, ready=ready,
-                        state="ready" if ready else ("empty" if charge == 0 else "charging"),
-                        track_px=118, row=120)
+                        state="ready" if ready else ("empty" if charge == 0 else "charging"))
 
 
 # ---------------------------------------------------------------------------
@@ -111,12 +112,18 @@ def test_a_kind_without_a_gadget_loads_as_a_kind_with_no_gadget(tmp_path):
 # parity with the sim
 # ---------------------------------------------------------------------------
 
-def _sim_env(action_repeat, auto_aim=False):
+def _sim_env(action_repeat, auto_aim=False, hero="mortis", regen=True, star_power=True):
     """One env, tiny map, zone off, bots unkillable. `autoreset=False` so an episode that somehow
     ends is a visible assertion failure rather than a silent state reset mid-comparison.
-    `auto_aim` turns on the fifth attack value (`action.auto_aim`)."""
+    `auto_aim` turns on the fifth attack value (`action.auto_aim`). `hero` is `entities.hero`, on
+    the cfg and the spec alike, as the env requires; `regen=False` holds an HP set by hand.
+    `star_power=False` zeroes the hero block's two Berserker fields, the sim's own "this kind has
+    none", which is how an account without the star power plays him."""
     overrides = {name: dict(section) if isinstance(section, dict) else section
                  for name, section in TINY.items()}
+    overrides["entities"] = {**overrides.get("entities", {}), "hero": hero}
+    if not regen:
+        overrides["regen"] = {"enabled": False}
     if auto_aim:
         overrides["action"] = {**overrides.get("action", {}), "auto_aim": True}
     # The preset's 300-tick episode truncates at decision 60 when action_repeat is 5, which is one
@@ -128,9 +135,13 @@ def _sim_env(action_repeat, auto_aim=False):
 
     spec = {**yaml.safe_load((CONFIGS / "default.yaml").read_text()),
             **yaml.safe_load((CONFIGS / "brawlers.yaml").read_text())}
+    spec["entities"] = {**spec["entities"], "hero": hero}
     for kind, block in spec.items():
         if isinstance(block, dict) and "base_hp" in block:
             block["base_hp"] = 1e7
+    if not star_power:
+        spec[f"hero_{hero}"] = {**spec[f"hero_{hero}"], "reload_boost_below_hp_frac": 0.0,
+                                "reload_boost_mult": 0.0}
     return BrawlVecEnv(cfg, n_envs=1, device="cpu", seed=0, spec=spec,
                        autoreset=False, verbose=False)
 
@@ -145,11 +156,14 @@ def _script(n_decisions, seed=0):
     return plan
 
 
+@pytest.mark.parametrize("hero", ["mortis", "bull"])
 @pytest.mark.parametrize("action_repeat", [1, 5])
-def test_the_shadow_matches_the_sim_field_for_field(action_repeat):
-    env = _sim_env(action_repeat)
+def test_the_shadow_matches_the_sim_field_for_field(action_repeat, hero):
+    """For Bull the script's fire is a volley, so it checks the volley's clip and cooldown, his
+    measured 1.6 s reload, and that he never dashes and never has a long dash."""
+    env = _sim_env(action_repeat, hero=hero)
     env.reset()
-    shadow = _shadow()
+    shadow = _shadow(f"hero_{hero}")
     shadow.reset(facing=float(env.state.ent_facing[0, 0]))
 
     # -1 in column 0 is `_override_phase`'s "no override for this slot", so the hero keeps its own
@@ -183,10 +197,158 @@ def test_the_shadow_matches_the_sim_field_for_field(action_repeat):
         assert s["invuln"] == bool(h["invuln"][0]), where
         assert s["long_dash_ready"] == bool(h["long_dash_ready"][0]), where
         assert s["long_dash_frac"] == pytest.approx(float(h["long_dash_frac"][0]), abs=1e-6), where
+        assert s["slow_window"] == float(h["slow_window"][0]), where
         # Direction vectors are cos/sin, so torch's and libm's last ulp may differ.
         for i in (0, 1):
             assert s["facing_vec"][i] == pytest.approx(float(h["facing_vec"][0, i]), abs=1e-6), where
             assert s["dash_dir"][i] == pytest.approx(float(h["dash_dir"][0, i]), abs=1e-6), where
+
+
+def _compare_hero(s, h, where):
+    """Every shadow field the sim also reports, exactly: the same float32 operations in the same
+    order. Direction vectors are cos/sin, so those get libm's last ulp."""
+    for field in ("ammo", "attack_cd", "dash_t", "attack_idle_t", "slow_window",
+                  "gadget_charge_frac"):
+        assert s[field] == float(h[field][0]), f"{field} at {where}"
+    for flag in ("can_attack", "dashing", "invuln", "gadget_ready"):
+        assert s[flag] == bool(h[flag][0]), f"{flag} at {where}"
+    for i in (0, 1):
+        assert s["facing_vec"][i] == pytest.approx(float(h["facing_vec"][0, i]), abs=1e-6), where
+        assert s["dash_dir"][i] == pytest.approx(float(h["dash_dir"][0, i]), abs=1e-6), where
+
+
+@pytest.mark.parametrize("action_repeat", [1, 5])
+def test_bulls_charge_matches_the_sims(action_repeat):
+    """BULL_HERO_PLAN.md §5.7b. Two charges on the blank map, each with a super seeded by hand on
+    both sides: one along bin 1 (+x), then, after a step west to turn him, one on the idle bin,
+    which the sim aims along `facing` when no enemy is in the charge's reach. The bots stand in
+    the far corners, out of that reach, and the charges never reach a wall, which is where the
+    shadow's always-full charge (Q6) and the sim's D3 stop would part.
+
+    Every decision asks to fire and passes on what the shadow modelled: refused through the
+    windup and the rush, a volley once he lands. Through it all the fields agree exactly: the
+    0.20 s windup standing still, `dash_t` running down, the gadget held, and the 1.5 s
+    `slow_window` from the landing tick."""
+    env = _sim_env(action_repeat, hero="bull")
+    env.reset()
+    st = env.state
+    st.ent_pos[0, 0] = torch.tensor([4.5, 10.5])
+    st.ent_pos[0, 1] = torch.tensor([1.5, 1.5])
+    st.ent_pos[0, 2] = torch.tensor([1.5, 18.5])
+    shadow = _shadow("hero_bull")
+    shadow.reset(facing=float(st.ent_facing[0, 0]))
+    override = torch.zeros(1, env.cfg.n_entities, 2, dtype=torch.int64)
+    override[0, 0, 0] = -1
+
+    step = action_repeat * env.cfg.dt
+    after = math.ceil((1.85 + 1.5 + 0.25) / step)          # the rush, the window, and a margin
+    plan = ([(1, ATTACK_SUPER)] + [(0, ATTACK_FIRE)] * after
+            + [(9, ATTACK_NONE), (0, ATTACK_SUPER)] + [(0, ATTACK_FIRE)] * after)
+    charges = refused = slowed = volleys = 0
+    for decision, (move, attack) in enumerate(plan):
+        if attack == ATTACK_SUPER:
+            st.ent_super_charge[0, 0] = env.params.super_charge_hits[0, 0]
+            shadow.set_super(_super(0.0, False))   # the bar the last spend emptied, then full
+            shadow.set_super(_super(1.0, True))
+        modelled = shadow.act(move, attack)
+        if attack == ATTACK_SUPER:
+            assert modelled == ATTACK_SUPER, f"decision {decision}: the super was refused"
+            charges += 1
+        elif attack == ATTACK_FIRE:
+            refused += modelled == ATTACK_NONE
+            volleys += modelled == ATTACK_FIRE
+        obs, _, terminated, truncated, _ = env.step(
+            torch.tensor([[move, modelled]], dtype=torch.int64), override)
+        assert not bool(terminated[0]) and not bool(truncated[0]), f"episode ended at {decision}"
+        shadow.advance(step)
+        h, s = obs["hero"], shadow.observe()
+        _compare_hero(s, h, f"decision {decision} (move={move}, attack={modelled})")
+        slowed += s["slow_window"] > 0
+    assert charges == 2 and volleys >= 2
+    assert refused >= 2 * math.floor(1.84 / step) - 2, refused
+    assert slowed >= 2 * math.floor(1.5 / step) - 2, slowed
+    # The second charge went west, along the facing the step west gave him, and stopped short of
+    # the far wall: it really was the idle bin's charge, not a held +x.
+    assert float(st.ent_pos[0, 0, 0]) < 7.0
+
+
+@pytest.mark.parametrize("action_repeat", [1, 5])
+def test_berserker_matches_the_sims_reload(action_repeat):
+    """Bull reloads at `reload_boost_mult` under `reload_boost_below_hp_frac` of his max HP. The
+    sim reads its own max; the shadow reads the most HP it has been handed (`set_hp`), so the HP
+    goes in at full first, as a match's first read does. Then it is cut under the threshold by
+    hand, held there (regen off), and restored, with a volley on every legal decision so the
+    clip is always refilling. The clip agrees exactly across both crossings."""
+    env = _sim_env(action_repeat, hero="bull", regen=False)
+    env.reset()
+    shadow = _shadow("hero_bull")
+    shadow.reset(facing=float(env.state.ent_facing[0, 0]))
+    override = torch.zeros(1, env.cfg.n_entities, 2, dtype=torch.int64)
+    override[0, 0, 0] = -1
+
+    n = math.ceil(24.0 / (action_repeat * env.cfg.dt))
+    low = range(n // 3, 2 * n // 3)
+    boosted = 0
+    for decision in range(n):
+        if decision == low.start:
+            env.state.ent_hp[0, 0] = 1e6                     # a tenth of 1e7: under 0.6
+        if decision == low.stop:
+            env.state.ent_hp[0, 0] = 1e7
+        shadow.set_hp(float(env.state.ent_hp[0, 0]))
+        boosted += shadow.hp < 0.6 * shadow.max_hp
+        attack = ATTACK_FIRE if shadow.attack_mask()[1] else ATTACK_NONE
+        assert shadow.act(3, attack) == attack
+        obs, _, terminated, truncated, _ = env.step(
+            torch.tensor([[3, attack]], dtype=torch.int64), override)
+        assert not bool(terminated[0]) and not bool(truncated[0]), f"episode ended at {decision}"
+        shadow.advance(action_repeat * env.cfg.dt)
+        _compare_hero(shadow.observe(), obs["hero"], f"decision {decision} (attack={attack})")
+    assert boosted == len(low) and shadow.max_hp == 1e7
+
+
+@pytest.mark.parametrize("action_repeat", [1, 5])
+def test_a_bull_without_berserker_matches_the_sims_bull_without_it(action_repeat):
+    """The account's Bull has Stomper and no Berserker (the user, 2026-11-04), so
+    `loadout.star_power: false` hands the loop `without_star_power()` (design §5.2). This is the
+    test above against a sim Bull whose block zeroes the same two fields. The HP sits under 60 %
+    for the whole middle third, where the full kit would reload twice as fast, and the clip still
+    agrees exactly: the base rate, at every HP."""
+    env = _sim_env(action_repeat, hero="bull", regen=False, star_power=False)
+    env.reset()
+    shadow = ShadowHero(_params("hero_bull").without_star_power())
+    shadow.reset(facing=float(env.state.ent_facing[0, 0]))
+    override = torch.zeros(1, env.cfg.n_entities, 2, dtype=torch.int64)
+    override[0, 0, 0] = -1
+
+    n = math.ceil(24.0 / (action_repeat * env.cfg.dt))
+    low = range(n // 3, 2 * n // 3)
+    under = 0
+    for decision in range(n):
+        if decision == low.start:
+            env.state.ent_hp[0, 0] = 1e6                     # a tenth of 1e7: under 0.6
+        if decision == low.stop:
+            env.state.ent_hp[0, 0] = 1e7
+        shadow.set_hp(float(env.state.ent_hp[0, 0]))
+        under += shadow.hp < 0.6 * shadow.max_hp
+        attack = ATTACK_FIRE if shadow.attack_mask()[1] else ATTACK_NONE
+        assert shadow.act(3, attack) == attack
+        obs, _, terminated, truncated, _ = env.step(
+            torch.tensor([[3, attack]], dtype=torch.int64), override)
+        assert not bool(terminated[0]) and not bool(truncated[0]), f"episode ended at {decision}"
+        shadow.advance(action_repeat * env.cfg.dt)
+        _compare_hero(shadow.observe(), obs["hero"], f"decision {decision} (attack={attack})")
+    assert under == len(low) and shadow.max_hp == 1e7
+
+
+def test_dropping_the_star_power_zeroes_berserker_and_nothing_else():
+    """`star_power` is Berserker's threshold. Dropping it changes exactly his two fields, and
+    Mortis, whose kit has none, comes back equal."""
+    bull, mortis = _params("hero_bull"), _params("hero_mortis")
+    bare = bull.without_star_power()
+    assert bull.star_power and not bare.star_power
+    changed = {f.name for f in fields(ShadowParams) if getattr(bull, f.name) != getattr(bare, f.name)}
+    assert changed == {"reload_boost_below_hp_frac", "reload_boost_mult"}
+    assert not mortis.star_power and mortis.without_star_power() == mortis
 
 
 def test_the_attack_bearing_is_where_the_sims_dash_goes():
@@ -250,19 +412,22 @@ def test_a_super_costs_the_sim_and_the_shadow_the_same_thing():
     assert s["ammo"] == 3.0
 
 
-@pytest.mark.parametrize("action_repeat,n_decisions", [(1, 400), (5, 100)])
-def test_the_shadows_gadget_matches_the_sims(action_repeat, n_decisions):
+@pytest.mark.parametrize("hero", ["mortis", "bull"])
+@pytest.mark.parametrize("action_repeat,n_decisions", [(1, 440), (5, 100)])
+def test_the_shadows_gadget_matches_the_sims(action_repeat, n_decisions, hero):
     """The gadget's parity test, closed-loop on the shadow's own mask so
     every throw is one the deployed loop could send. Decision 0 throws. Each time the gadget is
     legal again it is thrown mid-dash, with a dash started first when none is running, because
     the gadget's mask is the one with no dash term. Between throws the hero fires at random, so
     the timers a throw must NOT touch are moving under it.
 
-    400 decisions at 20 Hz and 100 at 4 Hz are 20 s and 25 s, both past one 18 s cooldown, so
-    the timer is compared all the way down and through a second throw."""
-    env = _sim_env(action_repeat)
+    440 decisions at 20 Hz and 100 at 4 Hz are 22 s and 25 s, both past one cooldown (Mortis's
+    18 s, Bull's 20 s), so the timer is compared all the way down and through a second throw.
+    Bull has no dash to throw inside (his fire is a volley, and his charge masks the gadget), so
+    he throws whenever it is legal."""
+    env = _sim_env(action_repeat, hero=hero)
     env.reset()
-    shadow = _shadow()
+    shadow = _shadow(f"hero_{hero}")
     shadow.reset(facing=float(env.state.ent_facing[0, 0]))
     override = torch.zeros(1, env.cfg.n_entities, 2, dtype=torch.int64)
     override[0, 0, 0] = -1
@@ -272,7 +437,7 @@ def test_the_shadows_gadget_matches_the_sims(action_repeat, n_decisions):
     for decision in range(n_decisions):
         legal = shadow.attack_mask()
         move = rng.randrange(0, 17)
-        if decision == 0 or (legal[3] and shadow.dash_t > 0):
+        if decision == 0 or (legal[3] and (shadow.dash_t > 0 or hero == "bull")):
             attack = ATTACK_GADGET
         elif legal[3] and legal[1]:
             attack = ATTACK_FIRE                 # a dash, so the next decision throws mid-dash
@@ -299,7 +464,7 @@ def test_the_shadows_gadget_matches_the_sims(action_repeat, n_decisions):
             assert s[field] == float(h[field][0]), f"{field} at {where}"
         for flag in ("can_attack", "dashing", "invuln", "long_dash_ready"):
             assert s[flag] == bool(h[flag][0]), f"{flag} at {where}"
-    assert throws >= 2 and mid_dash >= 1, (throws, mid_dash)
+    assert throws >= 2 and (mid_dash >= 1 or hero == "bull"), (throws, mid_dash)
 
 
 def test_the_scripted_run_actually_exercises_a_dash_and_a_long_dash():
@@ -654,6 +819,47 @@ def test_the_gadget_is_charged_at_the_gate():
     assert shadow.observe()["gadget_charge_frac"] == 1.0
 
 
+def test_an_unequipped_gadget_reads_as_the_sims_kind_with_no_gadget():
+    """Design §5.2: the game unlocks a gadget at power 7, so the account's brawler can lack the
+    one the kit has. `equip_gadget(False)` is the sim's own representation of that, a zero
+    cooldown: never legal, a fraction of 0.0, and `act` refuses the throw. Equipping again
+    restores the kit's, charged at the gate as before. It outlives `reset()`, which is a match
+    boundary the LOOP owns: `_begin_match` decides the loadout, the shadow only carries it."""
+    shadow = _shadow()
+    assert shadow.gadget_equipped
+    shadow.equip_gadget(False)
+    assert not shadow.gadget_equipped
+    assert shadow.attack_mask() == (True, True, False, False)
+    assert shadow.observe()["gadget_ready"] is False
+    assert shadow.observe()["gadget_charge_frac"] == 0.0
+    assert shadow.act(0, ATTACK_GADGET) == ATTACK_NONE
+    shadow.advance(20.0)
+    assert not shadow.attack_mask()[3]
+
+    shadow.reset()
+    assert not shadow.gadget_equipped
+
+    shadow.equip_gadget(True)
+    assert shadow.attack_mask() == (True, True, False, True)
+    assert shadow.observe()["gadget_charge_frac"] == 1.0
+    assert shadow.act(0, ATTACK_GADGET) == ATTACK_GADGET
+    shadow.advance(0.05)
+    assert shadow.gadget_cd == 18.0                  # the kit's own cooldown, not a stale zero
+
+
+def test_a_kit_with_no_gadget_cannot_be_equipped_with_one(tmp_path):
+    """The disc reader cannot conjure what the kit lacks: a sighting on a kind with no gadget
+    leaves it without one."""
+    mortis = yaml.safe_load((CONFIGS / "brawlers.yaml").read_text())["hero_mortis"]
+    path = tmp_path / "brawlers.yaml"
+    path.write_text(yaml.safe_dump(
+        {"hero_x": {k: v for k, v in mortis.items() if k != "gadget_cooldown"}}))
+    shadow = ShadowHero(ShadowParams.load("hero_x", path))
+    shadow.equip_gadget(True)
+    assert not shadow.gadget_equipped
+    assert shadow.act(0, ATTACK_GADGET) == ATTACK_NONE
+
+
 def test_a_throw_holds_the_gadget_for_exactly_360_sub_ticks():
     """`gadget_cooldown: 18.0` at `dt: 0.05`. The throw's own tick writes 18.0, and float32 needs
     360 decrements to bring that to zero, so the gadget is illegal for 359 more sub-ticks and
@@ -691,6 +897,18 @@ def test_at_the_deployed_4_hz_the_second_throw_is_decision_73():
     shadow.act(0, ATTACK_GADGET)                 # decision 0
     shadow.advance(0.25)
     for decision in range(1, 73):
+        assert not shadow.attack_mask()[3], f"legal at decision {decision}"
+        shadow.advance(0.25)
+    assert shadow.attack_mask()[3]
+
+
+def test_at_the_deployed_4_hz_bulls_second_throw_is_decision_81():
+    """The same count for Bull's 20 s Stomper: 19.8 s left after the throw's own decision, 0.05 s
+    still at decision 80, legal at 81, 20.25 s after the first throw."""
+    shadow = _shadow("hero_bull")
+    shadow.act(0, ATTACK_GADGET)                 # decision 0
+    shadow.advance(0.25)
+    for decision in range(1, 81):
         assert not shadow.attack_mask()[3], f"legal at decision {decision}"
         shadow.advance(0.25)
     assert shadow.attack_mask()[3]
@@ -1004,13 +1222,15 @@ _NOT_SHADOWED = {"hero.pos_norm", "hero.vel", "hero.hp", "hero.in_bush", "hero.i
                  "hero.near_edge", "meta.time_frac", "meta.n_enemies_alive"}
 
 
-@pytest.mark.parametrize("spec_path", sorted(CONFIGS.glob("agent_obs_deploy*.yaml")),
+@pytest.mark.parametrize("spec_path", sorted([*CONFIGS.glob("agent_obs_deploy*.yaml"),
+                                               CONFIGS / "agent_obs_bull.yaml"]),
                          ids=lambda p: p.name)
 def test_observe_covers_every_self_field_the_deploy_spec_asks_of_it(spec_path):
     """If a field is added to a deploy spec's `self` group, it either gets a CV supplier (and joins
     the set above) or it has to come from here. Silently returning neither is how a column of
     zeros reaches a policy trained to trust it. Every `agent_obs_deploy*.yaml`, so deploy4's
-    gadget pair is covered, and so is whatever the next spec adds."""
+    gadget pair is covered, and so is whatever the next spec adds, plus Bull's, which is deploy6
+    with `hero.slow_window` (BULL_HERO_PLAN.md §5.7b)."""
     spec = yaml.safe_load(spec_path.read_text())
     group = next(g for g in spec["groups"] if g["name"] == "self")
     keys = set(_shadow().observe())

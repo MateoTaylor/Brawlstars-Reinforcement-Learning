@@ -13,6 +13,7 @@ import torch
 from . import geometry as geo
 from . import melee_sweep
 from . import stats
+from . import status
 from . import terrain
 
 
@@ -23,10 +24,14 @@ def apply_movement(state, move_dir: torch.Tensor, bank, params, cfg) -> None:
     walks at full speed; a bot's intent is bots/policy.all_bot_intents's EMA-smoothed steering,
     which decays toward zero after the bot decides to stop. Renormalising that decaying vector
     would make a stopping bot coast at full speed along its old heading for tiles; scaling speed
-    by the length makes the stop a short deceleration."""
-    active = state.ent_alive & (state.ent_dash_t <= 0)  # skipped: dead or dashing
+    by the length makes the stop a short deceleration.
 
-    speed = stats.effective_speed(state.ent_kind, params)  # (N,E)
+    Status effects (core/status.py): a stunned or airborne unit stands still and keeps its
+    facing, and a slowed one walks at (1 - ent_slow_frac) of its speed."""
+    stopped = status.disabled(state)
+    active = state.ent_alive & (state.ent_dash_t <= 0) & ~stopped  # skipped: dead, dashing or stunned
+
+    speed = status.walk_speed(state, stats.effective_speed(state.ent_kind, params))  # (N,E)
     norm_dir = geo.normalize(move_dir)
     throttle = torch.clamp(geo.safe_norm(move_dir, dim=-1), max=1.0)
     delta = norm_dir * (speed * throttle).unsqueeze(-1) * cfg.dt
@@ -44,7 +49,7 @@ def apply_movement(state, move_dir: torch.Tensor, bank, params, cfg) -> None:
     # Facing tracks movement -- except mid-SWEEP: the swinger keeps moving while his hitscans land
     # but keeps facing the direction he started the attack in, so the fan stays a readable,
     # dodgeable arc instead of smearing wherever he walks. Gated on the KIND being swept, not on
-    # `ent_attack_cd > 0` alone (see melee_sweep.is_swept).
+    # `ent_attack_cd > 0` alone (see melee_sweep.is_swept). A stunned unit does not turn either.
     sweeping = melee_sweep.is_swept(state, params) & (state.ent_attack_cd > 0)
-    move_nonzero = ((move_dir[..., 0] != 0) | (move_dir[..., 1] != 0)) & ~sweeping
+    move_nonzero = ((move_dir[..., 0] != 0) | (move_dir[..., 1] != 0)) & ~sweeping & ~stopped
     state.ent_facing.copy_(torch.where(move_nonzero, geo.angle_of(move_dir), state.ent_facing))
